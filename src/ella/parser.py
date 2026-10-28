@@ -1,5 +1,6 @@
 from abc import ABC
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import ClassVar, NoReturn
 
 import ella.token as tok
@@ -8,51 +9,77 @@ from ella import op
 
 class Expr(ABC): ...
 
-
 class LiteralExpr(Expr, ABC):
     _instances: ClassVar[dict[type[tok.Literal], type[LiteralExpr]]] = {}
 
-    def __init_subclass__(cls, tokentype: type[tok.Literal]) -> None:
-        LiteralExpr._instances[tokentype] = cls
+    def __init_subclass__(cls, tokentype: type[tok.Literal] | None = None, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        if tokentype is not None:
+            LiteralExpr._instances[tokentype] = cls
 
 
+@dataclass(frozen=True, slots=True)
 class LiteralIntegerExpr(LiteralExpr, tokentype=tok.LiteralInteger):
-    def __init__(self, token: tok.LiteralInteger):
-        self.token = token
+    token: tok.LiteralInteger
+    value: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", int(self.token.value))
 
 
+@dataclass(frozen=True, slots=True)
 class LiteralFloatExpr(LiteralExpr, tokentype=tok.LiteralFloat):
-    def __init__(self, token: tok.LiteralFloat):
-        self.token = token
+    token: tok.LiteralFloat
+    value: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", float(self.token.value))
 
 
+@dataclass(frozen=True, slots=True)
 class LiteralStringExpr(LiteralExpr, tokentype=tok.LiteralString):
-    def __init__(self, token: tok.LiteralString):
-        self.token = token
+    token: tok.LiteralString
+    value: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.token.value)
 
 
+@dataclass(frozen=True, slots=True)
 class NameExpr(Expr):
-    def __init__(self, token: tok.Identifier) -> None:
-        self.token = token
+    token: tok.Identifier
+    value: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.token.value)
 
 
+@dataclass(frozen=True, slots=True)
+class KeywordExpr(Expr):
+    token: tok.Keyword
+    value: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.token.value)
+
+
+@dataclass(frozen=True, slots=True)
 class UnaryExpr(Expr):
-    def __init__(self, operator: type[op.Prefix], operand: Expr) -> None:
-        self.operator = operator
-        self.operand = operand
+    operator: type[op.Unary]
+    operand: Expr
 
 
+@dataclass(frozen=True, slots=True)
 class BinaryExpr(Expr):
-    def __init__(self, operator: type[op.Binary], left: Expr, right: Expr) -> None:
-        self.operator = operator
-        self.left = left
-        self.right = right
+    operator: type[op.Binary]
+    left: Expr
+    right: Expr
 
 
+@dataclass(frozen=True, slots=True)
 class CallExpr(Expr):
-    def __init__(self, callee: Expr, arguments: tuple[Expr, ...]) -> None:
-        self.callee = callee
-        self.arguments = arguments
+    callee: Expr
+    arguments: tuple[Expr, ...]
 
 
 class Parser:
@@ -73,11 +100,16 @@ class Parser:
 
         while self.position < len(self.tokens):
             token = self._current()
-            if token.value == "(":
-                precedence = op.Binary._types["("].precedence
-                if precedence < min_precedence:
+
+            postfix = op.Postfix._types.get(token.value)
+            if postfix is not None:
+                if postfix.precedence < min_precedence:
                     break
-                left = self._call(left)
+                if postfix is op.Call:
+                    left = self._call(left)
+                else:
+                    self.position += 1
+                    left = UnaryExpr(postfix, left)
                 continue
 
             operator = op.Binary._types.get(token.value)
@@ -104,6 +136,9 @@ class Parser:
         if isinstance(token, tok.Identifier):
             return NameExpr(token)
 
+        if isinstance(token, tok.Keyword):
+            return KeywordExpr(token)
+
         prefix = op.Prefix._types.get(token.value)
         if prefix is not None:
             return UnaryExpr(prefix, self._expression(prefix.precedence))
@@ -113,7 +148,7 @@ class Parser:
             self._expect(")")
             return expression
 
-        self._raise(f"unexpected token {token.value!r}")
+        self._raise(f"unexpected token {token.value!r}", token)
 
     def _call(self, callee: Expr) -> CallExpr:
         self._expect("(")
@@ -121,9 +156,12 @@ class Parser:
         if not self._matches(")"):
             while True:
                 arguments.append(self._expression(0))
-                if not self._matches(","):
+                if self._matches(","):
+                    self.position += 1
+                    if self._matches(")"):
+                        break
+                else:
                     break
-                self.position += 1
         self._expect(")")
         return CallExpr(callee, tuple(arguments))
 
@@ -138,9 +176,10 @@ class Parser:
     def _current(self) -> tok.Token:
         return self.tokens[self.position]
 
-    def _raise(self, message: str) -> NoReturn:
-        if self.position < len(self.tokens):
+    def _raise(self, message: str, token: tok.Token | None = None) -> NoReturn:
+        if token is None and self.position < len(self.tokens):
             token = self._current()
+        if token is not None:
             message += f" @ {token.line}:{token.column}"
         raise SyntaxError(message)
 

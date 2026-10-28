@@ -50,14 +50,14 @@ def test_literal_number_5() -> None:
 
 @pytest.mark.parametrize("s", ["123__123", "123__123e+3", "123__123e+3.5", "123__123e-+3"])
 def test_bad_literal_number(s: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(SyntaxError):
         _lex_literal_integer_float(0, 0, 0, s)
 
 
 def test_literal_string_1() -> None:
     s = '"abc123"'
     idx, column, line, res = _lex_literal_string(0, 0, 0, s)
-    assert idx + 1 == len(s)
+    assert idx == len(s)
     assert column == idx
     assert line == 0
     assert res.value == "abc123"
@@ -66,7 +66,7 @@ def test_literal_string_1() -> None:
 def test_literal_string_2() -> None:
     s = "'abc123'"
     idx, column, line, res = _lex_literal_string(0, 0, 0, s)
-    assert idx + 1 == len(s)
+    assert idx == len(s)
     assert column == idx
     assert line == 0
     assert res.value == "abc123"
@@ -74,7 +74,7 @@ def test_literal_string_2() -> None:
 
 @pytest.mark.parametrize("s", ["'abc123", "'abc\n", "'", '"'])
 def test_bad_literal_string(s: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(SyntaxError):
         _lex_literal_string(0, 0, 0, s)
 
 
