@@ -2,12 +2,16 @@ from abc import ABC
 from collections.abc import Iterator
 from typing import ClassVar
 
+from ella import op
+
 DIGITS = frozenset("0123456789")
 LOWER = frozenset("_abcdefghijklmnopqrstuvwxyz")
 UPPER = frozenset("_ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 LETTERS = LOWER | UPPER
 WHITESPACE = frozenset(" \t\r")
-QUOTES = frozenset("\"\'")
+QUOTES = frozenset("\"'")
+WORD_OPERATORS = frozenset({"and", "if", "not", "or"})
+
 
 class Token(ABC):
     __slots__ = ("column", "line", "value")
@@ -26,6 +30,7 @@ class Keyword(Token, ABC):
 
     def __init_subclass__(cls, value: str) -> None:
         cls.value = value
+        cls.__slots__ = ()
         Keyword._instances[value] = cls
 
 
@@ -36,18 +41,23 @@ class Float(Keyword, value="float"): ...
 
 
 def _lex_keyword(idx: int, column, line: int, src: str) -> tuple[int, int, int, Keyword | None]:
-    # all keywords have no spaces and must be followed by whitespace
     start = idx
-    while idx < len(src) and src[idx] not in WHITESPACE:
+    while idx < len(src) and src[idx] in LETTERS | DIGITS:
         idx += 1
 
     value = src[start:idx]
-    try:
-        print("KW", value, Keyword._instances)
-        kw = Keyword._instances[value]
-        return idx, column + (idx - start), line, kw(value, line, idx)
-    except KeyError:
+    keyword = Keyword._instances.get(value)
+    if keyword is None:
         return start, column, line, None
+    return idx, column + (idx - start), line, keyword(value, line, column)
+
+
+class Identifier(Token):
+    __slots__ = ()
+
+
+class OperatorToken(Token):
+    __slots__ = ()
 
 
 # fmt: off
@@ -85,14 +95,14 @@ def _lex_literal_integer_float(idx: int, column: int, line: int, src: str) -> tu
         except ValueError:
             raise ValueError(f"invalid literal for base 10: {value} @ {line}:{start}") from None
 
-        return idx, column + (idx - start), line, LiteralInteger(value, line, start)
+        return idx, column + (idx - start), line, LiteralInteger(value, line, column)
     else:
         try:
             _ = float(value)
         except ValueError:
             raise ValueError(f"invalid literal float: {value} @ {line}:{start}") from None
 
-        return idx, column + (idx - start), line, LiteralFloat(value, line, start)
+        return idx, column + (idx - start), line, LiteralFloat(value, line, column)
 
 
 class LiteralString(Literal):
@@ -114,31 +124,58 @@ def _lex_literal_string(idx: int, column: int, line: int, src: str) -> tuple[int
     if idx >= len(src) or src[idx] != quote:
         raise ValueError(f"unterminated string: {value} @ {line}:{column}")
 
-    return idx, column + (idx - start), line, LiteralString(value, column, line, quote)
+    return idx, column + (idx - start), line, LiteralString(value, line, column, quote)
 
 def lex(src: str) -> Iterator[Token]:
     idx, column, line = 0, 1, 1
+    operators = sorted(
+        set(op.Prefix._types) | set(op.Binary._types) | {"(", ")", ","},
+        key=len,
+        reverse=True,
+    )
 
     while idx < len(src):
-        print("ooping")
+        token: Token
         match src[idx]:
             case ch if ch in WHITESPACE:
-                column += 1
                 idx += 1
+                column += 1
             case "\n":
-                line += 1
+                idx += 1
                 column = 1
+                line += 1
             case ch if ch in DIGITS:
                 idx, column, line, token = _lex_literal_integer_float(idx, column, line, src)
                 yield token
             case ch if ch in QUOTES:
                 idx, column, line, token = _lex_literal_string(idx, column, line, src)
+                idx += 1
+                column += 1
                 yield token
             case ch if ch in LETTERS:
-                idx, column, line, token = _lex_keyword(idx, column, line, src)
-                if token is None:
-                    # will add identifiers eventually
-                    raise NameError(f"cannot find name @ {line}:{column}")
-                yield token
+                start = idx
+                idx += 1
+                while idx < len(src) and src[idx] in LETTERS | DIGITS:
+                    idx += 1
 
-    return
+                value = src[start:idx]
+                token_type = Keyword._instances.get(value)
+
+                if token_type is not None:
+                    token = token_type(value, line, column)
+                elif value in WORD_OPERATORS:
+                    token = OperatorToken(value, line, column)
+                else:
+                    token = Identifier(value, line, column)
+
+                column += idx - start
+                yield token
+            case _:
+                operator = next((value for value in operators if src.startswith(value, idx)), None)
+                if operator is None:
+                    raise SyntaxError(f"unexpected character {src[idx]!r} @ {line}:{column}")
+
+                idx += len(operator)
+                column += len(operator)
+
+                yield OperatorToken(operator, line, column)
