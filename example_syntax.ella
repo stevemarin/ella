@@ -1,30 +1,30 @@
+# Ella syntax tour. docs/grammar.md is the reference; this file should always
+# parse, and later run, without errors.
 
 # this is a comment
 
-# fibonacci is a function mapping non-negative int -> non-negative int
-# assigning to a function call is a function definition
-# indentation is relevant indicates scoping/blocks
-# we have a contract that fibonacci is called with positive integers
-# - for now, we can just insert runtime checks
-# IR will enforce/allow tail call optimization here
-# for now, type annotations are needed - we can relax this later
-# NOTE: replaced = with => in function def to make more consistent with lambdas
-# functions accept multple inputs not currying
+# Functions are lambdas bound with let: (params) -> ReturnType => body
+# - functions take multiple arguments; there is no currying
+# - type annotations are required for now; we can relax this later
+# - indentation defines blocks
+# - a let-bound lambda can call itself by name
+# - the IR will support tail-call optimization (fibonacci and factorial below
+#   are not tail calls, so they won't benefit)
 let fibonacci = (n: i64) -> i64 =>
-    # where clause validates inputs/outputs and produces runtime errors for now
-    # _ is the default name for the return value
+    # where must be the first clause in a function body. Its conditions are
+    # checked at run time; conditions mentioning `return` (the result) are
+    # checked on exit. fibonacci(-3) is a run-time error.
     where
         n >= 0
         return >= 0
     match n
-      case 0, 1
+      case 0 | 1
         1
       case _
         fibonacci(n - 1) + fibonacci(n - 2)
 
+# assert is a keyword so failures can show the asserted source text
 assert fibonacci(5) == 8
-
-# fibonacci(-3) == ??? - should this error, return Rust-like None or Error variants?
 
 # another recursive example
 let factorial = (n: i64) -> i64 =>
@@ -32,44 +32,132 @@ let factorial = (n: i64) -> i64 =>
         n >= 0
         return >= 0
     match n
-        case 0, 1 # this is also a comment, and the newline here is necessary
+        case 0 | 1 # this is also a comment, and the newline here is necessary
             1
         case _
             n * factorial(n - 1)
 
 assert factorial(5) == 120
 
-# bindings return the bound value, so 5 here
-# if x is not defined, then assignment defines it in the current scope
-# and are immutable by default
-# let y = let x = 5 sets x = 5 and returns 5 so y is then also set 5
+# Bindings are immutable unless marked mut, and evaluate to the bound value.
+# Every target in a let chain is a new binding; mut applies to x only.
 let y = mut x = z = 5
 x += 1
 print("x={{x}}, y={{y}}, z={{z}}") # prints: x=6, y=5, z=5
-y += 1 # doesn't work since y is immutable
+# y += 1   # compile error: y is immutable
 
-# for loop example    
-# string interpolation occurs inside {{}}
-# technically print returns something... maybe ()?
+# assignment (no let) requires an existing mut binding and returns the value
+x = 10
+
+# shadowing: a new let may reuse a name
+let x = 4
+
+# for loops; string interpolation takes any expression inside {{ }}
 let names: [str] = ["bob", "steve", "jane"]
 for name in names
     print("Hello, {{name}}!")
+print("{{ len(names) }} names, first is {{ names[0] }}")
 
 # ifs are expressions like everything
 let iseven = (n: i64) -> bool => if n % 2 == 0 then true else false
 
+# both of these ifs are valid; else may start its own line
+if x == 4 then
+    print("x={{x}}")
+else
+    print("not 4")
+
+if x == 4 then print("x={{x}}") else print("not 4")
+
 # lambda expressions
-# -> are for typing functions, this the type of x is i64 -> i64
-# => are for indicating computation
-# TODO: How do we want to format types in lambdas?
+# -> is for types, => is for computation
 (x: i64) -> i64 => x + 2
 
-# a two argument lambda
+# a two argument lambda; its type is (i64, i64) -> i64
 (x: i64, y: i64) -> i64 => x + y
 
 # no implicit type conversions
-# Result which have Ok and Error variants and Optional which have Some and None variants are builtin
-# Result's Error variant is an exception type
+# Result (Ok / Error) and Optional (Some / None) are built-in enums
 let invert = (n: f64) -> Result[f64, Error] =>
     if n == 0.0 then Error("divide by zero") else Ok(1.0 / n)
 
+# match destructures enum variants, with optional guards and one-line arms
+let describe = (r: Result[f64, Error]) -> str =>
+    match r
+        case Ok(v) if v > 1.0 => "big"
+        case Ok(v) => "small"
+        case Error(e) => "error"
+
+# ? propagates errors: Error(e)? returns Error(e) from the enclosing function
+let double_inverse = (n: f64) -> Result[f64, Error] =>
+    let v = invert(n)?
+    Ok(v * 2.0)
+
+# / always returns f64; // floors to an integer and % matches it
+assert 7 / 2 == 3.5
+assert -7 // 2 == -4
+assert -7 % 2 == 1
+assert 2 ** 10 == 1024
+
+# comparisons chain: 0 <= i < 10 means 0 <= i and i < 10
+let i = 3
+assert 0 <= i < 10
+assert i in 0..10 and not (i in 0..3)
+assert i not in [1, 2]
+
+# ranges: 0..n excludes n, 0..=n includes it
+let mut total = 0
+for k in 0..=4
+    total += k
+assert total == 10
+
+# pipes insert the left side as the first argument: xs |> f(a) is f(xs, a).
+# a line can't end with an operator, so multi-line pipes need parentheses
+let add = (a: i64, b: i64) -> i64 => a + b
+let piped = (1
+    |> add(2)
+    |> add(3))
+assert piped == 6
+
+# indexing and assignment through a mut binding
+let mut xs: [i64] = [1, 2, 3]
+xs[0] = 7
+assert xs[0] == 7 and len(xs) == 3
+
+# while, loop, and labeled break/continue
+let mut count = 0
+while count < 3
+    count += 1
+
+let grid: [[i64]] = [[1, 2], [0, 3], [-1, 4]]
+'outer for row in grid
+    for cell in row
+        if cell == 0 then continue 'outer
+        if cell < 0 then break 'outer
+
+# loop is an expression whose value comes from break
+let mut n = 0
+let found = loop
+    n += 1
+    if n * n > 50 then break n
+assert found == 8
+
+# multi-line strings keep their content exactly as written
+let poem = """roses are red
+violets are blue"""
+
+# enums (provisional syntax)
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+
+let area = (s: Shape) -> f64 =>
+    match s
+        case Circle(r) => 3.14159 * r * r
+        case Rect(w, h) => w * h
+        case Empty => 0.0
+
+# if main is defined, it runs after the top-level code
+let main = () -> () =>
+    print("done")

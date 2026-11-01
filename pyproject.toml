@@ -1,7 +1,7 @@
 [project]
 name = "ella"
 version = "0.1.0"
-description = "Add your description here"
+description = "A statically typed language for learning, from tokenizer to x64"
 readme = "README.md"
 authors = [
     { name = "Steve Marin" }
@@ -26,3 +26,10 @@ dev = [
 
 [tool.ruff]
 line-length = 119
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
+[tool.mypy]
+strict = true
+files = ["src", "test"]

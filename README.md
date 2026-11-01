@@ -21,6 +21,10 @@ will be an interpreter; a later compiler will lower it to x64 assembly.
 * Built-in vector types
 * No implicit type conversions
 * SIMD everywhere
+* Pass-by-value semantics; immutable bindings unless marked `mut`
+
+The language itself is described in [docs/grammar.md](docs/grammar.md), and
+[example_syntax.ella](example_syntax.ella) is a tour of the syntax.
 
 ## Design
 
@@ -66,6 +70,7 @@ and IR rather than treating every compiler pass as a stage of program execution.
 * Define token types and a tokenizer.
 * Build a small expression language with a Pratt (TDOP) parser.
 * Add functions, and types incrementally.
+* Done when [example_syntax.ella](example_syntax.ella) tokenizes and parses.
 * Keep syntax and operator definitions modular where that helps experimentation.
 
 ### 2. Source interpreter
@@ -99,10 +104,13 @@ and IR rather than treating every compiler pass as a stage of program execution.
 
 * Add explicit compile-time and run-time evaluation rules.
 * Represent generated run-time computations as residual IR.
-* Explore allocation, a non-moving garbage collector, and arenas once the
-  language has the functions and object model that need them.
+* Explore memory management without a garbage collector: stack-first
+  allocation, arenas for objects with related lifetimes, and pools for
+  long-lived fixed-size objects. Until then, the interpreters back lists with
+  Python lists and copy them to get value semantics.
 
 ## Current status
 
-The project is at the tokenizer and parser stage. The IR and later roadmap items
+The syntax is specified in [docs/grammar.md](docs/grammar.md); implementation
+is starting at stage 1 (tokenizer and parser). The IR and later roadmap items
 are design goals, not implemented features yet.

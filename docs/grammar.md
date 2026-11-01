@@ -1,0 +1,624 @@
+# Ella language reference (draft)
+
+This is the working definition of Ella's syntax and core semantics. The
+tokenizer and parser should follow it; when the implementation finds a problem
+with a rule, update this file first.
+
+Items marked **(provisional)** are reasonable defaults that have not been
+exercised yet. The [open questions](#open-questions) at the end are undecided.
+
+## Contents
+
+1. [Lexical structure](#1-lexical-structure)
+2. [Layout and blocks](#2-layout-and-blocks)
+3. [Program structure](#3-program-structure)
+4. [Bindings and assignment](#4-bindings-and-assignment)
+5. [Functions](#5-functions)
+6. [Control flow](#6-control-flow)
+7. [Patterns](#7-patterns)
+8. [Operators](#8-operators)
+9. [Types](#9-types)
+10. [Built-ins](#10-built-ins)
+11. [Grammar summary](#11-grammar-summary)
+12. [Open questions](#open-questions)
+
+## 1. Lexical structure
+
+Source files are UTF-8. Outside string literals and comments, only ASCII is
+allowed.
+
+### Whitespace and comments
+
+* Spaces separate tokens. **Tab characters are an error** anywhere outside
+  string literals and comments.
+* `#` starts a comment that runs to the end of the line. `#` inside a string is
+  not a comment.
+* Lines that are blank or contain only a comment are ignored entirely (they do
+  not affect indentation).
+
+### Identifiers
+
+```text
+identifier = [A-Za-z_][A-Za-z0-9_]*
+```
+
+`_` on its own is an ordinary identifier token. The parser gives it special
+meaning in patterns (wildcard). Type names such as `i64` and `str` are
+identifiers, not keywords.
+
+### Keywords
+
+```text
+and       assert    break     case      comptime  continue  else
+enum      false     for       if        import    in        let
+loop      match     mut       not       or        return    struct
+then      true      type      where     while
+```
+
+Reserved for later, not yet given a grammar: `comptime` (staging), `import`,
+`struct`, `type`.
+
+### Labels
+
+A label is `'` immediately followed by an identifier: `'outer`. Labels name
+loops for `break` and `continue` ([§6](#loops)). `'` is otherwise unused,
+because strings use `"`.
+
+### Operators and punctuation
+
+Longest match wins (`//=` before `//` before `/`).
+
+```text
++    -    *    /    //   %    **
+&    |    ^    ~    <<   >>
+==   !=   <    <=   >    >=
+=    +=   -=   *=   /=   //=  %=
+->   =>   |>   ..   ..=  ?
+.    ,    :    (    )    [    ]
+```
+
+`{`, `}`, `;`, `!` (alone), `@`, `$` and `` ` `` are not tokens; they are
+errors outside strings and comments.
+
+### Integer literals
+
+```text
+decimal = [0-9] ( '_'? [0-9] )*
+hex     = '0' [xX] [0-9a-fA-F] ( '_'? [0-9a-fA-F] )*
+```
+
+* `_` may appear only between digits: `1_000_000`, `0xFF_FF`.
+* Leading zeros on decimal literals other than `0` itself are an error
+  (`007`), to avoid confusion with C octal.
+* There are no negative literals: `-5` is unary minus applied to `5`.
+* A literal must fit in `i64`. The special case `-9223372036854775808` is
+  handled by the parser folding unary minus on a literal **(provisional)**.
+
+### Float literals
+
+```text
+float = decimal '.' decimal ( [eE] [+-]? decimal )?
+```
+
+A digit is required on both sides of the `.`: `1.0`, `0.5`, `2.5e-3`. `1.`,
+`.5`, and `1e3` are not floats. Because of this rule, `0..n` tokenizes as `0`,
+`..`, `n`.
+
+### String literals
+
+* `"..."` is a single-line string. A raw newline inside it is an error.
+* `"""..."""` is a multi-line string. Its content is kept exactly as written,
+  including leading indentation and newlines (no dedent).
+* Both forms support the same escapes and interpolation.
+
+Escapes:
+
+| Escape | Meaning |
+| --- | --- |
+| `\\` | backslash |
+| `\"` | double quote |
+| `\n` `\r` `\t` | newline, carriage return, tab |
+| `\0` | NUL |
+| `\xHH` | byte value `HH` (two hex digits, must be ≤ `7F`) |
+| `\u{H...}` | Unicode code point, 1–6 hex digits |
+| `\{` | literal `{` (so `"\{{x}}"` is the text `{{x}}`) |
+
+Any other `\` sequence is an error.
+
+### String interpolation
+
+`{{ expr }}` inside a string evaluates `expr` and inserts its text form. The
+expression may be any Ella expression, including calls and nested strings:
+
+```ella
+print("Hello, {{name}}!")
+print("{{ len(names) }} names, first is {{ names[0] }}")
+print("{{ greet("bob") }}")
+```
+
+* A single `{` or `}` is ordinary text. Only `{{` starts interpolation.
+* The interpolation ends at the first `}}` that is not inside a nested
+  bracket or string.
+* In a single-line string, the expression may not contain a newline.
+* `{{ }}` with no expression is an error.
+
+## 2. Layout and blocks
+
+Indentation defines blocks, as in Python.
+
+* The tokenizer tracks a stack of indentation widths, starting at `[0]`.
+* At the start of each logical line, a deeper indent emits `INDENT`; a
+  shallower one emits one `DEDENT` per level popped. Dedenting to a width that
+  is not on the stack is an error.
+* Any consistent increase is a new level; 4 spaces is the convention but not
+  enforced.
+* Every logical line ends with a `NEWLINE` token. At end of file the tokenizer
+  emits `NEWLINE` (if needed), the remaining `DEDENT`s, then `EOF`.
+* **Inside `(` `)` and `[` `]`, newlines and indentation are ignored.** This is
+  the only way to continue an expression over several lines.
+* **A line may not end with a binary operator.** This is a parse error with
+  the hint "wrap the expression in parentheses":
+
+  ```ella
+  let total = (xs
+      |> filter(iseven)
+      |> sum())
+  ```
+
+### Blocks
+
+A block is one or more expressions on separate lines, indented one level
+deeper than the line that opens it. Its value is the value of its last
+expression. A block whose last expression is a loop, an assignment, or
+another `()`-valued expression has value `()`.
+
+Wherever this document says "body", either form is allowed:
+
+* **inline**: an expression on the same line, or
+* **block**: end the line, then an indented block.
+
+Bodies appear after `=>`, `then`, `else`, `case ...`, `for ... in expr`,
+`while expr`, `loop`, `where`, and `match expr` (whose body is a list of
+cases, never inline).
+
+There are no colons at the ends of block-opening lines.
+
+## 3. Program structure
+
+A source file is a sequence of top-level expressions.
+
+1. Top-level `let` names are visible throughout the file, regardless of order.
+   This is what lets top-level functions call each other in any order.
+   Reading a top-level non-function value before its `let` has run is a
+   run-time error.
+2. The top-level expressions run in order, like a script.
+3. Afterwards, if the file defines a top-level `main`, it is called.
+   `main` has type `() -> ()`. Command-line arguments and exit codes come later.
+
+## 4. Bindings and assignment
+
+### `let`
+
+```ella
+let x = 5
+let names: [str] = ["bob", "steve", "jane"]
+let mut count = 0
+```
+
+* `let` introduces a new name in the enclosing block. Bindings are
+  **immutable** unless marked `mut`.
+* The type annotation is optional where the type checker can infer it (for
+  now: from the value). Function parameters always need annotations.
+* `let` is an expression; it evaluates to the bound value.
+* `let` inside a nested expression still binds in the enclosing block.
+
+### `let` chains
+
+Every target in a `let` chain is a **new** binding, and `mut` applies to one
+target only:
+
+```ella
+let y = mut x = z = 5   # three new bindings: y and z immutable, x mutable
+```
+
+This parses as `let y = (mut x = (z = 5))` with every target being a new
+binding. To assign to an existing variable inside a `let`, use parentheses:
+`let y = (x = 5)`.
+
+### Shadowing
+
+A `let` may reuse a name already in scope, in the same block or an inner one.
+The new binding hides the old one from that point on:
+
+```ella
+let x = 4
+let x = x + 1   # new x is 5
+```
+
+### Assignment
+
+```ella
+x = 10
+x += 1
+xs[0] = 7
+```
+
+* `name = expr` assigns to an **existing** binding, which must be `mut`.
+  Assigning to an immutable binding or an undefined name is a compile error.
+* Targets are names and index expressions (`a[i]`). Member targets come with
+  structs.
+* Assignment is right-associative and evaluates to the assigned value.
+* Compound operators: `+= -= *= /= //= %=`. `x op= e` means `x = x op e`, with
+  `x` evaluated once.
+* `mut` is deep: if `names` is not `mut`, `names[0] = "x"` is an error.
+
+### Values
+
+Ella uses **pass-by-value**. Binding, passing an argument, returning, and
+capturing in a closure all copy. The interpreters copy eagerly for now
+(lists are Python lists that get copied); optimization can remove copies later.
+
+## 5. Functions
+
+Functions are lambda expressions, usually bound with `let`:
+
+```ella
+let add = (x: i64, y: i64) -> i64 => x + y
+
+let fibonacci = (n: i64) -> i64 =>
+    where
+        n >= 0
+        return >= 0
+    match n
+        case 0 | 1 => 1
+        case _ => fibonacci(n - 1) + fibonacci(n - 2)
+```
+
+* The form is `( params ) -> ReturnType => body`. The parameter list is always
+  parenthesized, even with one parameter.
+* Each parameter is `name: Type`. Parameters are immutable.
+* Functions take multiple arguments; there is no currying.
+* `-> ReturnType` is required for now. Untyped lambdas such as `x => x + 2`
+  parse, but the type checker rejects them until there is type inference.
+* The body extends as far to the right as possible.
+* A `let` bound to a lambda can refer to its own name inside the body
+  (automatic `let rec`). Combined with [§3](#3-program-structure), top-level
+  functions can be mutually recursive.
+* Lambdas capture variables from enclosing scopes **by copy**.
+
+### `where` clauses
+
+`where` is a block of conditions checked at run time. If present, it must be
+**the first clause of a function's block body**.
+
+* Each line is a `bool` expression.
+* Conditions that mention `return` are **postconditions**; `return` there
+  names the function's result. They are checked just before returning.
+  All others are **preconditions**, checked on entry.
+* A failed condition is a run-time error reporting the condition's source.
+
+Inside `where`, `return` is parsed as a name, not as an early exit.
+
+### `return`
+
+`return expr` exits the innermost enclosing function with `expr`. `return`
+alone returns `()`. Its own value has type "never" (it does not produce one).
+
+### Calls
+
+`f(a, b)` calls `f`. Trailing commas are allowed in argument and parameter
+lists. Named arguments are not supported (yet).
+
+## 6. Control flow
+
+### `if`
+
+```ella
+let iseven = (n: i64) -> bool => if n % 2 == 0 then true else false
+
+if x == 4 then
+    print("x={{x}}")
+else if x == 5 then
+    print("five")
+else
+    print("not 4")
+```
+
+* Conditions must be `bool` (only booleans are truthy).
+* `else` may be on the same line as the `then` body or start its own line at
+  the same indentation as the `if`.
+* `if` without `else` has type `()` and its `then` body must have type `()`.
+
+### `match`
+
+```ella
+match result
+    case Ok(value) => value
+    case Error(e)
+        print("failed: {{e}}")
+        0
+```
+
+* `match expr` is followed by an indented list of `case` lines.
+* Each case is `case pattern [if guard]`, then either `=> expr` on the same
+  line or an indented block.
+* Cases are tried in order. If none matches, it is a run-time error
+  (exhaustiveness checking comes later).
+
+### Loops
+
+```ella
+for name in names
+    print("Hello, {{name}}!")
+
+for i in 0..len(xs)
+    print(xs[i])
+
+while count < 10
+    count += 1
+
+'outer for row in grid
+    for cell in row
+        if cell == 0 then continue 'outer
+        if cell < 0 then break 'outer
+
+let found = loop
+    if done() then break 42
+```
+
+* `for pattern in expr` iterates over a list, string, or range.
+* `while cond` runs while `cond` (a `bool`) is true.
+* `loop` repeats forever until `break`.
+* `for` and `while` have value `()`. `loop` has the value given to the
+  `break` that ends it (`break value`); plain `break` gives `()`.
+* `break` and `continue` apply to the innermost loop, or to the loop named by
+  a label: `break 'outer`, `continue 'outer`, `break 'outer value`.
+* A label is written directly before `for`, `while`, or `loop`.
+
+## 7. Patterns
+
+Patterns appear after `case`, in `for`, and (later) in `let`.
+
+| Pattern | Example | Matches |
+| --- | --- | --- |
+| wildcard | `_` | anything, binds nothing |
+| literal | `0`, `"x"`, `true` | an equal value |
+| range | `0..10`, `0..=9` | a value in the range |
+| binding | `n` | anything, binds it to `n` |
+| alternatives | `0 \| 1` | either side; both sides must bind the same names |
+| variant | `Ok(v)`, `Some(x)`, `None` | an enum variant, destructuring its fields |
+| tuple | `(a, b)` | a tuple, element-wise |
+
+Whether a bare name like `None` is a variant or a new binding is decided by
+name resolution after parsing, as in Rust: the parser produces a name
+pattern, and the resolver checks whether the name refers to a variant.
+
+Negative literal patterns (`-1`) are allowed as a special case.
+
+## 8. Operators
+
+### Precedence
+
+From loosest to tightest:
+
+| Level | Operators | Associativity |
+| --- | --- | --- |
+| 1 | `=` `+=` `-=` `*=` `/=` `//=` `%=` | right |
+| 2 | `=>` (lambda body) | right |
+| 3 | `or` | left |
+| 4 | `and` | left |
+| 5 | `not` (prefix) | — |
+| 6 | `==` `!=` `<` `<=` `>` `>=` `in` `not in` | chained |
+| 7 | `\|>` | left |
+| 8 | `..` `..=` | none |
+| 9 | `\|` | left |
+| 10 | `^` | left |
+| 11 | `&` | left |
+| 12 | `<<` `>>` | left |
+| 13 | `+` `-` | left |
+| 14 | `*` `/` `//` `%` | left |
+| 15 | `-` `~` (prefix) | — |
+| 16 | `**` | right |
+| 17 | call `f()`, index `a[i]`, member `a.b`, `?` (postfix) | left |
+
+Consequences worth knowing:
+
+* `not a == b` is `not (a == b)` (as in Python).
+* `-2 ** 2` is `-(2 ** 2)`, i.e. `-4` (as in Python).
+* `x in 0..n` is `x in (0..n)`; `0..n+1` is `0..(n+1)`.
+* `xs |> sum() == 10` is `(xs |> sum()) == 10`; `a + b |> f()` is `f(a + b)`.
+
+### Arithmetic
+
+* Operands must have the same type; there are no implicit conversions.
+* `/` is true division and always returns `f64`, for `i64` or `f64` operands.
+* `//` is integer division that **rounds toward negative infinity** (as in
+  Python): `-7 // 2 == -4`. `%` matches it, so
+  `a == (a // b) * b + a % b` always holds and `%` has the sign of `b`.
+  Both are defined for integers only.
+* `**` works on `i64` (a negative exponent is a run-time error) and on `f64`.
+* Integer division or modulo by zero is a run-time error.
+* `i64` arithmetic wraps on overflow (two's complement) **(provisional)**.
+
+### Comparisons
+
+Comparisons chain as in Python: `a < b <= c` means `a < b and b <= c`, with
+`b` evaluated once. The parser represents a chain as a single node holding
+the operands and operators, not as nested binary nodes.
+
+`in` and `not in` test membership in a list, string, or range.
+
+### Logic and bits
+
+* `and`, `or`, `not` take `bool` operands. `and` and `or` short-circuit.
+* `& | ^ ~ << >>` work on integers. `>>` is an arithmetic shift.
+
+### Pipe
+
+`x |> f(a, b)` means `f(x, a, b)`: the left side becomes the **first**
+argument. `x |> f` means `f(x)`. The right side must be a name or a call.
+
+### Error propagation
+
+Postfix `?` on a `Result`: `Ok(v)?` gives `v`; `Error(e)?` returns `Error(e)`
+from the enclosing function. On an `Optional`: `Some(v)?` gives `v`; `None?`
+returns `None`. The enclosing function's return type must be compatible.
+
+### Indexing and ranges
+
+* `a[i]` indexes lists and strings with an `i64`. Out-of-range or negative
+  indexes are a run-time error **(provisional; no Python-style negative
+  indexing)**.
+* `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
+
+## 9. Types
+
+```text
+i64  f64  bool  str              built-in scalars
+()                               unit
+[T]                              list of T
+(T, U)                           tuple
+(T, U) -> R                      function (parameters always parenthesized)
+Result[T, E]   Optional[T]       generic types use [ ]
+```
+
+* All integer types are signed. More widths (`i8`–`i32`, `f32`) and SIMD
+  vector types come later.
+* Types appear after `:` in annotations, after `->` in lambdas, and inside
+  other types. The parser uses a separate type grammar there, so `[str]` (a
+  type) and `[1, 2]` (a list literal) do not conflict.
+* In a lambda, the return type is parsed with the type grammar up to the
+  `=>`, so a function returning a function is
+  `(x: i64) -> (i64) -> i64 => ...`.
+
+### Enums **(provisional syntax)**
+
+```ella
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+
+enum Optional[T]
+    Some(T)
+    None
+```
+
+Variants are constructed like calls (`Circle(1.0)`, `Empty`) and destructured
+in patterns. `Result` and `Optional` are built-in enums with variants
+`Ok`/`Error` and `Some`/`None`.
+
+## 10. Built-ins
+
+Built-in functions (ordinary names, not keywords):
+
+* `print(value)` prints the text form of `value` and a newline; returns `()`.
+* `len(x)` returns the length of a list or string as `i64`.
+
+Python-style protocol methods (`len`, indexing, iteration, and so on for user
+types) are planned for when user-defined types exist.
+
+`assert expr` is a keyword expression rather than a function, so that a
+failure can report the asserted expression's source text. It has type `()`.
+
+Run-time errors (failed `assert`, failed `where`, out-of-range index, no
+matching `case`, division by zero) stop the program with a message and the
+source location.
+
+## 11. Grammar summary
+
+Informal EBNF. `NEWLINE`, `INDENT`, `DEDENT` are layout tokens from
+[§2](#2-layout-and-blocks). Binary-operator precedence is in
+[§8](#precedence) rather than encoded here; the parser is a Pratt parser.
+
+```ebnf
+program     = { expr NEWLINE } EOF ;
+block       = NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT ;
+body        = expr | block ;
+
+expr        = let | assignment | lambda | if | match | for | while | loop
+            | break | continue | return | assert | enum | operator_expr ;
+
+let         = "let" binding "=" { binding "=" } expr ;
+binding     = [ "mut" ] IDENT [ ":" type ] ;
+assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
+target      = IDENT | operator_expr "[" expr "]" ;
+
+lambda      = "(" [ param { "," param } [ "," ] ] ")" "->" type "=>" lambda_body
+            | IDENT "=>" body ;                  (* untyped; rejected for now *)
+param       = IDENT ":" type ;
+lambda_body = expr
+            | NEWLINE INDENT [ where NEWLINE ] expr { NEWLINE expr } NEWLINE DEDENT ;
+where       = "where" block ;
+
+if          = "if" expr "then" body [ [ NEWLINE ] "else" body ] ;
+match       = "match" expr NEWLINE INDENT case { case } DEDENT ;
+case        = "case" pattern [ "if" expr ] ( "=>" expr NEWLINE | block ) ;
+
+for         = [ LABEL ] "for" pattern "in" expr body ;
+while       = [ LABEL ] "while" expr body ;
+loop        = [ LABEL ] "loop" body ;
+break       = "break" [ LABEL ] [ expr ] ;
+continue    = "continue" [ LABEL ] ;
+return      = "return" [ expr ] ;
+assert      = "assert" expr ;
+
+enum        = "enum" IDENT [ "[" IDENT { "," IDENT } "]" ]
+              NEWLINE INDENT variant { NEWLINE variant } NEWLINE DEDENT ;
+variant     = IDENT [ "(" type { "," type } ")" ] ;
+
+operator_expr = prefix_op operator_expr
+            | operator_expr binary_op operator_expr
+            | operator_expr ( call | index | member | "?" )
+            | primary ;
+call        = "(" [ expr { "," expr } [ "," ] ] ")" ;
+index       = "[" expr "]" ;
+member      = "." IDENT ;
+
+primary     = INT | FLOAT | string | "true" | "false" | IDENT
+            | "(" ")"                            (* unit *)
+            | "(" expr ")"                       (* grouping *)
+            | "(" expr "," [ expr { "," expr } ] [ "," ] ")"  (* tuple *)
+            | "[" [ expr { "," expr } [ "," ] ] "]" ;  (* list *)
+string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING_END ;
+
+pattern     = pattern_atom { "|" pattern_atom } ;
+pattern_atom = "_" | IDENT | literal | literal ( ".." | "..=" ) literal
+            | IDENT "(" pattern { "," pattern } ")"
+            | "(" pattern "," [ pattern { "," pattern } ] ")" ;
+
+type        = IDENT [ "[" type { "," type } "]" ]
+            | "[" type "]"
+            | "(" ")"
+            | "(" [ type { "," type } ] ")" "->" type
+            | "(" type "," [ type { "," type } ] ")" ;
+```
+
+Parsing notes:
+
+* **Lambdas vs. grouping/tuples.** `(` can start a grouping, tuple, unit, or
+  lambda parameter list. Parse the parenthesized contents as expressions,
+  allowing `name: type` items; if `->` or `=>` follows the `)`, convert the
+  items into parameters (each must be `name: type`), otherwise reject any
+  `name: type` items. No backtracking needed.
+* **`let` chains.** After `let binding =`, another target follows if the next
+  tokens are `mut`, or `IDENT` followed by `=` or `:`.
+* **Comparison chains** are one node: `Compare(first, [(op, operand), ...])`.
+* **`else` on the next line.** After an `if`'s `then` body, peek past a single
+  `NEWLINE` for `else` at the same indentation.
+* **`return` in `where`** is parsed as a name.
+* **Trailing binary operator.** If a binary operator is followed by `NEWLINE`
+  (which can only happen outside brackets), report the "wrap in parentheses"
+  error.
+
+## Open questions
+
+* What is the `Error` type in `Result[T, Error]`? `Error` is also the name of
+  the variant. A built-in error type holding a message is likely.
+* How SIMD vector types are named and written (`f32x4`?), and how they relate
+  to `[T]`.
+* `i64` overflow: wrap (current default) or trap.
+* Struct syntax, member access semantics, and user-defined protocol methods.
+* Generic functions: how type parameters are declared on a lambda.
+* Staging syntax (`comptime` is reserved).
+* Modules and `import`.
