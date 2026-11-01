@@ -1,3 +1,3 @@
 from ella import main
 
-main()
+raise SystemExit(main())

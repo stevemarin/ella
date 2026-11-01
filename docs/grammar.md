@@ -25,7 +25,7 @@ exercised yet. The [open questions](#open-questions) at the end are undecided.
 ## 1. Lexical structure
 
 Source files are UTF-8. Outside string literals and comments, only ASCII is
-allowed.
+allowed. Lines end with `\n` or `\r\n`.
 
 ### Whitespace and comments
 
@@ -92,7 +92,10 @@ hex     = '0' [xX] [0-9a-fA-F] ( '_'? [0-9a-fA-F] )*
   (`007`), to avoid confusion with C octal.
 * There are no negative literals: `-5` is unary minus applied to `5`.
 * A literal must fit in `i64`. The special case `-9223372036854775808` is
-  handled by the parser folding unary minus on a literal **(provisional)**.
+  handled by the parser folding unary minus on a literal **(provisional)**:
+  `-` directly before an integer literal makes one negative literal, unless
+  the literal is followed by an operator that binds tighter than prefix `-`
+  (`**`, a call, an index, `.` or `?`). So `-2 ** 2` is still `-(2 ** 2)`.
 
 ### Float literals
 
@@ -103,6 +106,9 @@ float = decimal '.' decimal ( [eE] [+-]? decimal )?
 A digit is required on both sides of the `.`: `1.0`, `0.5`, `2.5e-3`. `1.`,
 `.5`, and `1e3` are not floats. Because of this rule, `0..n` tokenizes as `0`,
 `..`, `n`.
+
+A number immediately followed by a letter, digit or `_` is an error, so `1e3`,
+`12abc` and `1_` are rejected rather than split into two tokens.
 
 ### String literals
 
@@ -438,7 +444,7 @@ Consequences worth knowing:
   Both are defined for integers only.
 * `**` works on `i64` (a negative exponent is a run-time error) and on `f64`.
 * Integer division or modulo by zero is a run-time error.
-* `i64` arithmetic wraps on overflow (two's complement) **(provisional)**.
+* `i64` arithmetic traps on overflow
 
 ### Comparisons
 
@@ -607,6 +613,10 @@ Parsing notes:
 * **`else` on the next line.** After an `if`'s `then` body, peek past a single
   `NEWLINE` for `else` at the same indentation.
 * **`return` in `where`** is parsed as a name.
+* **An expression that ends with an indented block ends there.** The block
+  already consumed its closing `NEWLINE`, so the next line starts a new
+  expression; it can't continue the old one with an operator. Only `else`
+  (for `if`) and `case` (inside `match`) may follow a block.
 * **Trailing binary operator.** If a binary operator is followed by `NEWLINE`
   (which can only happen outside brackets), report the "wrap in parentheses"
   error.
@@ -617,7 +627,6 @@ Parsing notes:
   the variant. A built-in error type holding a message is likely.
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
-* `i64` overflow: wrap (current default) or trap.
 * Struct syntax, member access semantics, and user-defined protocol methods.
 * Generic functions: how type parameters are declared on a lambda.
 * Staging syntax (`comptime` is reserved).
