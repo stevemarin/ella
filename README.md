@@ -1,6 +1,6 @@
 # Ella
 
-A Linux, x64 language for fun and learning, implemented in pure Python.
+A Linux, x64 statically-typed language for fun and learning, implemented in pure Python.
 
 Ella is an experiment in building a language from the tokenizer through to native
 code generation. The compiler will use a sequence of representations, starting
@@ -12,12 +12,15 @@ will be an interpreter; a later compiler will lower it to x64 assembly.
 * Keep the implementation as simple as possible without hiding important ideas.
 * Use a lightweight, extensible syntax and grammar.
 * Learn how interpreters, IRs, optimization, and native code generation fit together.
-* Explore staged programming: distinguish computations performed during
-  compilation from code generated to run later.
+* Explore memory safety without GC
 * Compile to x64 on Linux.
-* Explore a non-moving garbage collector and arenas. Arenas can group objects
-  with related lifetimes, and the collector can reclaim an arena as a unit.
 * Leverage modern Python as much as possible in the design
+* All user-facing integer types are signed
+* Everything is an expression
+* Only booleans are truthy
+* Built-in vector types
+* No implicit type conversions
+* SIMD everywhere
 
 ## Design
 

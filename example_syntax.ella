@@ -1,0 +1,75 @@
+
+# this is a comment
+
+# fibonacci is a function mapping non-negative int -> non-negative int
+# assigning to a function call is a function definition
+# indentation is relevant indicates scoping/blocks
+# we have a contract that fibonacci is called with positive integers
+# - for now, we can just insert runtime checks
+# IR will enforce/allow tail call optimization here
+# for now, type annotations are needed - we can relax this later
+# NOTE: replaced = with => in function def to make more consistent with lambdas
+# functions accept multple inputs not currying
+let fibonacci = (n: i64) -> i64 =>
+    # where clause validates inputs/outputs and produces runtime errors for now
+    # _ is the default name for the return value
+    where
+        n >= 0
+        return >= 0
+    match n
+      case 0, 1
+        1
+      case _
+        fibonacci(n - 1) + fibonacci(n - 2)
+
+assert fibonacci(5) == 8
+
+# fibonacci(-3) == ??? - should this error, return Rust-like None or Error variants?
+
+# another recursive example
+let factorial = (n: i64) -> i64 =>
+    where
+        n >= 0
+        return >= 0
+    match n
+        case 0, 1 # this is also a comment, and the newline here is necessary
+            1
+        case _
+            n * factorial(n - 1)
+
+assert factorial(5) == 120
+
+# bindings return the bound value, so 5 here
+# if x is not defined, then assignment defines it in the current scope
+# and are immutable by default
+# let y = let x = 5 sets x = 5 and returns 5 so y is then also set 5
+let y = mut x = z = 5
+x += 1
+print("x={{x}}, y={{y}}, z={{z}}") # prints: x=6, y=5, z=5
+y += 1 # doesn't work since y is immutable
+
+# for loop example    
+# string interpolation occurs inside {{}}
+# technically print returns something... maybe ()?
+let names: [str] = ["bob", "steve", "jane"]
+for name in names
+    print("Hello, {{name}}!")
+
+# ifs are expressions like everything
+let iseven = (n: i64) -> bool => if n % 2 == 0 then true else false
+
+# lambda expressions
+# -> are for typing functions, this the type of x is i64 -> i64
+# => are for indicating computation
+# TODO: How do we want to format types in lambdas?
+(x: i64) -> i64 => x + 2
+
+# a two argument lambda
+(x: i64, y: i64) -> i64 => x + y
+
+# no implicit type conversions
+# Result which have Ok and Error variants and Optional which have Some and None variants are builtin
+# Result's Error variant is an exception type
+let invert = (n: f64) -> Result[f64, Error] =>
+    if n == 0.0 then Error("divide by zero") else Ok(1.0 / n)
+
