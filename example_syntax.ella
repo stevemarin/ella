@@ -130,10 +130,11 @@ while count < 3
     count += 1
 
 let grid: [[i64]] = [[1, 2], [0, 3], [-1, 4]]
-'outer for row in grid
+# a label is a name and a colon before the loop
+outer: for row in grid
     for cell in row
-        if cell == 0 then continue 'outer
-        if cell < 0 then break 'outer
+        if cell == 0 then continue outer
+        if cell < 0 then break outer
 
 # loop is an expression whose value comes from break
 let mut n = 0
@@ -142,9 +143,16 @@ let found = loop
     if n * n > 50 then break n
 assert found == 8
 
-# multi-line strings keep their content exactly as written
+# strings use double or single quotes, which work the same way; the other
+# kind of quote can appear inside without escaping
+let greeting = 'say "hi" to {{names[0]}}'
+let reply = "it's {{ len(greeting) }} characters"
+
+# triple quotes make multi-line strings, which keep their content exactly
 let poem = """roses are red
 violets are blue"""
+let verse = '''sugar is "sweet"
+and so are you'''
 
 # enums (provisional syntax)
 enum Shape

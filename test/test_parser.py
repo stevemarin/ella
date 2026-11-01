@@ -29,7 +29,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 48
+    assert len(program.body) == 51
 
 
 # Precedence (docs/grammar.md §8)
@@ -252,12 +252,38 @@ def test_loops() -> None:
 
 
 def test_labels_break_continue() -> None:
-    source = "'outer for row in grid\n    for x in row\n        if x then continue 'outer\n        break 'outer 42"
+    source = "outer: for row in grid\n    for x in row\n        if x then continue outer\n        break outer 42"
     assert one(source) == (
-        "(for 'outer row grid (block (for x row (block (if x (continue 'outer)) (break 'outer 42)))))"
+        "(for outer: row grid (block (for x row (block (if x (continue outer:)) (break outer: 42)))))"
     )
-    assert one("'l while x\n    break 'l") == "(while 'l x (block (break 'l)))"
-    assert "must be followed by" in error("'l x").message
+    assert one("l: while x\n    break l") == "(while l: x (block (break l:)))"
+    assert one("l: loop break l") == "(loop l: (break l:))"
+
+
+def test_label_names_only_count_inside_their_loop() -> None:
+    assert one("n: loop\n    loop break n") == "(loop n: (block (loop (break n:))))"
+    # outside the labeled loop, `n` is the break's value
+    assert lines("n: loop break\nloop break n") == ["(loop n: (break))", "(loop (break n))"]
+    # parentheses make a value even when the name is a label
+    assert one("n: loop break (n)") == "(loop n: (break n))"
+
+
+def test_labels_dont_reach_into_lambdas() -> None:
+    assert one("outer: loop\n    () -> () => break outer") == "(loop outer: (block (lambda () -> () (break outer))))"
+
+
+def test_labeled_loops_as_values() -> None:
+    assert one("let found = outer: loop break outer 1") == "(let [found] (loop outer: (break outer: 1)))"
+    assert one("f(outer: loop break outer)") == "(call f (loop outer: (break outer:)))"
+    # a name and a colon not followed by a loop is still a let chain target
+    assert one("let a = b: i64 = 1") == "(let [a, b: i64] 1)"
+
+
+def test_single_quoted_strings() -> None:
+    assert one("'Hi, {{name}}!'") == '(str "Hi, " name "!")'
+    assert one("""'{{ f("x") }}'""") == '(str (call f "x"))'
+    assert one("'''two\nlines'''") == r'"two\nlines"'
+    assert one("match s\n    case 'x' => 1") == '(match s (case "x" 1))'
 
 
 def test_break_value() -> None:

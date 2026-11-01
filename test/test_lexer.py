@@ -219,13 +219,39 @@ def test_multiline_interpolation_may_span_lines() -> None:
     assert texts('"""{{ f(1,\n 2) }}"""') == ['"""', "{{", "f", "(", "1", ",", "2", ")", "}}", '"""']
 
 
-# Labels
+# Single quotes
 
 
-def test_labels() -> None:
-    tokens = tokenize("'outer for x in xs")
-    assert (tokens[0].kind, tokens[0].text, tokens[0].value) == (K.LABEL, "'outer", "outer")
-    assert "label name" in error("' x").message
+def test_single_quoted_strings_work_like_double_quoted() -> None:
+    assert string_tokens("'Hi, {{name}}!'") == [
+        (K.STRING_START, "'"),
+        (K.STRING_TEXT, "Hi, "),
+        (K.INTERP_START, "{{"),
+        (K.NAME, "name"),
+        (K.INTERP_END, "}}"),
+        (K.STRING_TEXT, "!"),
+        (K.STRING_END, "'"),
+    ]
+    assert values(r"'a\tb\u{e9}'") == ["a\tbé"]
+    assert values("''") == []
+    assert "line break" in error("'abc\ndef'").message
+
+
+def test_the_other_quote_needs_no_escape() -> None:
+    assert values(""""it's" 'say "hi"' """) == ["it's", 'say "hi"']
+    # and both escapes work in both kinds of string
+    assert values(r"""'it\'s' "\"hi\"" '\"' "\'" """) == ["it's", '"hi"', '"', "'"]
+
+
+def test_triple_single_quotes() -> None:
+    source = "let s = '''one\n  'two' \"three\"\n'''\nx"
+    assert values(source) == ["one\n  'two' \"three\"\n"]
+    assert K.INDENT not in kinds(source)
+    assert "never closed" in error("'''abc\n").message
+
+
+def test_nested_strings_can_mix_quotes() -> None:
+    assert values("""'{{ f("a", 'b') }}'""") == ["a", "b"]
 
 
 # Layout

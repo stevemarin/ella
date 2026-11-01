@@ -60,9 +60,10 @@ Reserved for later, not yet given a grammar: `comptime` (staging), `import`,
 
 ### Labels
 
-A label is `'` immediately followed by an identifier: `'outer`. Labels name
-loops for `break` and `continue` ([§6](#loops)). `'` is otherwise unused,
-because strings use `"`.
+A label is an identifier and a colon written before a loop: `outer: for ...`.
+Labels name loops for `break` and `continue` ([§6](#loops)). There is no
+label token; the parser recognizes `IDENT ":"` followed by `for`, `while` or
+`loop`.
 
 ### Operators and punctuation
 
@@ -112,17 +113,21 @@ A number immediately followed by a letter, digit or `_` is an error, so `1e3`,
 
 ### String literals
 
-* `"..."` is a single-line string. A raw newline inside it is an error.
-* `"""..."""` is a multi-line string. Its content is kept exactly as written,
-  including leading indentation and newlines (no dedent).
-* Both forms support the same escapes and interpolation.
+* `"..."` and `'...'` are single-line strings. A raw newline inside one is an
+  error.
+* `"""..."""` and `'''...'''` are multi-line strings. Their content is kept
+  exactly as written, including leading indentation and newlines (no dedent).
+* All four forms support the same escapes and interpolation. Double and single
+  quotes mean exactly the same thing; pick whichever avoids escapes. A string
+  ends only at the quote it started with, so the other kind may appear inside
+  unescaped: `"it's"`, `'say "hi"'`.
 
 Escapes:
 
 | Escape | Meaning |
 | --- | --- |
 | `\\` | backslash |
-| `\"` | double quote |
+| `\"` `\'` | double quote, single quote (either works in any string) |
 | `\n` `\r` `\t` | newline, carriage return, tab |
 | `\0` | NUL |
 | `\xHH` | byte value `HH` (two hex digits, must be ≤ `7F`) |
@@ -363,10 +368,10 @@ for i in 0..len(xs)
 while count < 10
     count += 1
 
-'outer for row in grid
+outer: for row in grid
     for cell in row
-        if cell == 0 then continue 'outer
-        if cell < 0 then break 'outer
+        if cell == 0 then continue outer
+        if cell < 0 then break outer
 
 let found = loop
     if done() then break 42
@@ -378,8 +383,12 @@ let found = loop
 * `for` and `while` have value `()`. `loop` has the value given to the
   `break` that ends it (`break value`); plain `break` gives `()`.
 * `break` and `continue` apply to the innermost loop, or to the loop named by
-  a label: `break 'outer`, `continue 'outer`, `break 'outer value`.
-* A label is written directly before `for`, `while`, or `loop`.
+  a label: `break outer`, `continue outer`, `break outer value`.
+* A label is written as `name:` directly before `for`, `while`, or `loop`.
+* After `break` or `continue`, a name is the label only if it names an
+  enclosing loop in the same function; otherwise it is the start of the
+  break's value. To break with a variable that has the same name as a label,
+  use parentheses: `break (outer)`.
 
 ## 7. Patterns
 
@@ -561,11 +570,12 @@ if          = "if" expr "then" body [ [ NEWLINE ] "else" body ] ;
 match       = "match" expr NEWLINE INDENT case { case } DEDENT ;
 case        = "case" pattern [ "if" expr ] ( "=>" expr NEWLINE | block ) ;
 
-for         = [ LABEL ] "for" pattern "in" expr body ;
-while       = [ LABEL ] "while" expr body ;
-loop        = [ LABEL ] "loop" body ;
-break       = "break" [ LABEL ] [ expr ] ;
-continue    = "continue" [ LABEL ] ;
+for         = [ label ] "for" pattern "in" expr body ;
+while       = [ label ] "while" expr body ;
+loop        = [ label ] "loop" body ;
+label       = IDENT ":" ;
+break       = "break" [ IDENT ] [ expr ] ;   (* IDENT only if it names an enclosing loop *)
+continue    = "continue" [ IDENT ] ;
 return      = "return" [ expr ] ;
 assert      = "assert" expr ;
 
@@ -608,7 +618,11 @@ Parsing notes:
   items into parameters (each must be `name: type`), otherwise reject any
   `name: type` items. No backtracking needed.
 * **`let` chains.** After `let binding =`, another target follows if the next
-  tokens are `mut`, or `IDENT` followed by `=` or `:`.
+  tokens are `mut`, or `IDENT` followed by `=` or `:` (but not a labeled loop,
+  `IDENT ":" for`).
+* **Labels.** `IDENT ":"` followed by `for`, `while` or `loop` is a label.
+  The parser keeps a stack of the labels of enclosing loops (reset inside each
+  lambda) to decide whether a name after `break` or `continue` is a label.
 * **Comparison chains** are one node: `Compare(first, [(op, operand), ...])`.
 * **`else` on the next line.** After an `if`'s `then` body, peek past a single
   `NEWLINE` for `else` at the same indentation.

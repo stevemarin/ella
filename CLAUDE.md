@@ -45,7 +45,7 @@ Suggested layout:
 
 * `src/ella/lexer.py`: `Span`, `TokenKind`, `Token`, `tokenize(source)`.
   Handles comments, INDENT/DEDENT/NEWLINE layout, bracket depth (newlines
-  ignored inside `()`/`[]`), labels (`'outer`), number formats, escapes, and
+  ignored inside `()`/`[]`), number formats, escapes, and
   string interpolation (`STRING_START`, `STRING_TEXT`, `INTERP_START` …
   tokens … `INTERP_END`, `STRING_END`).
 * `src/ella/syntax.py`: AST node dataclasses.

@@ -3,11 +3,27 @@
 This follows docs/grammar.md: operator precedence from §8, and the grammar
 summary and parsing notes from §11.
 
-A Pratt parser handles operator precedence like this: `parse_expr(min_prec)`
-parses one operand (a "prefix" form: a literal, a name, `-x`, `if ...`, and so
-on), then keeps extending it with infix and postfix operators for as long as
-they bind at least as tightly as `min_prec`. Precedence lives in the
-`self.infix` and `self.prefix` tables.
+Most of the parser is "recursive descent": one method per kind of thing
+(`parse_if`, `parse_let`, `parse_type`, ...), each consuming its tokens and
+calling the others for the parts inside it.
+
+Expressions with operators use Pratt parsing (also called top-down operator
+precedence). `parse_expr(min_prec)` works in two steps:
+
+1. Parse one operand with `parse_prefix`: a literal, a name, `(...)`, a prefix
+   operator such as `-x`, or a keyword form such as `if ...`.
+2. Loop: while the next token is an infix or postfix operator whose
+   precedence is at least `min_prec`, consume it and combine it with the
+   operand so far. For a binary operator, the right operand is parsed by a
+   recursive `parse_expr` with a higher `min_prec`, so it only takes
+   operators that bind tighter.
+
+For example, `1 + 2 * 3 - 4`: we parse `1` and see `+` (13). The right operand
+is `parse_expr(14)`, which reads `2`, sees `*` (14, allowed), and reads `3`.
+It then sees `-` (13, below 14) and stops, giving `2 * 3`. Back at the top,
+`-` (13) is allowed, so the result is `(1 + (2 * 3)) - 4`.
+
+Precedence lives in the `self.infix` and `self.prefix` tables.
 """
 
 from collections.abc import Callable
@@ -70,38 +86,28 @@ from ella.syntax import (
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
 
-LOWEST = 0  # precedence that accepts any operator
+LOWEST = 0  # a precedence that accepts every operator
 
 ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "//=", "%="})
 
-# Keywords that can begin an expression, used to decide whether `break` and
-# `return` are followed by a value.
-EXPR_KEYWORDS = frozenset(
-    {
-        "assert",
-        "break",
-        "continue",
-        "enum",
-        "false",
-        "for",
-        "if",
-        "let",
-        "loop",
-        "match",
-        "not",
-        "return",
-        "true",
-        "while",
-    }
-)
+LOOP_KEYWORDS = ("for", "while", "loop")
+
+# Keywords that can begin an expression. `break` and `return` use this to
+# decide whether a value follows them.
+EXPR_KEYWORDS = frozenset({
+    "assert", "break", "continue", "enum", "false", "for", "if", "let", "loop", "match", "not", "return", "true",
+    "while",
+})  # fmt: skip
 
 
 class Assoc(Enum):
-    LEFT = auto()
-    RIGHT = auto()
-    NONE = auto()  # can't be chained: `a..b..c` is an error
+    """How an operator combines with itself, as in `a op b op c`."""
+
+    LEFT = auto()  # `a - b - c` is `(a - b) - c`
+    RIGHT = auto()  # `a ** b ** c` is `a ** (b ** c)`
+    NONE = auto()  # not allowed: `a..b..c` is an error
     CHAIN = auto()  # comparisons: `a < b <= c` becomes one Compare node
-    POSTFIX = auto()  # call, index, member, `?`
+    POSTFIX = auto()  # call, index, member and `?`, which have no right operand
 
 
 def parse(source: str) -> Program:
@@ -110,7 +116,7 @@ def parse(source: str) -> Program:
 
 
 def describe(token: Token) -> str:
-    """How a token is named in error messages."""
+    """How a token is named in error messages, as in "expected X, found <this>"."""
     match token.kind:
         case TokenKind.NEWLINE:
             return "end of line"
@@ -127,13 +133,26 @@ def describe(token: Token) -> str:
 
 
 class Parser:
+    """Reads a list of tokens from front to back, building syntax tree nodes.
+
+    The parser only ever looks a few tokens ahead (`peek`) and never backs up.
+    """
+
     def __init__(self, tokens: list[Token]) -> None:
         self.tokens = tokens
-        self.pos = 0  # index of the current token
-        self.in_where = False  # inside a `where` block, `return` is a name
+        self.pos = 0  # index of the current (next unconsumed) token
+        # Inside a `where` block, `return` names the function's result rather
+        # than exiting the function.
+        self.in_where = False
+        # Labels of the loops we are currently inside, innermost last. After
+        # `break` or `continue`, a name in this list is a label rather than a
+        # value. Each lambda body starts with an empty list, because `break`
+        # can't jump out of a function.
+        self.labels: list[str] = []
 
         # Infix and postfix operators: precedence (higher binds tighter) and
-        # associativity. The numbers are the levels in docs/grammar.md §8.
+        # associativity. The numbers are the levels in docs/grammar.md §8; the
+        # gaps (5 and 15) are the prefix operators below.
         self.infix: dict[str, tuple[int, Assoc]] = {
             **{op: (1, Assoc.RIGHT) for op in ASSIGN_OPS},
             "=>": (2, Assoc.RIGHT),
@@ -157,16 +176,19 @@ class Parser:
             "**": (16, Assoc.RIGHT),
             **{op: (17, Assoc.POSTFIX) for op in ("(", "[", ".", "?")},
         }
-        # Prefix operators and their precedence. The operand is parsed at the
-        # next level up, so `not a == b` is `not (a == b)` and `-a * b` is `(-a) * b`.
+        # Prefix operators and their precedence. The operand is parsed one
+        # level up, so it only takes operators that bind tighter: `not a == b`
+        # is `not (a == b)`, and `-a * b` is `(-a) * b`.
         self.prefix: dict[str, int] = {"not": 5, "-": 15, "~": 15}
 
     # Looking at tokens
 
     def peek(self, offset: int = 0) -> Token:
+        """The token `offset` places ahead. Past the end, that's always EOF."""
         return self.tokens[min(self.pos + offset, len(self.tokens) - 1)]
 
     def previous(self) -> Token:
+        """The token consumed most recently."""
         return self.tokens[self.pos - 1]
 
     def at(self, text: str, offset: int = 0) -> bool:
@@ -181,7 +203,12 @@ class Parser:
         """Does an indented block start here?"""
         return self.at_kind(TokenKind.NEWLINE) and self.at_kind(TokenKind.INDENT, 1)
 
+    def at_label(self) -> bool:
+        """Is this a loop label, as in `outer: for ...`?"""
+        return self.at_kind(TokenKind.NAME) and self.at(":", 1) and any(self.at(kw, 2) for kw in LOOP_KEYWORDS)
+
     def advance(self) -> Token:
+        """Consume the current token and return it. EOF is never consumed."""
         token = self.peek()
         if token.kind is not TokenKind.EOF:
             self.pos += 1
@@ -195,24 +222,29 @@ class Parser:
         return False
 
     def expect(self, text: str) -> Token:
+        """Consume the keyword or operator `text`, which must be next."""
         if not self.at(text):
             raise self.unexpected(f"'{text}'")
         return self.advance()
 
     def expect_kind(self, kind: TokenKind, expected: str) -> Token:
+        """Consume a token of `kind`, which must be next. `expected` describes it for errors."""
         if not self.at_kind(kind):
             raise self.unexpected(expected)
         return self.advance()
 
     def unexpected(self, expected: str) -> EllaError:
+        """An error for the current token, saying what should have been there."""
         token = self.peek()
         return EllaError(f"expected {expected}, found {describe(token)}", token.span)
 
     def parse_comma_list[T](self, parse_item: Callable[[], T], close: str) -> tuple[list[T], bool]:
         """Parse `item, item, ...` and the closing bracket, allowing a trailing comma.
 
-        Also returns whether there was a trailing comma, which tells `(x,)` (a
-        tuple) apart from `(x)` (grouping).
+        Used for argument lists, list literals, tuples, parameters, type
+        arguments and so on, with `parse_item` parsing one item. Also returns
+        whether there was a trailing comma, which tells `(x,)` (a tuple) apart
+        from `(x)` (grouping).
         """
         items: list[T] = []
         trailing_comma = False
@@ -227,6 +259,7 @@ class Parser:
     # Program structure and blocks
 
     def parse_program(self) -> Program:
+        """A file is a sequence of expressions, one per line."""
         body = []
         while not self.at_kind(TokenKind.EOF):
             body.append(self.parse_expr())
@@ -234,13 +267,17 @@ class Parser:
         return Program(tuple(body), Span(1, 1))
 
     def end_of_line(self) -> None:
-        """Each line in a block ends with NEWLINE. An expression that ended with
-        its own indented block has already consumed it."""
+        """Consume the NEWLINE that ends a line.
+
+        An expression that ended with its own indented block, like an `if`
+        with a block body, has already consumed that NEWLINE: the tokens are
+        `... NEWLINE DEDENT`, and the block took both.
+        """
         if self.previous().kind is not TokenKind.DEDENT:
             self.expect_kind(TokenKind.NEWLINE, "end of line")
 
     def parse_block(self) -> Block:
-        """NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT"""
+        """An indented block: NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT."""
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         indent = self.expect_kind(TokenKind.INDENT, "an indented block")
         return Block(self.parse_lines(), indent.span)
@@ -256,12 +293,17 @@ class Parser:
                 return tuple(exprs)
 
     def parse_body(self) -> Expr:
-        """A body is an expression on the same line, or an indented block."""
+        """A body (after `then`, `else`, a loop header, ...) is an expression on
+        the same line, or an indented block starting on the next line."""
         return self.parse_block() if self.at_block() else self.parse_expr()
 
     # Expressions
 
     def parse_expr(self, min_prec: int = LOWEST) -> Expr:
+        """Parse an expression, taking only operators with precedence >= `min_prec`.
+
+        This is the heart of the Pratt parser; see the module docstring.
+        """
         left = self.parse_prefix()
         while (op := self.infix_op()) is not None and self.infix[op][0] >= min_prec:
             left = self.parse_infix(left, op)
@@ -269,9 +311,11 @@ class Parser:
 
     def infix_op(self) -> str | None:
         """The infix or postfix operator at the current token, if there is one."""
-        # An expression that ended with an indented block ends there.
+        # An expression that ended with an indented block ends there. The next
+        # line can't continue it with an operator.
         if self.previous().kind is TokenKind.DEDENT:
             return None
+        # `not in` is two tokens but one operator.
         if self.at("not") and self.at("in", 1):
             return "not in"
         token = self.peek()
@@ -280,6 +324,7 @@ class Parser:
         return None
 
     def parse_infix(self, left: Expr, op: str) -> Expr:
+        """Combine `left` with the operator `op` (not yet consumed) and its right side."""
         prec, assoc = self.infix[op]
         if assoc is Assoc.POSTFIX:
             return self.parse_postfix(left)
@@ -289,8 +334,10 @@ class Parser:
         span = self.take_binary_op(op)
         if assoc is Assoc.CHAIN:
             return self.parse_comparison(left, op, span)
-        # A right-associative operator's right side may contain the same
-        # operator again: `a ** b ** c` is `a ** (b ** c)`.
+        # The right operand may only contain tighter operators (prec + 1), so
+        # `a - b - c` groups to the left. For a right-associative operator it
+        # may also contain the same operator again (prec), so `a ** b ** c` is
+        # `a ** (b ** c)`.
         right = self.parse_expr(prec if assoc is Assoc.RIGHT else prec + 1)
         if assoc is Assoc.NONE and (next_op := self.infix_op()) is not None and self.infix[next_op][0] == prec:
             raise EllaError(f"'{next_op}' can't follow '{op}' without parentheses", self.peek().span)
@@ -303,7 +350,13 @@ class Parser:
         return Binary(op, left, right, span)
 
     def take_binary_op(self, op: str) -> Span:
-        """Consume a binary operator, which must not end the line."""
+        """Consume a binary operator and return its span.
+
+        The operator must not end the line. Outside brackets, a line break
+        ends the expression, so a dangling operator would be confusing. The
+        fix is to wrap the expression in parentheses, inside which line breaks
+        are ignored.
+        """
         token = self.advance()
         if op == "not in":
             self.advance()
@@ -312,7 +365,7 @@ class Parser:
         return token.span
 
     def parse_comparison(self, first: Expr, op: str, span: Span) -> Compare:
-        """`a < b <= c` is one node, so that `b` is evaluated once."""
+        """`a < b <= c` is one node, meaning `a < b and b <= c` with `b` evaluated once."""
         operand_prec = self.infix[op][0] + 1
         rest = [(op, self.parse_expr(operand_prec))]
         while (next_op := self.infix_op()) is not None and self.infix[next_op][1] is Assoc.CHAIN:
@@ -321,7 +374,11 @@ class Parser:
         return Compare(first, tuple(rest), span)
 
     def make_pipe(self, left: Expr, right: Expr, span: Span) -> Call:
-        """`x |> f` is `f(x)`, and `x |> f(a, b)` is `f(x, a, b)`."""
+        """`x |> f` is `f(x)`, and `x |> f(a, b)` is `f(x, a, b)`.
+
+        Pipes are rewritten into ordinary calls here, so later stages never
+        see them.
+        """
         match right:
             case Name():
                 return Call(right, (left,), span)
@@ -330,6 +387,7 @@ class Parser:
         raise EllaError("the right side of '|>' must be a name or a call", span)
 
     def parse_postfix(self, left: Expr) -> Expr:
+        """`left(args)`, `left[index]`, `left.name` or `left?`."""
         token = self.advance()
         match token.text:
             case "(":
@@ -346,8 +404,12 @@ class Parser:
                 return Try(left, token.span)
 
     def parse_prefix(self) -> Expr:
-        """Parse an expression that doesn't start with an operand: literals, names,
-        brackets, prefix operators, and the keyword forms."""
+        """Parse an expression that doesn't continue an operand: literals, names,
+        brackets, prefix operators, and the keyword forms.
+
+        Because everything is an expression, `let`, `if`, loops and so on are
+        handled here too, and may appear anywhere an operand can.
+        """
         token = self.peek()
         match token.kind, token.text:
             case TokenKind.INT, _:
@@ -358,13 +420,13 @@ class Parser:
                 self.advance()
                 assert isinstance(token.value, float)
                 return FloatLit(token.value, token.span)
+            case TokenKind.NAME, _ if self.at_label():
+                return self.parse_labeled_loop()
             case TokenKind.NAME, _:
                 self.advance()
                 return Name(token.text, token.span)
             case TokenKind.STRING_START, _:
                 return self.parse_string()
-            case TokenKind.LABEL, _:
-                return self.parse_labeled_loop()
             case TokenKind.KEYWORD, ("true" | "false"):
                 self.advance()
                 return BoolLit(token.text == "true", token.span)
@@ -407,10 +469,14 @@ class Parser:
         raise self.unexpected("an expression")
 
     def starts_expr(self) -> bool:
-        """Can the current token begin an expression? (For the optional values of `break` and `return`.)"""
+        """Can the current token begin an expression?
+
+        `break` and `return` take an optional value, and this decides whether
+        one is there: `break n` has one, `break` at the end of a line doesn't.
+        """
         token = self.peek()
         match token.kind:
-            case TokenKind.INT | TokenKind.FLOAT | TokenKind.NAME | TokenKind.STRING_START | TokenKind.LABEL:
+            case TokenKind.INT | TokenKind.FLOAT | TokenKind.NAME | TokenKind.STRING_START:
                 return True
             case TokenKind.OP:
                 return token.text in ("(", "[", "-", "~")
@@ -420,16 +486,19 @@ class Parser:
                 return False
 
     def check_int(self, value: int, span: Span) -> int:
+        """Integer literals must fit in an i64."""
         if not I64_MIN <= value <= I64_MAX:
             raise EllaError("integer literal doesn't fit in i64", span)
         return value
 
     def parse_unary(self) -> Expr:
+        """A prefix operator and its operand: `-x`, `~x`, `not x`."""
         token = self.advance()
-        # `-` directly before an integer literal makes a negative literal, which
-        # is how the smallest i64, -9223372036854775808, can be written. This is
-        # skipped if the literal is followed by an operator that binds tighter
-        # than `-` (such as `**`), so `-2 ** 2` is still `-(2 ** 2)`.
+        # `-` directly before an integer literal makes a negative literal. This
+        # is the only way to write the smallest i64, -9223372036854775808,
+        # because 9223372036854775808 alone doesn't fit. It is skipped if the
+        # literal is followed by an operator that binds tighter than `-` (such
+        # as `**`), so `-2 ** 2` is still `-(2 ** 2)`.
         if token.text == "-" and self.at_kind(TokenKind.INT) and not self.binds_tighter_than_prefix(1):
             literal = self.advance()
             assert isinstance(literal.value, int)
@@ -445,6 +514,7 @@ class Parser:
         return self.infix[token.text][0] > self.prefix["-"]
 
     def parse_string(self) -> StringLit:
+        """A string: STRING_START, then text and `{{ expr }}` parts, then STRING_END."""
         start = self.expect_kind(TokenKind.STRING_START, "a string")
         parts: list[str | Expr] = []
         while not self.at_kind(TokenKind.STRING_END):
@@ -461,14 +531,18 @@ class Parser:
 
     def parse_parens(self) -> Expr:
         """`(` starts a unit `()`, a grouping `(x)`, a tuple `(x, y)`, or the
-        parameters of a lambda. Items are parsed as expressions that may also be
-        `name: type`; only once we reach `)` can we tell whether `->` or `=>`
-        follows, making them lambda parameters."""
+        parameters of a lambda `(x: i64) -> i64 => ...`.
+
+        We can't tell which until after the `)`, so items are parsed as
+        expressions that may also be `name: type`. If `->` or `=>` follows the
+        `)`, the items become lambda parameters. This avoids backtracking.
+        """
         open_paren = self.advance()
         items, trailing_comma = self.parse_comma_list(self.parse_paren_item, ")")
         if self.at("->") or self.at("=>"):
             return self.parse_lambda(items, open_paren.span)
 
+        # Not a lambda, so no `name: type` items are allowed.
         exprs: list[Expr] = []
         for item in items:
             if isinstance(item, Param):
@@ -483,7 +557,8 @@ class Parser:
         return TupleLit(tuple(exprs), open_paren.span)
 
     def parse_paren_item(self) -> Expr | Param:
-        if self.at_kind(TokenKind.NAME) and self.at(":", 1):
+        """One item inside `(...)`: an expression, or `name: type` in case this is a lambda."""
+        if self.at_kind(TokenKind.NAME) and self.at(":", 1) and not self.at_label():
             name = self.advance()
             self.advance()
             return Param(name.text, self.parse_type(), name.span)
@@ -499,6 +574,7 @@ class Parser:
                 case Param():
                     params.append(item)
                 case Name(name, name_span):
+                    # An untyped parameter, as in `(x) => x`.
                     params.append(Param(name, None, name_span))
                 case _:
                     raise EllaError("lambda parameters must look like 'x: i64'", item.span)
@@ -516,23 +592,33 @@ class Parser:
         return Lambda((Param(left.name, None, left.span),), None, where, body, left.span)
 
     def parse_lambda_body(self) -> tuple[tuple[Expr, ...], Expr]:
-        """A lambda body, and its `where` conditions, which may only start a block body."""
+        """A lambda body and its `where` conditions, which may only start a block body.
+
+        The body extends as far right as possible: `(x: i64) -> i64 => x + 1`
+        has the body `x + 1`.
+        """
+        # Loop labels outside the function aren't visible inside it.
+        outer_labels, self.labels = self.labels, []
         if not self.at_block():
-            return (), self.parse_expr()
-        self.advance()
+            body = self.parse_expr()
+            self.labels = outer_labels
+            return (), body
+        self.advance()  # NEWLINE
         indent = self.advance()
         where: tuple[Expr, ...] = ()
         if self.at("where"):
             self.advance()
-            outer, self.in_where = self.in_where, True
+            outer_where, self.in_where = self.in_where, True
             where = self.parse_block().exprs
-            self.in_where = outer
-        return where, Block(self.parse_lines(), indent.span)
+            self.in_where = outer_where
+        body = Block(self.parse_lines(), indent.span)
+        self.labels = outer_labels
+        return where, body
 
     def parse_return(self) -> Expr:
+        """`return` or `return value`. Inside `where`, `return` is the function's result."""
         token = self.advance()
         if self.in_where:
-            # In a `where` condition, `return` names the function's result.
             return Name("return", token.span)
         value = self.parse_expr() if self.starts_expr() else None
         return Return(value, token.span)
@@ -540,16 +626,23 @@ class Parser:
     # Bindings
 
     def parse_let(self) -> Let:
-        """`let a = mut b: i64 = c = value`: every target in the chain is a new binding."""
+        """`let a = mut b: i64 = c = value`: every target in the chain is a new binding.
+
+        After each `=`, another target follows if the next tokens are `mut`,
+        or a name followed by `=` or `:`. Otherwise the value starts.
+        """
         token = self.advance()
         bindings = [self.parse_binding()]
         self.expect("=")
-        while self.at("mut") or (self.at_kind(TokenKind.NAME) and (self.at("=", 1) or self.at(":", 1))):
+        while self.at("mut") or (
+            self.at_kind(TokenKind.NAME) and (self.at("=", 1) or self.at(":", 1)) and not self.at_label()
+        ):
             bindings.append(self.parse_binding())
             self.expect("=")
         return Let(tuple(bindings), self.parse_expr(), token.span)
 
     def parse_binding(self) -> Binding:
+        """One `let` target: `x`, `mut x`, `x: i64`."""
         mutable = self.accept("mut")
         name = self.expect_kind(TokenKind.NAME, "a name")
         type_ = self.parse_type() if self.accept(":") else None
@@ -558,17 +651,20 @@ class Parser:
     # Control flow
 
     def parse_if(self) -> If:
+        """`if cond then body [else body]`."""
         token = self.advance()
         cond = self.parse_expr()
         self.expect("then")
         then = self.parse_body()
-        # `else` may also start the next line.
+        # `else` may also start the next line, after an inline `then` body.
+        # (After a block body, the block has consumed the line end already.)
         if self.at_kind(TokenKind.NEWLINE) and self.at("else", 1):
             self.advance()
         else_ = self.parse_body() if self.accept("else") else None
         return If(cond, then, else_, token.span)
 
     def parse_match(self) -> Match:
+        """`match subject`, then an indented list of cases."""
         token = self.advance()
         subject = self.parse_expr()
         self.expect_kind(TokenKind.NEWLINE, "end of line")
@@ -585,7 +681,8 @@ class Parser:
         pattern = self.parse_pattern()
         guard = None
         if self.accept("if"):
-            # Stop before `=>` rather than reading it as an untyped lambda.
+            # Parse above `=>`'s precedence, so that in `case x if y => 1` the
+            # `y => 1` isn't read as an untyped lambda.
             guard = self.parse_expr(self.infix["=>"][0] + 1)
         if self.accept("=>"):
             body = self.parse_expr()
@@ -595,48 +692,65 @@ class Parser:
         return Case(pattern, guard, body, token.span)
 
     def parse_labeled_loop(self) -> Expr:
-        label = self.advance()
-        assert isinstance(label.value, str)
+        """`label: for ...`, `label: while ...` or `label: loop ...`."""
+        label = self.advance().text
+        self.advance()  # the `:`
         if self.at("for"):
-            return self.parse_for(label.value)
+            return self.parse_for(label)
         if self.at("while"):
-            return self.parse_while(label.value)
-        if self.at("loop"):
-            return self.parse_loop(label.value)
-        raise EllaError("a label must be followed by 'for', 'while' or 'loop'", label.span)
+            return self.parse_while(label)
+        return self.parse_loop(label)
+
+    def parse_loop_body(self, label: str | None) -> Expr:
+        """A loop body, inside which the loop's label (if any) can be used."""
+        if label is None:
+            return self.parse_body()
+        self.labels.append(label)
+        body = self.parse_body()
+        self.labels.pop()
+        return body
 
     def parse_for(self, label: str | None) -> For:
+        """`for pattern in iterable body`."""
         token = self.advance()
         pattern = self.parse_pattern()
         self.expect("in")
         iterable = self.parse_expr()
-        return For(label, pattern, iterable, self.parse_body(), token.span)
+        return For(label, pattern, iterable, self.parse_loop_body(label), token.span)
 
     def parse_while(self, label: str | None) -> While:
+        """`while cond body`."""
         token = self.advance()
         cond = self.parse_expr()
-        return While(label, cond, self.parse_body(), token.span)
+        return While(label, cond, self.parse_loop_body(label), token.span)
 
     def parse_loop(self, label: str | None) -> Loop:
+        """`loop body`, which repeats until a `break`."""
         token = self.advance()
-        return Loop(label, self.parse_body(), token.span)
+        return Loop(label, self.parse_loop_body(label), token.span)
 
     def parse_break(self) -> Break:
+        """`break [label] [value]`."""
         token = self.advance()
         label = self.parse_optional_label()
         value = self.parse_expr() if self.starts_expr() else None
         return Break(label, value, token.span)
 
     def parse_optional_label(self) -> str | None:
-        if not self.at_kind(TokenKind.LABEL):
-            return None
-        label = self.advance().value
-        assert isinstance(label, str)
-        return label
+        """The label after `break` or `continue`, if there is one.
+
+        A name is a label only if it names a loop we're inside. Otherwise
+        `break n` is a break with the value `n`. To break with a variable
+        that has the same name as a label, write `break (name)`.
+        """
+        if self.at_kind(TokenKind.NAME) and self.peek().text in self.labels:
+            return self.advance().text
+        return None
 
     # Enums
 
     def parse_enum(self) -> EnumDef:
+        """`enum Name[T, ...]`, then an indented list of variants."""
         token = self.advance()
         name = self.expect_kind(TokenKind.NAME, "an enum name")
         type_params: list[str] = []
@@ -655,6 +769,7 @@ class Parser:
                 return EnumDef(name.text, tuple(type_params), tuple(variants), token.span)
 
     def parse_variant(self) -> Variant:
+        """One variant: `Empty`, or `Rect(f64, f64)` with field types."""
         name = self.expect_kind(TokenKind.NAME, "a variant name")
         fields: list[TypeExpr] = []
         if self.accept("("):
@@ -662,8 +777,12 @@ class Parser:
         return Variant(name.text, tuple(fields), name.span)
 
     # Types
+    #
+    # Types have their own small grammar, used after `:` and `->`. That's why
+    # `[str]` here is a list type, while in an expression `[x]` is a list.
 
     def parse_type(self) -> TypeExpr:
+        """`i64`, `Result[T, E]`, `[T]`, `()`, `(T, U)` or `(T, U) -> R`."""
         token = self.peek()
         if self.at_kind(TokenKind.NAME):
             self.advance()
@@ -676,6 +795,7 @@ class Parser:
             self.expect("]")
             return ListType(element, token.span)
         if self.accept("("):
+            # `(...)` is a function type if `->` follows, otherwise unit or a tuple.
             items, trailing_comma = self.parse_comma_list(self.parse_type, ")")
             if self.accept("->"):
                 return FunctionType(tuple(items), self.parse_type(), token.span)
@@ -687,8 +807,11 @@ class Parser:
         raise self.unexpected("a type")
 
     # Patterns
+    #
+    # Patterns also have their own grammar, used after `case` and `for`.
 
     def parse_pattern(self) -> Pattern:
+        """A pattern, or alternatives separated by `|`: `0 | 1`."""
         first = self.parse_pattern_atom()
         if not self.at("|"):
             return first
@@ -698,6 +821,7 @@ class Parser:
         return OrPattern(tuple(alternatives), first.span)
 
     def parse_pattern_atom(self) -> Pattern:
+        """One pattern without `|`."""
         token = self.peek()
         if self.at_kind(TokenKind.NAME):
             self.advance()
@@ -706,12 +830,15 @@ class Parser:
             if self.accept("("):
                 args, _ = self.parse_comma_list(self.parse_pattern, ")")
                 return VariantPattern(token.text, tuple(args), token.span)
+            # Whether a bare name like `None` is a variant or a new binding is
+            # decided later, by name resolution.
             return NamePattern(token.text, token.span)
         if self.accept("("):
             items, trailing_comma = self.parse_comma_list(self.parse_pattern, ")")
             if len(items) < 2 and not trailing_comma:
                 raise EllaError("a tuple pattern needs a comma, like (a, b)", token.span)
             return TuplePattern(tuple(items), token.span)
+        # Anything else must be a literal, possibly the start of a range.
         low = self.parse_literal_value()
         if self.at("..") or self.at("..="):
             inclusive = self.advance().text == "..="

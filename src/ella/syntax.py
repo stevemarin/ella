@@ -5,7 +5,12 @@ Nodes are frozen dataclasses grouped into three unions: `Expr`, `Pattern` and
 `match` over them. Every node has a `span`: where it starts, or for infix and
 postfix nodes, where the operator is.
 
+Nodes keep only what later stages need. Punctuation, keywords and layout are
+gone, and a few conveniences are already rewritten: `x |> f(a)` arrives here
+as the call `f(x, a)`, and `-5` as the literal -5.
+
 `show` renders any node as a compact S-expression, for tests and the CLI.
+For example, `let x = 1 + 2 * 3` is shown as `(let [x] (+ 1 (* 2 3)))`.
 """
 
 import json
@@ -326,6 +331,8 @@ class Block:
 
 @dataclass(frozen=True, slots=True)
 class If:
+    """`if cond then ... else ...`; `else_` is None when there is no `else`."""
+
     cond: Expr
     then: Expr
     else_: Expr | None
@@ -334,6 +341,8 @@ class If:
 
 @dataclass(frozen=True, slots=True)
 class Match:
+    """`match subject` and its cases, tried in order."""
+
     subject: Expr
     cases: tuple[Case, ...]
     span: Span
@@ -341,6 +350,8 @@ class Match:
 
 @dataclass(frozen=True, slots=True)
 class For:
+    """`for pattern in iterable body`. Loops may have a label: `outer: for ...`."""
+
     label: str | None
     pattern: Pattern
     iterable: Expr
@@ -350,6 +361,8 @@ class For:
 
 @dataclass(frozen=True, slots=True)
 class While:
+    """`while cond body`."""
+
     label: str | None
     cond: Expr
     body: Expr
@@ -358,6 +371,8 @@ class While:
 
 @dataclass(frozen=True, slots=True)
 class Loop:
+    """`loop body`, which repeats until a `break`."""
+
     label: str | None
     body: Expr
     span: Span
@@ -365,6 +380,8 @@ class Loop:
 
 @dataclass(frozen=True, slots=True)
 class Break:
+    """`break [label] [value]`. The value becomes the value of a `loop`."""
+
     label: str | None
     value: Expr | None
     span: Span
@@ -372,18 +389,24 @@ class Break:
 
 @dataclass(frozen=True, slots=True)
 class Continue:
+    """`continue [label]`."""
+
     label: str | None
     span: Span
 
 
 @dataclass(frozen=True, slots=True)
 class Return:
+    """`return [value]`, exiting the innermost function."""
+
     value: Expr | None
     span: Span
 
 
 @dataclass(frozen=True, slots=True)
 class Assert:
+    """`assert expr`, a keyword so that failures can show the asserted source."""
+
     expr: Expr
     span: Span
 
@@ -540,6 +563,7 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
 
 
 def sexpr(head: str, *items: str) -> str:
+    """`sexpr("+", "1", "2")` is `(+ 1 2)`."""
     return f"({' '.join((head, *items))})"
 
 
@@ -548,6 +572,7 @@ def show_list(nodes: tuple[TypeExpr, ...]) -> str:
 
 
 def show_literal(value: LiteralValue) -> str:
+    """Literals as Ella writes them: `true` rather than `True`, strings quoted."""
     match value:
         case bool():
             return "true" if value else "false"
@@ -558,7 +583,8 @@ def show_literal(value: LiteralValue) -> str:
 
 
 def show_label(label: str | None) -> list[str]:
-    return [] if label is None else [f"'{label}"]
+    """Labels are shown with a colon, `outer:`, to tell them apart from values."""
+    return [] if label is None else [f"{label}:"]
 
 
 def show_binding(binding: Binding) -> str:
