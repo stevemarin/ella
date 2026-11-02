@@ -269,6 +269,15 @@ Ella uses **pass-by-value**. Binding, passing an argument, returning, and
 capturing in a closure all copy. The interpreters copy eagerly for now
 (lists are Python lists that get copied); optimization can remove copies later.
 
+Concretely, reading a variable or a list element gives a copy, so changing a
+list through one name is never visible through another:
+
+```ella
+let a = [1, 2]
+let mut b = a
+b[0] = 100      # a is still [1, 2]
+```
+
 ## 5. Functions
 
 Functions are lambda expressions, usually bound with `let`:
@@ -295,7 +304,12 @@ let fibonacci = (n: i64) -> i64 =>
 * A `let` bound to a lambda can refer to its own name inside the body
   (automatic `let rec`). Combined with [§3](#3-program-structure), top-level
   functions can be mutually recursive.
-* Lambdas capture variables from enclosing scopes **by copy**.
+* Lambdas capture variables from enclosing scopes **by copy**, at the moment
+  the lambda is evaluated. Later changes to those variables aren't seen, and
+  the captured copies are immutable inside the lambda. Top-level names are not
+  captured: a function sees their current values when it runs, which is what
+  lets top-level functions refer to each other.
+* A `break` or `continue` can't leave the function it is in.
 
 ### `where` clauses
 
@@ -306,7 +320,8 @@ let fibonacci = (n: i64) -> i64 =>
 * Conditions that mention `return` are **postconditions**; `return` there
   names the function's result. They are checked just before returning.
   All others are **preconditions**, checked on entry.
-* A failed condition is a run-time error reporting the condition's source.
+* A failed condition is a run-time error reporting the condition's source:
+  `precondition failed: n >= 0`.
 
 Inside `where`, `return` is parsed as a name, not as an early exit.
 
@@ -381,7 +396,10 @@ let found = loop
 * `while cond` runs while `cond` (a `bool`) is true.
 * `loop` repeats forever until `break`.
 * `for` and `while` have value `()`. `loop` has the value given to the
-  `break` that ends it (`break value`); plain `break` gives `()`.
+  `break` that ends it (`break value`); plain `break` gives `()`. A `break`
+  with a value out of a `for` or `while` is an error.
+* `for` over a string gives its characters as one-character strings. Each
+  iteration binds the pattern in a fresh scope.
 * `break` and `continue` apply to the innermost loop, or to the loop named by
   a label: `break outer`, `continue outer`, `break outer value`.
 * A label is written as `name:` directly before `for`, `while`, or `loop`.
@@ -446,6 +464,7 @@ Consequences worth knowing:
 ### Arithmetic
 
 * Operands must have the same type; there are no implicit conversions.
+* `+` also concatenates two `str`s or two lists.
 * `/` is true division and always returns `f64`, for `i64` or `f64` operands.
 * `//` is integer division that **rounds toward negative infinity** (as in
   Python): `-7 // 2 == -4`. `%` matches it, so
@@ -453,7 +472,10 @@ Consequences worth knowing:
   Both are defined for integers only.
 * `**` works on `i64` (a negative exponent is a run-time error) and on `f64`.
 * Integer division or modulo by zero is a run-time error.
-* `i64` arithmetic traps on overflow
+* `i64` arithmetic traps on overflow: if the exact result of `+`, `-`, `*`,
+  `//`, `**` or unary `-` doesn't fit in an `i64`, it is a run-time error.
+* `f64` arithmetic follows IEEE 754 and never fails: `1.0 / 0.0` is infinity
+  and `0.0 / 0.0` is NaN.
 
 ### Comparisons
 
@@ -461,12 +483,20 @@ Comparisons chain as in Python: `a < b <= c` means `a < b and b <= c`, with
 `b` evaluated once. The parser represents a chain as a single node holding
 the operands and operators, not as nested binary nodes.
 
-`in` and `not in` test membership in a list, string, or range.
+`in` and `not in` test membership in a list, string (substring), or range.
+
+* `==` and `!=` compare structurally: lists, tuples and enum values are equal
+  when their parts are. Both sides must have the same type, and functions
+  can't be compared.
+* `<`, `<=`, `>`, `>=` work on `i64`, `f64` and `str` (by code point).
 
 ### Logic and bits
 
 * `and`, `or`, `not` take `bool` operands. `and` and `or` short-circuit.
-* `& | ^ ~ << >>` work on integers. `>>` is an arithmetic shift.
+* `& | ^ ~ << >>` work on integers. `>>` is an arithmetic shift. These are
+  bit operations, so they don't trap: `<<` discards the bits shifted out, and
+  `1 << 63` is the smallest `i64`. A shift amount outside `0..64` is a
+  run-time error.
 
 ### Pipe
 
@@ -483,7 +513,8 @@ returns `None`. The enclosing function's return type must be compatible.
 
 * `a[i]` indexes lists and strings with an `i64`. Out-of-range or negative
   indexes are a run-time error **(provisional; no Python-style negative
-  indexing)**.
+  indexing)**. Indexing a string gives a one-character string; strings count
+  Unicode code points, and can't be assigned into.
 * `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
 
 ## 9. Types
@@ -528,7 +559,12 @@ in patterns. `Result` and `Optional` are built-in enums with variants
 Built-in functions (ordinary names, not keywords):
 
 * `print(value)` prints the text form of `value` and a newline; returns `()`.
-* `len(x)` returns the length of a list or string as `i64`.
+* `len(x)` returns the length of a list, string or range as `i64`.
+
+The text form of a value (used by `print` and interpolation) is how it would
+be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
+`Some(3)`, `None`. A string is its own text, but is quoted when it appears
+inside another value.
 
 Python-style protocol methods (`len`, indexing, iteration, and so on for user
 types) are planned for when user-defined types exist.
@@ -537,8 +573,12 @@ types) are planned for when user-defined types exist.
 failure can report the asserted expression's source text. It has type `()`.
 
 Run-time errors (failed `assert`, failed `where`, out-of-range index, no
-matching `case`, division by zero) stop the program with a message and the
-source location.
+matching `case`, division by zero, `i64` overflow) stop the program with a
+message and the source location.
+
+Until there is a type checker, the interpreter also checks types as the
+program runs, so `1 + true` is a run-time error. Type annotations are not yet
+checked.
 
 ## 11. Grammar summary
 

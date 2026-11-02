@@ -1,0 +1,5 @@
+# i64 arithmetic traps on overflow rather than wrapping around.
+let max = 9223372036854775807
+print(max - 1)
+print(max + 1)
+print("not reached")

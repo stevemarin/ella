@@ -1,0 +1,11 @@
+# Strings: four kinds of quotes, escapes, and interpolation.
+let name = "Ella"
+print("Hello, {{name}}!")
+print('single quotes work {{ "the same" }}')
+print("it's" + ' "fine"')
+print("""two
+lines""")
+print('''tab:\there, brace: \{{not interpolated}}''')
+print("{{ 1 + 2 }} {{ [1, 2] }} {{ (1, "a") }} {{ () }} {{ true }} {{ 2.5 }}")
+print(["quoted", "inside lists"])
+print("é\u{1F600}\x41")

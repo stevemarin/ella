@@ -1,0 +1,9 @@
+Hello, Ella!
+single quotes work the same
+it's "fine"
+two
+lines
+tab:	here, brace: {{not interpolated}}
+3 [1, 2] (1, "a") () true 2.5
+["quoted", "inside lists"]
+é😀A

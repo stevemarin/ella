@@ -39,20 +39,25 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Current stage: 1 (tokenizer and parser)
+## Layout (stages 1 and 2 done)
 
-Suggested layout:
-
-* `src/ella/lexer.py`: `Span`, `TokenKind`, `Token`, `tokenize(source)`.
-  Handles comments, INDENT/DEDENT/NEWLINE layout, bracket depth (newlines
-  ignored inside `()`/`[]`), number formats, escapes, and
+* `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
+  `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
+  depth (newlines ignored inside `()`/`[]`), number formats, escapes, and
   string interpolation (`STRING_START`, `STRING_TEXT`, `INTERP_START` …
   tokens … `INTERP_END`, `STRING_END`).
-* `src/ella/syntax.py`: AST node dataclasses.
+* `src/ella/syntax.py`: AST node dataclasses, and `show()` for S-expressions.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
   parsing notes in §11.
-* Tests in `test/test_lexer.py` and `test/test_parser.py`. `test/programs/` is
-  reserved for `.ella` programs with expected output, shared by every
-  interpreter and backend later.
+* `src/ella/values.py`: run-time values (plain Python values where possible),
+  scopes, copying, equality and text form. Shared by the interpreters.
+* `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2).
+  It defines the language's behavior; later stages are checked against it.
+  Types are checked at run time until there is a type checker.
+* Tests: `test/test_lexer.py`, `test/test_parser.py`,
+  `test/test_interpreter.py`, `test/test_cli.py`. `test/programs/` holds
+  `NAME.ella` programs with `NAME.out` (expected output) and optionally
+  `NAME.err` (expected error), run by `test/test_programs.py` and shared by
+  every interpreter and backend.
 
-No type checker or interpreter yet; those are later stages.
+Next is stage 3 (IR and IR interpreter); see README.md.

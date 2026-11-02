@@ -1,0 +1,37 @@
+# Enums, variants, and pattern matching.
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+
+let area = (s: Shape) -> f64 =>
+    match s
+        case Circle(r) => 3.0 * r * r
+        case Rect(w, h) => w * h
+        case Empty => 0.0
+
+for shape in [Circle(1.0), Rect(2.0, 3.0), Empty]
+    print("{{shape}} has area {{area(shape)}}")
+
+# Optional and Result are built in
+let find = (xs: [i64], target: i64) -> Optional[i64] =>
+    for i in 0..len(xs)
+        if xs[i] == target then return Some(i)
+    None
+print(find([5, 6, 7], 7))
+print(find([5, 6, 7], 8))
+
+let describe = (o: Optional[i64]) -> str =>
+    match o
+        case Some(0) => "at the start"
+        case Some(i) => "at {{i}}"
+        case None => "missing"
+print(describe(find([1, 2], 1)))
+print(describe(find([1, 2], 2)))
+print(describe(find([1, 2], 3)))
+
+# tuple patterns, in match and for
+for (name, age) in [("ann", 30), ("bo", 4)]
+    match (name, age)
+        case (_, 0..18) => print("{{name}} is a child")
+        case _ => print("{{name}} is an adult")

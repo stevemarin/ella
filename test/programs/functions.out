@@ -1,0 +1,13 @@
+true
+true
+2432902008176640000
+15
+100
+6
+[3, 2, 1, 0]
+6
+-4
+0
+Ok(3)
+Error("not a digit: x")
+main runs last

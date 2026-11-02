@@ -1,0 +1,8 @@
+# Conditions that mention `return` are checked on the result.
+let broken_abs = (n: i64) -> i64 =>
+    where
+        return >= 0
+    n
+print(broken_abs(3))
+broken_abs(-3)
+print("not reached")

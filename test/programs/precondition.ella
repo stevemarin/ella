@@ -1,0 +1,10 @@
+# A failed where condition stops the program with its source text.
+let sqrt_floor = (n: i64) -> i64 =>
+    where
+        n >= 0
+    let mut r = 0
+    while (r + 1) * (r + 1) <= n
+        r += 1
+    r
+print(sqrt_floor(17))
+print(sqrt_floor(-1))

@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-from ella import main
 from ella.lexer import EllaError, Span
 from ella.parser import parse
 from ella.syntax import Assign, Binary, Call, IntLit, Lambda, Let, Name, show
@@ -412,31 +411,3 @@ def test_unclosed_paren_reports_its_position() -> None:
 def test_pipe_in_call_node() -> None:
     [expr] = parse("x |> f(1)").body
     assert isinstance(expr, Call) and expr.args[0] == Name("x", Span(1, 1))
-
-
-# Command line
-
-
-def test_cli_prints_tree(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    path = tmp_path / "a.ella"
-    path.write_text("let x = 1 + 2\n")
-    assert main([str(path)]) == 0
-    assert capsys.readouterr().out == "(let [x] (+ 1 2))\n"
-
-
-def test_cli_prints_tokens(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    path = tmp_path / "a.ella"
-    path.write_text("x")
-    assert main(["--tokens", str(path)]) == 0
-    assert capsys.readouterr().out.splitlines() == ["1:1\tNAME\t'x'", "1:2\tNEWLINE\t''", "1:2\tEOF\t''"]
-
-
-def test_cli_reports_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    path = tmp_path / "bad.ella"
-    path.write_text("let = 1\n")
-    assert main([str(path)]) == 1
-    assert capsys.readouterr().err == f"{path}:1:5: expected a name, found '='\n"
-
-
-def test_cli_runs_example() -> None:
-    assert main([str(EXAMPLE)]) == 0

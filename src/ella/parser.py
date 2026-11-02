@@ -112,7 +112,7 @@ class Assoc(Enum):
 
 def parse(source: str) -> Program:
     """Tokenize and parse a source file. Raises EllaError on bad input."""
-    return Parser(tokenize(source)).parse_program()
+    return Parser(tokenize(source), source).parse_program()
 
 
 def describe(token: Token) -> str:
@@ -138,9 +138,15 @@ class Parser:
     The parser only ever looks a few tokens ahead (`peek`) and never backs up.
     """
 
-    def __init__(self, tokens: list[Token]) -> None:
+    def __init__(self, tokens: list[Token], source: str) -> None:
         self.tokens = tokens
         self.pos = 0  # index of the current (next unconsumed) token
+        # The source text, used to keep the text of `assert` and `where`
+        # conditions for error messages. Line endings are normalized the same
+        # way as in the tokenizer, so that spans line up.
+        self.source = source.replace("\r\n", "\n")
+        # The index in `source` where each line starts, to turn spans into indexes.
+        self.line_starts = [0] + [i + 1 for i, char in enumerate(self.source) if char == "\n"]
         # Inside a `where` block, `return` names the function's result rather
         # than exiting the function.
         self.in_where = False
@@ -232,6 +238,13 @@ class Parser:
         if not self.at_kind(kind):
             raise self.unexpected(expected)
         return self.advance()
+
+    def source_since(self, first: Token) -> str:
+        """The source text from token `first` through the last token consumed."""
+        last = self.previous()
+        start = self.line_starts[first.span.line - 1] + first.span.column - 1
+        end = self.line_starts[last.span.line - 1] + last.span.column - 1 + len(last.text)
+        return self.source[start:end].strip()
 
     def unexpected(self, expected: str) -> EllaError:
         """An error for the current token, saying what should have been there."""
@@ -459,7 +472,7 @@ class Parser:
                 return self.parse_return()
             case TokenKind.KEYWORD, "assert":
                 self.advance()
-                return Assert(self.parse_expr(), token.span)
+                return self.parse_condition()
             case TokenKind.KEYWORD, "enum":
                 return self.parse_enum()
             case TokenKind.KEYWORD, "where":
@@ -591,7 +604,7 @@ class Parser:
         where, body = self.parse_lambda_body()
         return Lambda((Param(left.name, None, left.span),), None, where, body, left.span)
 
-    def parse_lambda_body(self) -> tuple[tuple[Expr, ...], Expr]:
+    def parse_lambda_body(self) -> tuple[tuple[Assert, ...], Expr]:
         """A lambda body and its `where` conditions, which may only start a block body.
 
         The body extends as far right as possible: `(x: i64) -> i64 => x + 1`
@@ -605,15 +618,33 @@ class Parser:
             return (), body
         self.advance()  # NEWLINE
         indent = self.advance()
-        where: tuple[Expr, ...] = ()
+        where: tuple[Assert, ...] = ()
         if self.at("where"):
             self.advance()
             outer_where, self.in_where = self.in_where, True
-            where = self.parse_block().exprs
+            self.expect_kind(TokenKind.NEWLINE, "end of line")
+            self.expect_kind(TokenKind.INDENT, "an indented block of conditions")
+            where = self.parse_conditions()
             self.in_where = outer_where
         body = Block(self.parse_lines(), indent.span)
         self.labels = outer_labels
         return where, body
+
+    def parse_conditions(self) -> tuple[Assert, ...]:
+        """The lines of a `where` block, after its INDENT, through its DEDENT."""
+        conditions = []
+        while True:
+            conditions.append(self.parse_condition())
+            self.end_of_line()
+            if self.at_kind(TokenKind.DEDENT):
+                self.advance()
+                return tuple(conditions)
+
+    def parse_condition(self) -> Assert:
+        """A condition for `assert` or `where`, keeping its source text for error messages."""
+        first = self.peek()
+        expr = self.parse_expr()
+        return Assert(expr, self.source_since(first), first.span)
 
     def parse_return(self) -> Expr:
         """`return` or `return value`. Inside `where`, `return` is the function's result."""

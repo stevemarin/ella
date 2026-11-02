@@ -111,16 +111,22 @@ and IR rather than treating every compiler pass as a stage of program execution.
 
 ## Current status
 
-The syntax is specified in [docs/grammar.md](docs/grammar.md). Stage 1 is
-done: the tokenizer ([src/ella/lexer.py](src/ella/lexer.py)) and Pratt parser
-([src/ella/parser.py](src/ella/parser.py)) turn source into the syntax tree in
-[src/ella/syntax.py](src/ella/syntax.py), and
-[example_syntax.ella](example_syntax.ella) tokenizes and parses. Try it with:
+The syntax is specified in [docs/grammar.md](docs/grammar.md).
+
+* Stage 1 is done: the tokenizer ([src/ella/lexer.py](src/ella/lexer.py)) and
+  Pratt parser ([src/ella/parser.py](src/ella/parser.py)) turn source into the
+  syntax tree in [src/ella/syntax.py](src/ella/syntax.py).
+* Stage 2 is done: the tree-walking interpreter
+  ([src/ella/interpreter.py](src/ella/interpreter.py), with values in
+  [src/ella/values.py](src/ella/values.py)) runs programs, checking types as
+  it goes. [test/programs/](test/programs/) holds programs with their expected
+  output, for every later interpreter and backend to share.
 
 ```sh
-uv run ella example_syntax.ella           # print the syntax tree
+uv run ella example_syntax.ella           # run a program
+uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-The interpreter, IR and later roadmap items are design goals, not implemented
-features yet.
+A static type checker, the IR and the later roadmap items are design goals,
+not implemented features yet.

@@ -1,0 +1,53 @@
+# if, match, and loops are expressions.
+let sign = (n: i64) -> str =>
+    if n < 0 then "negative" else if n == 0 then "zero" else "positive"
+print(sign(-3))
+print(sign(0))
+print(sign(8))
+
+let describe = (n: i64) -> str =>
+    match n
+        case 0 => "zero"
+        case 1 | 2 | 3 => "small"
+        case 4..=9 => "digit"
+        case k if k % 2 == 0 => "big and even"
+        case _ => "big"
+for n in [0, 2, 7, 10, 11]
+    print("{{n}}: {{describe(n)}}")
+
+# for over ranges, lists and strings
+let mut total = 0
+for k in 0..=100
+    total += k
+print(total)
+for char in "abc"
+    print(char)
+
+# while and loop
+let mut count = 0
+while count < 3
+    count += 1
+print(count)
+
+let mut n = 0
+let found = loop
+    n += 1
+    if n * n > 50 then break n
+print(found)
+
+# labels name the loop to break out of or continue
+let grid = [[1, 2], [0, 3], [4, -1], [5, 6]]
+let mut seen = []
+outer: for row in grid
+    for cell in row
+        if cell == 0 then continue outer
+        if cell < 0 then break outer
+        seen = seen + [cell]
+print(seen)
+
+# continue skips to the next iteration
+let mut odds = []
+for k in 0..10
+    if k % 2 == 0 then continue
+    odds = odds + [k]
+print(odds)

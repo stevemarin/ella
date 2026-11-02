@@ -1,0 +1,39 @@
+# Pass-by-value: binding, passing, returning and capturing all copy.
+let mut a = [1, 2, 3]
+let mut b = a
+b[0] = 100
+print(a)
+print(b)
+
+let set_first = (xs: [i64]) -> [i64] =>
+    let mut copy = xs
+    copy[0] = -1
+    copy
+print(set_first(a))
+print(a)
+
+# nested lists copy deeply
+let mut grid = [[0, 0], [0, 0]]
+let mut row = grid[0]
+row[1] = 5
+grid[1][0] = 7
+grid[1][1] += 1
+print(grid)
+print(row)
+
+# let chains make independent bindings
+let first = mut second = [1]
+second[0] = 2
+print(first)
+print(second)
+
+# assignments evaluate to the assigned value
+let mut x = 0
+let y = (x = 5)
+print(y)
+print(x)
+
+# structural equality
+print([1, [2, 3]] == [1, [2, 3]])
+print((1, "a") != (1, "b"))
+print(Some([1]) == Some([1]))

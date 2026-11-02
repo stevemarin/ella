@@ -316,7 +316,7 @@ class Lambda:
 
     params: tuple[Param, ...]
     return_type: TypeExpr | None
-    where: tuple[Expr, ...]
+    where: tuple[Assert, ...]
     body: Expr
     span: Span
 
@@ -405,9 +405,14 @@ class Return:
 
 @dataclass(frozen=True, slots=True)
 class Assert:
-    """`assert expr`, a keyword so that failures can show the asserted source."""
+    """`assert expr`, or one condition of a `where` block.
+
+    `source` is the condition as written, so that a failure can show it:
+    "assertion failed: fibonacci(5) == 8".
+    """
 
     expr: Expr
+    source: str
     span: Span
 
 
@@ -533,7 +538,7 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             signature = f"({', '.join(map(show_param, params))})"
             if return_type is not None:
                 signature += f" -> {show(return_type)}"
-            conditions = [sexpr("where", *map(show, where))] if where else []
+            conditions = [sexpr("where", *(show(condition.expr) for condition in where))] if where else []
             return sexpr("lambda", signature, *conditions, show(body))
         case Block(exprs):
             return sexpr("block", *map(show, exprs))

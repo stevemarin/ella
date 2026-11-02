@@ -1,0 +1,38 @@
+# Integer and float arithmetic, following docs/grammar.md §8.
+print(7 + 3 * 2)
+print(7 / 2)          # true division always gives f64
+print(-7 // 2)        # floors toward negative infinity
+print(-7 % 2)         # has the sign of the divisor
+print(7 % -2)
+print(2 ** 10)
+print(-2 ** 2)        # -(2 ** 2)
+print(2.0 ** 0.5)
+
+# the full i64 range is usable; going past it is an error (see overflow.ella)
+let max = 9223372036854775807
+let min = -9223372036854775808
+print(max)
+print(min)
+print(max + min)
+print(3 ** 39)
+print(1 ** 1000000)
+
+# bits
+print(6 & 3)
+print(6 | 3)
+print(6 ^ 3)
+print(~5)
+print(1 << 62)
+print(-16 >> 2)       # arithmetic shift
+
+# f64 follows IEEE 754
+print(1.0 / 0.0)
+print(-1.0 / 0.0)
+print(0.0 / 0.0)
+
+# comparisons chain
+let i = 5
+print(0 <= i < 10)
+print(1 < 2 > 3)
+print("apple" < "banana")
+print(3 in [1, 2, 3] and 4 not in 0..4 and "ell" in "hello")
