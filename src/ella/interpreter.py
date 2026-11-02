@@ -81,7 +81,6 @@ from ella.values import (
     fits_i64,
     to_text,
     type_name,
-    wrap,
 )
 
 # How deeply Ella functions may call each other before we report a stack
@@ -582,10 +581,12 @@ class Interpreter:
             case "<<" | ">>":
                 if not 0 <= b < 64:
                     raise EllaError(f"shift amount must be between 0 and 63, not {b}", span)
-                # `<<` loses the bits shifted out (it's a bit operation, so it
-                # doesn't trap). Python's >> on a negative number is an
-                # arithmetic shift, as Ella's is.
-                return wrap(a << b) if op == "<<" else a >> b
+                # `a << b` is `a * 2**b`, so like `*` it traps if the result
+                # doesn't fit: shifting a bit into or past the sign bit is an
+                # error, not a silent change of sign. `>>` can't overflow;
+                # Python's >> on a negative number is an arithmetic shift, as
+                # Ella's is.
+                return self.check_i64(a << b, span) if op == "<<" else a >> b
         raise EllaError(f"'{op}' doesn't work on i64", span)
 
     def float_op(self, op: str, a: float, b: float, span: Span) -> Value:

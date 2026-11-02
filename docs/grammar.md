@@ -473,7 +473,8 @@ Consequences worth knowing:
 * `**` works on `i64` (a negative exponent is a run-time error) and on `f64`.
 * Integer division or modulo by zero is a run-time error.
 * `i64` arithmetic traps on overflow: if the exact result of `+`, `-`, `*`,
-  `//`, `**` or unary `-` doesn't fit in an `i64`, it is a run-time error.
+  `//`, `**`, `<<` or unary `-` doesn't fit in an `i64`, it is a run-time
+  error.
 * `f64` arithmetic follows IEEE 754 and never fails: `1.0 / 0.0` is infinity
   and `0.0 / 0.0` is NaN.
 
@@ -493,10 +494,11 @@ the operands and operators, not as nested binary nodes.
 ### Logic and bits
 
 * `and`, `or`, `not` take `bool` operands. `and` and `or` short-circuit.
-* `& | ^ ~ << >>` work on integers. `>>` is an arithmetic shift. These are
-  bit operations, so they don't trap: `<<` discards the bits shifted out, and
-  `1 << 63` is the smallest `i64`. A shift amount outside `0..64` is a
-  run-time error.
+* `& | ^ ~ << >>` work on integers. `>>` is an arithmetic shift.
+* `a << b` means `a * 2 ** b`, so it traps on overflow like `*`: `1 << 62` is
+  fine, but `1 << 63` is an error because the result doesn't fit. (`-1 << 63`
+  is the smallest `i64`.) `& | ^ ~ >>` can never overflow.
+* A shift amount outside `0..64` is a run-time error.
 
 ### Pipe
 

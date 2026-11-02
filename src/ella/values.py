@@ -124,15 +124,6 @@ def fits_i64(n: int) -> bool:
     return I64_MIN <= n <= I64_MAX
 
 
-def wrap(n: int) -> int:
-    """Keep the low 64 bits of an integer, as two's complement hardware does.
-
-    Arithmetic overflow is an error in Ella, but `<<` is a bit operation and
-    simply loses the bits shifted out: `wrap(1 << 63) == I64_MIN`.
-    """
-    return (n - I64_MIN) % 2**64 + I64_MIN
-
-
 def type_name(value: Value) -> str:
     """The Ella type of a value, as it appears in error messages."""
     match value:

@@ -5,7 +5,7 @@ import pytest
 
 from ella.interpreter import run
 from ella.lexer import EllaError, Span
-from ella.values import I64_MAX, I64_MIN, VariantValue, equal, fits_i64, to_text, wrap
+from ella.values import I64_MAX, I64_MIN, VariantValue, equal, fits_i64, to_text
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
 
@@ -40,8 +40,6 @@ def test_example_file_runs() -> None:
 def test_i64_range() -> None:
     assert fits_i64(I64_MAX) and fits_i64(I64_MIN)
     assert not fits_i64(I64_MAX + 1) and not fits_i64(I64_MIN - 1)
-    assert wrap(I64_MAX + 1) == I64_MIN
-    assert wrap(5) == 5
 
 
 def test_equal_distinguishes_bool_from_int() -> None:
@@ -80,7 +78,9 @@ def test_functions_print() -> None:
         ("0.0 ** -1.0", "inf"),
         ('"ab" + "cd"', "abcd"),
         ("[1] + [2, 3]", "[1, 2, 3]"),
-        ("1 << 63", "-9223372036854775808"),
+        ("1 << 62", "4611686018427387904"),
+        ("-1 << 63", "-9223372036854775808"),
+        ("-3 << 2", "-12"),
         ("~0", "-1"),
         ("not true", "false"),
         ("1 == 1 == 1", "true"),
@@ -118,6 +118,9 @@ def test_and_or_short_circuit() -> None:
         ("1 % 0", "integer division by zero"),
         ("2 ** -1", "negative power"),
         ("1 << 64", "shift amount must be between 0 and 63"),
+        ("1 << 63", "i64 overflow"),
+        ("3 << 62", "i64 overflow"),
+        ("-2 << 63", "i64 overflow"),
         ("-true", "'-' doesn't work on bool"),
         ("not 1", "'not' doesn't work on i64"),
         ("1 and true", "'and' needs a bool, not i64"),
