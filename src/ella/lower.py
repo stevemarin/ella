@@ -80,6 +80,7 @@ from ella.checker import (
     BOOL,
     I64,
     NEVER,
+    OPERATOR_METHODS,
     STR,
     UNIT,
     BuiltinTy,
@@ -87,6 +88,7 @@ from ella.checker import (
     EnumTy,
     FuncTy,
     ListTy,
+    ParamTy,
     TupleTy,
     Type,
     finish,
@@ -128,6 +130,7 @@ from ella.syntax import (
     Break,
     Call,
     Compare,
+    ConstraintDef,
     Continue,
     EnumDef,
     Expr,
@@ -662,16 +665,18 @@ class Lowerer:
         self.globals_changed = changed_in_place(program.body, self.checker, into_lambdas=True)
         self.start_function("top", UNIT, program.span, program.body)
         # Generic functions are made for each set of type arguments they are
-        # used with, and finalizers are functions of their own.
+        # used with. So are methods (`Point.norm`, `Stack.push[i64]`), which
+        # are generic in their type's parameters. Finalizers are always made.
         for expr in program.body:
             match expr:
                 case Let(bindings, Lambda() as generic) if bindings[0].type_params:
                     for binding in bindings:
                         self.module.generics[binding.name] = (generic, binding.type_params)
-                case EnumDef(name, finalize=Lambda() as finalizer):
-                    t = self.type_of(finalizer)
-                    assert isinstance(t, FuncTy)
-                    self.pending.append(PendingFunction(finalizer, self.module.enums[name].finalize, [], [], t))
+        for (type_name, method_name), method in self.checker.method_functions.items():
+            self.module.generics[f"{type_name}.{method_name}"] = (method, self.module.enums[type_name].params)
+        for type_name, info in self.module.enums.items():
+            if info.finalize:
+                self.specialize(info.finalize, (), program.span)
         # Top-level functions exist from the start (docs/grammar.md §3).
         hoisted: dict[int, Value] = {}
         for expr in program.body:
@@ -844,11 +849,16 @@ class Lowerer:
             case Assign(op, target, value_expr):
                 if isinstance(target, Name):
                     return self.lower_assign_name(op, target, value_expr, span)
+                if isinstance(target, Index) and self.has_method(self.type_of(target.target), "set"):
+                    return self.lower_assign_set(op, target, value_expr, span)
                 return self.lower_assign_place(op, target, value_expr, span)
 
             # Operators
             case Unary(op, operand):
-                return self.emit(UNARY_OPS[op], self.type_of(expr), [self.lower(operand)], span)
+                value = self.lower(operand)
+                if op == "-" and self.has_method(value.type, "neg"):
+                    return self.call_method("neg", [value], self.type_of(expr), span, dest)
+                return self.emit(UNARY_OPS[op], self.type_of(expr), [value], span)
             case Binary(("and" | "or") as op, left, right):
                 return self.lower_logic(op, left, right, span)
             case Binary(op, left, right):
@@ -857,6 +867,8 @@ class Lowerer:
                 return self.lower_compare(first, rest, span)
             case Index(target, index):
                 container = self.lower(target)
+                if self.has_method(container.type, "get"):
+                    return self.call_method("get", [container, self.lower(index)], self.type_of(expr), span, dest)
                 if isinstance(container.type, BuiltinTy):
                     return self.pool_get(container, self.lower(index), self.type_of(expr), span)
                 return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
@@ -953,8 +965,8 @@ class Lowerer:
             case Assert():
                 self.lower_condition(expr, "assertion")
                 return self.const((), span)
-            case EnumDef():
-                return self.const((), span)  # enums are only types; nothing runs
+            case EnumDef() | ConstraintDef():
+                return self.const((), span)  # enums and constraints are only types; nothing runs
 
     def type_of(self, expr: Expr) -> Type:
         return self.concrete(self.checker.types[id(expr)])
@@ -1003,7 +1015,13 @@ class Lowerer:
             return result
         a = self.protect(self.lower(left), [right], span)
         b = self.lower(right)
-        return self.emit(BINARY_OPS[op], t, [a, b], span, region=dest)
+        return self.operate(op, a, b, t, span, dest)
+
+    def operate(self, op: str, a: Value, b: Value, t: Type, span: Span, region: str) -> Value:
+        """A binary operator on two values, which may be a method of a struct or enum (`a + b` is `a.add(b)`)."""
+        if op in OPERATOR_METHODS and self.has_method(a.type, OPERATOR_METHODS[op]):
+            return self.call_method(OPERATOR_METHODS[op], [a, b], t, span, region)
+        return self.emit(BINARY_OPS[op], t, [a, b], span, region=region)
 
     def lower_index(self, container: Value, index: Value, t: Type, span: Span, dest: str) -> Value:
         """`xs[i]` is an item already in the list; `s[i]` makes a new string."""
@@ -1022,7 +1040,7 @@ class Lowerer:
         value = self.lower(value_expr, region if op == "=" else "")
         if op != "=":
             old = self.read_name(target.name, kind, target.span)
-            value = self.emit(BINARY_OPS[op.removesuffix("=")], old.type, [old, value], span, region=region)
+            value = self.operate(op.removesuffix("="), old, value, old.type, span, region)
         value = self.place(value, region, span, mutable=True)
         self.write_name(target.name, kind, value, span)
         return value
@@ -1061,7 +1079,7 @@ class Lowerer:
                 value = self.emit("append", old.type, [old, value], span, region=old_region)
             else:
                 new_region = self.here() if region == "slot" or self.is_pool_step(last) else region
-                value = self.emit(BINARY_OPS[op.removesuffix("=")], old.type, [old, value], span, region=new_region)
+                value = self.operate(op.removesuffix("="), old, value, old.type, span, new_region)
         self.store_step(container, (last, key), value, region, span)
         self.info[value.id] = Info(frozenset({self.borrow_key(root.name, kind)}), region)
         return value
@@ -1173,14 +1191,21 @@ class Lowerer:
 
     def compare(self, op: str, left: Value, right: Value, span: Span) -> Value:
         if op in ("in", "not in"):
-            result = self.emit("contains", BOOL, [left, right], span)
+            if self.has_method(right.type, "contains"):
+                result = self.call_method("contains", [right, left], BOOL, span, self.here())
+            else:
+                result = self.emit("contains", BOOL, [left, right], span)
             return self.emit("not", BOOL, [result], span) if op == "not in" else result
+        if op not in ("==", "!=") and self.has_method(left.type, "compare"):
+            # `a < b` is `a.compare(b) < 0`.
+            order = self.call_method("compare", [left, right], I64, span, self.here())
+            return self.emit(COMPARE_OPS[op], BOOL, [order, self.const(0, span)], span)
         return self.emit(COMPARE_OPS[op], BOOL, [left, right], span)
 
     def lower_try(self, value: Value, t: Type, span: Span) -> Value:
         """`v?`: if v is `Ok(x)` (or `Some(x)`) the result is x; otherwise return the error."""
         assert isinstance(value.type, EnumTy)
-        ok, error = ("Ok", "Error") if value.type.name == "Result" else ("Some", "None")
+        ok, error = ("Ok", "Err") if value.type.name == "Result" else ("Some", "None")
         ok_block, error_block = self.new_block("ok"), self.new_block("error")
         self.branch(self.emit("is_variant", BOOL, [value], span, ok), ok_block, error_block)
         # The error is rebuilt with the function's own result type, which may
@@ -1208,7 +1233,13 @@ class Lowerer:
             return self.lower_builtin(expr, callee.name, args, span, dest)
         if isinstance(callee, Name) and kind == "constructor":
             return self.build("variant", self.type_of(expr), self.lower_items(args, dest), span, dest, callee.name)
-        function = self.lower(callee)
+        if isinstance(callee, Member) and id(callee) in self.checker.methods:
+            # `v.name(args)` calls v's method with v first. A `mut v` is passed like any `mut` argument.
+            receiver = callee.target
+            function = self.method(self.type_of(receiver), callee.name, span)
+            args = (receiver, *args)
+        else:
+            function = self.lower(callee)
         values: list[Value] = []
         places: list[MutPlace] = []
         for i, arg in enumerate(args):
@@ -1220,7 +1251,13 @@ class Lowerer:
                 # An Ella function may change globals in place, so the argument
                 # needs protecting from the call itself, as well as from later arguments.
                 values.append(self.protect(self.lower(arg), args[i + 1 :], arg.span, calls=True))
-        result = self.emit("call", self.type_of(expr), [function, *values], span, region=dest)
+        return self.emit_call(function, values, places, self.type_of(expr), span, dest)
+
+    def emit_call(
+        self, function: Value, values: list[Value], places: list[MutPlace], t: Type, span: Span, dest: str
+    ) -> Value:
+        """A call, whose `mut` arguments' final values are written back to their places."""
+        result = self.emit("call", t, [function, *values], span, region=dest)
         call = self.block.instrs[-1]
         for place in places:
             out = self.new_value(self.mut_type(function, len(call.outs)))
@@ -1246,6 +1283,8 @@ class Lowerer:
             return self.emit("alloc", self.type_of(expr), [pool, value], span)
         operands = [self.lower(arg) for arg in args]
         match name:
+            case "len" if self.has_method(operands[0].type, "len"):
+                return self.call_method("len", operands, I64, span, dest)
             case "len":
                 return self.emit("len", I64, operands, span)
             case "print":
@@ -1293,20 +1332,72 @@ class Lowerer:
         self.quotes.pop()
         return self.emit("quote", self.type_of(quote), [begin, *outer, *values], span, index=number)
 
+    def has_method(self, t: Type, name: str) -> bool:
+        """Whether values of type `t` (a struct or enum) have a method, such as the `add` that gives them `+`."""
+        return isinstance(t, EnumTy) and name in self.module.enums[t.name].methods
+
+    def method(self, t: Type, name: str, span: Span) -> Value:
+        """A closure of the method `name` of a struct or enum type, specialized for its type arguments."""
+        assert isinstance(t, EnumTy)
+        function = self.specialize(f"{t.name}.{name}", t.args, span)
+        lambda_, params = self.module.generics[f"{t.name}.{name}"]
+        function_type = self.generic_type(lambda_, dict(zip(params, t.args)))
+        return self.emit("closure", function_type, [], span, function, region=self.here())
+
+    def call_method(self, name: str, values: list[Value], t: Type | None, span: Span, dest: str) -> Value:
+        """Call the method that gives an operator or another protocol, on values already lowered.
+
+        The result has type `t`, or the method's result type if it is None.
+        An Ella function may change globals in place, so the values are
+        protected from the call itself.
+        """
+        values = [self.protect(value, [], span, calls=True) for value in values]
+        function = self.method(values[0].type, name, span)
+        assert isinstance(function.type, FuncTy)
+        return self.emit("call", t or function.type.result, [function, *values], span, region=dest)
+
+    def lower_assign_set(self, op: str, target: Index, value_expr: Expr, span: Span) -> Value:
+        """`v[k] = x` on a struct or enum calls `mut v.set(k, x)`; `v[k] op= x` gets the item first.
+
+        The value is evaluated first, then the place and the key, as for any assignment.
+        """
+        value = self.protect(self.lower(value_expr), [target.index], span, calls=True)
+        place, container = self.mut_place(MutArg(target.target, target.span))
+        key = self.lower(target.index)
+        if op != "=":
+            old = self.call_method("get", [container, key], None, span, self.here())
+            value = self.operate(op.removesuffix("="), old, value, old.type, span, self.here())
+        function = self.method(container.type, "set", span)
+        self.emit_call(function, [container, key, value], [place], UNIT, span, self.here())
+        return value
+
     def specialize(self, name: str, args: tuple[Type, ...], span: Span) -> str:
-        """The IR function for a generic function with these type arguments: `first[i64]`."""
+        """The IR function for a generic function with these type arguments: `first[i64]`.
+
+        A method of a type without type parameters is just `Point.norm`.
+        """
         key = (name, args)
         if key not in self.module.specializations:
             function, params = self.module.generics[name]
             if sum(1 for n, _ in self.module.specializations if n == name) >= MAX_SPECIALIZATIONS:
                 raise EllaError(f"{name} is used with too many different types", span)
-            specialized = f"{name}[{', '.join(show_type(arg) for arg in args)}]"
+            specialized = f"{name}[{', '.join(show_type(arg) for arg in args)}]" if params else name
             self.module.specializations[key] = specialized
             subst = dict(zip(params, args))
-            t = substitute(finish(self.checker.types[id(function)]), subst)
-            assert isinstance(t, FuncTy)
-            self.pending.append(PendingFunction(function, specialized, [], [], t, subst))
+            self.pending.append(
+                PendingFunction(function, specialized, [], [], self.generic_type(function, subst), subst)
+            )
         return self.module.specializations[key]
+
+    def generic_type(self, function: Lambda, subst: dict[str, Type]) -> FuncTy:
+        """The type of a generic function (or a method) with its type arguments.
+
+        Code being lowered to `run` has a checker of its own, without the program's functions.
+        """
+        types = self.checker.types if id(function) in self.checker.types else self.module.checker.types
+        t = substitute(finish(types[id(function)]), subst)
+        assert isinstance(t, FuncTy)
+        return t
 
     def lower_code(self, code: Expr) -> str:
         """Lower code made by `quote` into a function of no parameters, to `run` it. Returns its name."""
@@ -1428,6 +1519,8 @@ class Lowerer:
         """
         span = expr.span
         iterable = self.protect(self.lower(expr.iterable), [expr.body], span)
+        if self.has_method(iterable.type, "iter"):
+            iterable = self.call_method("iter", [iterable], None, span, self.here())  # a new list, str or range
         count = self.emit("len", I64, [iterable], span)
         counter = self.new_slot("for.i", I64)
         self.function.local_regions[counter] = self.here()
@@ -1574,10 +1667,12 @@ def names_written(node: object, checker: Checker) -> set[str]:
             return {place_root(target)} | names_written(target, checker)
         case Call(callee, args):
             calls = {CALLS} if checker.kinds.get(id(callee)) not in ("builtin", "constructor") else set()
+            calls |= {CALLS} if calls_method(node, checker) else set()
             return calls | names_written(callee, checker) | names_written(args, checker)
         case Lambda():
             return set()
-    return set().union(*(names_written(child, checker) for child in children(node)))
+    calls = {CALLS} if calls_method(node, checker) else set()
+    return calls.union(*(names_written(child, checker) for child in children(node)))
 
 
 def changed_in_place(node: object, checker: Checker, into_lambdas: bool) -> set[str]:
@@ -1600,7 +1695,44 @@ def changed_in_place(node: object, checker: Checker, into_lambdas: bool) -> set[
             return set()
         case _:
             changed = set()
+    if calls_method(node, checker):
+        changed |= {CALLS}
     return changed.union(*(changed_in_place(child, checker, into_lambdas) for child in children(node)))
+
+
+def calls_method(node: object, checker: Checker) -> bool:
+    """Whether an operator (or `len`, indexing or a loop) may call a method of a struct or enum, an Ella function.
+
+    A value of a type parameter may turn out to be a struct with the method.
+    """
+
+    def has(expr: Expr, name: str) -> bool:
+        t = finish(checker.types.get(id(expr), UNIT))
+        return isinstance(t, ParamTy) or (isinstance(t, EnumTy) and name in checker.enums[t.name].methods)
+
+    match node:
+        case Binary(op, left) if op in OPERATOR_METHODS:
+            return has(left, OPERATOR_METHODS[op])
+        case Assign(op, target):
+            operator = op.removesuffix("=")
+            return (isinstance(target, Index) and has(target.target, "set")) or (
+                operator in OPERATOR_METHODS and has(target, OPERATOR_METHODS[operator])
+            )
+        case Index(target):
+            return has(target, "get")
+        case For(iterable=iterable):
+            return has(iterable, "iter")
+        case Unary("-", operand):
+            return has(operand, "neg")
+        case Compare(first, rest):
+            operands = [first, *(operand for _, operand in rest)]
+            return any(
+                has(b, "contains") if op in ("in", "not in") else op not in ("==", "!=") and has(a, "compare")
+                for a, (op, b) in zip(operands, rest)
+            )
+        case Call(Name("len"), (arg,)) if checker.kinds.get(id(node.callee)) == "builtin":
+            return has(arg, "len")
+    return False
 
 
 def returned_names(body: Expr | tuple[Expr, ...]) -> set[str]:

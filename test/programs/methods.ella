@@ -1,0 +1,237 @@
+# Methods: functions defined in a struct or enum, called as `value.name(...)`
+# with the value as their first argument.
+
+struct Point
+    x: f64
+    y: f64
+    norm2 = (p: Point) -> f64 => p.x * p.x + p.y * p.y
+    scaled = (p: Point, k: f64) -> Point => Point(p.x * k, p.y * k)
+    # A method can call the others.
+    describe = (p: Point) -> str => "({{p.x}}, {{p.y}}) with norm² {{p.norm2()}}"
+    # A `mut` first parameter changes the value it is called on.
+    move = (mut p: Point, dx: f64, dy: f64) -> () =>
+        p.x += dx
+        p.y += dy
+
+let origin = Point(0.0, 0.0)
+let p = Point(3.0, 4.0)
+print(p.norm2())
+print(p.scaled(2.0).describe())
+print(origin.describe())
+
+let mut q = Point(1.0, 1.0)
+mut q.move(2.0, -1.0)
+print(q)
+
+# Enums have methods too.
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    area = (s: Shape) -> f64 =>
+        match s
+            case Circle(r) => 3.0 * r * r
+            case Rect(w, h) => w * h
+    name = (s: Shape) -> str =>
+        match s
+            case Circle(_) => "circle"
+            case Rect(_, _) => "rect"
+
+for s in [Circle(1.0), Rect(2.0, 3.0)]
+    print("{{s.name()}}: {{s.area()}}")
+
+# Generic types: a method is generic in its type's parameters, and is made
+# for each set of type arguments it is used with.
+struct Stack[T]
+    items: [T]
+    push = (mut s: Stack[T], x: T) -> () =>
+        s.items += [x]
+    pop = (mut s: Stack[T]) -> Optional[T] =>
+        if len(s.items) == 0 then return None
+        let last = s.items[len(s.items) - 1]
+        let mut rest = []
+        for i in 0..len(s.items) - 1
+            rest += [s.items[i]]
+        s.items = rest
+        Some(last)
+    len = (s: Stack[T]) -> i64 => len(s.items)
+
+let mut numbers = Stack([])
+mut numbers.push(1)
+mut numbers.push(2)
+print(numbers)
+print(mut numbers.pop())
+print(len(numbers))
+let mut words: Stack[str] = Stack([])
+mut words.push("hi")
+print(words.len())
+
+# A `mut` receiver can be any place: a field or an item of a `mut` variable.
+struct Shelf
+    stacks: [Stack[i64]]
+let mut shelf = Shelf([Stack([]), Stack([10])])
+mut shelf.stacks[1].push(20)
+mut shelf.stacks[0].push(5)
+print(shelf)
+
+# A field that holds a function is called the same way.
+struct Handler
+    run: (i64) -> i64
+let h = Handler((n: i64) -> i64 => n * 10)
+print(h.run(4))
+
+# Operators: `add`, `sub`, `mul` and `div` give `+`, `-`, `*` and `/`, `neg`
+# gives unary `-`, `compare` gives `<`, `<=`, `>` and `>=`, and `len` gives len().
+struct Money
+    cents: i64
+    add = (a: Money, b: Money) -> Money => Money(a.cents + b.cents)
+    sub = (a: Money, b: Money) -> Money => Money(a.cents - b.cents)
+    mul = (a: Money, n: i64) -> Money => Money(a.cents * n)
+    div = (a: Money, b: Money) -> f64 => a.cents / b.cents
+    neg = (a: Money) -> Money => Money(-a.cents)
+    compare = (a: Money, b: Money) -> i64 => a.cents - b.cents
+
+let five = Money(500)
+let two = Money(200)
+print(five + two)
+print(five - two * 2)
+print(-five)
+print(five / two)
+print((two < five, five <= five, two > five, Money(1) < Money(2) < Money(3)))
+print(five == Money(500))
+let mut wallet = Money(0)
+wallet += five
+wallet -= two
+print(wallet)
+struct Account
+    balance: Money
+let mut account = Account(Money(100))
+account.balance += Money(50)
+print(account)
+
+# A type with `compare` is Ord, and one whose `add` gives its own type is
+# Add, so generic functions with those constraints work on it.
+let largest[T: Ord] = (xs: [T]) -> T =>
+    let mut best = xs[0]
+    for x in xs
+        if x > best then best = x
+    best
+let sum[T: Add] = (first: T, rest: [T]) -> T =>
+    let mut total = first
+    for x in rest
+        total = total + x
+    total
+print(largest([Money(3), Money(9), Money(4)]))
+print(sum(Money(1), [Money(2), Money(3)]))
+
+# User-defined constraints name methods, with `Self` for the type that has them.
+constraint Measured
+    area: (Self) -> f64
+    name: (Self) -> str
+
+struct Square
+    side: f64
+    area = (s: Square) -> f64 => s.side * s.side
+    name = (s: Square) -> str => "square"
+
+# Any type with those methods meets the constraint: Shape and Square here.
+let report[T: Measured] = (xs: [T]) -> str =>
+    let mut total = 0.0
+    let mut names = ""
+    for x in xs
+        total += x.area()
+        names += x.name() + " "
+    "{{names}}= {{total}}"
+print(report([Square(2.0), Square(1.0)]))
+print(report([Circle(1.0), Rect(1.0, 2.0)]))
+
+# A constraint's method can change the value, and generic code can combine
+# user-defined and built-in constraints.
+constraint Counter
+    tick: (mut Self) -> ()
+    count: (Self) -> i64
+
+struct Clicks
+    n: i64
+    tick = (mut c: Clicks) -> () =>
+        c.n += 1
+    count = (c: Clicks) -> i64 => c.n
+    compare = (a: Clicks, b: Clicks) -> i64 => a.n - b.n
+
+let tick_all[T: Counter + Ord] = (mut xs: [T], times: i64) -> T =>
+    for i in 0..len(xs)
+        for _ in 0..times * (i + 1)
+            mut xs[i].tick()
+    largest(xs)
+let mut clicks = [Clicks(0), Clicks(10)]
+print(tick_all(mut clicks, 2).count())
+print(clicks)
+
+# A generic type's parameters can have constraints, for its methods to use.
+struct Set[T: Eq]
+    items: [T]
+    has = (s: Set[T], x: T) -> bool => x in s.items
+    insert = (mut s: Set[T], x: T) -> () =>
+        if not s.has(x) then s.items += [x]
+let mut seen = Set([])
+for word in ["a", "b", "a", "c", "b"]
+    mut seen.insert(word)
+print((seen, seen.has("c"), seen.has("z")))
+
+# Methods of a generic type in a generic function.
+struct Box[T]
+    value: T
+    unwrap = (b: Box[T]) -> T => b.value
+let unbox_all[T: Measured] = (boxes: [Box[T]]) -> f64 =>
+    let mut total = 0.0
+    for b in boxes
+        total += b.unwrap().area()
+    total
+print(unbox_all([Box(Square(3.0)), Box(Square(1.0))]))
+
+# A nocopy struct's methods borrow it, or change it with `mut`.
+nocopy struct Log
+    name: str
+    lines: [str]
+    write = (mut log: Log, line: str) -> () =>
+        log.lines += [line]
+    size = (log: Log) -> i64 => len(log.lines)
+    finalize = (log: Log) -> () => print("closing {{log.name}} after {{log.size()}} lines")
+
+let work = () -> () =>
+    let mut log = Log("work", [])
+    mut log.write("one")
+    mut log.write("two")
+    print(log.size())
+work()
+
+# Operators and methods called from top-level code, inside loops.
+let mut total = Money(0)
+for cents in [1, 2, 3]
+    total = total + Money(cents)
+print(total)
+
+# A pool's values have methods too, and `mut` ones can change them in place.
+struct Node
+    name: str
+    rename = (mut n: Node, s: str) -> () =>
+        n.name = s
+    shout = (n: Node) -> str => n.name + "!"
+let mut nodes: Pool[Node] = pool_new()
+let root = alloc(mut nodes, Node("root"))
+mut nodes[root].rename("top")
+print(nodes[root].shout())
+
+# Compile-time code can call methods.
+let four = () -> i64 => $(if Money(2) * 2 == Money(4) then quote 4 else quote 0)
+print(four())
+
+# An operator is a call, which may change a global that an earlier operand
+# still holds: the operand keeps the value it had when it was read.
+let mut history = [Money(1)]
+struct Tally
+    n: i64
+    add = (a: Tally, b: Tally) -> Tally =>
+        history[0] = Money(99)
+        Tally(a.n + b.n)
+print((history, Tally(1) + Tally(2)))
+print(history)

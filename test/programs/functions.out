@@ -9,5 +9,5 @@ true
 -4
 0
 Ok(3)
-Error("not a digit: x")
+Err("not a digit: x")
 main runs last

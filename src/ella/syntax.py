@@ -448,6 +448,15 @@ class Assert:
 
 
 @dataclass(frozen=True, slots=True)
+class Method:
+    """A function in a struct or enum definition: `area = (c: Circle) -> f64 => ...`."""
+
+    name: str
+    function: Expr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class EnumDef:
     """`enum Name[T]` followed by an indented list of variants, or a struct.
 
@@ -455,7 +464,10 @@ class EnumDef:
     names: `struct Point` with fields `x: f64` and `y: f64` is like `enum
     Point` with the variant `Point(f64, f64)`, so constructing, matching,
     comparing and printing work the same way. `nocopy` structs can't be
-    copied, and may have a `finalize` function, run when a value dies.
+    copied, and may have a `finalize` method, run when a value dies.
+
+    Both can have methods, called as `value.name(...)`. `constraints` has
+    the constraints of each type parameter, as in Binding.
     """
 
     name: str
@@ -465,7 +477,17 @@ class EnumDef:
     struct: bool = False
     field_names: tuple[str, ...] = ()
     nocopy: bool = False
-    finalize: Expr | None = None
+    methods: tuple[Method, ...] = ()
+    constraints: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintDef:
+    """`constraint Name` followed by the methods a type needs to meet it: `area: (Self) -> f64`."""
+
+    name: str
+    methods: tuple[Param, ...]
+    span: Span
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,6 +554,7 @@ type Expr = (
     | Return
     | Assert
     | EnumDef
+    | ConstraintDef
     | Quote
     | Splice
     | TypeLit
@@ -666,16 +689,19 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("return", *([show(value)] if value is not None else []))
         case Assert(expr):
             return sexpr("assert", show(expr))
-        case EnumDef(name, type_params, variants, struct=True, field_names=names, nocopy=nocopy, finalize=finalize):
-            head = f"{name}[{', '.join(type_params)}]" if type_params else name
+        case EnumDef(variants=variants, struct=True, field_names=names, nocopy=nocopy, methods=methods):
             fields = (f"{n}: {show(t)}" for n, t in zip(names, variants[0].fields))
-            extra = [sexpr("finalize", show(finalize))] if finalize is not None else []
-            return sexpr("nocopy struct" if nocopy else "struct", head, *fields, *extra)
-        case EnumDef(name, type_params, variants):
-            head = f"{name}[{', '.join(type_params)}]" if type_params else name
+            functions = [sexpr(m.name, show(m.function)) for m in methods]
+            return sexpr("nocopy struct" if nocopy else "struct", show_head(node), *fields, *functions)
+        case EnumDef(variants=variants, methods=methods):
             return sexpr(
-                "enum", head, *(sexpr(v.name, *map(show, v.fields)) if v.fields else v.name for v in variants)
+                "enum",
+                show_head(node),
+                *(sexpr(v.name, *map(show, v.fields)) if v.fields else v.name for v in variants),
+                *(sexpr(m.name, show(m.function)) for m in methods),
             )
+        case ConstraintDef(name, methods):
+            return sexpr("constraint", name, *map(show_param, methods))
         case Quote(body):
             return sexpr("quote", show(body))
         case Splice(code):
@@ -711,12 +737,21 @@ def show_label(label: str | None) -> list[str]:
     return [] if label is None else [f"{label}:"]
 
 
+def show_type_params(params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...]) -> str:
+    """`[T: Ord + Add, U]`, or nothing without type parameters."""
+    if not params:
+        return ""
+    constraints = constraints or tuple(() for _ in params)
+    return f"[{', '.join(f'{p}: {" + ".join(c)}' if c else p for p, c in zip(params, constraints))}]"
+
+
+def show_head(enum: EnumDef) -> str:
+    return enum.name + show_type_params(enum.type_params, enum.constraints)
+
+
 def show_binding(binding: Binding) -> str:
     text = f"mut {binding.name}" if binding.mutable else binding.name
-    if binding.type_params:
-        constraints = binding.constraints or tuple(() for _ in binding.type_params)
-        shown = (f"{p}: {' + '.join(c)}" if c else p for p, c in zip(binding.type_params, constraints))
-        text += f"[{', '.join(shown)}]"
+    text += show_type_params(binding.type_params, binding.constraints)
     return text if binding.type is None else f"{text}: {show(binding.type)}"
 
 

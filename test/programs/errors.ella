@@ -1,0 +1,41 @@
+# The built-in Error type: a struct holding a message.
+let invert = (n: f64) -> Result[f64, Error] =>
+    if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
+
+# ? passes the Error on, and Ok types may differ.
+let halve_inverse = (n: f64) -> Result[f64, Error] =>
+    Ok(invert(n)? / 2.0)
+let check = (n: f64) -> Result[(), Error] =>
+    invert(n)?
+    Ok(())
+
+print(invert(4.0))
+print(halve_inverse(0.0))
+print(check(0.0))
+
+match halve_inverse(0.0)
+    case Ok(v) => print(v)
+    case Err(e) => print("failed: {{e.message}}")
+match invert(0.0)
+    case Err(Error(message)) => print(message)
+    case Ok(_) => print("no error")
+
+# Errors are values: compared, kept in lists, copied, and changed.
+let e = Error("bad")
+print(e == Error("bad"))
+print(e != Error("worse"))
+let mut errors = [e, Error("worse")]
+errors[0].message = "changed"
+print(errors)
+print(e)
+
+# Building messages from values.
+let parse_digit = (s: str) -> Result[i64, Error] =>
+    match s
+        case "0" => Ok(0)
+        case "1" => Ok(1)
+        case _ => Err(Error("not a digit: {{s}}"))
+for s in ["0", "7", "1", "x"]
+    match parse_digit(s)
+        case Ok(d) => print(d)
+        case Err(e) => print(e.message)

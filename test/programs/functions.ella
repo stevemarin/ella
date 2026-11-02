@@ -56,7 +56,7 @@ let parse_digit = (s: str) -> Result[i64, str] =>
         case "0" => Ok(0)
         case "1" => Ok(1)
         case "2" => Ok(2)
-        case _ => Error("not a digit: {{s}}")
+        case _ => Err("not a digit: {{s}}")
 let add_digits = (a: str, b: str) -> Result[i64, str] =>
     Ok(parse_digit(a)? + parse_digit(b)?)
 print(add_digits("1", "2"))

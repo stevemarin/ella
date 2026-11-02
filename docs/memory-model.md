@@ -568,6 +568,21 @@ Specialization is unchanged: each use is still compiled for its own types.
 Template-style parameters checked at each use remain possible later, for
 code that constraints can't express.
 
+Later, structs and enums got **methods**, and programs their own
+constraints ([grammar.md §9](grammar.md#methods-provisional-syntax)). A
+method is a function of its type's parameters, specialized like a generic
+function (`Stack.push[i64]`), so a method call is a direct call even
+through a constraint: dispatch stays static, as §8 asks. A user-defined
+constraint lists methods, and a type meets it by having them
+(structurally). Methods named `add`, `compare`, `len` and so on give a type
+operators, and so the built-in constraints `Add` and `Ord`; `get`, `set`,
+`iter` and `contains` give it indexing, loops and `in`. An item `get` gives
+is a copy, so `v[k] = x` is `mut v.set(k, x)` and only the last step of a
+place can be one; `iter` makes a list (or str, or range) to loop over,
+the simplest choice, at the cost of the memory for it. An operator on
+such a type is a call, which may change globals, so the lowering's
+analysis of what changes in place counts it as one.
+
 ### Structs
 
 A struct is an enum with one variant named after it. Its fields can change

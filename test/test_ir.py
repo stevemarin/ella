@@ -162,7 +162,7 @@ print(quarter(8))
 print(quarter(6))
 """,
     "try rewraps the error": """\
-let parse = (s: str) -> Result[i64, str] => if s == "1" then Ok(1) else Error("bad: {{s}}")
+let parse = (s: str) -> Result[i64, str] => if s == "1" then Ok(1) else Err("bad: {{s}}")
 let check = (s: str) -> Result[(), str] =>
     let n = parse(s)?
     print(n)
@@ -276,7 +276,7 @@ print(find(["a", "bb", "ccc"], "z"))
 print(find(["a"], "z"))
 """,
     "try inside a loop": """\
-let half = (n: i64) -> Result[[i64], str] => if n % 2 == 0 then Ok([n // 2]) else Error("odd {{n}}")
+let half = (n: i64) -> Result[[i64], str] => if n % 2 == 0 then Ok([n // 2]) else Err("odd {{n}}")
 let halves = (xs: [i64]) -> Result[[i64], str] =>
     let mut out = []
     for x in xs
@@ -428,6 +428,18 @@ let r = 1..4
 let c = quote (p, shapes, r, "q\\"", -0.0, ())
 print(c)
 print(run(c))
+""",
+    # The code uses a method and a generic function the program never did,
+    # so they are lowered for the first time when it runs.
+    "methods and generics first used by code": """\
+struct V
+    x: i64
+    add = (a: V, b: V) -> V => V(a.x + b.x)
+    double = (v: V) -> V => v + v
+let twice[T: Add] = (x: T) -> T => x + x
+print(run(quote V(5).double()))
+print(run(quote twice(V(1)) + V(2)))
+print(run(quote twice(3)))
 """,
 }
 

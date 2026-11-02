@@ -50,10 +50,11 @@ identifiers, not keywords.
 ### Keywords
 
 ```text
-and       assert    break     case      comptime  continue  else
-enum      false     for       if        import    in        let
-loop      match     mut       nocopy    not       or        quote
-return    struct    then      true      type      where     while
+and         assert      break       case        comptime    constraint
+continue    else        enum        false       for         if
+import      in          let         loop        match       mut
+nocopy      not         or          quote       return      struct
+then        true        type        where       while
 ```
 
 Reserved for later, not yet given a grammar: `comptime`, `import`.
@@ -209,6 +210,8 @@ A source file is a sequence of top-level expressions.
 3. The top-level expressions run in order, like a script.
 4. Afterwards, if the file defines a top-level `main`, it is called.
    `main` has type `() -> ()`. Command-line arguments and exit codes come later.
+5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
+   structs and enums with methods, can only be defined at the top level.
 
 ## 4. Bindings and assignment
 
@@ -398,8 +401,8 @@ else
 ```ella
 match result
     case Ok(value) => value
-    case Error(e)
-        print("failed: {{e}}")
+    case Err(e)
+        print("failed: {{e.message}}")
         0
 ```
 
@@ -430,7 +433,8 @@ let found = loop
     if done() then break 42
 ```
 
-* `for pattern in expr` iterates over a list, string, or range.
+* `for pattern in expr` iterates over a list, string, or range, or a struct
+  or enum with an `iter` method ([§9](#methods-provisional-syntax)).
 * `while cond` runs while `cond` (a `bool`) is true.
 * `loop` repeats forever until `break`.
 * `for` and `while` have value `()`. `loop` has the value given to the
@@ -545,7 +549,7 @@ argument. `x |> f` means `f(x)`. The right side must be a name or a call.
 
 ### Error propagation
 
-Postfix `?` on a `Result`: `Ok(v)?` gives `v`; `Error(e)?` returns `Error(e)`
+Postfix `?` on a `Result`: `Ok(v)?` gives `v`; `Err(e)?` returns `Err(e)`
 from the enclosing function. On an `Optional`: `Some(v)?` gives `v`; `None?`
 returns `None`. The enclosing function's return type must be compatible.
 
@@ -554,7 +558,9 @@ returns `None`. The enclosing function's return type must be compatible.
 * `a[i]` indexes lists and strings with an `i64`. Out-of-range or negative
   indexes are a run-time error **(provisional; no Python-style negative
   indexing)**. Indexing a string gives a one-character string; strings count
-  Unicode code points, and can't be assigned into.
+  Unicode code points, and can't be assigned into. Pools are indexed with
+  handles, and structs and enums with `get` and `set` methods with any key
+  ([§9](#methods-provisional-syntax)).
 * `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
 
 ## 9. Types
@@ -608,8 +614,6 @@ let found = None         # Optional of something; used as Optional[str] later
   values are discarded.
 * `print`, `len` and variant constructors like `Some` can only be called, not
   used as values (for now).
-* `Error` used as a type means `str` for now **(provisional)**, so
-  `Result[f64, Error]` is `Result[f64, str]`; see the open questions.
 * Enums, structs and top-level functions can be generic.
 
 ### Enums **(provisional syntax)**
@@ -627,7 +631,7 @@ enum Optional[T]
 
 Variants are constructed like calls (`Circle(1.0)`, `Empty`) and destructured
 in patterns. `Result` and `Optional` are built-in enums with variants
-`Ok`/`Error` and `Some`/`None`.
+`Ok`/`Err` and `Some`/`None`.
 
 ### Structs **(provisional syntax)**
 
@@ -655,11 +659,153 @@ match p
   the same way.
 * Structs are values, like everything else: `let q = p` copies.
 
+### Methods **(provisional syntax)**
+
+A struct or enum can define functions of its own, *methods*, alongside its
+fields or variants. A method takes the value it is called on as its first
+parameter, and is called with `value.name(...)`:
+
+```ella
+struct Point
+    x: f64
+    y: f64
+    norm2 = (p: Point) -> f64 => p.x * p.x + p.y * p.y
+    move = (mut p: Point, dx: f64, dy: f64) -> () =>
+        p.x += dx
+        p.y += dy
+
+let mut p = Point(3.0, 4.0)
+print(p.norm2())          # 25.0
+mut p.move(1.0, 0.0)      # p is Point(4.0, 4.0)
+
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    area = (s: Shape) -> f64 =>
+        match s
+            case Circle(r) => 3.0 * r * r
+            case Rect(w, h) => w * h
+```
+
+* A method's first parameter must be of its type: `Point`, or `Stack[T]`
+  in `struct Stack[T]`. A method of a generic type is generic in the
+  type's parameters, and is specialized for each set of type arguments it
+  is used with, like a generic function.
+* Each type has its own methods, so different types can have methods with
+  the same name. A method can't have the name of a field, and only
+  top-level structs and enums can have methods.
+* A method whose first parameter is `mut` changes the value it is called
+  on, which is marked as for any `mut` argument: `mut p.move(1.0, 0.0)`.
+  The value must be a place: a `mut` variable, or a field or item of one
+  (`mut shelf.stacks[1].push(20)`). `mut` applies to the call after it,
+  even as an argument: `print(mut s.pop())`.
+* `v.f(x)` calls a function held in a field `f` too, without passing `v`.
+* Methods can call each other and any top-level function, in any order.
+* A generic type's parameters can have constraints, as a generic
+  function's can, for its methods to use. They are checked where a method
+  is used:
+
+  ```ella
+  struct Set[T: Eq]
+      items: [T]
+      has = (s: Set[T], x: T) -> bool => x in s.items
+  ```
+
+**Operators.** Methods with these names give a struct or enum operators,
+and `len`:
+
+| Method | Gives | Type |
+| --- | --- | --- |
+| `add`, `sub`, `mul`, `div` | `a + b`, `a - b`, `a * b`, `a / b` | `(Self, T) -> R` |
+| `neg` | `-a` | `(Self) -> R` |
+| `compare` | `a < b` (`a.compare(b) < 0`), `<=`, `>`, `>=` | `(Self, Self) -> i64` |
+| `len` | `len(a)` | `(Self) -> i64` |
+
+`Self` is the type itself. The right operand and the result can have any
+types, so `mul = (v: Vec, k: f64) -> Vec` scales a vector. Compound
+assignments use them too: `total += Money(5)`. `==` and `!=` always compare
+values field by field.
+
+```ella
+struct Money
+    cents: i64
+    add = (a: Money, b: Money) -> Money => Money(a.cents + b.cents)
+    compare = (a: Money, b: Money) -> i64 => a.cents - b.cents
+
+print(Money(5) + Money(7))       # Money(12)
+print(Money(5) < Money(7))       # true
+```
+
+**Protocols.** Methods with these names let a struct or enum be indexed,
+looped over and searched, like the built-in collections:
+
+| Method | Gives | Type |
+| --- | --- | --- |
+| `get` | `v[k]` | `(Self, K) -> V` |
+| `set` | `v[k] = x`, and with `get`, `v[k] += x` and so on | `(mut Self, K, V) -> ()` |
+| `iter` | `for x in v`: loops over what `v.iter()` gives | `(Self) -> R`, R a list, str or range |
+| `contains` | `x in v` (`v.contains(x)`), `x not in v` | `(Self, T) -> bool` |
+
+```ella
+struct Table[V]
+    keys: [str]
+    values: [V]
+    get = (t: Table[V], key: str) -> V => t.values[t.find(key)]
+    set = (mut t: Table[V], key: str, value: V) -> () => ...
+    contains = (t: Table[V], key: str) -> bool => key in t.keys
+    iter = (t: Table[V]) -> [str] => t.keys
+    find = (t: Table[V], key: str) -> i64 => ...
+
+let mut ages = Table([], [])
+ages["ann"] = 31
+ages["ann"] += 1
+for name in ages
+    print("{{name}}: {{ages[name]}}")    # ann: 32
+```
+
+* The key can have any type: a grid can be indexed with `(row, column)`
+  tuples. If a type has both `get` and `set`, they must agree on the key
+  and value types.
+* An item that `get` gives is a copy, so only the last step of an
+  assignment can go through `set`: `world.grids[0][(1, 1)] = 4` works, but
+  `table["a"].x = 1` and `f(mut table["a"])` don't.
+* `iter` gives a new list, string or range, which the loop then goes
+  through. (It is called once, before the first iteration.)
+* A user-defined constraint can ask for these methods too, so generic code
+  can index, loop over and search its values.
+* All these names (and the operators' above, and `finalize`) are kept for
+  their meaning: a method with one of them must have its type.
+
+### Errors
+
+`Error` is a built-in struct for the error side of a `Result`, holding a
+message:
+
+```ella
+struct Error
+    message: str
+```
+
+```ella
+let invert = (n: f64) -> Result[f64, Error] =>
+    if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
+
+match invert(0.0)
+    case Ok(v) => print(v)
+    case Err(e) => print(e.message)    # divide by zero
+print(invert(0.0))                     # Err(Error("divide by zero"))
+```
+
+* It is an ordinary struct that happens to be predefined, so it is built,
+  read, compared, printed and matched (`case Err(Error(message))`) like any
+  other. A program can define its own `Error`, which replaces it.
+* `Result[T, E]` can still hold any error type: `Result[i64, str]` is fine.
+
 ### Values that can't be copied **(provisional syntax)**
 
 A `nocopy struct` is for values with an identity, which a copy would
 duplicate: a resource that must be released once, say. Its values are
-never copied, and it may have a `finalize` function, which runs on each
+never copied, and it may have a `finalize` method, which runs on each
 value when the value dies:
 
 ```ella
@@ -683,8 +829,10 @@ work()                 # prints: working, closing app
   list, captured by a closure, returned from a parameter, or used with a
   generic function.
 * A struct with a nocopy field must be nocopy itself. A nocopy struct needs
-  at least one field; one with a `finalize` function must be top-level and
-  not generic.
+  at least one field; one with a `finalize` method can't be generic. Only
+  a nocopy struct can have a `finalize` method, of type `(Self) -> ()`,
+  which can't be called directly. Its other methods borrow the value, or
+  change it with `mut`.
 * **When values die.** A value dies at the end of the function call or loop
   iteration it is made in (a `let` belongs to the iteration it is in), or at
   the end of the program for top-level variables. A value that is
@@ -729,8 +877,8 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 | Constraint | Allows on `T` | Met by |
 | --- | --- | --- |
 | `Eq` | `==`, `!=`, `in` | every type except functions, pools and code |
-| `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str` |
-| `Add` | `+` | `i64`, `f64`, `str`, lists |
+| `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str`, types with a `compare` method |
+| `Add` | `+` | `i64`, `f64`, `str`, lists, types with an `add` method of type `(Self, Self) -> Self` |
 | `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `f64` |
 
 * The body is checked once, against the constraints: `(a: T, b: T) -> T =>
@@ -739,7 +887,45 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 * Each use is checked against them: `largest([true])` is an error, as
   `bool` isn't `Ord`. A type parameter meets the constraints it has, so a
   generic function can call another one with its own `T`.
-* There are no user-defined constraints yet.
+* `Num` is only met by numbers: `/` on a `Num` gives an `f64`, which a
+  struct's `div` needn't.
+
+### User-defined constraints **(provisional syntax)**
+
+A program can define its own constraints, as the methods a type must have,
+with `Self` standing for the type:
+
+```ella
+constraint Shape
+    area: (Self) -> f64
+    name: (Self) -> str
+
+struct Square
+    side: f64
+    area = (s: Square) -> f64 => s.side * s.side
+    name = (s: Square) -> str => "square"
+
+let total[T: Shape] = (xs: [T]) -> f64 =>
+    let mut sum = 0.0
+    for x in xs
+        sum += x.area()
+    sum
+
+print(total([Square(2.0), Square(1.0)]))     # 5.0
+```
+
+* A struct or enum meets a constraint if it has each of its methods, with
+  the same types (with `Self` replaced by the type). It doesn't say so: any
+  type with the methods will do. Other types never meet one.
+* In a generic function, a value of a type parameter has the methods of its
+  constraints: `x.area()`. A method can be `mut` (`tick: (mut Self) -> ()`),
+  and is then called as `mut x.tick()`. Two constraints of one type
+  parameter can't have different methods with the same name.
+* User-defined and built-in constraints combine: `[T: Shape + Ord]`.
+* A constraint's method named `len` gives `len(x)` in the generic function;
+  operators still need the built-in constraints.
+* Each use is still compiled for its own types, so a method call is a
+  direct call: there is no dynamic dispatch.
 
 ### Pools **(provisional syntax)**
 
@@ -779,7 +965,7 @@ Built-in functions (ordinary names, not keywords):
 
 * `print(value)` prints the text form of `value` and a newline; returns `()`.
 * `len(x)` returns the length of a list, string or range as `i64`, or how
-  many values a pool holds.
+  many values a pool holds. On a struct or enum, it calls its `len` method.
 * `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
   pools ([§9](#pools-provisional-syntax)).
 * `run(code)` runs code made with `quote` ([§11](#11-stages)).
@@ -795,8 +981,8 @@ quoted when it appears inside another value. A pool is `<pool of 3>`, a
 handle `<handle 0:1>` (its slot and generation), and code `<code ...>`,
 with the code as an S-expression.
 
-Python-style protocol methods (`len`, indexing, iteration, and so on for user
-types) are planned for when user-defined types exist.
+Structs and enums can give themselves `len`, operators, indexing,
+iteration and `in` with methods ([§9](#methods-provisional-syntax)).
 
 `assert expr` is a keyword expression rather than a function, so that a
 failure can report the asserted expression's source text. It has type `()`.
@@ -946,11 +1132,11 @@ block       = NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT ;
 body        = expr | block ;
 
 expr        = let | assignment | lambda | if | match | for | while | loop
-            | break | continue | return | assert | enum | struct | quote
-            | operator_expr ;
+            | break | continue | return | assert | enum | struct | constraint
+            | quote | mut_call | operator_expr ;
 
 let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr ;
-type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* a constraint: Eq, Ord, Add or Num *)
+type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* built-in or user-defined constraints *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
 target      = IDENT | operator_expr "[" expr "]" | operator_expr "." IDENT ;
@@ -975,12 +1161,16 @@ continue    = "continue" [ IDENT ] ;
 return      = "return" [ expr ] ;
 assert      = "assert" expr ;
 
-enum        = "enum" IDENT [ "[" IDENT { "," IDENT } "]" ]
-              NEWLINE INDENT variant { NEWLINE variant } NEWLINE DEDENT ;
+enum        = "enum" IDENT [ "[" type_param { "," type_param } "]" ]
+              NEWLINE INDENT ( variant | method ) { NEWLINE ( variant | method ) } NEWLINE DEDENT ;
 variant     = IDENT [ "(" type { "," type } ")" ] ;
-struct      = [ "nocopy" ] "struct" IDENT [ "[" IDENT { "," IDENT } "]" ]
-              NEWLINE INDENT field { NEWLINE field } NEWLINE DEDENT ;
-field       = IDENT ":" type | "finalize" "=" expr ;
+struct      = [ "nocopy" ] "struct" IDENT [ "[" type_param { "," type_param } "]" ]
+              NEWLINE INDENT ( field | method ) { NEWLINE ( field | method ) } NEWLINE DEDENT ;
+field       = IDENT ":" type ;
+method      = IDENT "=" expr ;                   (* a function; `finalize` for a nocopy struct *)
+constraint  = "constraint" IDENT
+              NEWLINE INDENT IDENT ":" type { NEWLINE IDENT ":" type } NEWLINE DEDENT ;
+mut_call    = "mut" operator_expr ;              (* a method call: `mut s.push(3)` *)
 quote       = "quote" body ;
 splice      = "$" ( IDENT | "(" expr ")" | block ) ;
 
@@ -989,7 +1179,7 @@ operator_expr = prefix_op operator_expr
             | operator_expr ( call | index | member | "?" )
             | primary ;
 call        = "(" [ arg { "," arg } [ "," ] ] ")" ;
-arg         = [ "mut" ] expr ;                   (* `mut` only for a place: a name or an index *)
+arg         = [ "mut" ] expr ;                   (* `mut` only for a place, or before a method call *)
 index       = "[" expr "]" ;
 member      = "." ( IDENT | "$" ( IDENT | "(" expr ")" ) ) ;  (* `.$f`: a spliced field name *)
 
@@ -1039,22 +1229,33 @@ Parsing notes:
 * **Trailing binary operator.** If a binary operator is followed by `NEWLINE`
   (which can only happen outside brackets), report the "wrap in parentheses"
   error.
+* **Methods vs. fields and variants.** In a struct or enum, a line starting
+  `IDENT "="` is a method; otherwise it is a field or a variant.
+* **`mut` before a method call** (`mut s.items[0].push(1)`) is parsed as a
+  postfix expression after `mut`, which must end with a call of a member;
+  the value the method is called on becomes the `mut` argument:
+  `Call(Member(MutArg(s.items[0]), "push"), [1])`. In an argument list,
+  `mut` followed by such a call means the same.
 
 ## Open questions
 
-* What is the `Error` type in `Result[T, Error]`? `Error` is also the name of
-  the variant. A built-in error type holding a message is likely. For now,
-  `Error` as a type means `str`.
+* What else an `Error` should hold: where it was made, or the error that
+  caused it.
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
-* User-defined protocol methods (`len`, iteration, ...) for structs.
+* Whether `==` and the text form (`print`) should use methods too, and
+  whether iteration should use a stateful iterator (`next`) rather than
+  making a list.
+* Methods for built-in types (`xs.len()`), and functions in a type's
+  namespace that don't take a value of it (`Stack.new()`).
+* Whether a constraint should be able to require other constraints, or
+  operators (`constraint Ring: Add` ...).
 * Generic functions inside functions. Generic functions currently support
   the built-in constraints `Eq`, `Ord`, `Add` and `Num`.
 * Whether `comptime` (still reserved) is worth having as shorthand for a
   splice, now that staging uses `quote` and `$`.
-* User-defined constraints (with the protocol methods above), and
-  compile-time type parameters checked at each use, for template-style code
-  that constraints can't express. See docs/memory-model.md §15.
+* Compile-time type parameters checked at each use, for template-style
+  code that constraints can't express. See docs/memory-model.md §15.
 * Generic computed types (`new_struct` makes structs without type
   parameters) and splicing types into struct definitions.
 * Modules and `import`.

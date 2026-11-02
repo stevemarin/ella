@@ -540,9 +540,10 @@ class Expander:
         self.expanding: set[int] = set()
         self.interpreter: Interpreter = Interpreter(out, checker, self.tables)
         self.interpreter.prepare_function = self.prepare_function
+        # Top-level functions and methods, which compile-time code may call.
         self.top_level = {
             id(expr.value) for expr in program.body if isinstance(expr, Let) and isinstance(expr.value, Lambda)
-        }
+        } | {id(method.function) for expr in program.body if isinstance(expr, EnumDef) for method in expr.methods}
         self.interpreter.declare_top_level(program)
         checker.compile_time = self.run_while_checking
 
@@ -565,6 +566,12 @@ class Expander:
         for expr in self.program.body:
             if isinstance(expr, Let) and isinstance(expr.value, Lambda):
                 body.append(replace(expr, value=self.expand_function(expr.value)))
+            elif isinstance(expr, EnumDef) and expr.methods:
+                methods = tuple(
+                    replace(m, function=self.expand_function(m.function)) if isinstance(m.function, Lambda) else m
+                    for m in expr.methods
+                )
+                body.append(replace(expr, methods=methods))
             else:
                 body.append(self.expand(expr))
         return Program(tuple(body), self.program.span)

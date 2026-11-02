@@ -85,7 +85,7 @@ def test_finish_defaults_unknowns_to_unit() -> None:
         ("()", "()"),
         ("[[1], []]", "[[i64]]"),
         ("Some(1)", "Optional[i64]"),
-        ('Error("x")', "Result[(), str]"),  # nothing decides the Ok type, so it defaults to ()
+        ('Err("x")', "Result[(), str]"),  # nothing decides the Ok type, so it defaults to ()
         ("if true then 1 else 2", "i64"),
         ("if true then 1", "()"),
         ("let f = () -> i64 => 1\nf()", "i64"),
@@ -120,8 +120,14 @@ def test_annotations_are_checked() -> None:
     assert error('let f = () -> i64 => "no"').message == "the function's result should be i64, not str"
 
 
-def test_error_type_means_str_for_now() -> None:
-    assert type_of('let f = () -> Result[i64, Error] => Error("bad")\nf()') == "Result[i64, str]"
+def test_error_type() -> None:
+    assert type_of('let f = () -> Result[i64, Error] => Err(Error("bad"))\nf()') == "Result[i64, Error]"
+    assert type_of('Error("bad").message') == "str"
+    assert error('let f = () -> Result[i64, Error] => Err("bad")').message == (
+        "the function's result should be Result[i64, Error], not Result[i64, str]"
+    )
+    assert error("Error(1)").message == "the argument of Error should be str, not i64"
+    assert error('Error("bad").msg').message == "Error has no field 'msg'"
 
 
 # Type errors
@@ -403,7 +409,7 @@ def test_struct_and_generic_types() -> None:
         (RES + "struct Holder\n    r: Res", "field 'r' can't be copied, so Holder must be a nocopy struct too"),
         (
             "struct P\n    x: i64\n    finalize = (p: P) -> () => ()",
-            "only a nocopy struct can have a finalize function",
+            "only a nocopy struct can have a finalize method",
         ),
         ("nocopy struct E\n    finalize = (e: E) -> () => ()", "a nocopy struct needs at least one field"),
         ("let mut p: Pool[str] = pool_new()\nlet q = p", "a Pool[str] can't be copied, so it can't be used here"),
@@ -568,4 +574,217 @@ def test_constrained_generics() -> None:
     ],
 )
 def test_constraint_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+SET = "struct Set[T: Eq]\n    items: [T]\n    has = (s: Set[T], x: T) -> bool => x in s.items\n"
+
+SHAPES = """\
+constraint Shape
+    area: (Self) -> f64
+struct Square
+    side: f64
+    area = (s: Square) -> f64 => s.side * s.side
+    compare = (a: Square, b: Square) -> i64 => 0
+    add = (a: Square, b: Square) -> Square => a
+    mul = (a: Square, k: f64) -> Square => a
+    neg = (a: Square) -> str => "negative"
+    len = (s: Square) -> i64 => 4
+    grow = (mut s: Square, by: f64) -> () => ()
+let total[T: Shape] = (xs: [T]) -> f64 => xs[0].area()
+let sq = Square(2.0)
+"""
+
+
+def test_methods() -> None:
+    assert type_of(SHAPES + "sq.area()") == "f64"
+    assert type_of(SHAPES + "let mut s = sq\nmut s.grow(1.0)") == "()"
+    assert type_of(SHAPES + "total([sq])") == "f64"
+    # Operators and len() come from methods with those names.
+    assert type_of(SHAPES + "sq + sq") == "Square"
+    assert type_of(SHAPES + "sq * 2.0") == "Square"
+    assert type_of(SHAPES + "-sq") == "str"
+    assert type_of(SHAPES + "sq < sq") == "bool"
+    assert type_of(SHAPES + "len(sq)") == "i64"
+    # So Square is Ord and Add.
+    assert type_of(SHAPES + "let max[T: Ord] = (a: T, b: T) -> T => a\nmax(sq, sq)") == "Square"
+    assert type_of(SHAPES + "let sum[T: Add] = (a: T, b: T) -> T => a + b\nsum(sq, sq)") == "Square"
+    # Methods of a generic type are generic in its parameters.
+    source = "struct Box[T]\n    v: T\n    unwrap = (b: Box[T]) -> T => b.v\nBox('x').unwrap()"
+    assert type_of(source) == "str"
+    # A field holding a function is called like a method.
+    assert type_of("struct H\n    f: (i64) -> str\nH((n: i64) -> str => '').f(1)") == "str"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("struct P\n    x: i64\n    f = 3", "a method must be a function, like 'f = (x: P) -> ... => ...'"),
+        (
+            "struct P\n    x: i64\n    f = (n: i64) -> i64 => n",
+            "a method's first parameter is the value it is called on, so it must be a P",
+        ),
+        (
+            "struct P[T]\n    x: T\n    f = (p: P[i64]) -> i64 => 1",
+            "a method's first parameter is the value it is called on, so it must be a P[T]",
+        ),
+        ("struct P\n    x: i64\n    x = (p: P) -> i64 => 1", "'x' is already a field of P"),
+        (
+            "struct P\n    x: i64\n    compare = (p: P, q: P) -> bool => true",
+            "the method 'compare' must have the type (P, P) -> i64",
+        ),
+        (
+            "struct P\n    x: i64\n    add = (mut p: P, q: P) -> P => p",
+            "the method 'add' must have the type (P, T) -> R, without 'mut'",
+        ),
+        ("struct P\n    x: i64\n    len = (p: P) -> str => ''", "the method 'len' must have the type (P) -> i64"),
+        (
+            "let f = () -> () =>\n    struct Q\n        x: i64\n        g = (q: Q) -> i64 => 1\n    ()",
+            "only a top-level struct or enum can have methods",
+        ),
+        (SHAPES + "sq.perimeter()", "Square has no method 'perimeter'"),
+        (SHAPES + "sq.area(1)", "area takes 0 arguments but was given 1"),
+        (SHAPES + "sq.grow(1.0)", "'grow' changes the value it is called on, so mark it: 'mut x.grow(...)'"),
+        (
+            SHAPES + "let mut s = sq\nmut s.area()",
+            "'area' doesn't change the value it is called on, so it can't be 'mut'",
+        ),
+        (SHAPES + "mut sq.grow(1.0)", "can't pass 'sq' as 'mut' because it isn't mutable; declare it with 'let mut'"),
+        (SHAPES + "sq - sq", "'-' doesn't work on Square"),
+        ("struct P\n    x: i64\nP(1) < P(2)", "'<' doesn't work on P"),
+        (SHAPES + "total([1])", "total needs T to be Shape, and i64 isn't"),
+        (
+            SHAPES + "struct Circle\n    r: f64\ntotal([Circle(1.0)])",
+            "total needs T to be Shape, and Circle isn't: it has no method 'area'",
+        ),
+        (
+            SHAPES + "struct Circle\n    r: f64\n    area = (c: Circle) -> i64 => 1\ntotal([Circle(1.0)])",
+            "total needs T to be Shape, and Circle isn't: its method 'area' is (Circle) -> i64, not (Circle) -> f64",
+        ),
+        (
+            SHAPES + "let f[T: Shape] = (x: T) -> f64 => x.perimeter()",
+            "T has no method 'perimeter' (its constraints don't have one)",
+        ),
+        (SHAPES + "let f[T: Shape] = (x: T) -> T => x + x", "'+' on T needs the constraint Add, like [T: Add]"),
+        (SHAPES + "constraint Shape\n    area: (Self) -> i64", "there is already a constraint named Shape"),
+        (
+            "constraint Bad\n    area: (i64) -> f64",
+            "a constraint's method is a function taking Self first, like 'area: (Self) -> i64'",
+        ),
+        (
+            "let f = () -> () =>\n    constraint Bad\n        area: (Self) -> f64\n    ()",
+            "a constraint can only be defined at the top level",
+        ),
+        (
+            "constraint A\n    f: (Self) -> i64\nconstraint B\n    f: (Self) -> str\nlet g[T: A + B] = (x: T) -> i64 => x.f()",
+            "the constraints A and B have different methods named 'f'",
+        ),
+        (
+            SET + "let f = (x: i64) -> i64 => x\nSet([f]).has(f)",
+            "Set.has needs T to be Eq, and (i64) -> i64 isn't",
+        ),
+        (
+            "struct Set[T]\n    items: [T]\n    has = (s: Set[T], x: T) -> bool => x in s.items",
+            "'in' on T needs the constraint Eq, like [T: Eq]",
+        ),
+        (
+            "nocopy struct R\n    n: i64\n    f = (r: R) -> R => r",
+            "a R can't be copied, so it can't be returned unless it is a local variable",
+        ),
+        (
+            "struct P[T]\n    x: T\n    finalize = (p: P[T]) -> () => ()",
+            "only a nocopy struct can have a finalize method",
+        ),
+        (
+            RES + "let f = (r: Res) -> () => r.finalize()",
+            "a finalize method runs by itself when the value dies, so it can't be called",
+        ),
+    ],
+)
+def test_method_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+COPIED_ITEM = (
+    "an item of a {} is a copy, so it can't be changed in place; only a set method can store one, with 'v[k] = x'"
+)
+
+PS = """\
+struct P
+    x: i64
+struct Ps
+    items: [P]
+    get = (s: Ps, i: i64) -> P => s.items[i]
+    set = (mut s: Ps, i: i64, p: P) -> () => ()
+"""
+
+BAG = """\
+struct Bag
+    items: [str]
+    get = (b: Bag, i: i64) -> str => b.items[i]
+    set = (mut b: Bag, i: i64, s: str) -> () =>
+        b.items[i] = s
+    iter = (b: Bag) -> [str] => b.items
+    contains = (b: Bag, s: str) -> bool => s in b.items
+let mut bag = Bag(["a"])
+"""
+
+
+def test_protocols() -> None:
+    assert type_of(BAG + "bag[0]") == "str"
+    assert type_of(BAG + "bag[0] = 'b'") == "str"
+    assert type_of(BAG + "bag[0] += 'b'") == "str"
+    # The last step of a place can be an item stored with `set`.
+    assert type_of(BAG + "struct Box\n    b: Bag\nlet mut box = Box(bag)\nbox.b[0] = 'x'") == "str"
+    assert type_of(BAG + "'a' in bag") == "bool"
+    assert type_of(BAG + "let mut n = ''\nfor s in bag\n    n += s\nn") == "str"
+    source = "constraint Seq\n    get: (Self, i64) -> str\nlet first[T: Seq] = (t: T) -> str => t[0]\n"
+    assert type_of(BAG + source + "first(bag)") == "str"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (BAG + "bag['x']", "the index should be i64, not str"),
+        (BAG + "bag[0] = 1", "the assigned value should be str, not i64"),
+        (BAG + "1 in bag", "the value looked for with 'in' should be str, not i64"),
+        (
+            BAG + "let f = (mut s: str) -> () => ()\nf(mut bag[0])",
+            COPIED_ITEM.format("Bag"),
+        ),
+        (
+            "struct R\n    n: i64\n    get = (r: R, i: i64) -> i64 => i\nlet mut r = R(1)\nr[0] = 2",
+            COPIED_ITEM.format("R"),
+        ),
+        (
+            PS + "let mut ps = Ps([P(1)])\nps[0].x = 2",
+            COPIED_ITEM.format("Ps"),
+        ),
+        (
+            "struct R\n    n: i64\n    set = (mut r: R, i: i64, v: i64) -> () => ()\nlet mut r = R(1)\nr[0] += 2",
+            "'+=' on an item needs a get method as well as set",
+        ),
+        (
+            "struct R\n    n: i64\n    get = (r: R, i: i64) -> i64 => i\n    set = (mut r: R, i: str, v: i64) -> () => ()",
+            "set must take the key and value types get uses: (i64, i64)",
+        ),
+        (
+            "struct R\n    n: i64\n    set = (r: R, i: i64, v: i64) -> () => ()",
+            "the method 'set' must have the type (mut R, K, V) -> ()",
+        ),
+        (
+            "struct R\n    n: i64\n    iter = (r: R) -> i64 => 1",
+            "the method 'iter' must have the type (R) -> a list, str or range",
+        ),
+        (
+            "struct R\n    n: i64\n    contains = (r: R, x: i64) -> i64 => 1",
+            "the method 'contains' must have the type (R, T) -> bool, without 'mut'",
+        ),
+        (
+            "constraint It\n    iter: (Self) -> i64\nlet f[T: It] = (t: T) -> () =>\n    for x in t\n        ()",
+            "the iter method of T must give a list, str or range, not i64",
+        ),
+    ],
+)
+def test_protocol_errors(source: str, message: str) -> None:
     assert error(source).message == message

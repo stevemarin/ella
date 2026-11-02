@@ -1,0 +1,13 @@
+Ok(0.25)
+Err(Error("divide by zero"))
+Err(Error("divide by zero"))
+failed: divide by zero
+divide by zero
+true
+true
+[Error("changed"), Error("worse")]
+Error("bad")
+0
+not a digit: 7
+1
+not a digit: x

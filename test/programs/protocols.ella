@@ -1,0 +1,126 @@
+# Protocols: methods that let a struct or enum be indexed (`get`, `set`),
+# looped over (`iter`) and searched with `in` (`contains`).
+
+# A grid indexed by (row, column) pairs.
+struct Grid
+    width: i64
+    cells: [i64]
+    index = (g: Grid, at: (i64, i64)) -> i64 =>
+        match at
+            case (row, column) => row * g.width + column
+    get = (g: Grid, at: (i64, i64)) -> i64 => g.cells[g.index(at)]
+    set = (mut g: Grid, at: (i64, i64), value: i64) -> () =>
+        g.cells[g.index(at)] = value
+    iter = (g: Grid) -> [i64] => g.cells
+    contains = (g: Grid, value: i64) -> bool => value in g.cells
+
+let mut grid = Grid(3, [0, 0, 0, 0, 0, 0])
+grid[(0, 1)] = 5
+grid[(1, 2)] = 7
+grid[(1, 2)] += 1
+print(grid)
+print(grid[(1, 2)])
+print((8 in grid, 9 in grid, 9 not in grid))
+let mut total = 0
+for cell in grid
+    total += cell
+print(total)
+
+# The last step of an assignment can be an item of a field or list item.
+struct World
+    name: str
+    grids: [Grid]
+let mut world = World("w", [Grid(2, [1, 2, 3, 4])])
+world.grids[0][(1, 1)] = 40
+world.grids[0][(0, 0)] *= 10
+print(world)
+
+# `iter` can give a range or a string, and an enum can have it.
+struct Countdown
+    from: i64
+    iter = (c: Countdown) -> [i64] =>
+        let mut out = []
+        for i in 0..c.from
+            out += [c.from - i]
+        out
+for n in Countdown(3)
+    print(n)
+
+enum Word
+    Short(str)
+    Long(str, i64)
+    iter = (w: Word) -> str =>
+        match w
+            case Short(s) => s
+            case Long(s, times)
+                let mut out = ""
+                for _ in 0..times
+                    out += s
+                out
+let mut letters = []
+for c in Long("ab", 2)
+    letters += [c]
+print(letters)
+
+# A generic type with protocols.
+struct Table[V]
+    keys: [str]
+    values: [V]
+    get = (t: Table[V], key: str) -> V =>
+        let mut i = 0
+        while t.keys[i] != key
+            i += 1
+        t.values[i]
+    set = (mut t: Table[V], key: str, value: V) -> () =>
+        for i in 0..len(t.keys)
+            if t.keys[i] == key then
+                t.values[i] = value
+                return ()
+        t.keys += [key]
+        t.values += [value]
+    contains = (t: Table[V], key: str) -> bool => key in t.keys
+    iter = (t: Table[V]) -> [str] => t.keys
+    len = (t: Table[V]) -> i64 => len(t.keys)
+
+let mut ages = Table([], [])
+ages["ann"] = 31
+ages["bob"] = 25
+ages["ann"] += 1
+for name in ages
+    print("{{name}}: {{ages[name]}}")
+print(("bob" in ages, "cy" in ages, len(ages)))
+let mut tags: Table[[str]] = Table([], [])
+tags["x"] = ["a"]
+tags["x"] += ["b"]
+print(tags["x"])
+
+# Constraints can ask for protocol methods, for generic code to use them.
+constraint Lookup
+    get: (Self, str) -> i64
+    iter: (Self) -> [str]
+    contains: (Self, str) -> bool
+
+let sum_of[T: Lookup] = (t: T, keys: [str]) -> i64 =>
+    let mut sum = 0
+    for key in keys
+        if key in t then sum += t[key]
+    sum
+let all_of[T: Lookup] = (t: T) -> [str] =>
+    let mut out = []
+    for key in t
+        out += [key]
+    out
+print(sum_of(ages, ["ann", "zed", "bob"]))
+print(all_of(ages))
+
+# An item is read with `get`, which is a call: it may change a global that
+# an earlier operand still holds, which keeps its old value.
+let mut seen = [0]
+struct Spy
+    n: i64
+    get = (s: Spy, i: i64) -> i64 =>
+        seen[0] = i
+        s.n * i
+let spy = Spy(2)
+print((seen, spy[21]))
+print(seen)

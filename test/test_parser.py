@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 81
+    assert len(program.body) == 93
 
 
 # Precedence (docs/grammar.md §8)
@@ -224,13 +224,13 @@ def test_match() -> None:
 match r
     case Ok(v) if v > 1.0 => "big"
     case Ok(v) => "small"
-    case Error(e)
+    case Err(e)
         print(e)
         0
 """
     assert one(source) == (
         '(match r (case (Ok v) if (compare v > 1.0) "big") (case (Ok v) "small") '
-        "(case (Error e) (block (call print e) 0)))"
+        "(case (Err e) (block (call print e) 0)))"
     )
 
 
@@ -440,6 +440,28 @@ def test_structs() -> None:
     assert one(source) == "(nocopy struct File name: str (finalize (lambda (f: File) -> () ())))"
     assert one("p.x = 1") == "(= (. p x) 1)"
     assert error("struct P\n    x: i64\n    x: i64").message == "'x' is already a field of P"
+
+
+def test_methods_and_constraints() -> None:
+    source = "struct Set[T: Eq]\n    items: [T]\n    has = (s: Set[T], x: T) -> bool => x in s.items"
+    assert (
+        one(source)
+        == "(struct Set[T: Eq] items: [T] (has (lambda (s: Set[T], x: T) -> bool (compare x in (. s items)))))"
+    )
+    source = "enum Shape\n    Circle(f64)\n    area = (s: Shape) -> f64 => 1.0\n    Empty"
+    assert one(source) == "(enum Shape (Circle f64) Empty (area (lambda (s: Shape) -> f64 1.0)))"
+    source = "constraint Stack\n    push: (mut Self, i64) -> ()\n    size: (Self) -> i64"
+    assert one(source) == "(constraint Stack push: (mut Self, i64) -> () size: (Self) -> i64)"
+    assert one("p.area()") == "(call (. p area))"
+    # `mut` before a method call marks the value it is called on, wherever the call is.
+    assert one("mut s.items[0].push(1, 2)") == "(call (. (mut (index (. s items) 0)) push) 1 2)"
+    assert one("mut s.pop() + 1") == "(+ (call (. (mut s) pop)) 1)"
+    assert one("print(mut s.pop())") == "(call print (call (. (mut s) pop)))"
+    assert one("f(mut xs, mut s.pop())") == "(call f (mut xs) (call (. (mut s) pop)))"
+    message = "'mut' here must be followed by a method call that changes its value, like 'mut s.push(3)'"
+    assert error("mut x").message == message
+    assert error("struct P\n    x: i64\n    f = 1\n    f = 2").message == "there is already a method named 'f'"
+    assert error("enum E\n    f = (e: E) -> i64 => 1").message == "enum E needs at least one variant"
 
 
 def test_generic_functions() -> None:

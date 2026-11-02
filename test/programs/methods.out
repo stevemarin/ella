@@ -1,0 +1,35 @@
+25.0
+(6.0, 8.0) with norm² 100.0
+(0.0, 0.0) with norm² 0.0
+Point(3.0, 0.0)
+circle: 3.0
+rect: 6.0
+Stack([1, 2])
+Some(2)
+1
+1
+Shelf([Stack([5]), Stack([10, 20])])
+40
+Money(700)
+Money(100)
+Money(-500)
+2.5
+(true, true, false, true)
+true
+Money(300)
+Account(Money(150))
+Money(9)
+Money(6)
+square square = 5.0
+circle rect = 5.0
+14
+[Clicks(2), Clicks(14)]
+(Set(["a", "b", "c"]), true, false)
+10.0
+2
+closing work after 2 lines
+Money(6)
+top!
+4
+([Money(1)], Tally(3))
+[Money(99)]

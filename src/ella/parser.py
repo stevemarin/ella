@@ -41,6 +41,7 @@ from ella.syntax import (
     Call,
     Case,
     Compare,
+    ConstraintDef,
     Continue,
     EnumDef,
     Expr,
@@ -60,6 +61,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    Method,
     MutArg,
     Name,
     NamedType,
@@ -101,8 +103,8 @@ LOOP_KEYWORDS = ("for", "while", "loop")
 # Keywords that can begin an expression. `break` and `return` use this to
 # decide whether a value follows them.
 EXPR_KEYWORDS = frozenset({
-    "assert", "break", "continue", "enum", "false", "for", "if", "let", "loop", "match", "nocopy", "not", "quote",
-    "return", "struct", "true", "while",
+    "assert", "break", "constraint", "continue", "enum", "false", "for", "if", "let", "loop", "match", "mut",
+    "nocopy", "not", "quote", "return", "struct", "true", "while",
 })  # fmt: skip
 
 
@@ -486,6 +488,10 @@ class Parser:
                 return self.parse_enum()
             case TokenKind.KEYWORD, ("struct" | "nocopy"):
                 return self.parse_struct()
+            case TokenKind.KEYWORD, "constraint":
+                return self.parse_constraint()
+            case TokenKind.KEYWORD, "mut":
+                return self.parse_mut_method_call()
             case TokenKind.KEYWORD, "quote":
                 self.advance()
                 return Quote(self.parse_body(), token.span)
@@ -524,11 +530,33 @@ class Parser:
         return value
 
     def parse_arg(self) -> Expr:
-        """A call argument: an expression, or `mut target` for a `mut` parameter."""
+        """A call argument: an expression, or `mut target` for a `mut` parameter.
+
+        A method call can't be a `mut` argument, so `f(mut s.pop())` passes
+        what `mut s.pop()` gives, as on its own.
+        """
         token = self.peek()
         if self.accept("mut"):
-            return MutArg(self.parse_expr(), token.span)
+            match self.parse_expr():
+                case Call(Member(target, name, member_span), args, span) if not isinstance(target, MutArg):
+                    return Call(Member(MutArg(target, token.span), name, member_span), args, span)
+                case target:
+                    return MutArg(target, token.span)
         return self.parse_expr()
+
+    def parse_mut_method_call(self) -> Call:
+        """`mut s.push(3)`: a method call that changes its receiver, which becomes `MutArg(s)`.
+
+        Only postfix operators are taken after `mut`, so `mut s.pop() + 1`
+        adds 1 to what `pop` gives.
+        """
+        token = self.advance()
+        match self.parse_expr(self.infix["("][0]):
+            case Call(Member(target, name, member_span), args, span) if not isinstance(target, MutArg):
+                return Call(Member(MutArg(target, token.span), name, member_span), args, span)
+        raise EllaError(
+            "'mut' here must be followed by a method call that changes its value, like 'mut s.push(3)'", token.span
+        )
 
     def parse_splice(self) -> Splice:
         """`$name`, `$(expr)` or `$` and a block: splice in code.
@@ -848,45 +876,53 @@ class Parser:
     # Enums
 
     def parse_enum(self) -> EnumDef:
-        """`enum Name[T, ...]`, then an indented list of variants."""
+        """`enum Name[T, ...]`, then an indented list of variants and methods."""
         token = self.advance()
         name = self.expect_kind(TokenKind.NAME, "an enum name")
-        type_params: list[str] = []
-        if self.accept("["):
-            type_params, _ = self.parse_comma_list(
-                lambda: self.expect_kind(TokenKind.NAME, "a type parameter").text, "]"
-            )
+        type_params, constraints = self.parse_type_params()
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         self.expect_kind(TokenKind.INDENT, "an indented list of variants")
-        variants = []
+        variants: list[Variant] = []
+        methods: list[Method] = []
         while True:
-            variants.append(self.parse_variant())
-            self.expect_kind(TokenKind.NEWLINE, "end of line")
+            if self.at_kind(TokenKind.NAME) and self.at("=", 1):
+                methods.append(self.parse_method(methods))
+            else:
+                variants.append(self.parse_variant())
+            self.end_of_line()
             if self.at_kind(TokenKind.DEDENT):
                 self.advance()
-                return EnumDef(name.text, tuple(type_params), tuple(variants), token.span)
+                if not variants:
+                    raise EllaError(f"enum {name.text} needs at least one variant", name.span)
+                return EnumDef(
+                    name.text,
+                    type_params,
+                    tuple(variants),
+                    token.span,
+                    methods=tuple(methods),
+                    constraints=constraints,
+                )
 
     def parse_struct(self) -> EnumDef:
-        """`struct Name[T, ...]` or `nocopy struct ...`, then an indented list of fields.
+        """`struct Name[T, ...]` or `nocopy struct ...`, then an indented list of fields and methods.
 
-        The last line may be `finalize = function`, for a `nocopy` struct.
+        A method is `name = function`. A `nocopy` struct may have a
+        `finalize` method, run when a value dies.
         """
         nocopy = self.accept("nocopy")
         token = self.expect("struct")
         name = self.expect_kind(TokenKind.NAME, "a struct name")
-        type_params: list[str] = []
-        if self.accept("["):
-            type_params, _ = self.parse_comma_list(self.parse_type_param, "]")
+        type_params, constraints = self.parse_type_params()
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         self.expect_kind(TokenKind.INDENT, "an indented list of fields")
         names: list[str] = []
         types: list[TypeExpr] = []
-        finalize: Expr | None = None
+        methods: list[Method] = []
         while True:
-            field = self.expect_kind(TokenKind.NAME, "a field name")
-            if field.text == "finalize" and self.accept("="):
-                finalize = self.parse_expr()
+            if self.at_kind(TokenKind.NAME) and self.at("=", 1):
+                methods.append(self.parse_method(methods))
             else:
+                field = self.expect_kind(TokenKind.NAME, "a field name")
                 if field.text in names:
                     raise EllaError(f"'{field.text}' is already a field of {name.text}", field.span)
                 self.expect(":")
@@ -897,8 +933,50 @@ class Parser:
                 self.advance()
                 variant = Variant(name.text, tuple(types), name.span)
                 return EnumDef(
-                    name.text, tuple(type_params), (variant,), token.span, True, tuple(names), nocopy, finalize
+                    name.text,
+                    type_params,
+                    (variant,),
+                    token.span,
+                    True,
+                    tuple(names),
+                    nocopy,
+                    tuple(methods),
+                    constraints,
                 )
+
+    def parse_type_params(self) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+        """A struct's or enum's `[T: Ord, U]`, if any: the names, and their constraints (empty if none have any)."""
+        params: list[tuple[str, tuple[str, ...]]] = []
+        if self.accept("["):
+            params, _ = self.parse_comma_list(self.parse_constrained_param, "]")
+        constraints = tuple(c for _, c in params) if any(c for _, c in params) else ()
+        return tuple(name for name, _ in params), constraints
+
+    def parse_method(self, methods: list[Method]) -> Method:
+        """`name = function` in a struct or enum."""
+        name = self.advance()
+        if any(m.name == name.text for m in methods):
+            raise EllaError(f"there is already a method named '{name.text}'", name.span)
+        self.expect("=")
+        return Method(name.text, self.parse_expr(), name.span)
+
+    def parse_constraint(self) -> ConstraintDef:
+        """`constraint Name`, then an indented list of methods with their types: `area: (Self) -> f64`."""
+        token = self.advance()
+        name = self.expect_kind(TokenKind.NAME, "a constraint name")
+        self.expect_kind(TokenKind.NEWLINE, "end of line")
+        self.expect_kind(TokenKind.INDENT, "an indented list of methods, like 'area: (Self) -> f64'")
+        methods: list[Param] = []
+        while True:
+            method = self.expect_kind(TokenKind.NAME, "a method name")
+            if any(m.name == method.text for m in methods):
+                raise EllaError(f"'{method.text}' is already a method of {name.text}", method.span)
+            self.expect(":")
+            methods.append(Param(method.text, self.parse_type(), method.span))
+            self.end_of_line()
+            if self.at_kind(TokenKind.DEDENT):
+                self.advance()
+                return ConstraintDef(name.text, tuple(methods), token.span)
 
     def parse_variant(self) -> Variant:
         """One variant: `Empty`, or `Rect(f64, f64)` with field types."""

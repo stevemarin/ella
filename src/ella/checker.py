@@ -48,6 +48,7 @@ from ella.syntax import (
     Break,
     Call,
     Compare,
+    ConstraintDef,
     Continue,
     EnumDef,
     Expr,
@@ -67,6 +68,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    Method,
     MutArg,
     Name,
     NamedType,
@@ -211,6 +213,10 @@ CONSTRAINTS = {
 # The constraint each operator needs of a type parameter.
 NEEDS = {"+": "Add", "-": "Num", "*": "Num", "/": "Num", "**": "Num"}
 
+# The methods that give a struct or enum an operator (docs/grammar.md §9):
+# `a + b` calls `a.add(b)`, `-a` calls `a.neg()`, and `a < b` is `a.compare(b) < 0`.
+OPERATOR_METHODS = {"+": "add", "-": "sub", "*": "mul", "/": "div"}
+
 
 @dataclass(eq=False, slots=True)
 class TyVar:
@@ -327,8 +333,10 @@ class EnumInfo:
     """An enum's definition: its type parameters and each variant's field types.
 
     A struct is an enum with one variant, named after it, and also has field
-    names. A `nocopy` struct may have a finalizer, the IR function
-    `finalize`, which is run on each value when it dies.
+    names. Both can have methods: each is a function named `Type.method`
+    (specialized like a generic function when the type has type
+    parameters). A `nocopy` struct may have a finalizer, the IR function
+    `finalize` (its `finalize` method), which is run on each value when it dies.
     """
 
     name: str
@@ -339,12 +347,21 @@ class EnumInfo:
     nocopy: bool = False
     finalize: str = ""
     created: bool = False  # made by compile-time code (`new_struct`), not defined in the program
+    # The methods' types. Their type parameters are the enum's, with the
+    # constraints in `constraints` (one tuple per type parameter, or none).
+    methods: dict[str, FuncTy] = field(default_factory=dict)
+    constraints: tuple[tuple[str, ...], ...] = ()
 
 
-# The built-in enums. Their variants' fields refer to the type parameters.
+# `Self` in a constraint's methods: the type that meets it.
+SELF = ParamTy("Self")
+
+# The built-in enums, and the built-in struct `Error`. Variants' fields refer
+# to the type parameters.
 BUILTIN_ENUMS = {
-    "Result": EnumInfo("Result", ("T", "E"), {"Ok": (ParamTy("T"),), "Error": (ParamTy("E"),)}),
+    "Result": EnumInfo("Result", ("T", "E"), {"Ok": (ParamTy("T"),), "Err": (ParamTy("E"),)}),
     "Optional": EnumInfo("Optional", ("T",), {"Some": (ParamTy("T"),), "None": ()}),
+    "Error": EnumInfo("Error", (), {"Error": (STR,)}, ("message",), struct=True),
 }
 
 PRIMITIVE_NAMES = {"i64": I64, "f64": F64, "bool": BOOL, "str": STR}
@@ -441,12 +458,18 @@ def check(program: Program) -> Checker:
 def check_code(code: Expr, program: Checker) -> Checker:
     """Type check code made by `quote`, to run it with `run`: an expression that may use the program's top-level names.
 
-    Returns a new checker, with tables for the code's nodes.
+    Returns a new checker, with tables for the code's nodes. They start
+    with the program's, since the code may use a generic function or a
+    method that the program never did, which is then lowered for the first time.
     """
     checker = Checker()
     checker.enums = program.enums
     checker.globals = Env(None, dict(program.globals.vars))
-    checker.finalizers = program.finalizers
+    checker.constraints = program.constraints
+    checker.method_functions = program.method_functions
+    for table in ("types", "kinds", "resolved", "members", "methods", "instances", "type_values", "quote_levels"):
+        setattr(checker, table, dict(getattr(program, table)))
+    checker.checked = set(program.checked)
     checker.check(code, checker.globals)
     while checker.pending_bodies:
         checker.check_body(checker.pending_bodies.pop(0))
@@ -474,7 +497,11 @@ class Checker:
         self.quotes = 0  # how many quotes the code being checked is in (minus splices)
         self.env = Env(None)  # the scope of the expression being checked, for splices in its types
         self.instances: dict[int, tuple[Type, ...]] = {}  # use of a generic function -> its type arguments
-        self.finalizers: dict[str, Lambda] = {}  # nocopy struct -> its `finalize` function
+        self.constraints: dict[str, dict[str, FuncTy]] = {}  # user-defined constraint -> its methods' types, with SELF
+        self.method_functions: dict[tuple[str, str], Lambda] = {}  # (struct or enum, method) -> its function
+        self.methods: dict[int, str] = {}  # `.name` node called as a method -> the method's name
+        self.defined: set[int] = set()  # top-level enums already defined
+        self.item_sets: set[int] = set()  # `v[k]` places stored with v's `set` method
         self.level = 0  # the stage being checked
         self.type_params: dict[str, Type] = {}  # in a generic function's body: T -> ParamTy("T")
         # Checks that need final types, made once everything has been checked.
@@ -639,10 +666,6 @@ class Checker:
                 return params[name]
             case NamedType(name, (), span) if name in PRIMITIVE_NAMES:
                 return PRIMITIVE_NAMES[name]
-            case NamedType("Error", (), span):
-                # Provisional: until there is a proper error type, `Error` in a
-                # type means a message string (docs/grammar.md, open questions).
-                return STR
             case NamedType(name, args, span) if name in self.enums:
                 enum = self.enums[name]
                 if len(args) != len(enum.params):
@@ -685,14 +708,26 @@ class Checker:
         self.enums[enum.name] = EnumInfo(enum.name, enum.type_params, {})
 
     def define_enum(self, enum: EnumDef, env: Env) -> None:
-        """Read an enum's variants (or a struct's fields), and make them names in `env`."""
+        """Read an enum's variants (or a struct's fields) and methods, and make the variants names in `env`."""
+        if env is self.globals:
+            self.defined.add(id(enum))
         self.declare_enum(enum)
         params: dict[str, Type] = {name: ParamTy(name) for name in enum.type_params}
         if any(has_type_splice(f) for v in enum.variants for f in v.fields):
             raise EllaError("a type can't be spliced into a definition yet; use new_struct()", enum.span)
         variants = {v.name: tuple(self.annotation(f, params) for f in v.fields) for v in enum.variants}
-        finalize = f"{enum.name}.finalize" if enum.finalize is not None else ""
-        info = EnumInfo(enum.name, enum.type_params, variants, enum.field_names, enum.struct, enum.nocopy, finalize)
+        has_finalize = any(m.name == "finalize" for m in enum.methods)
+        finalize = f"{enum.name}.finalize" if has_finalize else ""
+        info = EnumInfo(
+            enum.name,
+            enum.type_params,
+            variants,
+            enum.field_names,
+            enum.struct,
+            enum.nocopy,
+            finalize,
+            constraints=enum.constraints,
+        )
         self.enums[enum.name] = info
         if enum.struct and not enum.nocopy:
             for field_name, field_type in zip(enum.field_names, variants[enum.name]):
@@ -702,18 +737,83 @@ class Checker:
                     )
         if enum.nocopy and not enum.field_names:
             raise EllaError("a nocopy struct needs at least one field", enum.span)
-        if enum.finalize is not None:
+        if has_finalize:
             if not enum.nocopy:
-                raise EllaError("only a nocopy struct can have a finalize function", enum.span)
-            if env is not self.globals or enum.type_params:
-                raise EllaError("a struct with a finalize function must be top-level, and not generic", enum.span)
-            if not isinstance(enum.finalize, Lambda):
-                raise EllaError("finalize must be a function, like '(x: T) -> () => ...'", enum.finalize.span)
-            t = self.check_lambda(enum.finalize, self.globals, [])
-            self.types[id(enum.finalize)] = t
-            self.expect(t, FuncTy((EnumTy(enum.name),), UNIT), enum.finalize.span, "finalize")
-            self.finalizers[enum.name] = enum.finalize
+                raise EllaError("only a nocopy struct can have a finalize method", enum.span)
+            if enum.type_params:
+                raise EllaError("a struct with a finalize method can't be generic", enum.span)
+        if enum.methods and env is not self.globals:
+            raise EllaError("only a top-level struct or enum can have methods", enum.span)
+        # The type parameters' constraints are checked even without methods, which use them.
+        self.param_types(enum.type_params, enum.constraints, enum.span)
+        methods = {method.name: self.define_method(enum, method) for method in enum.methods}
+        if "get" in methods and "set" in methods:
+            get, set_ = methods["get"], methods["set"]
+            if set_.params[1:] != (get.params[1], get.result):
+                raise EllaError(
+                    f"set must take the key and value types get uses: ({show_type(get.params[1])}, "
+                    f"{show_type(get.result)})",
+                    enum.span,
+                )
+        self.enums[enum.name] = dataclasses.replace(info, methods=methods)
         self.define_variants(self.enums[enum.name], env)
+
+    def define_method(self, enum: EnumDef, method: Method) -> FuncTy:
+        """A method's type. It is checked like a top-level generic function with the enum's type parameters."""
+        function = method.function
+        if method.name in enum.field_names:
+            raise EllaError(f"'{method.name}' is already a field of {enum.name}", method.span)
+        if not isinstance(function, Lambda):
+            raise EllaError(
+                f"a method must be a function, like '{method.name} = (x: {enum.name}) -> ... => ...'", function.span
+            )
+        t = self.check_lambda(function, self.globals, [], enum.type_params, enum.constraints)
+        self.types[id(function)] = t
+        self.method_functions[enum.name, method.name] = function
+        params = self.param_types(enum.type_params, enum.constraints, enum.span)
+        own = EnumTy(enum.name, tuple(params[name] for name in enum.type_params))
+        if not t.params or t.params[0] != own:
+            raise EllaError(
+                f"a method's first parameter is the value it is called on, so it must be a {show_type(own)}",
+                function.span,
+            )
+        # Methods with these names give operators and built-ins, so their types are fixed.
+        binary = "(Self, T) -> R, without 'mut'"
+        iterable = describe_kind(t.result) in ("list", "str", "range")
+        expected = {
+            "finalize": ("(Self) -> ()", t == FuncTy((own,), UNIT)),
+            "compare": ("(Self, Self) -> i64", t == FuncTy((own, own), I64)),
+            "len": ("(Self) -> i64", t == FuncTy((own,), I64)),
+            "neg": ("(Self) -> R, without 'mut'", len(t.params) == 1 and not t.mutable),
+            **{name: (binary, len(t.params) == 2 and not t.mutable) for name in OPERATOR_METHODS.values()},
+            "get": ("(Self, K) -> V, without 'mut'", len(t.params) == 2 and not t.mutable),
+            "set": ("(mut Self, K, V) -> ()", len(t.params) == 3 and t.mutable == (0,) and t.result == UNIT),
+            "contains": (
+                "(Self, T) -> bool, without 'mut'",
+                len(t.params) == 2 and not t.mutable and t.result == BOOL,
+            ),
+            "iter": ("(Self) -> a list, str or range", len(t.params) == 1 and not t.mutable and iterable),
+        }
+        if method.name in expected and not expected[method.name][1]:
+            what = expected[method.name][0].replace("Self", show_type(own))
+            raise EllaError(f"the method '{method.name}' must have the type {what}", function.span)
+        return t
+
+    def define_constraint(self, constraint: ConstraintDef) -> None:
+        """A user-defined constraint: the methods, with their types, that a type needs to meet it."""
+        if constraint.name in CONSTRAINTS or constraint.name in self.constraints:
+            raise EllaError(f"there is already a constraint named {constraint.name}", constraint.span)
+        methods: dict[str, FuncTy] = {}
+        for method in constraint.methods:
+            assert method.type is not None
+            t = self.annotation(method.type, {"Self": SELF})
+            if not isinstance(t, FuncTy) or not t.params or t.params[0] != SELF:
+                raise EllaError(
+                    f"a constraint's method is a function taking Self first, like '{method.name}: (Self) -> i64'",
+                    method.span,
+                )
+            methods[method.name] = t
+        self.constraints[constraint.name] = methods
 
     def define_variants(self, enum: EnumInfo, env: Env) -> None:
         for name, fields in enum.variants.items():
@@ -738,9 +838,14 @@ class Checker:
 
     def check_program(self, program: Program) -> None:
         # Enums first, in two steps so that they can refer to each other.
+        # Constraints come in between: their methods' types may use enums,
+        # and enums' type parameters may have constraints.
         for expr in program.body:
             if isinstance(expr, EnumDef):
                 self.declare_enum(expr)
+        for expr in program.body:
+            if isinstance(expr, ConstraintDef):
+                self.define_constraint(expr)
         for expr in program.body:
             if isinstance(expr, EnumDef):
                 self.define_enum(expr, self.globals)
@@ -797,8 +902,30 @@ class Checker:
                 if is_nocopy(arg, self.enums):
                     raise EllaError(f"{name} can't be used with {show_type(arg)}, which can't be copied", span)
                 for constraint in needs:
-                    if not satisfies(arg, constraint, self.enums):
-                        raise EllaError(f"{name} needs {param} to be {constraint}, and {show_type(arg)} isn't", span)
+                    reason = self.unmet(arg, constraint)
+                    if reason is not None:
+                        raise EllaError(
+                            f"{name} needs {param} to be {constraint}, and {show_type(arg)} isn't{reason}", span
+                        )
+
+    def unmet(self, t: Type, constraint: str) -> str | None:
+        """Why a type doesn't meet a constraint (perhaps ""), or None if it does.
+
+        A struct or enum meets a user-defined constraint if it has each of
+        its methods, with the same types (with Self standing for the type).
+        """
+        t = finish(t)
+        if constraint not in self.constraints or not isinstance(t, EnumTy):
+            return None if satisfies(t, constraint, self.enums) else ""
+        for name, required in self.constraints[constraint].items():
+            wanted = substitute(required, {"Self": t})
+            info = self.enums[t.name]
+            if name not in info.methods:
+                return f": it has no method '{name}'"
+            method = finish(substitute(info.methods[name], dict(zip(info.params, t.args))))
+            if method != wanted:
+                return f": its method '{name}' is {show_type(method)}, not {show_type(wanted)}"
+        return None
 
     # Expressions
 
@@ -899,6 +1026,12 @@ class Checker:
             case Assign(op, target, value_expr, span):
                 value_type = self.check(value_expr, env)
                 target_type = self.check_place(target, env)
+                if op != "=" and isinstance(target, Index) and id(target) in self.item_sets:
+                    # `v[k] += x` reads the item with `get`, then stores it with `set`.
+                    getter = self.method_type(self.types[id(target.target)], "get", span)
+                    if getter is None:
+                        raise EllaError(f"'{op}' on an item needs a get method as well as set", span)
+                    self.expect(getter.result, target_type, span, "the item get gives")
                 if op == "=":
                     self.expect(value_type, target_type, value_expr.span, "the assigned value")
                 else:
@@ -912,6 +1045,8 @@ class Checker:
                 return BOOL
             case Unary(op, operand, span):
                 t = self.check(operand, env)
+                if op == "-" and (method := self.operator_method(t, "neg", span)) is not None:
+                    return method.result
                 if isinstance(param := resolve(t), ParamTy) and op != "not":
                     self.require_constraint(param, "Num" if op == "-" else None, op, span)
                     return t
@@ -937,6 +1072,9 @@ class Checker:
                 index_type = self.check(index, env)
                 if isinstance(container, DeferredTy):
                     return DEFERRED
+                if (getter := self.method_type(container, "get", span)) is not None:
+                    self.expect(index_type, getter.params[1], index.span, "the index")
+                    return getter.result
                 if isinstance(container, BuiltinTy) and container.name == "Pool":
                     self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
                     return container.args[0]
@@ -1024,6 +1162,16 @@ class Checker:
                 return match_type
             case For(label, pattern, iterable, body, span):
                 iterable_type = self.known(self.check(iterable, env), iterable.span)
+                if (iterator := self.method_type(iterable_type, "iter", span)) is not None:
+                    # `for x in v` loops over what `v.iter()` gives.
+                    given = self.known(iterator.result, iterable.span)
+                    if describe_kind(given) not in ("list", "str", "range"):
+                        raise EllaError(
+                            f"the iter method of {show_type(iterable_type)} must give a list, str or range, "
+                            f"not {show_type(given)}",
+                            span,
+                        )
+                    iterable_type = given
                 match iterable_type:
                     case DeferredTy():
                         item_type: Type = DEFERRED
@@ -1067,7 +1215,12 @@ class Checker:
                 self.check_bool(expr.expr, env, "an assertion")
                 return UNIT
             case EnumDef():
-                self.define_enum(expr, env)
+                if id(expr) not in self.defined:  # top-level ones are defined before the program is checked
+                    self.define_enum(expr, env)
+                return UNIT
+            case ConstraintDef(name, span=span):
+                if env is not self.globals or name not in self.constraints:
+                    raise EllaError("a constraint can only be defined at the top level", span)
                 return UNIT
 
     # Stages
@@ -1148,6 +1301,9 @@ class Checker:
 
     def binary_type(self, op: str, a: Type, b: Type, span: Span) -> Type:
         """The result type of an arithmetic, bitwise or range operator."""
+        if op in OPERATOR_METHODS and (method := self.operator_method(a, OPERATOR_METHODS[op], span)) is not None:
+            self.expect(b, method.params[1], span, f"the right side of '{op}'")
+            return method.result
         if not self.unify(a, b):
             raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
         if isinstance(resolve(a), DeferredTy) or isinstance(resolve(b), DeferredTy):
@@ -1179,6 +1335,9 @@ class Checker:
         if isinstance(resolve(a), DeferredTy) or isinstance(resolve(b), DeferredTy):
             return
         if op in ("in", "not in"):
+            if (method := self.method_type(self.known(b, span), "contains", span)) is not None:
+                self.expect(a, method.params[1], span, f"the value looked for with '{op}'")
+                return
             match self.known(b, span):
                 case ListTy(element):
                     self.expect(a, element, span, f"the value looked for with '{op}'")
@@ -1195,6 +1354,8 @@ class Checker:
             raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
         if isinstance(param := resolve(a), ParamTy):
             self.require_constraint(param, "Eq" if op in ("==", "!=") else "Ord", op, span)
+            return
+        if op not in ("==", "!=") and self.operator_method(a, "compare", span) is not None:
             return
         kind = describe_kind(self.known(a, span))
         if kind in ("function", "Pool", "Code"):
@@ -1237,8 +1398,12 @@ class Checker:
                 return value
         raise EllaError(f"'?' needs a Result or Optional, not {show_type(t)}", span)
 
-    def check_place(self, target: Expr, env: Env, verb: str = "assign to") -> Type:
-        """The type of something being assigned to (or passed as `mut`): a `mut` variable, or an element of one."""
+    def check_place(self, target: Expr, env: Env, verb: str = "assign to", last: bool = True) -> Type:
+        """The type of something being assigned to (or passed as `mut`): a `mut` variable, or an element of one.
+
+        `last` says whether `target` is the whole place, rather than a part
+        of a longer one: only the last step can store an item with a `set` method.
+        """
         match target:
             case Name(name, span):
                 info = self.lookup(name, env, span)
@@ -1252,9 +1417,20 @@ class Checker:
                     raise EllaError(f"can't change '{name}' from a later stage", span)
                 t = info.type
             case Index(container_expr, index, span):
-                container = self.known(self.check_place(container_expr, env, verb), container_expr.span)
+                container = self.known(self.check_place(container_expr, env, verb, False), container_expr.span)
                 index_type = self.check(index, env)
-                if isinstance(container, BuiltinTy) and container.name == "Pool":
+                setter = self.method_type(container, "set", span)
+                if setter is not None or self.method_type(container, "get", span) is not None:
+                    if setter is None or not last or verb != "assign to":
+                        raise EllaError(
+                            f"an item of a {show_type(container)} is a copy, so it can't be changed in place; "
+                            "only a set method can store one, with 'v[k] = x'",
+                            span,
+                        )
+                    self.expect(index_type, setter.params[1], index.span, "the index")
+                    self.item_sets.add(id(target))
+                    t = setter.params[2]
+                elif isinstance(container, BuiltinTy) and container.name == "Pool":
                     self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
                     t = container.args[0]
                 else:
@@ -1266,7 +1442,7 @@ class Checker:
                         case _:
                             raise EllaError(f"can't {verb} an element of a {show_type(container)}", span)
             case Member(container_expr, _, span):
-                t = self.member_type(target, self.check_place(container_expr, env, verb))
+                t = self.member_type(target, self.check_place(container_expr, env, verb, False))
             case _:
                 raise EllaError(f"can only {verb} a variable or a part of one", target.span)
         self.types[id(target)] = t
@@ -1282,10 +1458,12 @@ class Checker:
         for i, name in enumerate(type_params):
             implied: frozenset[str] = frozenset()
             for constraint in constraints[i] if constraints else ():
+                if constraint in self.constraints:
+                    implied |= {constraint}
+                    continue
                 if constraint not in CONSTRAINTS:
-                    raise EllaError(
-                        f"unknown constraint '{constraint}'; the constraints are {', '.join(CONSTRAINTS)}", span
-                    )
+                    known = ", ".join([*CONSTRAINTS, *self.constraints])
+                    raise EllaError(f"unknown constraint '{constraint}'; the constraints are {known}", span)
                 implied |= CONSTRAINTS[constraint]
             result[name] = ParamTy(name, implied)
         return result
@@ -1384,6 +1562,8 @@ class Checker:
             if struct is not None:
                 self.types[id(callee)] = UNIT
                 return struct
+        if isinstance(callee, Member):
+            return self.check_member_call(callee, args, env, span)
         if isinstance(callee, Name):
             info = self.lookup(callee.name, env, callee.span)
             if info.kind == "builtin":
@@ -1396,31 +1576,129 @@ class Checker:
                 for arg, field_type in zip(args, fields):
                     self.expect(self.check(arg, env), field_type, arg.span, f"the argument of {callee.name}")
                 return enum_type
-        function = self.known(self.check(callee, env), callee.span)
+        return self.check_function_call(self.check(callee, env), callee, args, env, span)
+
+    def check_function_call(self, t: Type, callee: Expr, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
+        """A call of a function value of type `t`."""
+        function = self.known(t, callee.span)
         if isinstance(function, DeferredTy):
-            for arg in args:
-                if isinstance(arg, MutArg):
-                    self.types[id(arg)] = self.check_place(arg.target, env, "pass")
-                else:
-                    self.check(arg, env)
+            self.check_deferred_args(args, env)
             return DEFERRED
         if not isinstance(function, FuncTy):
             raise EllaError(f"can't call a value of type {show_type(function)}", span)
         self.check_arity("function", len(function.params), args, span)
+        self.check_args(function, args, env)
+        self.check_exclusive(callee, args)
+        return function.result
+
+    def check_deferred_args(self, args: tuple[Expr, ...], env: Env) -> None:
+        """The arguments of a call whose function is only known once the code is built."""
+        for arg in args:
+            if isinstance(arg, MutArg):
+                self.types[id(arg)] = self.check_place(arg.target, env, "pass")
+            else:
+                self.check(arg, env)
+
+    def check_args(self, function: FuncTy, args: tuple[Expr, ...], env: Env, receiver: Type | None = None) -> None:
+        """Check a call's arguments against the function's parameters.
+
+        `receiver` is the type of the first argument of a method call, which
+        has been checked already.
+        """
         for i, (arg, param_type) in enumerate(zip(args, function.params)):
+            known = receiver if i == 0 else None
             if i in function.mutable:
                 if not isinstance(arg, MutArg):
                     raise EllaError(f"argument {i + 1} is for a 'mut' parameter, so mark it: 'mut ...'", arg.span)
-                arg_type = self.check_place(arg.target, env, "pass")
+                arg_type = known if known is not None else self.check_place(arg.target, env, "pass")
                 self.types[id(arg)] = arg_type
                 # The function changes the variable itself, so the types must match exactly.
                 self.expect(arg_type, param_type, arg.span, f"argument {i + 1}")
             else:
                 if isinstance(arg, MutArg):
                     raise EllaError(f"argument {i + 1} isn't for a 'mut' parameter, so it can't be 'mut'", arg.span)
-                self.expect(self.check(arg, env), param_type, arg.span, f"argument {i + 1}")
-        self.check_exclusive(callee, args)
-        return function.result
+                arg_type = known if known is not None else self.check(arg, env)
+                self.expect(arg_type, param_type, arg.span, f"argument {i + 1}")
+
+    # Methods
+
+    def check_member_call(self, callee: Member, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
+        """`v.name(args)`: a call of v's method `name`, which gets v first, or of a function in v's field `name`.
+
+        `mut v.name(args)` calls a method whose first parameter is `mut`.
+        """
+        receiver, name = callee.target, callee.name
+        if isinstance(receiver, MutArg):
+            t = self.check_place(receiver.target, env, "pass")
+        else:
+            t = self.check(receiver, env)
+        self.types[id(receiver)] = t
+        value_type = self.known(t, receiver.span)
+        if isinstance(value_type, DeferredTy):
+            self.types[id(callee)] = DEFERRED
+            self.check_deferred_args(args, env)
+            return DEFERRED
+        method = self.method_type(value_type, name, span)
+        if method is None:
+            fields = isinstance(value_type, EnumTy) and name in self.enums[value_type.name].field_names
+            if isinstance(receiver, MutArg) or not fields:
+                hint = " (its constraints don't have one)" if isinstance(value_type, ParamTy) else ""
+                raise EllaError(f"{show_type(value_type)} has no method '{name}'{hint}", callee.span)
+            # A field holding a function.
+            field_type = self.member_type(callee, value_type)
+            self.types[id(callee)] = field_type
+            return self.check_function_call(field_type, callee, args, env, span)
+        if name == "finalize" and isinstance(value_type, EnumTy) and self.enums[value_type.name].finalize:
+            raise EllaError("a finalize method runs by itself when the value dies, so it can't be called", span)
+        self.methods[id(callee)] = name
+        self.types[id(callee)] = method
+        if 0 in method.mutable and not isinstance(receiver, MutArg):
+            raise EllaError(f"'{name}' changes the value it is called on, so mark it: 'mut x.{name}(...)'", span)
+        if 0 not in method.mutable and isinstance(receiver, MutArg):
+            raise EllaError(f"'{name}' doesn't change the value it is called on, so it can't be 'mut'", span)
+        self.check_arity(name, len(method.params) - 1, args, span)
+        self.check_args(method, (receiver, *args), env, t)
+        self.check_exclusive(UnitLit(span), (receiver, *args))
+        return method.result
+
+    def method_type(self, t: Type, name: str, span: Span) -> FuncTy | None:
+        """The type of the method `name` of values of type `t`, if they have one.
+
+        A struct's or enum's methods are its own. A type parameter has the
+        methods of its user-defined constraints.
+        """
+        match resolve(t):
+            case EnumTy(enum_name, args) if name in self.enums[enum_name].methods:
+                info = self.enums[enum_name]
+                method = substitute(info.methods[name], dict(zip(info.params, args)))
+                assert isinstance(method, FuncTy)
+                if info.params:
+                    # A method is a generic function of the type's parameters.
+                    needs = info.constraints or tuple(() for _ in info.params)
+                    self.generic_uses.append((f"{enum_name}.{name}", args, tuple(zip(info.params, needs)), span))
+                return method
+            case ParamTy(_, constraints) as param:
+                found = {
+                    c: self.constraints[c][name]
+                    for c in sorted(constraints)
+                    if c in self.constraints and name in self.constraints[c]
+                }
+                if len(set(found.values())) > 1:
+                    raise EllaError(
+                        f"the constraints {' and '.join(found)} have different methods named '{name}'", span
+                    )
+                if found:
+                    method = substitute(next(iter(found.values())), {"Self": param})
+                    assert isinstance(method, FuncTy)
+                    return method
+        return None
+
+    def operator_method(self, t: Type, name: str, span: Span) -> FuncTy | None:
+        """A struct's or enum's method that gives it an operator or `len` (not through a constraint)."""
+        t = resolve(t)
+        if isinstance(t, EnumTy) and name in self.enums[t.name].methods:
+            return self.method_type(t, name, span)
+        return None
 
     def may_share(self, other: Type, passed: Type) -> bool:
         """Whether an argument of type `other` could share storage that a `mut` argument of type `passed` changes.
@@ -1530,7 +1808,12 @@ class Checker:
                 )
             return result
         if name == "len":
-            if describe_kind(self.known(arg_type, args[0].span)) not in ("list", "str", "range", "Pool", "?"):
+            arg_type = self.known(arg_type, args[0].span)
+            method = self.method_type(arg_type, "len", span)
+            if method is not None:
+                self.expect(method, FuncTy((arg_type,), I64), args[0].span, "its len method")
+                return I64
+            if describe_kind(arg_type) not in ("list", "str", "range", "Pool", "?"):
                 raise EllaError(f"len() needs a list, str, range or Pool, not {show_type(arg_type)}", args[0].span)
             return I64
         return UNIT
@@ -1796,7 +2079,10 @@ class CopyChecker:
                 self.walk_place(target)
                 self.walk(value, "copy")
             case Call(callee, args):
-                self.walk(callee, "borrow")
+                if isinstance(callee, Member) and isinstance(callee.target, MutArg):
+                    self.walk_place(callee.target.target)  # `mut v.method(...)`
+                else:
+                    self.walk(callee, "borrow")
                 for arg in args:
                     if isinstance(arg, MutArg):
                         self.walk_place(arg.target)
@@ -1852,8 +2138,9 @@ class CopyChecker:
                     self.walk(condition.expr, "borrow")
                 self.walk(body, "return")
                 self.movable, self.function_binders, self.loop_depth = outer
-            case EnumDef(finalize=finalize):
-                self.walk(finalize, "copy")
+            case EnumDef(methods=methods):
+                for method in methods:
+                    self.walk(method.function, "copy")
             case _:
                 self.walk_parts(node)
 
@@ -1920,8 +2207,15 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
 
             return not any_part(t, enums, unequal)
         case "Ord":
-            return t in (I64, F64, STR)
+            # Structs and enums with a `compare` method too (its type is checked where it is defined).
+            return t in (I64, F64, STR) or (isinstance(t, EnumTy) and "compare" in enums[t.name].methods)
         case "Add":
+            # Structs and enums with an `add` method that gives one of the same type.
+            if isinstance(t, EnumTy) and "add" in enums[t.name].methods:
+                info = enums[t.name]
+                return finish(substitute(info.methods["add"], dict(zip(info.params, t.args)))) == FuncTy((t, t), t)
             return t in (I64, F64, STR) or isinstance(t, ListTy)
-        case _:  # Num
+        case "Num":
             return t in (I64, F64)
+        case _:  # user-defined constraints are checked by Checker.unmet
+            return False

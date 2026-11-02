@@ -161,9 +161,9 @@ last[0] = 0
 print(nested)
 print(last)
 
-# Error values pass through `?` with lists in them.
+# Err values pass through `?` with lists in them.
 let parse = (s: str) -> Result[[str], [str]] =>
-    if s == "" then Error(["empty"]) else Ok([s, s])
+    if s == "" then Err(["empty"]) else Ok([s, s])
 let twice = (s: str) -> Result[[str], [str]] =>
     let parts = parse(s)?
     Ok(parts + parts)

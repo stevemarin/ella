@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import TextIO
 
-from ella.checker import REFLECTION, Checker, check_code, finish
+from ella.checker import OPERATOR_METHODS, REFLECTION, Checker, check_code, finish
 from ella.lexer import EllaError, Span
 from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
@@ -48,6 +48,7 @@ from ella.syntax import (
     Call,
     Case,
     Compare,
+    ConstraintDef,
     Continue,
     EnumDef,
     Expr,
@@ -109,7 +110,20 @@ from ella.values import (
 # overflow. Each Ella call uses a few dozen Python frames, so the Python
 # recursion limit is raised to match while a program runs.
 MAX_CALL_DEPTH = 1000
+
+# How `a.compare(b)` decides each ordering comparison.
+ORDERING: dict[str, Callable[[int], bool]] = {
+    "<": lambda order: order < 0,
+    "<=": lambda order: order <= 0,
+    ">": lambda order: order > 0,
+    ">=": lambda order: order >= 0,
+}
 PYTHON_FRAMES_PER_CALL = 50
+
+
+# A `mut` argument's place, found when the arguments are evaluated: its root
+# variable, its indexes (values) and fields (Member nodes), and its span.
+type Place = tuple[Expr, list[tuple[Value | Member, Span]], Span]
 
 
 class BreakSignal(Exception):
@@ -169,9 +183,10 @@ class Interpreter:
         self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
         # While compiling, a top-level function's splices are expanded before it runs.
         self.prepare_function: Callable[[Lambda], Lambda] | None = None
-        self.structs: dict[str, tuple[str, ...]] = {}  # struct -> its field names
+        self.structs: dict[str, tuple[str, ...]] = {"Error": ("message",)}  # struct -> its field names
         self.nocopy: set[str] = set()  # the nocopy structs
         self.finalizers: dict[str, Value] = {}  # struct -> its finalize function
+        self.methods: dict[str, dict[str, Value]] = {}  # struct or enum -> its methods
         # Values with finalizers, by owner: the program (globals), and each
         # function call and loop iteration in progress, innermost last. When
         # an owner ends, it finalizes its values, newest first.
@@ -189,9 +204,10 @@ class Interpreter:
         # alloc and free change their pool, and are handled in `call_pool`.
         self.globals.define("alloc", Builtin("alloc", 2, lambda args, span: UNIT))
         self.globals.define("free", Builtin("free", 2, lambda args, span: UNIT))
-        # Result and Optional are ordinary enums that happen to be predefined.
+        # Result, Optional and Error are ordinary enums and structs that happen to be predefined.
         self.globals.define("Ok", Constructor("Result", "Ok", 1))
-        self.globals.define("Error", Constructor("Result", "Error", 1))
+        self.globals.define("Err", Constructor("Result", "Err", 1))
+        self.globals.define("Error", Constructor("Error", "Error", 1))
         self.globals.define("Some", Constructor("Optional", "Some", 1))
         self.globals.define("None", VariantValue("Optional", "None"))
 
@@ -282,21 +298,24 @@ class Interpreter:
 
             # Operators
             case Unary(op, operand, span):
-                return unary(op, self.eval(operand, scope), span)
+                value = self.eval(operand, scope)
+                if op == "-" and (method := self.find_method(value, "neg")) is not None:
+                    return self.call(method, [value], span)
+                return unary(op, value, span)
             case Binary("and", left, right):
                 # `and` and `or` only evaluate their right side if needed.
                 return self.eval_bool(left, scope, "'and'") and self.eval_bool(right, scope, "'and'")
             case Binary("or", left, right):
                 return self.eval_bool(left, scope, "'or'") or self.eval_bool(right, scope, "'or'")
             case Binary(op, left, right, span):
-                return binary(op, self.eval(left, scope), self.eval(right, scope), span)
+                return self.binary(op, self.eval(left, scope), self.eval(right, scope), span)
             case Compare(first, rest, span):
                 # `a < b <= c` evaluates each operand once, stopping at the
                 # first comparison that is false.
                 left_value = self.eval(first, scope)
                 for op, operand in rest:
                     right_value = self.eval(operand, scope)
-                    if not compare(op, left_value, right_value, span):
+                    if not self.compare(op, left_value, right_value, span):
                         return False
                     left_value = right_value
                 return True
@@ -324,13 +343,13 @@ class Interpreter:
             # Functions
             case Lambda():
                 return Closure(expr, self.capture(scope))
+            case Call(Member() as callee, args, span):
+                return self.call_member(callee, args, scope, span)
             case Call(callee, args, span):
                 function = self.eval(callee, scope)
                 if isinstance(function, Builtin) and function.name in ("alloc", "free"):
                     return self.call_pool(function.name, args, scope, span)
-                if any(isinstance(arg, MutArg) for arg in args):
-                    return self.call_with_mut(function, args, scope, span)
-                return self.call(function, [self.eval(arg, scope) for arg in args], span)
+                return self.call_with_args(function, args, scope, span)
             case MutArg(span=span):
                 raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
             case Return(returned, span):
@@ -371,6 +390,8 @@ class Interpreter:
             case EnumDef():
                 self.define_enum(expr, scope)
                 return UNIT
+            case ConstraintDef():
+                return UNIT  # constraints are only for the checker
 
     def eval_bool(self, expr: Expr, scope: Scope, what: str) -> bool:
         """Evaluate an expression that must give a bool, since only bools are truthy."""
@@ -438,26 +459,40 @@ class Interpreter:
             case Name(name, name_span):
                 var = self.lookup_mutable(name, scope, name_span)
                 if op != "=":
-                    value = binary(op.removesuffix("="), var.value, value, span)
+                    value = self.binary(op.removesuffix("="), var.value, value, span)
                 var.value = value
             case Index(container_expr, index_expr, index_span):
-                container = self.reference(container_expr, scope, for_assignment=True)
+                root, steps = self.evaluate_place(container_expr, scope)
+                if not isinstance(root, Name):
+                    raise EllaError("can only assign to a variable or a part of one", container_expr.span)
+                container = self.read_place(root, steps, scope)
                 index = self.eval(index_expr, scope)
+                if (setter := self.find_method(container, "set")) is not None:
+                    # `v[k] = x` is `mut v.set(k, x)`, and `v[k] op= x` gets the item first.
+                    if op != "=":
+                        old = self.call(self.method(container, "get", index_span), [container, index], span)
+                        value = self.binary(op.removesuffix("="), old, value, span)
+                    finals: list[Value] = []
+                    self.call(setter, [copy_value(container), index, value], span, finals)
+                    self.write_place(root, steps, finals[0], scope, index_span)
+                    return copy_value(value)
                 old = self.item(container, index, index_span)
                 if op != "=":
-                    value = binary(op.removesuffix("="), old, value, span)
+                    value = self.binary(op.removesuffix("="), old, value, span)
                 self.set_item(container, index, value, index_span)
             case Member(struct_expr, name, member_span):
                 struct = self.reference(struct_expr, scope, for_assignment=True)
                 assert isinstance(struct, VariantValue)
                 i = self.field_index(struct, name, member_span)
                 if op != "=":
-                    value = binary(op.removesuffix("="), struct.fields[i], value, span)
+                    value = self.binary(op.removesuffix("="), struct.fields[i], value, span)
                 struct.fields[i] = value
         return copy_value(value)
 
     def item(self, container: Value, index: Value, span: Span) -> Value:
-        """`container[index]`: an item of a list or string, or a pool's value."""
+        """`container[index]`: an item of a list or string, a pool's value, or what a `get` method gives."""
+        if (getter := self.find_method(container, "get")) is not None:
+            return self.call(getter, [container, index], span)
         if isinstance(container, PoolValue):
             assert isinstance(index, HandleValue)
             return self.pool_slot(container, index, span)
@@ -504,8 +539,15 @@ class Interpreter:
                 captured.define(name, copy_value(var.value))
         return captured
 
-    def call_with_mut(self, function: Value, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
-        """A call with `mut` arguments, which are passed in and out ("value-result").
+    def call_with_args(
+        self,
+        function: Value,
+        args: tuple[Expr, ...],
+        scope: Scope,
+        span: Span,
+        receiver: tuple[Value, Place | None] | None = None,
+    ) -> Value:
+        """Evaluate a call's arguments and call the function, passing `mut` arguments in and out ("value-result").
 
         Each `mut` argument's place is found when the arguments are evaluated:
         the variable, and the values of any indexes. The function gets a copy
@@ -513,23 +555,84 @@ class Interpreter:
         parameter's final value is assigned back to the place, as `place =
         value` would. The compiled code passes the variable by reference
         instead, which no program can tell apart (docs/grammar.md §5).
+
+        A method call's `receiver` is the value it is called on, already
+        evaluated, and the place it was read from if it is `mut`.
         """
         values: list[Value] = []
-        places: list[
-            tuple[int, Expr, list[tuple[Value | Member, Span]]]
-        ] = []  # argument position, root variable, indexes
-        for i, arg in enumerate(args):
+        places: list[Place] = []
+        if receiver is not None:
+            value, place = receiver
+            values.append(value)
+            if place is not None:
+                places.append(place)
+        for arg in args:
             if isinstance(arg, MutArg):
                 root, indexes = self.evaluate_place(arg.target, scope)
-                places.append((i, root, indexes))
+                places.append((root, indexes, arg.span))
                 values.append(copy_value(self.read_place(root, indexes, scope)))
             else:
                 values.append(self.eval(arg, scope))
+        if not places:
+            return self.call(function, values, span)
         finals: list[Value] = []
         result = self.call(function, values, span, finals)
-        for (i, root, indexes), final in zip(places, finals):
-            self.write_place(root, indexes, final, scope, args[i].span)
+        for (root, indexes, place_span), final in zip(places, finals):
+            self.write_place(root, indexes, final, scope, place_span)
         return result
+
+    # Methods
+
+    def call_member(self, callee: Member, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
+        """`v.name(args)`: v's method `name`, called with v first, or a function held in v's field `name`.
+
+        In `mut v.name(args)`, the method changes v.
+        """
+        receiver, name = callee.target, callee.name
+        if isinstance(receiver, MutArg):
+            root, indexes = self.evaluate_place(receiver.target, scope)
+            value = copy_value(self.read_place(root, indexes, scope))
+            function = self.method(value, name, callee.span)
+            return self.call_with_args(function, args, scope, span, (value, (root, indexes, receiver.span)))
+        value = self.eval(receiver, scope)
+        if (
+            self.find_method(value, name) is None
+            and isinstance(value, VariantValue)
+            and name in self.structs.get(value.enum, ())
+        ):
+            return self.call_with_args(value.fields[self.field_index(value, name, callee.span)], args, scope, span)
+        return self.call_with_args(self.method(value, name, callee.span), args, scope, span, (value, None))
+
+    def find_method(self, value: Value, name: str) -> Value | None:
+        """The method `name` of a struct or enum value, if its type has one."""
+        if isinstance(value, VariantValue):
+            return self.methods.get(value.enum, {}).get(name)
+        return None
+
+    def method(self, value: Value, name: str, span: Span) -> Value:
+        method = self.find_method(value, name)
+        if method is None:
+            raise EllaError(f"a {type_name(value)} has no method '{name}'", span)
+        return method
+
+    def binary(self, op: str, left: Value, right: Value, span: Span) -> Value:
+        """An arithmetic operator, which a struct or enum may give with a method (`a + b` is `a.add(b)`)."""
+        if op in OPERATOR_METHODS and (method := self.find_method(left, OPERATOR_METHODS[op])) is not None:
+            return self.call(method, [left, right], span)
+        return binary(op, left, right, span)
+
+    def compare(self, op: str, left: Value, right: Value, span: Span) -> bool:
+        """A comparison. `a < b` on a struct or enum with a `compare` method is `a.compare(b) < 0`, and
+        `a in b` is `b.contains(a)` if b has a `contains` method."""
+        if op in ("in", "not in") and (method := self.find_method(right, "contains")) is not None:
+            found = self.call(method, [right, left], span)
+            assert isinstance(found, bool)
+            return found if op == "in" else not found
+        if op in ORDERING and (method := self.find_method(left, "compare")) is not None:
+            order = self.call(method, [left, right], span)
+            assert isinstance(order, int)
+            return ORDERING[op](order)
+        return compare(op, left, right, span)
 
     def evaluate_place(self, target: Expr, scope: Scope) -> tuple[Expr, list[tuple[Value | Member, Span]]]:
         """The root variable of `xs[i].f[j]`, and its indexes and fields, left to right, with their spans.
@@ -801,11 +904,11 @@ class Interpreter:
             raise EllaError(f"{kind} failed: {cond.source}", cond.span)
 
     def eval_try(self, value: Value, span: Span) -> Value:
-        """Postfix `?`: unwrap `Ok(v)` or `Some(v)`, or return the `Error`/`None` from the function."""
+        """Postfix `?`: unwrap `Ok(v)` or `Some(v)`, or return the `Err`/`None` from the function."""
         match value:
             case VariantValue("Result", "Ok", (inner,)) | VariantValue("Optional", "Some", (inner,)):
                 return inner
-            case VariantValue("Result", "Error") | VariantValue("Optional", "None"):
+            case VariantValue("Result", "Err") | VariantValue("Optional", "None"):
                 raise ReturnSignal(value, span)
         raise EllaError(f"'?' needs a Result or Optional, not {type_name(value)}", span)
 
@@ -922,7 +1025,9 @@ class Interpreter:
     def eval_for(
         self, label: str | None, pattern: Pattern, iterable: Value, body: Expr, scope: Scope, span: Span
     ) -> Value:
-        """`for pattern in iterable`: run the body once for each item."""
+        """`for pattern in iterable`: run the body once for each item (of what an `iter` method gives)."""
+        if (iterator := self.find_method(iterable, "iter")) is not None:
+            iterable = self.call(iterator, [iterable], span)
         match iterable:
             case list() | range():
                 items: list[Value] | range = iterable
@@ -948,14 +1053,17 @@ class Interpreter:
     def define_enum(self, enum: EnumDef, scope: Scope) -> None:
         """Make each variant a name: a value if it has no fields, a constructor if it does.
 
-        A struct also gets its field names, and maybe a finalizer.
+        A struct also gets its field names. Methods are functions, and a
+        struct's `finalize` method is its finalizer.
         """
         if enum.struct:
             self.structs[enum.name] = enum.field_names
             if enum.nocopy:
                 self.nocopy.add(enum.name)
-            if enum.finalize is not None:
-                self.finalizers[enum.name] = self.eval(enum.finalize, scope)
+        if enum.methods:
+            self.methods[enum.name] = {method.name: self.eval(method.function, scope) for method in enum.methods}
+            if "finalize" in self.methods[enum.name]:
+                self.finalizers[enum.name] = self.methods[enum.name]["finalize"]
         for variant in enum.variants:
             if variant.fields:
                 scope.define(variant.name, Constructor(enum.name, variant.name, len(variant.fields)))
@@ -970,6 +1078,8 @@ class Interpreter:
     def builtin_len(self, args: list[Value], span: Span) -> Value:
         """`len(x)` is the length of a list, string or range, or how many values a pool holds."""
         value = args[0]
+        if (method := self.find_method(value, "len")) is not None:
+            return self.call(method, [value], span)
         if isinstance(value, PoolValue):
             return value.live()
         if not isinstance(value, list | str | range):
