@@ -370,6 +370,7 @@ class Lowerer:
         """Make the IR function for a lambda: captures and parameters, `where`, body, and exit."""
         function, t = pending.function, pending.type
         self.start_function(pending.name, t.result, function.span)
+        self.function.captures = len(pending.captures)
         entry = self.block
         self.scopes = [{}]
         self.self_info = SelfInfo(pending.name, t)

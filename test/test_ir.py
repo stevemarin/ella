@@ -1,4 +1,5 @@
 import io
+import shutil
 from collections.abc import Callable
 
 import pytest
@@ -22,6 +23,7 @@ from ella.ir import (
 from ella.ir_interpreter import IRInterpreter, run_ir
 from ella.lexer import EllaError, Span
 from ella.lower import compile_program
+from ella.native import run_native
 from ella.parser import parse
 from ella.passes import optimize
 
@@ -37,6 +39,12 @@ def ir_output(source: str) -> list[str]:
 def optimized_output(source: str) -> list[str]:
     out = io.StringIO()
     IRInterpreter(optimize(compile_program(source)), out).run()
+    return out.getvalue().splitlines()
+
+
+def native_output(source: str) -> list[str]:
+    out = io.StringIO()
+    run_native(source, out)
     return out.getvalue().splitlines()
 
 
@@ -213,6 +221,8 @@ def test_interpreters_agree(source: str) -> None:
     expected = outcome(tree_output, source)
     assert outcome(ir_output, source) == expected
     assert outcome(optimized_output, source) == expected
+    if shutil.which("gcc") is not None:
+        assert outcome(native_output, source) == expected
 
 
 def test_some_programs_fail_the_same_way() -> None:

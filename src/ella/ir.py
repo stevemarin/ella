@@ -175,13 +175,18 @@ class Block:
 
 @dataclass(slots=True)
 class Function:
-    """A function. Its parameters are the entry block's parameters."""
+    """A function. Its parameters are the entry block's parameters.
+
+    The first `captures` parameters are the variables a closure captured;
+    the rest are the declared parameters.
+    """
 
     name: str
     result: Type
     span: Span
     blocks: list[Block] = field(default_factory=list)
     locals: dict[str, Type] = field(default_factory=dict)  # slot name -> type
+    captures: int = 0
 
     @property
     def params(self) -> list[Value]:
@@ -555,6 +560,7 @@ class Verifier:
                 function = self.module.functions.get(instr.name)
                 self.require(function is not None, f"closure of unknown function {instr.name}", block)
                 assert function is not None
+                need(len(args) == function.captures)
                 captured = [p.type for p in function.params[: len(args)]]
                 rest = tuple(p.type for p in function.params[len(args) :])
                 need(captured == args and dest == FuncTy(rest, function.result))

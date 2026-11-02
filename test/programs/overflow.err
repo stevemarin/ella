@@ -1,1 +1,1 @@
-4:11: i64 overflow: the result 9223372036854775808 doesn't fit in 64 bits
+4:11: i64 overflow: 9223372036854775807 + 1 doesn't fit in 64 bits

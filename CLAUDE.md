@@ -1,7 +1,8 @@
 # Ella
 
 A statically typed language for learning and fun, implemented in pure Python
-3.15. See [README.md](README.md) for goals and roadmap.
+3.15. Native executables also link a small C runtime (`src/ella/runtime.c`),
+built with gcc. See [README.md](README.md) for goals and roadmap.
 
 * **Language reference:** [docs/grammar.md](docs/grammar.md). It is the source
   of truth for syntax and semantics. If the implementation needs a rule to
@@ -16,7 +17,7 @@ uv run pytest          # tests (test/)
 uv run ruff check      # lint
 uv run ruff format     # format (line length 119)
 uv run mypy            # strict type checking of src/ and test/
-uv run ella            # CLI entry point (src/ella/__init__.py:main)
+uv run ella FILE       # run a program; --help lists --ir, --asm, --native, -O, ...
 ```
 
 ## Code style
@@ -39,7 +40,7 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Layout (stages 1 to 4 done)
+## Layout (stages 1 to 5 done)
 
 * `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
   `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
@@ -69,12 +70,22 @@ plain:
   `optimize()` in `__init__.py` runs them, verifying the IR after every pass.
   Passes must keep behavior identical, including run-time errors: never fold
   or remove an operation that can fail.
+* `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). A stack slot
+  per value, Ella's own calling convention (arguments pushed; see the module
+  docstring), C calling convention for runtime calls.
+* `src/ella/runtime.c`: the C runtime linked into native programs. It must
+  match `operators.py` and `values.py` exactly, including error messages and
+  float formatting (Python's `repr`).
+* `src/ella/native.py`: builds executables with gcc (the compiled runtime is
+  cached in the temp directory) and runs them (`run_native`).
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
-  of both interpreters and the optimized IR), `test/test_passes.py`,
-  `test/test_cli.py`. `test/programs/` holds
+  of both interpreters, the optimized IR and native code), `test/test_passes.py`,
+  `test/test_native.py`, `test/test_cli.py`. Native tests need gcc and are
+  skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), run through both interpreters and the
-  optimized IR by `test/test_programs.py`.
+  `NAME.err` (expected error), run by `test/test_programs.py` through both
+  interpreters, the optimized IR, and native code (plain and optimized).
 
-Next is stage 5 (x64 code generation); see README.md.
+Next is stage 6 (memory model), then stage 7 (staged programming); see
+README.md.

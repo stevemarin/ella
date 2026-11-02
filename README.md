@@ -28,12 +28,12 @@ The language itself is described in [docs/grammar.md](docs/grammar.md), and
 
 ## Design
 
-### Initial compiler pipeline
+### Compiler pipeline
 
 ```text
-source → tokenizer → parser → AST → type checker → IR → IR interpreter
-                                ↓                     └→ optimizer → x64 code generation
-                                AST interpreter
+source → tokenizer → parser → AST → type checker → IR ──→ IR interpreter
+                                ↓                    └→ optimizer → IR → x64 assembly → native executable
+                                AST interpreter                          (+ C runtime)
 ```
 
 Start with one IR. Add another representation only when a later lowering needs
@@ -110,17 +110,21 @@ and IR rather than treating every compiler pass as a stage of program execution.
 * Lower the verified IR to x64 assembly.
 * Define the calling convention and runtime support needed by generated code.
 * Compare native execution against the IR interpreter on the same programs.
+* Later: register allocation, instead of a stack slot for every value.
 
-### 6. Staged programming and runtime memory
+### 6. Memory model
 
-* Add explicit compile-time and run-time evaluation rules.
-* Represent generated run-time computations as residual IR.
 * Explore memory management without a garbage collector: stack-first
   allocation, arenas for objects with related lifetimes, and pools for
   long-lived fixed-size objects. The design is in
   [docs/memory-model.md](docs/memory-model.md). Until then, the interpreters back lists with
   Python lists: the AST interpreter copies them to get value semantics, and
   the IR builds new lists instead of changing them.
+
+### 7. Staged programming
+
+* Add explicit compile-time and run-time evaluation rules.
+* Represent generated run-time computations as residual IR.
 
 ## Current status
 
@@ -144,16 +148,26 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   promote slots to SSA values (mem2reg), fold and propagate constants,
   simplify the control-flow graph, and remove dead code. The IR is verified
   after every pass, and every test program also runs through the optimized IR.
+* Stage 5 is done: the code generator ([src/ella/codegen.py](src/ella/codegen.py))
+  turns IR into x64 assembly, which gcc links with a small C runtime
+  ([src/ella/runtime.c](src/ella/runtime.c)) into a native executable
+  ([src/ella/native.py](src/ella/native.py)). Every value gets a stack slot,
+  and Ella functions pass arguments on the stack. Every test program runs
+  natively too, and must print the same output and errors byte for byte.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)
 uv run ella --tree example_syntax.ella    # check and run it with the AST interpreter
 uv run ella -O example_syntax.ella        # optimize the IR, then run it
+uv run ella --native example_syntax.ella  # compile to native code and run it (add -O to optimize)
+uv run ella -o tour example_syntax.ella   # compile to a native executable named tour
+uv run ella --asm example_syntax.ella     # print the x64 assembly
 uv run ella --ir example_syntax.ella      # print the IR (add -O to optimize it,
                                           # or --passes mem2reg,fold to pick passes)
 uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-Native code generation and the later roadmap items are design goals, not
-implemented features yet.
+Memory management (stage 6) and staged programming (stage 7) are design goals,
+not implemented features yet. Native programs need gcc; memory is allocated and
+never freed until stage 6.

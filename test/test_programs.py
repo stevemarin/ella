@@ -1,12 +1,14 @@
 """Run every program in test/programs and compare with its expected output (see test/programs/README.md).
 
-Each program is run three ways: by the tree-walking interpreter, through the
-IR, and through the optimized IR. All must give the expected output and
-error. This is what checks that lowering and optimization keep the program's
+Each program is run five ways: by the tree-walking interpreter, through the
+IR, through the optimized IR, and as native code made from the plain and the
+optimized IR. All must give the expected output and error. This is what
+checks that lowering, optimization and code generation keep the program's
 meaning.
 """
 
 import io
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
@@ -18,6 +20,7 @@ from ella.interpreter import Interpreter
 from ella.ir_interpreter import IRInterpreter, run_ir
 from ella.lexer import EllaError
 from ella.lower import compile_program
+from ella.native import run_native
 from ella.parser import parse
 from ella.passes import optimize
 
@@ -36,12 +39,24 @@ def run_optimized(source: str, out: TextIO) -> None:
     IRInterpreter(optimize(compile_program(source)), out).run()
 
 
-RUNNERS: dict[str, Callable[[str, TextIO], None]] = {"tree": run_tree, "ir": run_ir, "optimized": run_optimized}
+def run_native_unoptimized(source: str, out: TextIO) -> None:
+    run_native(source, out, optimized=False)
+
+
+RUNNERS: dict[str, Callable[[str, TextIO], None]] = {
+    "tree": run_tree,
+    "ir": run_ir,
+    "optimized": run_optimized,
+    "native": run_native_unoptimized,
+    "native-optimized": run_native,
+}
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
 @pytest.mark.parametrize("path", sorted(PROGRAMS.glob("*.ella")), ids=lambda path: path.stem)
 def test_program(path: Path, runner: str) -> None:
+    if runner.startswith("native") and shutil.which("gcc") is None:
+        pytest.skip("native code needs gcc")
     out = io.StringIO()
     expected_error = path.with_suffix(".err")
     if expected_error.exists():

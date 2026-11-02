@@ -1,15 +1,19 @@
 """Ella: a statically typed language for learning and fun."""
 
 import argparse
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from ella.checker import check
+from ella.codegen import generate
 from ella.interpreter import Interpreter
-from ella.ir import format_module
+from ella.ir import Module, format_module
 from ella.ir_interpreter import IRInterpreter
 from ella.lexer import EllaError, tokenize
 from ella.lower import compile_program
+from ella.native import build, parse_error
 from ella.parser import parse
 from ella.passes import PASSES, optimize
 from ella.syntax import show
@@ -23,7 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--tokens", action="store_true", help="print the tokens")
     mode.add_argument("--ast", action="store_true", help="print the syntax tree")
     mode.add_argument("--ir", action="store_true", help="print the IR")
+    mode.add_argument("--asm", action="store_true", help="print the x64 assembly")
     mode.add_argument("--tree", action="store_true", help="run with the tree-walking interpreter instead of the IR")
+    mode.add_argument("--native", action="store_true", help="compile to a native executable and run it")
+    mode.add_argument("-o", "--output", type=Path, help="compile to a native executable with this name")
     args.add_argument("-O", "--optimize", action="store_true", help="optimize the IR before running or printing it")
     args.add_argument(
         "--passes",
@@ -55,6 +62,12 @@ def main(argv: list[str] | None = None) -> int:
                 optimize(module, passes)
             if options.ir:
                 print(format_module(module), end="")
+            elif options.asm:
+                print(generate(module), end="")
+            elif options.output is not None:
+                build(module, options.output)
+            elif options.native:
+                run_executable(module)
             else:
                 IRInterpreter(module).run()
     except EllaError as error:
@@ -63,3 +76,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{options.file}:{error}", file=sys.stderr)
         return 1
     return 0
+
+
+def run_executable(module: Module) -> None:
+    """Build a native executable in a temporary directory, run it, and pass on its output."""
+    with tempfile.TemporaryDirectory() as directory:
+        executable = Path(directory) / "program"
+        build(module, executable)
+        result = subprocess.run([str(executable)], check=False, capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        raise parse_error(result.stderr)

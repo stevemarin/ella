@@ -44,7 +44,7 @@ def unary(op: str, value: Value, span: Span) -> Value:
         case _, bool():
             pass  # bools aren't numbers, though Python thinks they are
         case "-", int():
-            return check_i64(-value, span)
+            return check_i64(-value, f"-({value})", span)
         case "-", float():
             return -value
         case "~", int():
@@ -71,10 +71,15 @@ def binary(op: str, a: Value, b: Value, span: Span) -> Value:
     raise EllaError(f"'{op}' doesn't work on {type_name(a)}", span)
 
 
-def check_i64(n: int, span: Span) -> int:
-    """i64 arithmetic traps on overflow: a result that doesn't fit is an error."""
+def check_i64(n: int, expr: str, span: Span) -> int:
+    """i64 arithmetic traps on overflow: a result that doesn't fit is an error.
+
+    The message shows the operation, like `9223372036854775807 + 1`, rather
+    than the result, which can be huge. (Native code reports overflow the
+    same way, and its operands always fit in 64 bits.)
+    """
     if not fits_i64(n):
-        raise EllaError(f"i64 overflow: the result {n} doesn't fit in 64 bits", span)
+        raise EllaError(f"i64 overflow: {expr} doesn't fit in 64 bits", span)
     return n
 
 
@@ -82,11 +87,11 @@ def int_op(op: str, a: int, b: int, span: Span) -> Value:
     """i64 arithmetic. Python computes the exact result, then we check it fits."""
     match op:
         case "+":
-            return check_i64(a + b, span)
+            return check_i64(a + b, f"{a} + {b}", span)
         case "-":
-            return check_i64(a - b, span)
+            return check_i64(a - b, f"{a} - {b}", span)
         case "*":
-            return check_i64(a * b, span)
+            return check_i64(a * b, f"{a} * {b}", span)
         case "/":
             return float_div(float(a), float(b))  # `/` always gives f64
         case "//" | "%":
@@ -94,7 +99,7 @@ def int_op(op: str, a: int, b: int, span: Span) -> Value:
                 raise EllaError("integer division by zero", span)
             # Python's // and % already round toward negative infinity, as
             # Ella's do. Only `I64_MIN // -1` can overflow.
-            return check_i64(a // b, span) if op == "//" else a % b
+            return check_i64(a // b, f"{a} // {b}", span) if op == "//" else a % b
         case "**":
             if b < 0:
                 raise EllaError("an i64 can't be raised to a negative power", span)
@@ -102,7 +107,7 @@ def int_op(op: str, a: int, b: int, span: Span) -> Value:
             # exponent of 64, so don't compute an enormous number first.
             if abs(a) > 1 and b >= 64:
                 raise EllaError(f"i64 overflow: {a} ** {b} doesn't fit in 64 bits", span)
-            return check_i64(a**b, span)
+            return check_i64(a**b, f"{a} ** {b}", span)
         case "&":
             return a & b
         case "|":
@@ -117,7 +122,7 @@ def int_op(op: str, a: int, b: int, span: Span) -> Value:
             # error, not a silent change of sign. `>>` can't overflow;
             # Python's >> on a negative number is an arithmetic shift, as
             # Ella's is.
-            return check_i64(a << b, span) if op == "<<" else a >> b
+            return check_i64(a << b, f"{a} << {b}", span) if op == "<<" else a >> b
     raise EllaError(f"'{op}' doesn't work on i64", span)
 
 
