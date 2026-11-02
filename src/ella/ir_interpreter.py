@@ -34,7 +34,16 @@ strings from arena 3 is tagged with arena 3.) The interpreter checks that
   the value's tag says it can.
 
 A failed check is a bug in the compiler, reported as a run-time error that
-starts with "memory check failed". The interpreter also adds up roughly how
+starts with "memory check failed".
+
+A pool's values each live in an arena of their own, a *slot arena*, which
+is freed when the value is (`free`) or replaced. Slot arenas are numbered
+from SLOT_DEPTH up, and aren't freed in any particular order, so they are
+only checked for use after they are freed. Operations that put a value in
+a pool copy it into the slot's arena.
+
+When an arena is freed, the finalizers of the values in it run first,
+newest first (docs/memory-model.md §7). The interpreter also adds up roughly how
 many bytes native code would use (`--profile` shows them): the high-water
 mark of each scope level, and what each allocating instruction made.
 """
@@ -44,13 +53,39 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TextIO
 
-from ella.checker import EnumTy, ListTy
-from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, allocates, is_boxed, region_level
+from ella.checker import EnumTy, ListTy, check_code
+from ella.ir import (
+    Block,
+    Branch,
+    Function,
+    Instr,
+    Jump,
+    Module,
+    Return,
+    Trap,
+    allocates,
+    is_boxed,
+    region_level,
+    verify,
+)
 from ella.ir import Value as IRValue
 from ella.lexer import EllaError, Span
-from ella.lower import BINARY_OPS, COMPARE_OPS, compile_program
+from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
 from ella.operators import binary, compare, contains, index_into, unary
-from ella.values import UNIT, FunctionRef, Value, VariantValue, copy_value, to_text
+from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
+from ella.syntax import Expr, Name
+from ella.values import (
+    UNIT,
+    CodeValue,
+    FunctionRef,
+    HandleValue,
+    PoolValue,
+    TypeValue,
+    Value,
+    VariantValue,
+    copy_value,
+    to_text,
+)
 
 # The other direction of ella.lower's tables: IR operation -> Ella operator.
 OPERATORS = {op: symbol for symbol, op in (BINARY_OPS | COMPARE_OPS).items()}
@@ -63,10 +98,13 @@ PYTHON_FRAMES_PER_CALL = 10
 # values that aren't boxed or are static constants.
 type Tag = tuple[int, int] | None
 
+SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
+POOL = "<pool>"  # the finalizer of a pool: free its values
+
 
 def run_ir(source: str, out: TextIO | None = None) -> None:
     """Compile a program to IR and run it. Raises EllaError."""
-    IRInterpreter(compile_program(source), out).run()
+    IRInterpreter(compile_program(source, out), out).run()
 
 
 @dataclass(slots=True)
@@ -74,6 +112,8 @@ class Arena:
     generation: int = 0
     used: int = 0  # estimated bytes in use
     owner: tuple[str, int] = ("global", 0)  # the function and scope level using it
+    # The values in it with finalizers, oldest first, with the finalizer's IR function.
+    finals: list[tuple[Value, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -107,6 +147,9 @@ class IRInterpreter:
         self.depth = 0  # how many calls are in progress
         self.arenas = [Arena()]  # by depth; 0 is the global arena
         self.next_depth = 1
+        self.slot_arenas: dict[int, Arena] = {}
+        self.free_slot_arenas: list[int] = []
+        self.pool_arenas: dict[int, list[int]] = {}  # id of a pool -> the arena of each of its slots
         self.high_water: dict[tuple[str, int], int] = defaultdict(int)
         self.sites: dict[tuple[str, Span, str], Site] = defaultdict(Site)
 
@@ -115,15 +158,25 @@ class IRInterpreter:
         sys.setrecursionlimit(max(limit, MAX_CALL_DEPTH * PYTHON_FRAMES_PER_CALL))
         try:
             self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
+            self.free(0, 1)  # the globals, at the end of the program
         finally:
             sys.setrecursionlimit(limit)
 
     # Arenas
 
     def arena(self, depth: int) -> Arena:
+        if depth >= SLOT_DEPTH:
+            return self.slot_arenas[depth]
         while len(self.arenas) <= depth:
             self.arenas.append(Arena())
         return self.arenas[depth]
+
+    def new_slot_arena(self) -> int:
+        if self.free_slot_arenas:
+            return self.free_slot_arenas.pop()
+        depth = SLOT_DEPTH + len(self.slot_arenas)
+        self.slot_arenas[depth] = Arena(owner=("pool slots", 0))
+        return depth
 
     def depth_of(self, region: str, frame: Frame) -> int:
         level = region_level(region)
@@ -145,19 +198,50 @@ class IRInterpreter:
         return (depth, arena.generation)
 
     def free(self, first: int, end: int) -> None:
-        """Free the arenas at depths first, ..., end - 1."""
-        for depth in range(first, end):
-            arena = self.arena(depth)
-            arena.generation += 1
-            arena.used = 0
+        """Free the arenas at depths end - 1, ..., first, after running their finalizers."""
+        for depth in reversed(range(first, end)):
+            self.free_arena(depth)
+
+    def free_arena(self, depth: int) -> None:
+        arena = self.arena(depth)
+        while arena.finals:
+            value, finalizer = arena.finals.pop()
+            self.finalize(value, finalizer)
+        arena.generation += 1
+        arena.used = 0
+        if depth >= SLOT_DEPTH:
+            self.free_slot_arenas.append(depth)
+
+    def finalize(self, value: Value, finalizer: str) -> None:
+        if finalizer == POOL:
+            assert isinstance(value, PoolValue)
+            for slot in reversed(range(len(value.slots))):
+                if value.slots[slot] is not None:
+                    self.free_arena(self.pool_arenas[id(value)][slot])
+                    value.slots[slot] = None
+            return
+        self.call(self.module.functions[finalizer], [value], [None], 0, {}, Span(0, 0))
+
+    def move_finals(self, value: Value, depth: int) -> None:
+        """Move the finalizers of the values `value` holds to the arena at `depth`, keeping their order."""
+        moving = {id(v) for v in held_values(value)}
+        moved: list[tuple[Value, str]] = []
+        for arena in [*self.arenas, *self.slot_arenas.values()]:
+            if any(id(v) in moving for v, _ in arena.finals):
+                moved += [(v, f) for v, f in arena.finals if id(v) in moving]
+                arena.finals = [(v, f) for v, f in arena.finals if id(v) not in moving]
+        self.arena(depth).finals += moved
 
     def check_alive(self, tag: Tag, what: str, span: Span) -> None:
         if tag is not None and self.arena(tag[0]).generation != tag[1]:
             raise EllaError(f"memory check failed: {what} is used after its arena (depth {tag[0]}) was freed", span)
 
     def check_fits(self, tag: Tag, depth: int, what: str, span: Span) -> None:
-        """A value tagged `tag` may be stored in a place in the arena at `depth`: it lives at least as long."""
-        if tag is not None and tag[0] > depth:
+        """A value tagged `tag` may be stored in a place in the arena at `depth`: it lives at least as long.
+
+        Slot arenas don't come in order, so they are only checked when used.
+        """
+        if tag is not None and tag[0] > depth and tag[0] < SLOT_DEPTH and depth < SLOT_DEPTH:
             raise EllaError(
                 f"memory check failed: {what} would outlive its arena (depth {tag[0]} stored at depth {depth})", span
             )
@@ -199,7 +283,9 @@ class IRInterpreter:
                     case Branch(cond, then, else_):
                         block = then if frame.values[cond.id] else else_
                     case Return(value, outs):
-                        return self.leave(value, outs, frame, span)
+                        returned = self.leave(value, outs, frame, span)
+                        self.free(base, base + function.levels)
+                        return returned
                     case Trap(message, value, trap_span):
                         if value is not None:
                             self.check_alive(frame.tags.get(value.id), str(value), trap_span)
@@ -208,7 +294,7 @@ class IRInterpreter:
                     case None:
                         raise AssertionError(f"{function.name}: {block.name} has no terminator")
         finally:
-            self.free(base, base + function.levels)
+            # After an error, the program stops: nothing is freed or finalized.
             self.next_depth = base
             self.depth -= 1
 
@@ -242,7 +328,12 @@ class IRInterpreter:
             self.check_alive(arg_tag, str(arg), span)
         result: Value = UNIT
         tag: Tag = None
-        depth = self.depth_of(instr.region, frame) if instr.region else 0
+        if instr.region == "slot":
+            # The arena of the object being changed: a pool's value, in its slot's arena.
+            assert tags[0] is not None
+            depth = tags[0][0]
+        else:
+            depth = self.depth_of(instr.region, frame) if instr.region else 0
         match instr.op:
             case "const":
                 result = instr.const
@@ -294,9 +385,11 @@ class IRInterpreter:
                 container, i, item = args
                 index_into(container, i, span)  # check that the index is in range
                 assert isinstance(container, list) and isinstance(i, int)
-                self.check_fits(tags[0], depth, f"the list {instr.args[0]}", span)
-                self.check_fits(tags[2], depth, f"the item {instr.args[2]}", span)
-                container[i] = item
+                container[i] = self.store_in(item, tags[0], tags[2], depth, instr, frame)
+            case "set_field":
+                struct, item = args
+                assert isinstance(struct, VariantValue)
+                struct.fields[instr.index] = self.store_in(item, tags[0], tags[1], depth, instr, frame)
             case "append":
                 items, new_items = args
                 assert isinstance(items, list) and isinstance(new_items, list)
@@ -308,20 +401,52 @@ class IRInterpreter:
             case "copy":
                 result = copy_value(args[0])
                 tag = self.allocate(depth, deep_size(result), instr, frame)
+            case "move":
+                # Something that can't be copied, moved to another arena (a returned local variable).
+                result = copy_value(args[0])  # the same object: it isn't copied
+                self.move_finals(result, depth)
+                tag = self.allocate(depth, deep_size(result), instr, frame)
+            case "pool_new":
+                result = PoolValue()
+                self.pool_arenas[id(result)] = []
+            case "alloc" | "pool_get" | "pool_set" | "free":
+                result, tag = self.execute_pool(instr, args, tags, frame)
+            case "quote_begin":
+                quote, _ = self.module.templates[instr.index]
+                result = start_code(quote, self.module.tables)  # type: ignore[assignment]
+            case "quote":
+                result = self.build_code(instr, args)
+            case "run":
+                result, tag = self.run_code(args[0], depth, span)
+            case "type_value":
+                texpr, static = self.module.types[instr.index]
+                if args:
+                    spliced = iter(args)
+                    result = TypeValue(type_from(texpr, self.module.enums, lambda node: next(spliced)))
+                else:
+                    result = TypeValue(static)
+            case "reflect":
+                result = reflect(instr.name, args, self.module.enums, span)
             case "reset":
                 self.free(frame.base + instr.index, frame.base + frame.function.levels)
             case "len":
                 container = args[0]
-                assert isinstance(container, list | str | range)
-                result = len(container)
+                if isinstance(container, PoolValue):
+                    result = container.live()
+                else:
+                    assert isinstance(container, list | str | range)
+                    result = len(container)
             case "to_text":
                 result = to_text(args[0])
             case "print":
                 self.out.write(to_text(args[0]) + "\n")
             case "variant":
                 assert instr.dest is not None and isinstance(instr.dest.type, EnumTy)
-                result = VariantValue(instr.dest.type.name, instr.name, tuple(args))
+                enum = self.module.enums[instr.dest.type.name]
+                result = VariantValue(enum.name, instr.name, list(args), nocopy=enum.nocopy)
                 tag = shortest(*tags)
+                if enum.finalize:
+                    self.arena(depth).finals.append((result, enum.finalize))
             case "is_variant":
                 value = args[0]
                 result = isinstance(value, VariantValue) and value.variant == instr.name
@@ -340,10 +465,95 @@ class IRInterpreter:
             case op:
                 raise AssertionError(f"unknown IR operation {op}")
         if instr.dest is not None:
-            if allocates(instr) and instr.op not in ("append", "copy", "call"):
+            if instr.op == "pool_new":
+                self.arena(depth).finals.append((result, POOL))
+            if allocates(instr) and instr.op not in ("append", "copy", "move", "call", "run"):
                 tag = shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
             frame.values[instr.dest.id] = result
             frame.tags[instr.dest.id] = tag if is_boxed(instr.dest.type) else None
+
+    def store_in(
+        self, item: Value, container_tag: Tag, item_tag: Tag, depth: int, instr: Instr, frame: Frame
+    ) -> Value:
+        """The value to store into an object in the arena at `depth`, checking it lives long enough.
+
+        A pool's value lives in its slot's arena, so a value stored into it is
+        copied there.
+        """
+        if depth >= SLOT_DEPTH:
+            copied = copy_value(item)
+            self.allocate(depth, deep_size(copied), instr, frame)
+            return copied
+        self.check_fits(container_tag, depth, f"the object {instr.args[0]}", instr.span)
+        self.check_fits(item_tag, depth, f"the value {instr.args[-1]}", instr.span)
+        return item
+
+    def execute_pool(self, instr: Instr, args: list[Value], tags: list[Tag], frame: Frame) -> tuple[Value, Tag]:
+        """`alloc`, `free`, `pool_get` and `pool_set`. Each value of a pool lives in its slot's own arena."""
+        pool, key = args[0], args[1]
+        assert isinstance(pool, PoolValue)
+        arenas = self.pool_arenas[id(pool)]
+        if instr.op == "alloc":
+            depth = self.new_slot_arena()
+            value = copy_value(key)  # a value that can't be copied is moved, finalizers and all
+            self.move_finals(value, depth)
+            self.allocate(depth, deep_size(value), instr, frame)
+            if pool.free:
+                slot = pool.free.pop()
+                pool.slots[slot], arenas[slot] = value, depth
+            else:
+                slot = len(pool.slots)
+                pool.slots.append(value)
+                pool.generations.append(0)
+                arenas.append(depth)
+            return HandleValue(slot, pool.generations[slot]), None
+        assert isinstance(key, HandleValue)
+        if key.slot >= len(pool.slots) or pool.generations[key.slot] != key.generation:
+            raise EllaError(f"handle {to_text(key)} is stale: its value was freed", instr.span)
+        depth = arenas[key.slot]
+        match instr.op:
+            case "pool_get":
+                held = pool.slots[key.slot]
+                assert held is not None
+                return held, (depth, self.arena(depth).generation)
+            case "pool_set":
+                # Copy the new value into a new arena before freeing the old one: it may share parts of the old value.
+                new_depth = self.new_slot_arena()
+                value = copy_value(args[2])
+                self.allocate(new_depth, deep_size(value), instr, frame)
+                self.free_arena(depth)
+                pool.slots[key.slot], arenas[key.slot] = value, new_depth
+            case _:  # free
+                self.free_arena(depth)
+                pool.slots[key.slot] = None
+                pool.generations[key.slot] += 1
+                pool.free.append(key.slot)
+        return UNIT, None
+
+    def build_code(self, instr: Instr, args: list[Value]) -> Value:
+        """`quote`: build the code from the quote's syntax tree, with the splices and constants computed for it."""
+        _, outer_count = self.module.templates[instr.index]
+        builder = args[0]
+        assert isinstance(builder, CodeBuilder)
+        outer = [b.renamed for b in args[1 : 1 + outer_count] if isinstance(b, CodeBuilder)]
+        values = iter(args[1 + outer_count :])
+
+        def splice(node: AnySplice) -> object:
+            return splice_value(node, next(values))
+
+        def persist(node: Name) -> Expr:
+            return reify(copy_value(next(values)), node.span)
+
+        return CodeValue(builder.build(splice, persist, outer))
+
+    def run_code(self, code: Value, depth: int, span: Span) -> tuple[Value, Tag]:
+        """`run`: check the code and lower it into the module as a function of its own, then call it."""
+        assert isinstance(code, CodeValue)
+        checker = check_code(code.expr, self.module.checker)
+        name = Lowerer(checker, self.module).lower_code(code.expr)
+        verify(self.module)
+        result, tag, _ = self.call(self.module.functions[name], [], [], depth, {}, span)
+        return result, tag
 
     def execute_call(
         self, instr: Instr, args: list[Value], tags: list[Tag], depth: int, frame: Frame
@@ -418,3 +628,15 @@ def deep_size(value: Value) -> int:
             return shallow_size(value) + sum(deep_size(item) for item in captured)
         case _:
             return shallow_size(value)
+
+
+def held_values(value: Value) -> list[Value]:
+    """The objects a value holds, itself included."""
+    match value:
+        case VariantValue(fields=fields):
+            return [value, *(v for item in fields for v in held_values(item))]
+        case list() | tuple():
+            return [v for item in value for v in held_values(item)]
+        case PoolValue():
+            return [value]
+    return []

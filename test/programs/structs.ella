@@ -1,0 +1,82 @@
+# Structs: named fields, value semantics, changes in place, and generic structs and functions.
+
+struct Point
+    x: f64
+    y: f64
+
+struct Box
+    items: [i64]
+    label: str
+
+struct Pair[A, B]
+    first: A
+    second: B
+
+let mut p = Point(1.0, 2.0)
+let q = p
+p.x = 3.0
+print(p)
+print(q)
+print(p.x + p.y)
+match p
+    case Point(x, y) => print(x * y)
+print(Point(1.0, 2.0) == Point(1.0, 2.0))
+
+# Copies are deep; fields change in place.
+let boxes = () -> [Box] =>
+    let mut a = Box([1], "a")
+    let b = a
+    a.items += [2]
+    a.items[0] = 9
+    a.label = a.label + "!"
+    let mut all = [a, b]
+    all[1].items += [7]
+    print(a)
+    all
+print(boxes())
+
+# Built up in a loop, in place, in the caller's arena.
+struct Acc
+    total: i64
+    names: [str]
+let collect = (n: i64) -> Acc =>
+    let mut acc = Acc(0, [])
+    for i in 0..n
+        let name = "n{{i}}"
+        acc.total += i
+        acc.names += [name]
+    acc
+print(collect(4))
+
+# Fields as mut arguments.
+let push = (mut xs: [i64], x: i64) -> () =>
+    xs += [x]
+let mut b = Box([], "b")
+push(mut b.items, 3)
+let mut bs = [Box([1], "c")]
+push(mut bs[0].items, 4)
+print(b)
+print(bs)
+
+# Generic functions, made for each set of types they are used with.
+let pair[A, B] = (a: A, b: B) -> Pair[A, B] => Pair(a, b)
+let swap[A, B] = (p: Pair[A, B]) -> Pair[B, A] => Pair(p.second, p.first)
+let map[T, U] = (xs: [T], f: (T) -> U) -> [U] =>
+    let mut out = []
+    for x in xs
+        out += [f(x)]
+    out
+let rest[T] = (xs: [T]) -> [T] =>
+    let mut out = []
+    for i in 1..len(xs)
+        out += [xs[i]]
+    out
+let reverse[T] = (xs: [T]) -> [T] => if len(xs) == 0 then [] else reverse(rest(xs)) + [xs[0]]
+let id[T] = (x: T) -> T => x
+
+print(pair(1, "x"))
+print(swap(pair(1, "x")))
+print(map([1, 2, 3], (x: i64) -> str => "<{{x}}>"))
+print(reverse(["a", "b", "c"]))
+print(reverse([[1], [2]]))
+print(id(id)(5))

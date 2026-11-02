@@ -1,0 +1,21 @@
+open x
+open tb
+free tmp
+3
+open r0
+free r0
+open r1
+free r1
+free kept
+counted 2
+free two ta
+free tb
+free ta
+free x
+open p2
+free p1
+end of top level
+main
+free main
+free p2
+free global

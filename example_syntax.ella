@@ -177,6 +177,54 @@ let area = (s: Shape) -> f64 =>
         case Rect(w, h) => w * h
         case Empty => 0.0
 
+# structs have named fields; generic types and functions take type parameters
+struct Point
+    x: f64
+    y: f64
+let mut corner = Point(1.0, 2.0)
+corner.x = 3.0
+assert corner.x + corner.y == 5.0
+
+struct Pair[T]
+    first: T
+    second: T
+let swap[T] = (p: Pair[T]) -> Pair[T] => Pair(p.second, p.first)
+assert swap(Pair(1, 2)) == Pair(2, 1)
+
+# a nocopy struct is never copied, and its finalizer runs when it dies
+nocopy struct Session
+    user: str
+    finalize = (s: Session) -> () => print("goodbye {{s.user}}")
+
+# a pool holds long-lived values; a handle to a freed value is caught
+let mut points: Pool[Point] = pool_new()
+let p = alloc(mut points, Point(0.0, 1.0))
+points[p].y += 1.0
+assert points[p].y == 2.0
+free(mut points, p)
+
+# multi-stage programming: quote makes code, $ splices it in, and a splice
+# outside any quote runs while compiling
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+let cube = (x: i64) -> i64 => $(power(3, quote x))   # compiles to x * (x * (x * 1))
+assert cube(2) == 8
+
+# types are values too, so code can be generated from a struct's fields:
+# $t splices in a type, and v.$f a field
+let sum_fields = (names: [str], v: Code[Point]) -> Code[f64] =>
+    let mut total = quote 0.0
+    for name in names
+        total = quote $total + $v.$name
+    total
+let point_sum = $(quote (p: Point) -> f64 => $(sum_fields(fields(type Point), quote p)))
+assert point_sum(Point(1.0, 2.0)) == 3.0
+
+# functions can compute types while compiling, used with $ in a type
+let Stack = (t: Type) -> Type => new_struct("Stack[{{type_name(t)}}]", ["items"], [type [$t]])
+let numbers: $(Stack(type i64)) = $(Stack(type i64))([1, 2])
+assert len(numbers.items) == 2
+
 # if main is defined, it runs after the top-level code
 let main = () -> () =>
     print("done")

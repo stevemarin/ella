@@ -40,7 +40,7 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Layout (stages 1 to 6 done)
+## Layout (stages 1 to 7 done)
 
 * `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
   `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
@@ -49,18 +49,28 @@ plain:
   tokens … `INTERP_END`, `STRING_END`).
 * `src/ella/syntax.py`: AST node dataclasses, and `show()` for S-expressions.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
-  parsing notes in §11.
+  parsing notes in §12.
 * `src/ella/checker.py`: static type checker with simple inference
   (unification of type variables). Records each node's type and what each
   name refers to, in tables keyed by `id(node)`, for the lowering. Also the
-  `mut` argument rules and their exclusivity check.
+  `mut` argument rules and their exclusivity check, stages (each variable's
+  level), generic functions, and the rules for `nocopy` values
+  (`check_copies`). Splices in types run while checking, through
+  `compile_time` (set by `staging.Expander`).
+* `src/ella/staging.py`: multi-stage programming: building code from quotes
+  (fresh names, constants, and splices of code, types and field names),
+  reflection on types (`fields(t)`, ...), and expanding splices outside quotes
+  before lowering (`prepare` = check + expand + check again; use it rather
+  than `check` to run a program).
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
-  the reference for the language's behavior. It copies eagerly, and passes
-  `mut` arguments in and out (value-result).
+  the reference for the language's behavior. It copies eagerly, passes
+  `mut` arguments in and out (value-result), and finalizes values through
+  owners (one per call and loop iteration). It is also the compile-time
+  evaluator for splices.
 * `src/ella/ir.py`: the IR (typed CFG: functions, blocks with parameters,
   three-address instructions, terminators), its printer and its verifier.
   The module docstring specifies every operation.
@@ -68,10 +78,12 @@ plain:
   local slots; lambdas are closure converted. It also decides memory: which
   region (arena) each object is made in, and where `copy` is needed, by
   tracking what each value borrows and how long it lives (see its docstring
-  and docs/memory-model.md §14).
-* `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas, checks every
-  use and store against them ("memory check failed" means a compiler bug),
-  and keeps the `--profile` numbers.
+  and docs/memory-model.md §14). Generic functions are specialized per type
+  arguments.
+* `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
+  and an arena per pool slot), runs finalizers, checks every use and store
+  ("memory check failed" means a compiler bug), and keeps the `--profile`
+  numbers. It builds run-time code and lowers it into the module for `run`.
 * `src/ella/passes/`: optimization passes, one module each (`mem2reg`,
   `moves`, `fold`, `simplify`, `dce`), each `pass(function, module) -> bool`
   (changed?).
@@ -83,8 +95,9 @@ plain:
   docstring), C calling convention for runtime calls.
 * `src/ella/runtime.c`: the C runtime linked into native programs. It must
   match `operators.py` and `values.py` exactly, including error messages and
-  float formatting (Python's `repr`). Objects live in arenas: one reserved
-  address range per depth, bump allocated, freed by scope.
+  float formatting (Python's `repr`). Objects live in arenas, all in one
+  reserved address range (so an object's arena follows from its address),
+  bump allocated, freed by scope or pool slot, with finalization lists.
 * `src/ella/native.py`: builds executables with gcc (the compiled runtime is
   cached in the temp directory) and runs them (`run_native`, which sets
   `ELLA_POISON` so freed arena memory is overwritten).
@@ -97,5 +110,6 @@ plain:
   `NAME.err` (expected error), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized).
 
-Next is stage 7 (staged programming); see README.md. Pools, slabs and
-non-copyable types (the rest of docs/memory-model.md) come after it.
+Stage 7 (staged programming, structs, generics, pools, nocopy and
+finalizers) is done; see README.md and docs/memory-model.md §15 for what is
+still open.

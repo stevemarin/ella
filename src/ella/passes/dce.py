@@ -12,7 +12,8 @@ error. Only instructions that can never fail are removed:
 
 * building and taking apart values: `const`, `tuple`, `list`, `variant`,
   `closure`, `tuple_get`, `is_variant`, `variant_field`, `range`, `len`,
-  `to_text`
+  `to_text`, `copy`, `quote` (but not making a struct with a finalizer,
+  which will run)
 * comparisons, `not`, and the bitwise operations that can't overflow
 * floating point arithmetic, which never fails (IEEE 754 gives infinities
   and NaNs instead), and joining strings and lists with `add`
@@ -27,7 +28,7 @@ Finally, scope levels that nothing allocates in any more are dropped, with
 the `reset`s that free them (ella.ir.trim_levels).
 """
 
-from ella.checker import F64, STR, ListTy
+from ella.checker import F64, STR, EnumTy, ListTy
 from ella.ir import Function, Instr, Module, remove_param, trim_levels, used_values
 
 # Operations that never fail and have no effect.
@@ -59,14 +60,18 @@ SAFE = frozenset(
         "bitxor",
         "div",  # always f64, so it never fails
         "copy",
+        "quote",
+        "quote_begin",
     }
 )
 
 
-def can_remove(instr: Instr) -> bool:
+def can_remove(instr: Instr, module: Module) -> bool:
     """Whether an instruction whose result is unused can be removed."""
     if instr.dest is None:
         return False  # it is only there for its effect
+    if instr.op == "variant" and isinstance(instr.dest.type, EnumTy) and module.enums[instr.dest.type.name].finalize:
+        return False  # making it registers its finalizer, which will run
     if instr.op in SAFE:
         return True
     t = instr.dest.type
@@ -82,7 +87,7 @@ def eliminate_dead_code(function: Function, module: Module) -> bool:
         changed = False
         used = used_values(function)
         for block in function.blocks:
-            kept = [i for i in block.instrs if i.dest is None or i.dest.id in used or not can_remove(i)]
+            kept = [i for i in block.instrs if i.dest is None or i.dest.id in used or not can_remove(i, module)]
             if len(kept) != len(block.instrs):
                 block.instrs = kept
                 changed = True

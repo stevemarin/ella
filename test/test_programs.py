@@ -15,7 +15,6 @@ from typing import TextIO
 
 import pytest
 
-from ella.checker import check
 from ella.interpreter import Interpreter
 from ella.ir_interpreter import IRInterpreter, run_ir
 from ella.lexer import EllaError
@@ -23,6 +22,7 @@ from ella.lower import compile_program
 from ella.native import run_native
 from ella.parser import parse
 from ella.passes import optimize
+from ella.staging import prepare
 
 PROGRAMS = Path(__file__).parent / "programs"
 
@@ -30,13 +30,13 @@ PROGRAMS = Path(__file__).parent / "programs"
 def run_tree(source: str, out: TextIO) -> None:
     """Type check, then run with the tree-walking interpreter."""
     program = parse(source)
-    check(program)
-    Interpreter(out).run(program)
+    program, checker = prepare(program, out)
+    Interpreter(out, checker).run(program)
 
 
 def run_optimized(source: str, out: TextIO) -> None:
     """Compile to IR, optimize it, and run it."""
-    IRInterpreter(optimize(compile_program(source)), out).run()
+    IRInterpreter(optimize(compile_program(source, out)), out).run()
 
 
 def run_native_unoptimized(source: str, out: TextIO) -> None:

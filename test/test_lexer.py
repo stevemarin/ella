@@ -55,7 +55,7 @@ def test_operators_longest_match() -> None:
     assert texts("a**b<<c>>d!=e") == ["a", "**", "b", "<<", "c", ">>", "d", "!=", "e"]
 
 
-@pytest.mark.parametrize("char", ["{", "}", ";", "!", "@", "$", "`", "é"])
+@pytest.mark.parametrize("char", ["{", "}", ";", "!", "@", "`", "é"])
 def test_invalid_characters(char: str) -> None:
     assert "unexpected character" in error(f"a {char} b").message
 

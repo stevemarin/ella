@@ -48,14 +48,14 @@ the same "stack overflow" error as in the interpreters.
 
 import struct
 
-from ella.checker import F64, I64, EnumTy, FuncTy, ListTy, PrimTy, TupleTy, Type, substitute
+from ella.checker import F64, I64, BuiltinTy, EnumTy, FuncTy, ListTy, PrimTy, TupleTy, Type, substitute
 from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, Value, format_instr, region_level
 from ella.ir_interpreter import MAX_CALL_DEPTH
 from ella.lexer import Span
 
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
 KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0}
-LIST_KIND, TUPLE_KIND, FUNCTION_KIND, ENUM_KIND = 6, 7, 8, 9
+LIST_KIND, TUPLE_KIND, FUNCTION_KIND, ENUM_KIND, POOL_KIND, HANDLE_KIND, CODE_KIND = 6, 7, 8, 9, 10, 11, 12
 
 # The registers for the first six arguments of a C call.
 C_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -75,6 +75,10 @@ class Region(str):
     """A region, passed to the runtime as the depth of its arena."""
 
 
+class Register(str):
+    """A register whose value is passed to the runtime."""
+
+
 def generate(module: Module) -> str:
     """The assembly text for a whole module."""
     return CodeGen(module).generate()
@@ -89,6 +93,7 @@ class CodeGen:
         self.strings: dict[str, Label] = {}  # Ella string constants
         self.c_strings: dict[str, Label] = {}  # C strings: messages and names
         self.type_labels: dict[Type, Label] = {}
+        self.finalizers: set[str] = set()
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
 
         # The function being generated: the stack slot of each value and local,
@@ -120,6 +125,19 @@ class CodeGen:
             "    push 0                      # the top-level code isn't a closure",
             f"    call {self.function_labels[self.module.entry]}",
             "    add rsp, 16",
+            "    ret",
+            "",
+            "# Call an Ella closure with one argument, from the runtime: ella_call1(closure, argument).",
+            "# It runs finalizers, whose results are () and need no arena.",
+            "    .globl ella_call1",
+            "ella_call1:",
+            "    push rbp",
+            "    mov rbp, rsp",
+            "    push rsi                    # the argument",
+            "    push 0                      # where the result goes",
+            "    push rdi                    # the closure",
+            "    call qword ptr [rdi]",
+            "    leave",
             "    ret",
         ]
         for name, function in self.module.functions.items():
@@ -166,7 +184,7 @@ class CodeGen:
         for name in function.locals:
             self.local_slots[name] = new_slot()
         uses_levels = any(
-            region_level(instr.region) is not None and instr.op != "set_index"
+            region_level(instr.region) is not None and instr.op not in ("set_index", "set_field")
             for block in function.blocks
             for instr in block.instrs
         )
@@ -225,7 +243,7 @@ class CodeGen:
         move = "movsd" if register.startswith("xmm") else "mov"
         self.emit(f"{move} {self.slots[value.id]}, {register}")
 
-    def call_c(self, function: str, *args: Value | int | Label | Region) -> None:
+    def call_c(self, function: str, *args: Value | int | Label | Region | Register) -> None:
         """Call a runtime function with the C calling convention. The result is in rax."""
         for register, arg in zip(C_ARGS, args):
             match arg:
@@ -235,6 +253,8 @@ class CodeGen:
                     self.emit(f"lea {register}, [rip + {arg}]")
                 case Region():
                     self.region_to(register, arg)
+                case Register():
+                    self.emit(f"mov {register}, {arg}")
                 case int():
                     self.emit(f"mov {register}, {arg}")
         self.emit(f"call {function}")
@@ -282,17 +302,25 @@ class CodeGen:
                 kind, count, parts = TUPLE_KIND, len(items), [self.type_descriptor(item) for item in items]
             case FuncTy():
                 kind, count = FUNCTION_KIND, 0
+            case BuiltinTy("Pool"):
+                kind, count = POOL_KIND, 0
+            case BuiltinTy("Handle"):
+                kind, count = HANDLE_KIND, 0
+            case BuiltinTy("Code" | "Type"):
+                kind, count = CODE_KIND, 0  # never made: native code can't build code at run time
             case EnumTy(name, args):
                 enum = self.module.enums[name]
                 mapping = dict(zip(enum.params, args))
                 kind, count = ENUM_KIND, len(enum.variants)
+                finalize = self.finalizer(name) if enum.finalize else "0"
                 for variant, fields in enum.variants.items():
                     field_labels = [self.type_descriptor(substitute(f, mapping)) for f in fields]
                     variant_label = self.label("variant")
                     self.rodata += [
                         "    .balign 8",
                         f"{variant_label}:",
-                        f"    .quad {self.c_string(variant)}, {len(fields)}" + "".join(f", {f}" for f in field_labels),
+                        f"    .quad {self.c_string(variant)}, {len(fields)}, {finalize}"
+                        + "".join(f", {f}" for f in field_labels),
                     ]
                     parts.append(variant_label)
             case _:
@@ -302,6 +330,16 @@ class CodeGen:
             f"{label}:  # {t}",
             f"    .quad {kind}, {count}" + "".join(f", {p}" for p in parts),
         ]
+        return label
+
+    def finalizer(self, struct: str) -> Label:
+        """A static closure of a struct's finalizer (which captures nothing)."""
+        label = Label(f"ella_finalize.{struct}")
+        if label not in self.finalizers:
+            self.finalizers.add(label)
+            code = self.function_labels[self.module.enums[struct].finalize]
+            empty = self.type_descriptor(TupleTy(()))
+            self.rodata += ["    .balign 8", f"{label}:", f"    .quad {code}, 0, {empty}"]
         return label
 
     def tag(self, enum_type: Type, variant: str) -> int:
@@ -401,12 +439,45 @@ class CodeGen:
                         self.call_c("ella_range_index", container, index)
                 self.store(dest)
             case "set_index":
-                self.call_c("ella_list_set", args[0], args[1], args[2], line, column)
+                self.slot_value(instr, args[0], args[2])
+                self.call_c("ella_list_set", args[0], args[1], Register("rax"), line, column)
+            case "set_field":
+                self.slot_value(instr, args[0], args[1])
+                self.emit("mov rdx, rax")
+                self.load("rax", args[0])
+                self.emit(f"mov qword ptr [rax + {16 + 8 * instr.index}], rdx")
             case "append":
                 assert isinstance(args[0].type, ListTy)
                 item_type = self.type_descriptor(args[0].type.element)
-                self.call_c("ella_list_append", args[0], args[1], item_type, Region(instr.region))
+                region: Region | int = -1 if instr.region == "slot" else Region(instr.region)
+                self.call_c("ella_list_append", args[0], args[1], item_type, region)
                 self.store(dest)
+            case "move":
+                self.call_c("ella_move", args[0], self.type_descriptor(args[0].type), Region(instr.region))
+                self.store(dest)
+            case "pool_new":
+                self.call_c("ella_pool_new", Region(instr.region))
+                self.store(dest)
+            case "alloc":
+                self.call_c("ella_alloc", args[0], args[1], self.type_descriptor(args[1].type))
+                self.store(dest)
+            case "free" | "pool_get":
+                self.call_c(f"ella_{op}", args[0], args[1], line, column)
+                if dest is not None:
+                    self.store(dest)
+            case "pool_set":
+                t = self.type_descriptor(args[2].type)
+                self.call_c("ella_pool_set", args[0], args[1], args[2], t, line, column)
+            case "quote_begin":
+                self.emit("mov rax, 0")
+                self.store(dest)
+            case "quote" | "run" | "type_value" | "reflect":
+                # A function may use quotes only when called while compiling.
+                # If native code gets here, it stops.
+                message = (
+                    f"'{op}' at run time needs an interpreter: native code can only build and run code while compiling"
+                )
+                self.call_c("ella_error", line, column, self.c_string(message))
             case "copy":
                 self.call_c("ella_copy", args[0], self.type_descriptor(args[0].type), Region(instr.region))
                 self.store(dest)
@@ -419,6 +490,9 @@ class CodeGen:
                     self.emit("call ella_reset")
             case "len" if isinstance(args[0].type, PrimTy) and args[0].type.name == "range":
                 self.call_c("ella_range_len", args[0])
+                self.store(dest)
+            case "len" if isinstance(args[0].type, BuiltinTy):
+                self.call_c("ella_pool_len", args[0])
                 self.store(dest)
             case "len":
                 self.load("rax", args[0])
@@ -436,6 +510,10 @@ class CodeGen:
                     self.load("rdx", field)
                     self.emit(f"mov qword ptr [rax + {16 + 8 * i}], rdx")
                 self.store(dest)
+                assert isinstance(dest.type, EnumTy)
+                if self.module.enums[dest.type.name].finalize:
+                    finalizer = self.finalizer(dest.type.name)
+                    self.call_c("ella_register", dest, finalizer, Region(instr.region))
             case "is_variant":
                 self.load("rax", args[0])
                 self.emit(f"cmp qword ptr [rax], {self.tag(args[0].type, instr.name)}")
@@ -465,6 +543,13 @@ class CodeGen:
                 self.text.append(f"{ok}:")
             case _:
                 raise AssertionError(f"no code for IR operation {op}")
+
+    def slot_value(self, instr: Instr, container: Value, value: Value) -> None:
+        """Put the value to store into `container` in rax: copied into its slot's arena if it is a pool's value."""
+        if instr.region != "slot":
+            self.load("rax", value)
+            return
+        self.call_c("ella_store_slot", container, value, self.type_descriptor(value.type))
 
     def const(self, instr: Instr) -> None:
         value = instr.const
@@ -570,9 +655,19 @@ class CodeGen:
         self.call_c("ella_stack_overflow", MAX_CALL_DEPTH, line, column)
         self.text.append(f"{ok}:")
         self.emit("inc qword ptr [rip + ella_depth]")
-        for region in reversed(instr.out_regions):
-            self.region_to("rax", region)
-            self.emit("push rax                  # where a mut argument lives")
+        # A mut argument that is a pool's value lives in its slot's arena, found
+        # from its address. Its new value's slot holds that until the call returns.
+        mut_args = [args[i] for i in closure.type.mutable] if isinstance(closure.type, FuncTy) else []
+        for region, mut_arg, out in zip(instr.out_regions, mut_args, instr.outs):
+            if region == "slot":
+                self.call_c("ella_region_of", mut_arg)
+                self.store(out)
+        for region, out in reversed(list(zip(instr.out_regions, instr.outs))):
+            if region == "slot":
+                self.emit(f"push {self.slots[out.id]}")
+            else:
+                self.region_to("rax", region)
+                self.emit("push rax                  # where a mut argument lives")
         for arg in reversed(args):
             self.emit(f"push {self.slots[arg.id]}")
         self.region_to("rax", instr.region or "global")

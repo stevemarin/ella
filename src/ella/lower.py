@@ -73,6 +73,8 @@ expression changes its variable in place.
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
+from itertools import count
+from typing import TextIO
 
 from ella.checker import (
     BOOL,
@@ -80,17 +82,21 @@ from ella.checker import (
     NEVER,
     STR,
     UNIT,
+    BuiltinTy,
     Checker,
     EnumTy,
     FuncTy,
     ListTy,
     TupleTy,
     Type,
-    check,
     finish,
-    has_list,
+    has_mutable,
+    has_pool,
+    is_nocopy,
     literal_type,
     place_root,
+    show_type,
+    substitute,
 )
 from ella.ir import (
     Block,
@@ -111,8 +117,9 @@ from ella.ir import (
     trim_levels,
     verify,
 )
-from ella.lexer import Span
+from ella.lexer import EllaError, Span
 from ella.parser import parse
+from ella.staging import AnySplice, Tables, prepare, start_code
 from ella.syntax import (
     Assert,
     Assign,
@@ -124,6 +131,7 @@ from ella.syntax import (
     Continue,
     EnumDef,
     Expr,
+    FieldSplice,
     FloatLit,
     For,
     If,
@@ -142,11 +150,15 @@ from ella.syntax import (
     OrPattern,
     Pattern,
     Program,
+    Quote,
     RangePattern,
+    Splice,
     StringLit,
     Try,
     TupleLit,
     TuplePattern,
+    TypeLit,
+    TypeSplice,
     Unary,
     UnitLit,
     VariantPattern,
@@ -190,10 +202,14 @@ SELF = "<self>"
 CALLS = "<calls>"
 
 
-def compile_program(source: str) -> Module:
-    """Parse, type check and lower a program, and verify the IR. Raises EllaError."""
-    program = parse(source)
-    module = Lowerer(check(program)).lower_program(program)
+def compile_program(source: str, out: TextIO | None = None) -> Module:
+    """Parse, type check and lower a program, and verify the IR. Raises EllaError.
+
+    Splices outside quotes run first, while compiling (see ella.staging);
+    what they print goes to `out`.
+    """
+    program, checker = prepare(parse(source), out)
+    module = Lowerer(checker).lower_program(program)
     verify(module)
     return module
 
@@ -235,6 +251,7 @@ class PendingFunction:
     captures: list[tuple[str, Type]]  # the captured variables, in parameter order
     self_names: list[str]  # names the function has for itself, from `let`
     type: FuncTy
+    subst: dict[str, Type] = field(default_factory=dict)  # a generic function's type arguments
 
 
 @dataclass(slots=True)
@@ -257,25 +274,40 @@ class SelfInfo:
     capture_slots: list[str] = field(default_factory=list)
 
 
+# One step into a place: an index (a list's or a pool's) with its value, or a field.
+type Step = tuple[Index | Member, Value | None]
+
+
 @dataclass(slots=True)
 class MutPlace:
-    """A `mut` argument being passed: its variable, the values of its indexes, and its region."""
+    """A `mut` argument being passed: its variable, its steps (indexes and fields), and its region."""
 
     root: Name
     kind: str
-    indexes: list[Value]
+    steps: list[Step]
     region: str
     span: Span
 
 
+# The most specializations one generic function may have, to stop
+# polymorphic recursion like `f[T]` calling `f[[T]]` from going on forever.
+MAX_SPECIALIZATIONS = 100
+
+
 class Lowerer:
-    def __init__(self, checker: Checker) -> None:
+    def __init__(self, checker: Checker, module: Module | None = None) -> None:
+        """Lower a checked program into a new module, or more code (to `run`) into an existing one."""
         self.checker = checker
-        self.module = Module(enums=dict(checker.enums))
-        for name, info in checker.globals.vars.items():
-            if info.kind == "global":
-                self.module.globals[name] = finish(info.type)
+        if module is None:
+            module = Module(enums=checker.enums, checker=checker, tables=Tables())
+            for name, info in checker.globals.vars.items():
+                if info.kind == "global" and not info.type_params:
+                    module.globals[name] = finish(info.type)
+        self.module = module
+        self.module.tables.add(checker)
         self.pending: list[PendingFunction] = []
+        self.subst: dict[str, Type] = {}  # in a specialized generic function: its type arguments
+        self.quotes: list[Value] = []  # the `quote_begin`s of the quotes whose splices are being lowered
         self.globals_changed: set[str] = set()  # globals changed in place anywhere
 
         # The function being lowered. `start_function` resets all of these.
@@ -412,9 +444,23 @@ class Lowerer:
         """What is known about a value. Values not recorded are new objects, unboxed values, or constants."""
         return self.info.get(value.id, Info())
 
-    def needs_copy(self, t: Type) -> bool:
-        """Whether sharing a value of type `t` could ever be seen: it has lists in it."""
-        return has_list(t, self.module.enums)
+    def needs_copy(self, t: Type, info: Info | None = None) -> bool:
+        """Whether sharing a value of type `t` could ever be seen: it has parts that can change.
+
+        A value borrowed from a pool always needs copying to be kept: the
+        pool may free it.
+        """
+        if info is not None and any(self.from_pool(b) for b in info.borrows):
+            return is_boxed(t)
+        return has_mutable(t, self.module.enums)
+
+    def from_pool(self, borrowed: str) -> bool:
+        """Whether a borrowed variable holds a pool."""
+        if borrowed.startswith("global "):
+            t = self.module.globals.get(borrowed.removeprefix("global "))
+        else:
+            t = self.function.locals.get(borrowed)
+        return t is not None and has_pool(t, self.module.enums)
 
     def unstable(self, borrowed: str) -> bool:
         """Whether a borrowed variable's objects may change in place while the borrower is alive."""
@@ -436,9 +482,14 @@ class Lowerer:
         if not is_boxed(value.type):
             return value
         info = self.info_of(value)
+        if self.nocopy(value.type):
+            # Never copied: the checker makes sure it is made where it stays.
+            if not outlives(info.lives, region):
+                raise EllaError(f"a {show_type(value.type)} would have to be copied here", span)
+            return value
         shared = (
             bool(info.borrows)
-            and self.needs_copy(value.type)
+            and self.needs_copy(value.type, info)
             and (mutable or any(self.unstable(b) for b in info.borrows))
         )
         if shared or not outlives(info.lives, region):
@@ -454,8 +505,14 @@ class Lowerer:
         if not is_boxed(value.type):
             return value
         info = self.info_of(value)
+        if self.nocopy(value.type):
+            # A local variable moves to the caller (the checker allows nothing else).
+            if not outlives(info.lives, "result"):
+                return self.emit("move", value.type, [value], span, region="result")
+            return value
         dying = all(b in self.slots and self.slots[b].kind == "local" for b in info.borrows)
-        if (self.needs_copy(value.type) and not dying) or not outlives(info.lives, "result"):
+        pooled = any(self.from_pool(b) for b in info.borrows)
+        if (self.needs_copy(value.type, info) and (not dying or pooled)) or not outlives(info.lives, "result"):
             return self.copy(value, "result", span)
         return value
 
@@ -465,9 +522,9 @@ class Lowerer:
         `calls` says that an Ella function is called before the value is
         used, which may change any global.
         """
-        if not is_boxed(value.type) or not self.needs_copy(value.type):
-            return value
         info = self.info_of(value)
+        if not is_boxed(value.type) or self.nocopy(value.type) or not self.needs_copy(value.type, info):
+            return value
         if not info.borrows:
             return value
         changed: set[str] = set()
@@ -517,11 +574,15 @@ class Lowerer:
         self.function.locals[slot] = t
         return slot
 
-    def home(self, name: str) -> str:
-        """The region for a new local variable: the current level, or the caller's if the function returns it."""
+    def home(self, name: str, t: Type | None = None) -> str:
+        """The region for a new local variable: the current level, or the caller's if the function returns it.
+
+        A value that can't be copied stays where it is made, and is moved
+        out if it is returned, so that it is finalized in the right place.
+        """
         if not self.scopes:
             return "global"
-        if self.level == 0 and name in self.returned:
+        if self.level == 0 and name in self.returned and not (t is not None and self.nocopy(t)):
             return "result"
         return self.here()
 
@@ -600,9 +661,22 @@ class Lowerer:
         """Lower the top-level code into the `top` function, then every function it uses."""
         self.globals_changed = changed_in_place(program.body, self.checker, into_lambdas=True)
         self.start_function("top", UNIT, program.span, program.body)
+        # Generic functions are made for each set of type arguments they are
+        # used with, and finalizers are functions of their own.
+        for expr in program.body:
+            match expr:
+                case Let(bindings, Lambda() as generic) if bindings[0].type_params:
+                    for binding in bindings:
+                        self.module.generics[binding.name] = (generic, binding.type_params)
+                case EnumDef(name, finalize=Lambda() as finalizer):
+                    t = self.type_of(finalizer)
+                    assert isinstance(t, FuncTy)
+                    self.pending.append(PendingFunction(finalizer, self.module.enums[name].finalize, [], [], t))
         # Top-level functions exist from the start (docs/grammar.md §3).
         hoisted: dict[int, Value] = {}
         for expr in program.body:
+            if isinstance(expr, Let) and expr.bindings[0].type_params:
+                continue
             if isinstance(expr, Let) and isinstance(expr.value, Lambda):
                 function = self.lower_lambda(expr.value, [b.name for b in expr.bindings], expr.span, "global")
                 for binding in expr.bindings:
@@ -612,6 +686,8 @@ class Lowerer:
         # How many top-level `let`s bind each name.
         lets = Counter(b.name for expr in program.body if isinstance(expr, Let) for b in expr.bindings)
         for expr in program.body:
+            if isinstance(expr, Let) and expr.bindings[0].type_params:
+                continue
             if isinstance(expr, Let) and id(expr) in hoisted:
                 # Bind it again where its `let` is if the name could hold
                 # something else by now: if another top-level `let` binds it
@@ -640,6 +716,10 @@ class Lowerer:
         visible: dict[str, str] = {}
         for scope in self.scopes:  # outermost first, so inner names shadow outer ones
             visible.update(scope)
+        # Values that can't be copied can't be captured either (the checker makes sure no lambda uses one).
+        visible = {
+            n: slot for n, slot in visible.items() if slot == SELF or not self.nocopy(self.function.locals[slot])
+        }
         captured = [self.read_local(name, span) for name in visible]
         # Captured values can't change inside the closure, but they mustn't share
         # objects that change outside it, and must live as long as the closure.
@@ -649,15 +729,16 @@ class Lowerer:
         while name in self.module.functions or name == "top" or any(p.name == name for p in self.pending):
             n += 1
             name = f"{base}.{n}"
-        t = self.checker.type_of(function)
+        t = self.type_of(function)
         assert isinstance(t, FuncTy)
         captures = [(var, value.type) for var, value in zip(visible, captured)]
-        self.pending.append(PendingFunction(function, name, captures, self_names, t))
+        self.pending.append(PendingFunction(function, name, captures, self_names, t, self.subst))
         return self.emit("closure", t, captured, span, name, region=region)
 
     def lower_function(self, pending: PendingFunction) -> None:
         """Make the IR function for a lambda: captures and parameters, `where`, body, and exit."""
         function, t = pending.function, pending.type
+        self.subst = pending.subst
         self.start_function(pending.name, t.result, function.span, function.body)
         self.function.captures = len(pending.captures)
         self.function.mut_params = t.mutable
@@ -744,20 +825,26 @@ class Lowerer:
                 kind = self.checker.kinds[id(expr)]
                 if kind == "variant":
                     return self.emit("variant", self.type_of(expr), [], span, name, region=dest)
+                if id(expr) in self.checker.instances:
+                    args = tuple(self.concrete(arg) for arg in self.checker.instances[id(expr)])
+                    function = self.specialize(name, args, span)
+                    return self.emit("closure", self.type_of(expr), [], span, function, region=dest)
                 return self.read_name(name, kind, span, dest)
             case Let(bindings, value_expr):
-                region = self.home(bindings[0].name)
+                t = self.type_of(value_expr)
+                region = self.home(bindings[0].name, t)
                 if isinstance(value_expr, Lambda):
                     value = self.lower_lambda(value_expr, [b.name for b in bindings], span, region)
                 else:
                     value = self.lower(value_expr, region)
                 for binding in bindings:
-                    value = self.bind(binding.name, value, binding.span, binding.mutable, self.home(binding.name))
+                    home = self.home(binding.name, t)
+                    value = self.bind(binding.name, value, binding.span, binding.mutable, home)
                 return value
             case Assign(op, target, value_expr):
                 if isinstance(target, Name):
                     return self.lower_assign_name(op, target, value_expr, span)
-                return self.lower_assign_index(op, target, value_expr, span)
+                return self.lower_assign_place(op, target, value_expr, span)
 
             # Operators
             case Unary(op, operand):
@@ -769,11 +856,30 @@ class Lowerer:
             case Compare(first, rest):
                 return self.lower_compare(first, rest, span)
             case Index(target, index):
-                return self.lower_index(self.lower(target), self.lower(index), self.type_of(expr), span, dest)
+                container = self.lower(target)
+                if isinstance(container.type, BuiltinTy):
+                    return self.pool_get(container, self.lower(index), self.type_of(expr), span)
+                return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
+            case Member(target):
+                struct = self.lower(target)
+                return self.field(struct, self.checker.members[id(expr)], self.type_of(expr), span)
+            case Quote():
+                return self.lower_quote(expr, span)
+            case TypeLit(texpr):
+                # A type as a value, which only the interpreters can make. The
+                # operands are the types spliced into it (`type [$t]`), if any.
+                number = len(self.module.types)
+                self.module.types.append((texpr, self.concrete(self.checker.type_values[id(expr)])))
+                splices = [self.lower(node.code) for node in type_splices(texpr)]
+                return self.emit("type_value", self.type_of(expr), splices, span, index=number)
+            case FieldSplice():
+                raise AssertionError("the checker only allows field splices in quotes")
+            case Splice():
+                raise AssertionError("splices outside quotes are expanded before lowering")
             case Try(operand):
                 return self.lower_try(self.lower(operand), self.type_of(expr), span)
-            case Member() | MutArg():
-                raise AssertionError("the checker rejects member access, and 'mut' outside calls")
+            case MutArg():
+                raise AssertionError("the checker rejects 'mut' outside calls")
 
             # Functions
             case Lambda():
@@ -851,7 +957,15 @@ class Lowerer:
                 return self.const((), span)  # enums are only types; nothing runs
 
     def type_of(self, expr: Expr) -> Type:
-        return self.checker.type_of(expr)
+        return self.concrete(self.checker.types[id(expr)])
+
+    def concrete(self, t: Type) -> Type:
+        """A checked type, with a specialized generic function's type arguments filled in."""
+        t = finish(t)
+        return substitute(t, self.subst) if self.subst else t
+
+    def nocopy(self, t: Type) -> bool:
+        return is_nocopy(t, self.module.enums)
 
     def lower_string(self, parts: tuple[str | Expr, ...], span: Span, dest: str) -> Value:
         """`"a{{x}}b"` becomes `"a" + to_text(x) + "b"`. Only the final string goes in `dest`."""
@@ -922,32 +1036,94 @@ class Lowerer:
         self.write_name(target.name, kind, new, span)
         return new
 
-    def lower_assign_index(self, op: str, target: Index, value_expr: Expr, span: Span) -> Value:
-        """`xs[i][j] = v` and `xs[i][j] op= v`: change the list xs[i] in place."""
-        # The chain of indexes from the variable out: xs[i][j] has [xs[i], xs[i][j]].
-        chain: list[Index] = []
-        root: Expr = target
-        while isinstance(root, Index):
-            chain.insert(0, root)
-            root = root.target
-        assert isinstance(root, Name)
+    def lower_assign_place(self, op: str, target: Index | Member, value_expr: Expr, span: Span) -> Value:
+        """`xs[i].y = v` and `xs[i].y op= v`: change the last list, struct or pool in place.
+
+        A pool's values live in arenas of their own (one per slot), so a value
+        stored into one is copied there by the operation itself (`@slot`).
+        """
+        root, chain = place_steps(target)
         kind = self.checker.kinds[id(root)]
         region = self.var_region(root.name, kind)
-        value = self.lower(value_expr, region if op == "=" else "")
-        value = self.protect(value, [node.index for node in chain], span)
+        in_pool = any(self.is_pool_step(node) for node in chain)
+        value = self.lower(value_expr, region if op == "=" and not in_pool else "")
+        value = self.protect(value, [node.index for node in chain if isinstance(node, Index)], span)
         container = self.read_name(root.name, kind, root.span)
         for node in chain[:-1]:
-            container = self.lower_index(container, self.lower(node.index), self.type_of(node), node.span, "")
+            container, region = self.step_into(container, (node, self.step_key(node)), region)
         last = chain[-1]
-        index = self.lower(last.index)
+        key = self.step_key(last)
         if op != "=":
-            # Reading the item also checks the index is in range.
-            old = self.lower_index(container, index, self.type_of(last), last.span, "")
-            value = self.emit(BINARY_OPS[op.removesuffix("=")], old.type, [old, value], span, region=region)
-        value = self.place(value, region, span, mutable=True)
-        self.emit_effect("set_index", [container, index, value], last.span, region=region)
+            # Reading the old value also checks the index or handle.
+            old, old_region = self.step_into(container, (last, key), region)
+            if op == "+=" and isinstance(old.type, ListTy):
+                # Add to the list in place, like `xs += ys` (it may move, so it is stored back).
+                value = self.emit("append", old.type, [old, value], span, region=old_region)
+            else:
+                new_region = self.here() if region == "slot" or self.is_pool_step(last) else region
+                value = self.emit(BINARY_OPS[op.removesuffix("=")], old.type, [old, value], span, region=new_region)
+        self.store_step(container, (last, key), value, region, span)
         self.info[value.id] = Info(frozenset({self.borrow_key(root.name, kind)}), region)
         return value
+
+    def is_pool_step(self, node: Index | Member) -> bool:
+        return isinstance(node, Index) and isinstance(self.type_of(node.target), BuiltinTy)
+
+    def step_key(self, node: Index | Member) -> Value | None:
+        """Evaluate a step's index (fields need nothing)."""
+        return self.lower(node.index) if isinstance(node, Index) else None
+
+    def step_into(self, container: Value, step: Step, region: str, span: Span | None = None) -> tuple[Value, str]:
+        """The part of `container` a step names, borrowed, and the region it lives in.
+
+        Errors are reported at the step, or at `span` if given.
+        """
+        node, key = step
+        t = self.type_of(node)
+        where = span or node.span
+        if isinstance(node, Member):
+            return self.field(container, self.checker.members[id(node)], t, where), region
+        assert key is not None
+        if isinstance(container.type, BuiltinTy):
+            return self.pool_get(container, key, t, where), "slot"
+        return self.lower_index(container, key, t, where, ""), region
+
+    def store_step(
+        self, container: Value, step: Step, value: Value, region: str, span: Span, at_step: bool = True
+    ) -> None:
+        """Change the part of `container` a step names to `value`, in place.
+
+        Errors are reported at the step, or at `span` unless `at_step`.
+        """
+        node, key = step
+        where = node.span if at_step else span
+        if isinstance(container.type, BuiltinTy):
+            assert key is not None
+            self.emit_effect("pool_set", [container, key, value], where)
+            return
+        if region != "slot":
+            value = self.place(value, region, span, mutable=True)
+        if isinstance(node, Member):
+            enum = container.type
+            assert isinstance(enum, EnumTy)
+            index = self.checker.members[id(node)]
+            self.block.instrs.append(
+                Instr("set_field", None, [container, value], where, enum.name, index, region=region)
+            )
+        else:
+            assert key is not None
+            self.emit_effect("set_index", [container, key, value], where, region=region)
+
+    def field(self, struct: Value, index: int, t: Type, span: Span) -> Value:
+        """A struct's field, borrowed."""
+        assert isinstance(struct.type, EnumTy)
+        return self.variant_field(struct, struct.type.name, index, t, span)
+
+    def pool_get(self, pool: Value, handle: Value, t: Type, span: Span) -> Value:
+        """A pool's value, borrowed: it lives in the slot's own arena, until the slot is freed."""
+        result = self.emit("pool_get", t, [pool, handle], span)
+        self.info[result.id] = self.info_of(pool)
+        return result
 
     def borrow_key(self, name: str, kind: str) -> str:
         return self.find_slot(name) if kind == "local" else f"global {name}"
@@ -1024,16 +1200,12 @@ class Lowerer:
 
     def fields(self, enum_type: Type, variant: str) -> tuple[Type, ...]:
         assert isinstance(enum_type, EnumTy)
-        return tuple(finish(t) for t in self.checker.variant_fields(enum_type, variant))
+        return tuple(self.concrete(t) for t in self.checker.variant_fields(enum_type, variant))
 
     def lower_call(self, expr: Call, callee: Expr, args: tuple[Expr, ...], span: Span, dest: str) -> Value:
         kind = self.checker.kinds.get(id(callee))
         if isinstance(callee, Name) and kind == "builtin":
-            operands = [self.lower(arg) for arg in args]
-            if callee.name == "len":
-                return self.emit("len", I64, operands, span)
-            self.emit_effect("print", operands, span)
-            return self.const((), span)
+            return self.lower_builtin(expr, callee.name, args, span, dest)
         if isinstance(callee, Name) and kind == "constructor":
             return self.build("variant", self.type_of(expr), self.lower_items(args, dest), span, dest, callee.name)
         function = self.lower(callee)
@@ -1059,6 +1231,99 @@ class Lowerer:
             self.write_back(place, out)
         return result
 
+    def lower_builtin(self, expr: Call, name: str, args: tuple[Expr, ...], span: Span, dest: str) -> Value:
+        """`print`, `len`, `run`, and the pool functions."""
+        if name in ("alloc", "free"):
+            pool_arg, value_expr = args
+            assert isinstance(pool_arg, MutArg)
+            _, pool = self.mut_place(pool_arg)
+            value = self.lower(value_expr)
+            if name == "free":
+                self.emit_effect("free", [pool, value], span)
+                return self.const((), span)
+            # The pool copies the value into an arena of its own (a value that
+            # can't be copied is moved there, with its finalizers).
+            return self.emit("alloc", self.type_of(expr), [pool, value], span)
+        operands = [self.lower(arg) for arg in args]
+        match name:
+            case "len":
+                return self.emit("len", I64, operands, span)
+            case "print":
+                self.emit_effect("print", operands, span)
+                return self.const((), span)
+            case "pool_new":
+                return self.emit("pool_new", self.type_of(expr), [], span, region=dest)
+            case "run":
+                return self.emit("run", self.type_of(expr), operands, span, region=dest)
+            case _:  # reflection, which only the interpreters can do
+                return self.emit("reflect", self.type_of(expr), operands, span, name, region=dest)
+
+    def lower_quote(self, quote: Quote, span: Span) -> Value:
+        """`quote e`: code, built at run time by the interpreter from the quote's syntax tree.
+
+        The splices of the quote, and the variables it carries into the
+        later stage, are evaluated here first, in the order the interpreter
+        will want them (see ella.staging.build_code). The `quote` instruction
+        gets the `quote_begin`s of the quotes it is inside the splices of
+        too, for their fresh names.
+        """
+        events: list[AnySplice | Name] = []
+
+        def splice(node: AnySplice) -> object:
+            events.append(node)
+            return "_" if isinstance(node, FieldSplice) else node  # a field's name; any will do here
+
+        def persist(node: Name) -> Expr:
+            events.append(node)
+            return node
+
+        start_code(quote, self.module.tables, count()).build(splice, persist)  # names aren't needed here
+        number = len(self.module.templates)
+        outer = list(self.quotes)
+        self.module.templates[number] = (quote, len(outer))
+        # `quote_begin` chooses the fresh names, which quotes in the splices may use.
+        begin = self.emit("quote_begin", UNIT, [], span, index=number)
+        self.quotes.append(begin)
+        values = []
+        for event in events:
+            if not isinstance(event, Name):
+                values.append(self.lower(event.code))
+            else:
+                values.append(self.read_name(event.name, "local", event.span))
+        self.quotes.pop()
+        return self.emit("quote", self.type_of(quote), [begin, *outer, *values], span, index=number)
+
+    def specialize(self, name: str, args: tuple[Type, ...], span: Span) -> str:
+        """The IR function for a generic function with these type arguments: `first[i64]`."""
+        key = (name, args)
+        if key not in self.module.specializations:
+            function, params = self.module.generics[name]
+            if sum(1 for n, _ in self.module.specializations if n == name) >= MAX_SPECIALIZATIONS:
+                raise EllaError(f"{name} is used with too many different types", span)
+            specialized = f"{name}[{', '.join(show_type(arg) for arg in args)}]"
+            self.module.specializations[key] = specialized
+            subst = dict(zip(params, args))
+            t = substitute(finish(self.checker.types[id(function)]), subst)
+            assert isinstance(t, FuncTy)
+            self.pending.append(PendingFunction(function, specialized, [], [], t, subst))
+        return self.module.specializations[key]
+
+    def lower_code(self, code: Expr) -> str:
+        """Lower code made by `quote` into a function of no parameters, to `run` it. Returns its name."""
+        name = f"run.{len(self.module.functions)}"
+        self.start_function(name, self.type_of(code), code.span, code)
+        self.scopes = [{}]
+        self.exit = self.new_block("exit")
+        result = self.new_value(self.function.result)
+        self.exit.params.append(result)
+        self.jump(self.exit, [self.place_return(self.lower(code, "result"), code.span)])
+        self.block = self.exit
+        self.block.terminator = Return(result)
+        self.finish_function()
+        while self.pending:
+            self.lower_function(self.pending.pop(0))
+        return name
+
     def mut_type(self, function: Value, n: int) -> Type:
         """The type of the n-th `mut` parameter of a function value."""
         t = function.type
@@ -1066,39 +1331,35 @@ class Lowerer:
         return t.params[t.mutable[n]]
 
     def mut_place(self, arg: MutArg) -> tuple[MutPlace, Value]:
-        """Evaluate a `mut` argument's place, its variable and indexes, and get its current value.
+        """Evaluate a `mut` argument's place, its variable and steps, and get its current value.
 
         The value itself is passed, to be changed in place. A global's is
         copied first, so that the function sees the global's old value if it
         reads the global directly, as with the AST interpreter, which passes
-        every `mut` argument as a copy.
+        every `mut` argument as a copy. (A value that can't be copied is
+        passed as it is, there too.)
         """
-        chain: list[Index] = []
-        root: Expr = arg.target
-        while isinstance(root, Index):
-            chain.insert(0, root)
-            root = root.target
-        assert isinstance(root, Name)
+        root, chain = place_steps(arg.target) if not isinstance(arg.target, Name) else (arg.target, [])
         kind = self.checker.kinds[id(root)]
-        indexes = [self.lower(node.index) for node in chain]
-        value = self.read_name(root.name, kind, root.span)
-        for node, index in zip(chain, indexes):
-            value = self.lower_index(value, index, self.type_of(node), node.span, "")
+        steps: list[Step] = [(node, self.step_key(node)) for node in chain]
         region = self.var_region(root.name, kind)
-        if kind != "local":
+        value = self.read_name(root.name, kind, root.span)
+        for step in steps:
+            value, region = self.step_into(value, step, region)
+        if kind != "local" and not self.nocopy(value.type):
             value = self.copy(value, "global", arg.span)
-        return MutPlace(root, kind, indexes, region, arg.span), value
+        return MutPlace(root, kind, steps, region, arg.span), value
 
     def write_back(self, place: MutPlace, value: Value) -> None:
         """Give a `mut` argument's place its new value after the call."""
-        if not place.indexes:
+        if not place.steps:
             self.write_name(place.root.name, place.kind, value, place.span)
             return
+        region = self.var_region(place.root.name, place.kind)
         container = self.read_name(place.root.name, place.kind, place.span)
-        for index in place.indexes[:-1]:
-            assert isinstance(container.type, ListTy)
-            container = self.lower_index(container, index, container.type.element, place.span, "")
-        self.emit_effect("set_index", [container, place.indexes[-1], value], place.span, region=place.region)
+        for step in place.steps[:-1]:
+            container, region = self.step_into(container, step, region, place.span)
+        self.store_step(container, place.steps[-1], value, region, place.span, at_step=False)
 
     def lower_if(self, cond: Expr, then: Expr, else_: Expr | None, t: Type, span: Span, dest: str) -> Value:
         then_block, else_block = self.new_block("then"), self.new_block("else")
@@ -1182,8 +1443,8 @@ class Lowerer:
         self.branch(self.emit("lt", BOOL, [i, count], span), body, exit)
 
         self.block = body
-        item_type = self.checker.types[id(expr.pattern)]
-        item = self.lower_index(iterable, i, finish(item_type), span, "")
+        item_type = self.concrete(self.checker.types[id(expr.pattern)])
+        item = self.lower_index(iterable, i, item_type, span, "")
         no_match = self.new_block("nomatch")
         self.scopes.append({})
         self.lower_pattern(expr.pattern, item, no_match)
@@ -1267,6 +1528,23 @@ class Lowerer:
 # Finding what code does, for the decisions above
 
 
+def type_splices(node: object) -> list[TypeSplice]:
+    """The splices in a type, in order."""
+    if isinstance(node, TypeSplice):
+        return [node]
+    return [s for part in children(node) for s in type_splices(part)]
+
+
+def place_steps(place: Expr) -> tuple[Name, list[Index | Member]]:
+    """The variable at the root of a place, and the indexes and fields from it out: `xs[i].y` has [xs[i], xs[i].y]."""
+    chain: list[Index | Member] = []
+    while isinstance(place, Index | Member):
+        chain.insert(0, place)
+        place = place.target
+    assert isinstance(place, Name)
+    return place, chain
+
+
 def is_append(assign: Assign, checker: Checker) -> bool:
     """Whether an assignment adds to a list variable in place: `xs += ys`, or `xs = xs + ys`.
 
@@ -1305,12 +1583,12 @@ def names_written(node: object, checker: Checker) -> set[str]:
 def changed_in_place(node: object, checker: Checker, into_lambdas: bool) -> set[str]:
     """The variables some code changes in place, by name, and CALLS if it calls an Ella function.
 
-    Lists change in place through an assignment to an item (`xs[i] = v`),
-    `xs += ys`, and `mut` arguments. Nested lambdas are only searched if
+    Lists and structs change in place through an assignment to an item or
+    field (`xs[i] = v`, `p.x = v`), `xs += ys`, and `mut` arguments. Nested lambdas are only searched if
     `into_lambdas`: their code runs when they are called, not where they are.
     """
     match node:
-        case Assign(_, Index() as target):
+        case Assign(_, Index() | Member() as target):
             changed = {place_root(target)}
         case Assign(_, Name(name)) as assign if is_append(assign, checker):
             changed = {name}

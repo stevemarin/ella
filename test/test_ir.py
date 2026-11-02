@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import pytest
 
-from ella.checker import BOOL, I64, UNIT, FuncTy, ListTy, check
+from ella.checker import BOOL, I64, UNIT, FuncTy, ListTy
 from ella.interpreter import Interpreter
 from ella.ir import (
     Block,
@@ -27,6 +27,7 @@ from ella.lower import compile_program
 from ella.native import run_native
 from ella.parser import parse
 from ella.passes import optimize
+from ella.staging import prepare
 
 S = Span(1, 1)
 
@@ -39,7 +40,7 @@ def ir_output(source: str) -> list[str]:
 
 def optimized_output(source: str) -> list[str]:
     out = io.StringIO()
-    IRInterpreter(optimize(compile_program(source)), out).run()
+    IRInterpreter(optimize(compile_program(source, out)), out).run()
     return out.getvalue().splitlines()
 
 
@@ -50,10 +51,9 @@ def native_output(source: str) -> list[str]:
 
 
 def tree_output(source: str) -> list[str]:
-    program = parse(source)
-    check(program)
     out = io.StringIO()
-    Interpreter(out).run(program)
+    program, checker = prepare(parse(source), out)
+    Interpreter(out, checker).run(program)
     return out.getvalue().splitlines()
 
 
@@ -366,6 +366,72 @@ f()
 }
 
 
+# Code built and run at run time, which only the interpreters can do.
+RUN_TIME_STAGING = {
+    "run at run time": """\
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+let code = power(3, quote 2)
+print(code)
+print(run(code))
+let k = 10
+let add_k = quote (x: i64) -> i64 => x + k
+print(run(add_k)(5))
+let meta = quote quote 1 + 2
+print(run(run(meta)))
+""",
+    "quoting a quote's variable in its splice": """\
+let id = (c: Code[i64]) -> Code[i64] => c
+let c = quote
+    let y = 1
+    $(id(quote y)) + 1
+print(c)
+print(run(c))
+let wrap = (body: Code[i64]) -> Code[i64] => quote
+    let y = 10
+    $body * y
+let d = quote
+    let y = 2
+    $(wrap(quote y))
+print(run(d))
+""",
+    "reflection at run time": """\
+struct P
+    x: i64
+    y: i64
+let t = type P
+print(t)
+print(fields(t))
+print(field_type(t, "y"))
+print(type_kind(t))
+let sum_fields = (names: [str], v: Code[P]) -> Code[i64] =>
+    let mut total = quote 0
+    for n in names
+        total = quote $total + $v.$n
+    total
+let code = quote (p: $t) -> i64 => $(sum_fields(fields(t), quote p))
+print(code)
+print(run(code)(P(3, 4)))
+print(type P == type P)
+print(field_type(t, "x") == type str)
+""",
+    "carrying data into code": """\
+enum Shape
+    Circle(f64)
+    Square(f64)
+struct P
+    x: i64
+    tags: [str]
+let p = P(1, ["a"])
+let shapes = [Circle(1.5), Square(2.0)]
+let r = 1..4
+let c = quote (p, shapes, r, "q\\"", -0.0, ())
+print(c)
+print(run(c))
+""",
+}
+
+
 @pytest.mark.parametrize("source", PROGRAMS.values(), ids=PROGRAMS.keys())
 def test_interpreters_agree(source: str) -> None:
     expected = outcome(tree_output, source)
@@ -373,6 +439,18 @@ def test_interpreters_agree(source: str) -> None:
     assert outcome(optimized_output, source) == expected
     if shutil.which("gcc") is not None:
         assert outcome(native_output, source) == expected
+
+
+@pytest.mark.parametrize("source", RUN_TIME_STAGING.values(), ids=RUN_TIME_STAGING.keys())
+def test_run_time_staging(source: str) -> None:
+    expected = outcome(tree_output, source)
+    assert expected[1] is None
+    assert outcome(ir_output, source) == expected
+    assert outcome(optimized_output, source) == expected
+    if shutil.which("gcc") is not None:
+        # Native code can only build code while compiling, and stops if it gets to a quote.
+        _, error = outcome(native_output, source)
+        assert error is not None and "at run time needs an interpreter" in error
 
 
 def test_some_programs_fail_the_same_way() -> None:
@@ -609,3 +687,39 @@ def test_profile_and_placement_report() -> None:
     profile = interpreter.format_profile()
     assert "High water by scope:" in profile and "f level 0" in profile
     assert "3x  4:15 add in f" in profile
+
+
+@pytest.mark.parametrize(
+    ("instr", "message"),
+    [
+        (Instr("pool_new", Value(1, ListTy(I64)), [], S, region="0"), "bad operand or result types for"),
+        (
+            Instr("set_field", None, [Value(9, I64), Value(9, I64)], S, "P", region="0"),
+            "bad operand or result types for",
+        ),
+        (Instr("set_index", None, [], S, region="global"), "bad operand or result types for"),
+        (Instr("list", Value(1, ListTy(I64)), [], S, region="slot"), "list needs a valid region, not @slot"),
+    ],
+)
+def test_verifier_checks_new_operations(instr: Instr, message: str) -> None:
+    one = Instr("const", Value(9, I64), [], S, const=1)
+    with pytest.raises(IRError, match=message):
+        verify(function_with(one, instr, Instr("const", Value(10, I64), [], S, const=1)))
+
+
+def test_lowering_new_operations() -> None:
+    source = """\
+struct Node
+    name: str
+let mut p: Pool[Node] = pool_new()
+let h = alloc(mut p, Node("a"))
+p[h].name = p[h].name + "!"
+free(mut p, h)
+let first[T] = (xs: [T]) -> T => xs[0]
+print(first([1]))
+print(first(["a"]))
+"""
+    text = format_module(compile_program(source))
+    assert "= pool_new @global" in text and "= alloc %" in text and "free %" in text
+    assert "= pool_get %" in text and "set_field %" in text and "@slot" in text
+    assert "function first[i64](%" in text and "function first[str](%" in text

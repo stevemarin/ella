@@ -6,7 +6,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ella.checker import check
 from ella.codegen import generate
 from ella.interpreter import Interpreter
 from ella.ir import Module, format_module, format_placement
@@ -16,6 +15,7 @@ from ella.lower import compile_program
 from ella.native import build, parse_error
 from ella.parser import parse
 from ella.passes import PASSES, optimize
+from ella.staging import prepare
 from ella.syntax import show
 
 
@@ -26,6 +26,9 @@ def main(argv: list[str] | None = None) -> int:
     mode = args.add_mutually_exclusive_group()
     mode.add_argument("--tokens", action="store_true", help="print the tokens")
     mode.add_argument("--ast", action="store_true", help="print the syntax tree")
+    mode.add_argument(
+        "--expanded", action="store_true", help="print the syntax tree after running the splices outside quotes"
+    )
     mode.add_argument("--ir", action="store_true", help="print the IR")
     mode.add_argument("--asm", action="store_true", help="print the x64 assembly")
     mode.add_argument("--placement", action="store_true", help="print which arena each allocation goes to")
@@ -56,10 +59,14 @@ def main(argv: list[str] | None = None) -> int:
         elif options.ast:
             for expr in parse(source).body:
                 print(show(expr))
+        elif options.expanded:
+            program, _ = prepare(parse(source))
+            for expr in program.body:
+                print(show(expr))
         elif options.tree:
             program = parse(source)
-            check(program)
-            Interpreter().run(program)
+            program, checker = prepare(program)
+            Interpreter(checker=checker).run(program)
         else:
             module = compile_program(source)
             if options.optimize or passes is not None:

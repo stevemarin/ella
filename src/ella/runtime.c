@@ -62,7 +62,7 @@ typedef struct {
 
 // Type descriptors, emitted as static data by the code generator. Equality
 // and the text form of a list of enums of floats need to know all of that.
-enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM };
+enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE };
 
 struct Type {
     word kind;
@@ -72,9 +72,12 @@ struct Type {
     const void *parts[];
 };
 
+// A variant (or struct). A nocopy struct may have a finalizer, a closure run
+// on each value when it dies.
 typedef struct {
     const char *name;
     word count;
+    const Closure *finalize;
     const Type *fields[];
 } VariantType;
 
@@ -124,27 +127,47 @@ _Noreturn static void out_of_memory(const char *what) {
 // Arenas
 //
 // Every object lives in an arena, numbered by depth. Depth 0 is the global
-// arena, which is never freed. Each Ella call takes the next few depths for
-// its scope levels (its body, and one more for each loop nested in it) and
-// frees them when it returns; a loop frees its level after each iteration.
-// The generated code passes the depth to every function here that makes an
-// object.
+// arena, freed when the program ends. Each Ella call takes the next few
+// depths for its scope levels (its body, and one more for each loop nested
+// in it) and frees them when it returns; a loop frees its level after each
+// iteration. The generated code passes the depth to every function here
+// that makes an object.
 //
-// An arena is a range of address space, reserved the first time its depth is
-// used and never moved, so its objects never move either. Making an object
-// just bumps the arena's `top` pointer; pages are made usable ("committed")
-// as `top` passes them. Freeing an arena sets `top` back to the start.
+// A pool's values each live in an arena of their own, a *slot arena*,
+// numbered from SLOT_DEPTH up, which is freed when the value is.
+//
+// All the arenas are parts of one range of address space, reserved when the
+// program starts: SCOPE_SIZE bytes for each scope arena, then SLOT_SIZE for
+// each slot arena. So an arena never moves, and the arena an object is in
+// can be worked out from its address. Making an object just bumps the
+// arena's `top` pointer; the system gives the memory pages as they are first
+// used, and freeing an arena sets `top` back to the start.
 
-#define MAX_DEPTHS 65536
-#define ARENA_RESERVE ((size_t)4 << 30)  // address space per arena: 4 GiB
-#define COMMIT_STEP ((size_t)1 << 20)  // commit pages 1 MiB at a time
-#define KEEP_COMMITTED ((size_t)16 << 20)  // when freeing, give memory beyond 16 MiB back to the OS
+#define SCOPE_ARENAS 16384
+#define SCOPE_SIZE ((size_t)1 << 30)  // 1 GiB of address space per scope arena
+#define SLOT_ARENAS ((word)1 << 20)
+#define SLOT_SIZE ((size_t)16 << 20)  // 16 MiB per slot arena
+#define SLOT_DEPTH ((word)1 << 20)
+#define KEEP_SCOPE ((size_t)16 << 20)  // when freeing, give memory beyond this back to the OS
+#define KEEP_SLOT ((size_t)64 << 10)
+
+// A value with a finalizer, in the arena it lives in: a nocopy struct with
+// its finalizer, or a pool (with no closure), which frees its values.
+typedef struct {
+    word object;
+    const Closure *finalize;
+} Final;
 
 typedef struct {
-    char *start, *top, *committed, *end;
+    char *top;
+    Final *finals;
+    word count, capacity;
 } Arena;
 
-static Arena arenas[MAX_DEPTHS];
+static char *space;  // all the arenas' address space
+static Arena scope_arenas[SCOPE_ARENAS];
+static Arena *slot_arenas;
+static word *free_slots, free_slot_count, slot_arenas_used;
 
 // The first depth not taken by a call in progress (depth 0 is global).
 word ella_next_depth = 1;
@@ -160,62 +183,106 @@ static size_t in_use, peak;
 
 static size_t round16(size_t size) { return (size + 15) & ~(size_t)15; }
 
-static void commit(Arena *a, char *new_top) {
-    if (new_top > a->end) out_of_memory("an arena is full");
-    if (new_top <= a->committed) return;
-    char *limit = a->start + (new_top - a->start + COMMIT_STEP - 1) / COMMIT_STEP * COMMIT_STEP;
-    if (limit > a->end) limit = a->end;
-    if (mprotect(a->committed, (size_t)(limit - a->committed), PROT_READ | PROT_WRITE) != 0) {
-        out_of_memory("can't commit arena memory");
-    }
-    a->committed = limit;
+static void reserve(void) {
+    size_t size = SCOPE_ARENAS * SCOPE_SIZE + (size_t)SLOT_ARENAS * SLOT_SIZE;
+    space = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    slot_arenas = calloc((size_t)SLOT_ARENAS, sizeof(Arena));
+    free_slots = malloc((size_t)SLOT_ARENAS * sizeof(word));
+    if (space == MAP_FAILED || slot_arenas == NULL || free_slots == NULL) out_of_memory("can't reserve address space");
+    for (word i = 0; i < SCOPE_ARENAS; i++) scope_arenas[i].top = space + i * SCOPE_SIZE;
+}
+
+static char *arena_start(word depth) {
+    if (depth >= SLOT_DEPTH) return space + SCOPE_ARENAS * SCOPE_SIZE + (size_t)(depth - SLOT_DEPTH) * SLOT_SIZE;
+    return space + depth * SCOPE_SIZE;
 }
 
 static Arena *arena(word depth) {
-    if (depth < 0 || depth >= MAX_DEPTHS) out_of_memory("too many nested scopes");
-    Arena *a = &arenas[depth];
-    if (a->start == NULL) {
-        void *range = mmap(NULL, ARENA_RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (range == MAP_FAILED) out_of_memory("can't reserve address space for an arena");
-        a->start = a->top = a->committed = range;
-        a->end = a->start + ARENA_RESERVE;
-    }
-    return a;
+    if (depth >= SLOT_DEPTH) return &slot_arenas[depth - SLOT_DEPTH];
+    if (depth < 0 || depth >= SCOPE_ARENAS) out_of_memory("too many nested scopes");
+    return &scope_arenas[depth];
+}
+
+// The arena an object is in, from its address: -1 for static data.
+word ella_region_of(word object) {
+    char *p = (char *)object;
+    char *slots = space + SCOPE_ARENAS * SCOPE_SIZE;
+    if (p >= space && p < slots) return (word)((size_t)(p - space) / SCOPE_SIZE);
+    if (p >= slots && p < slots + (size_t)SLOT_ARENAS * SLOT_SIZE) return SLOT_DEPTH + (word)((size_t)(p - slots) / SLOT_SIZE);
+    return -1;
 }
 
 static void *alloc(size_t size, word depth) {
     Arena *a = arena(depth);
     char *object = a->top;
-    commit(a, object + round16(size));
+    size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : SCOPE_SIZE;
+    if ((size_t)(object + round16(size) - arena_start(depth)) > limit) out_of_memory("an arena is full");
     a->top = object + round16(size);
     in_use += round16(size);
     if (in_use > peak) peak = in_use;
     return object;
 }
 
-static void free_arena(word depth) {
-    Arena *a = &arenas[depth];
-    if (a->start == NULL) return;
-    size_t used = (size_t)(a->top - a->start);
-    in_use -= used;
-    if (poison) memset(a->start, 0xA5, used);
-    a->top = a->start;
-    // Memory well beyond what the arena usually needs goes back to the OS.
-    // It reads as zeros if it is used again.
-    size_t committed = (size_t)(a->committed - a->start);
-    if (committed > KEEP_COMMITTED) madvise(a->start + KEEP_COMMITTED, committed - KEEP_COMMITTED, MADV_DONTNEED);
+// Remember a value with a finalizer, made in the arena at `depth`.
+void ella_register(word object, const Closure *finalize, word depth) {
+    Arena *a = arena(depth);
+    if (a->count == a->capacity) {
+        a->capacity = a->capacity ? 2 * a->capacity : 8;
+        a->finals = realloc(a->finals, (size_t)a->capacity * sizeof(Final));
+        if (a->finals == NULL) out_of_memory("can't grow a finalization list");
+    }
+    a->finals[a->count++] = (Final){object, finalize};
 }
 
-// Free the arenas at depths first, ..., end - 1: a loop's levels when an
+// Forget a value's finalizer, when the value moves to another arena.
+static void unregister(word object) {
+    word depth = ella_region_of(object);
+    if (depth < 0) return;
+    Arena *a = arena(depth);
+    for (word i = a->count - 1; i >= 0; i--) {
+        if (a->finals[i].object == object) {
+            memmove(&a->finals[i], &a->finals[i + 1], (size_t)(a->count - i - 1) * sizeof(Final));
+            a->count--;
+            return;
+        }
+    }
+}
+
+extern void ella_call1(const Closure *closure, word argument);  // in the generated code
+static void free_pool(word pool);
+
+static void free_arena(word depth) {
+    Arena *a = arena(depth);
+    // Finalizers first, newest first, while the values are still there.
+    while (a->count > 0) {
+        Final final = a->finals[--a->count];
+        if (final.finalize == NULL) {
+            free_pool(final.object);
+        } else {
+            ella_call1(final.finalize, final.object);
+        }
+    }
+    char *start = arena_start(depth);
+    size_t used = (size_t)(a->top - start);
+    in_use -= used;
+    if (poison) memset(start, 0xA5, used);
+    a->top = start;
+    // Memory well beyond what the arena usually needs goes back to the OS.
+    // It reads as zeros if it is used again.
+    size_t keep = depth >= SLOT_DEPTH ? KEEP_SLOT : KEEP_SCOPE;
+    if (used > keep) madvise(start + keep, used - keep, MADV_DONTNEED);
+}
+
+// Free the arenas at depths end - 1, ..., first: a loop's levels when an
 // iteration ends.
 void ella_reset(word first, word end) {
-    for (word depth = first; depth < end; depth++) free_arena(depth);
+    for (word depth = end - 1; depth >= first; depth--) free_arena(depth);
 }
 
 // A call starts: take `levels` depths, and return the first.
 word ella_enter(word levels) {
     word base = ella_next_depth;
-    if (base + levels > MAX_DEPTHS) out_of_memory("too many nested scopes");
+    if (base + levels > SCOPE_ARENAS) out_of_memory("too many nested scopes");
     ella_next_depth = base + levels;
     return base;
 }
@@ -224,6 +291,19 @@ word ella_enter(word levels) {
 void ella_leave(word base) {
     ella_reset(base, ella_next_depth);
     ella_next_depth = base;
+}
+
+static word new_slot_arena(void) {
+    if (free_slot_count > 0) return free_slots[--free_slot_count];
+    if (slot_arenas_used == SLOT_ARENAS) out_of_memory("too many values in pools");
+    word depth = SLOT_DEPTH + slot_arenas_used++;
+    arena(depth)->top = arena_start(depth);
+    return depth;
+}
+
+static void free_slot_arena(word depth) {
+    free_arena(depth);
+    free_slots[free_slot_count++] = depth;
 }
 
 // Integer arithmetic. `+`, `-` and `*` are done by generated code directly;
@@ -409,7 +489,9 @@ Closure *ella_closure_alloc(void *code, word count, const Type *types, word dept
 // it shares nothing with v. Strings are copied too, since v's may be in an
 // arena that is freed sooner.
 
-static int is_boxed(const Type *t) { return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL; }
+static int is_boxed(const Type *t) {
+    return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL && t->kind != K_HANDLE;
+}
 
 word ella_copy(word v, const Type *t, word depth) {
     switch (t->kind) {
@@ -454,9 +536,151 @@ word ella_copy(word v, const Type *t, word depth) {
         }
         return (word)copy;
     }
-    default:  // (), i64, f64, bool
+    default:  // (), i64, f64, bool, handles; pools can't be copied
         return v;
     }
+}
+
+// `move v @r`: a value that can't be copied, moved to another arena: copied
+// there, with the finalizers of the values it holds moving with them. The
+// old value is never used again.
+word ella_move(word v, const Type *t, word depth) {
+    switch (t->kind) {
+    case K_TUPLE: {
+        const List *xs = (const List *)v;
+        List *moved = ella_list_alloc(xs->len, depth);
+        for (word i = 0; i < xs->len; i++) moved->items[i] = ella_move(xs->items[i], t->parts[i], depth);
+        return (word)moved;
+    }
+    case K_ENUM: {
+        const Variant *x = (const Variant *)v;
+        const VariantType *variant = t->parts[x->tag];
+        Variant *moved = ella_variant_alloc(x->tag, x->count, depth);
+        for (word i = 0; i < x->count; i++) moved->fields[i] = ella_move(x->fields[i], variant->fields[i], depth);
+        if (variant->finalize != NULL) {
+            unregister(v);
+            ella_register((word)moved, variant->finalize, depth);
+        }
+        return (word)moved;
+    }
+    case K_POOL: {
+        // A pool's header moves; its values stay in their slot arenas.
+        word *moved = alloc(5 * sizeof(word), depth);
+        memcpy(moved, (const void *)v, 5 * sizeof(word));
+        unregister(v);
+        ella_register((word)moved, NULL, depth);
+        return (word)moved;
+    }
+    default:
+        return is_boxed(t) ? ella_copy(v, t, depth) : v;
+    }
+}
+
+// Storing `value` into an object that may be a pool's value (`@slot`): a
+// pool's value lives in its slot's arena, so the value is copied there.
+word ella_store_slot(word object, word value, const Type *t) {
+    word depth = ella_region_of(object);
+    if (depth < SLOT_DEPTH || !is_boxed(t)) return value;
+    return ella_copy(value, t, depth);
+}
+
+// Pools. A pool has slots, each holding a value (in its own slot arena) or
+// free. A slot's generation goes up when its value is freed, and a handle
+// remembers the generation it was made with, so a handle to a freed value
+// is caught. A handle is one word: the slot in the low 32 bits, the
+// generation in the high 32.
+
+typedef struct {
+    word generation;
+    word depth;  // its slot arena, while it holds a value
+    word value;
+    word next_free;  // while it is free: the next free slot, or -1
+} Slot;
+
+typedef struct {
+    word live;  // how many slots hold values
+    word len, capacity;
+    Slot *slots;
+    word free;  // the most recently freed slot, or -1
+} Pool;
+
+word ella_pool_new(word depth) {
+    Pool *pool = alloc(sizeof(Pool), depth);
+    *pool = (Pool){0, 0, 0, NULL, -1};
+    ella_register((word)pool, NULL, depth);  // when it dies, its values are freed
+    return (word)pool;
+}
+
+static word handle(word slot, word generation) { return (word)(((uint64_t)generation << 32) | (uint64_t)slot); }
+
+word ella_alloc(Pool *pool, word value, const Type *t) {
+    word slot;
+    if (pool->free >= 0) {
+        slot = pool->free;
+        pool->free = pool->slots[slot].next_free;
+    } else {
+        if (pool->len == pool->capacity) {
+            pool->capacity = pool->capacity ? 2 * pool->capacity : 8;
+            pool->slots = realloc(pool->slots, (size_t)pool->capacity * sizeof(Slot));
+            if (pool->slots == NULL) out_of_memory("can't grow a pool");
+        }
+        slot = pool->len++;
+        pool->slots[slot].generation = 0;
+    }
+    Slot *s = &pool->slots[slot];
+    s->depth = new_slot_arena();
+    // A value that can't be copied is moved, with its finalizers.
+    s->value = ella_move(value, t, s->depth);
+    pool->live++;
+    return handle(slot, s->generation);
+}
+
+static Slot *slot_of(Pool *pool, word h, word line, word column) {
+    word slot = (word)((uint64_t)h & 0xFFFFFFFF), generation = (word)((uint64_t)h >> 32);
+    if (slot >= pool->len || pool->slots[slot].generation != generation || pool->slots[slot].depth < 0) {
+        fail(line, column, "handle <handle %" PRId64 ":%" PRId64 "> is stale: its value was freed", slot, generation);
+    }
+    return &pool->slots[slot];
+}
+
+word ella_pool_get(Pool *pool, word h, word line, word column) { return slot_of(pool, h, line, column)->value; }
+
+void ella_pool_set(Pool *pool, word h, word value, const Type *t, word line, word column) {
+    Slot *s = slot_of(pool, h, line, column);
+    // Copy the new value into a new arena before freeing the old one: it may share parts of the old value.
+    word depth = new_slot_arena();
+    s->value = is_boxed(t) ? ella_copy(value, t, depth) : value;
+    free_slot_arena(s->depth);
+    s->depth = depth;
+}
+
+void ella_free(Pool *pool, word h, word line, word column) {
+    Slot *s = slot_of(pool, h, line, column);
+    word slot = s - pool->slots;
+    word depth = s->depth;
+    s->depth = -1;
+    s->generation++;
+    s->next_free = pool->free;
+    pool->free = slot;
+    pool->live--;
+    free_slot_arena(depth);
+}
+
+word ella_pool_len(const Pool *pool) { return pool->live; }
+
+// A pool dies: free its values, last slot first.
+static void free_pool(word object) {
+    Pool *pool = (Pool *)object;
+    for (word slot = pool->len - 1; slot >= 0; slot--) {
+        if (pool->slots[slot].depth >= 0) {
+            word depth = pool->slots[slot].depth;
+            pool->slots[slot].depth = -1;
+            free_slot_arena(depth);
+        }
+    }
+    free(pool->slots);
+    pool->slots = NULL;
+    pool->len = pool->live = 0;
 }
 
 // `xs += ys`: add copies of ys's items to xs, which lives in the arena at
@@ -464,6 +688,7 @@ word ella_copy(word v, const Type *t, word depth) {
 // its arena, it grows in place; otherwise it moves to a new home with room
 // for twice as many items. Either way, adding an item costs O(1) on average.
 List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
+    if (depth < 0) depth = ella_region_of((word)xs);  // @slot: the arena xs is in
     word n = ys->len, len = xs->len;  // ys may be xs, so read its length first
     if (len + n > xs->cap) {
         word cap = len + n > 2 * xs->cap ? len + n : 2 * xs->cap;
@@ -472,7 +697,8 @@ List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
         char *end = (char *)xs + round16(sizeof(List) + (size_t)xs->cap * sizeof(word));
         if (end == a->top) {
             char *new_end = (char *)xs + round16(sizeof(List) + (size_t)cap * sizeof(word));
-            commit(a, new_end);
+            size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : SCOPE_SIZE;
+            if ((size_t)(new_end - arena_start(depth)) > limit) out_of_memory("an arena is full");
             in_use += (size_t)(new_end - end);
             if (in_use > peak) peak = in_use;
             a->top = new_end;
@@ -671,6 +897,19 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
     case K_F64: put_f64(b, as_f64(v)); break;
     case K_BOOL: put_ascii(b, v ? "true" : "false"); break;
     case K_FUNCTION: put_ascii(b, "<function>"); break;
+    case K_CODE: put_ascii(b, "<code>"); break;  // never made: native code can't build code at run time
+    case K_POOL:
+        put_ascii(b, "<pool of ");
+        put_i128(b, ((const Pool *)v)->live);
+        put(b, '>');
+        break;
+    case K_HANDLE:
+        put_ascii(b, "<handle ");
+        put_i128(b, (word)((uint64_t)v & 0xFFFFFFFF));
+        put(b, ':');
+        put_i128(b, (word)((uint64_t)v >> 32));
+        put(b, '>');
+        break;
     case K_STR: {
         const Str *s = (const Str *)v;
         if (nested) {
@@ -783,7 +1022,9 @@ extern void ella_main(void);
 
 int main(void) {
     poison = getenv("ELLA_POISON") != NULL;
+    reserve();
     ella_main();
+    ella_reset(0, 1);  // the globals, and their finalizers
     fflush(stdout);
     if (getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);
     return 0;

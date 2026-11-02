@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 57
+    assert len(program.body) == 79
 
 
 # Precedence (docs/grammar.md §8)
@@ -395,7 +395,7 @@ def test_enum() -> None:
 
 
 def test_reserved_keywords() -> None:
-    assert "reserved" in error("struct Point").message
+    assert "reserved" in error("comptime x").message
 
 
 def test_error_spans() -> None:
@@ -431,3 +431,33 @@ def test_mut_parameters_and_arguments() -> None:
 )
 def test_mut_errors(source: str, message: str) -> None:
     assert error(source).message == message
+
+
+def test_structs() -> None:
+    assert one("struct Point\n    x: f64\n    y: f64") == "(struct Point x: f64 y: f64)"
+    assert one("struct Pair[T]\n    a: T\n    b: T") == "(struct Pair[T] a: T b: T)"
+    source = "nocopy struct File\n    name: str\n    finalize = (f: File) -> () => ()"
+    assert one(source) == "(nocopy struct File name: str (finalize (lambda (f: File) -> () ())))"
+    assert one("p.x = 1") == "(= (. p x) 1)"
+    assert error("struct P\n    x: i64\n    x: i64").message == "'x' is already a field of P"
+
+
+def test_generic_functions() -> None:
+    assert one("let first[T] = (xs: [T]) -> T => xs[0]") == "(let [first[T]] (lambda (xs: [T]) -> T (index xs 0)))"
+
+
+def test_quotes_and_splices() -> None:
+    assert one("quote $x * $(f(x))") == "(quote (* ($ x) ($ (call f x))))"
+    assert (
+        one("let c: Code[i64] = quote\n    let y = 1\n    y") == "(let [c: Code[i64]] (quote (block (let [y] 1) y)))"
+    )
+    assert one("$\n    quote 1") == "($ (block (quote 1)))"
+    # `$` takes only a name or parentheses: `$f(x)` calls the spliced `f`.
+    assert one("$f(x)") == "(call ($ f) x)"
+    assert error("$1").message == "expected a name or '(' after '$', found '1'"
+
+
+def test_types_as_values_and_splices() -> None:
+    assert one("type [Pair[i64]]") == "(type [Pair[i64]])"
+    assert one("quote (a: $t) -> $u => a.$f") == "(quote (lambda (a: $(t)) -> $(u) (. a ($ f))))"
+    assert one("quote $v.$(names[0])") == "(quote (. ($ v) ($ (index names 0))))"

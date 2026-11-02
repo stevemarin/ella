@@ -1,14 +1,15 @@
 # Ella memory model
 
-**Status:** partly implemented. This is roadmap stage 6 in the
-[README](../README.md), which built steps 1 to 5 and 9 of the
+**Status:** mostly implemented, in roadmap stages 6 and 7 of the
+[README](../README.md). Stage 6 built steps 1 to 5 and 9 of the
 [plan](#9-implementation-plan): explicit copies, lists that change in place,
 `mut` parameters, scope arenas whose placement the compiler chooses and the
-IR interpreter checks, and real arenas in native code. Pools, slabs,
-sub-arenas, non-copyable types and finalization wait until after staging
-(stage 7), since they need generics and user-defined types.
-[What stage 6 built](#14-what-stage-6-built) describes the implementation,
-and where it settles or departs from this design.
+IR interpreter checks, and real arenas in native code. Stage 7 built steps
+6 to 8: generics, pools with generation-checked handles, non-copyable types
+and finalizers, together with structs and multi-stage programming.
+Sub-arenas are not built yet. [What stage 6 built](#14-what-stage-6-built)
+and [what stage 7 built](#15-what-stage-7-built) describe the
+implementation, and where it settles or departs from this design.
 
 The rest of this document is the design, recorded so an implementation can
 start from it without repeating the discussion. Items marked
@@ -94,7 +95,7 @@ References are **second-class**:
 Parameter modes **(provisional syntax)**:
 
 | Mode | Meaning | Mechanism |
-|---|---|---|
+| --- | --- | --- |
 | (default) | read-only input | copy or hidden reference, chosen by the compiler |
 | `mut` | read and write the caller's variable (like Ada `in out`, Swift `inout`) | a reference (defined as value-result; see §14) |
 | `out` | the callee must initialize it (maybe; see the open questions) | always a reference |
@@ -134,7 +135,7 @@ needed later. Leave room in the syntax for it, but don't design it yet.
 ## 5. Storage classes
 
 | Storage | Holds | Freed | Safety mechanism |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Stack | fixed-size, small locals | function return | references are second-class |
 | Scope arena | dynamically sized values, large values, return values | scope exit (reset to a mark) | placement rules (§6), depth checks |
 | `Pool[T]` | long-lived objects of one type | explicit `free(handle)` | generational handles |
@@ -312,14 +313,15 @@ code only after the rules are settled and tested.
    their chosen depth or result region. The interpreter's run-time checks
    from step 4 then verify the compiler's choices. *(Done in stage 6.)*
 6. **Comptime and generics** (§8), including `needs_cleanup` and generated
-   copy functions. *(Stage 7.)*
+   copy functions. *(Done in stage 7, with generics as type parameters and
+   staging as quotes and splices; see §15.)*
 7. **Pools, handles and slabs**, simulated in the interpreter with
-   generation checks. *(After stage 7.)*
-8. **Non-copyable types and finalization lists** (§3, §7). *(After stage 7.)*
+   generation checks. *(Done in stage 7, with an arena per pool slot instead
+   of size-class slabs; see §15.)*
+8. **Non-copyable types and finalization lists** (§3, §7). *(Done in stage 7.)*
 9. **Native runtime** for x64: real virtual-range reservations with
    `mmap`/`madvise`, bump allocation, pools, slabs. Compare results against
-   the IR interpreter on the same test programs. *(Done in stage 6 for scope
-   arenas; pools and slabs come with step 7.)*
+   the IR interpreter on the same test programs. *(Done in stages 6 and 7.)*
 
 Each step should keep every test program producing the same output through
 both interpreters, as the README requires today.
@@ -338,12 +340,14 @@ Out of scope for now. The intended direction:
 
 ## 11. Open questions
 
-* Syntax for non-copyable types. (Parameter modes are `mut name: T`, and
-  call sites mark `mut` arguments: settled in stage 6.)
+* Settled: parameter modes are `mut name: T`, call sites mark `mut`
+  arguments (stage 6), and non-copyable types are `nocopy struct` (stage 7).
 * Whether `out` parameters are worth having, or whether returning tuples is
   enough.
-* A shared, non-owning handle type for pools, and what copying an owning
-  handle means (forbidden, or a deep copy of the target?).
+* Owning, non-copyable handles. Stage 7's handles are plain copyable
+  values that don't own their slots (a freed value is caught by its
+  generation, not prevented); whether owning handles are worth adding is
+  open, as is a handle knowing its pool.
 * Whether types need an `adjust` hook after copies.
 * What exactly a "scope" is for placement: a function, any block, or a loop
   iteration. Stage 6 uses function bodies and loop iterations only (§14);
@@ -503,3 +507,114 @@ program reports its peak arena use when it finishes.
   when they would live long enough.
 * The exclusivity check, and the analysis of which variables change in
   place, go by name, so shadowed names make them more cautious than needed.
+
+## 15. What stage 7 built
+
+Stage 7 added the rest of the memory model (steps 6 to 8 of the plan),
+with the language features it needed: structs, generic functions, and
+multi-stage programming. The syntax is in [grammar.md](grammar.md) §9 and
+§11.
+
+### Generics, and stages instead of comptime
+
+The design (§8) makes generics comptime functions that return types. Stage
+7 separates the two ideas:
+
+* **Generics** are type parameters, as enums already had: `struct Pair[T]`
+  and `let first[T] = (xs: [T]) -> T => ...`. Every generic function is
+  specialized for each set of type arguments it is used with
+  (monomorphization), so every type's size is still known when compiling.
+  `needs_cleanup(T)` is worked out while compiling (`is_nocopy` and the
+  `finalize` of structs, in ella.checker), and copying uses type
+  descriptors in the runtime rather than generated copy functions.
+* **Staging** is multi-stage rather than two-stage: `quote` and `$` build
+  code at any stage, in both directions, so compile time is just stage -1
+  ([src/ella/staging.py](../src/ella/staging.py)). Splices outside quotes
+  run in the AST interpreter, before lowering, and only the code they give
+  reaches the IR, as §8 says. Code built at run time runs in the
+  interpreters, which check and lower it when it is `run`; native code
+  can't do that yet.
+
+The two meet in **types as values** ([grammar.md
+§11](grammar.md#types-as-values-and-generated-code)): `type T` is a
+`Type[T]`, quotes can splice in a type (`$t`) or a field name (`v.$f`), and
+built-ins such as `fields(t)` look at a type. That is the compile-time
+reflection §8 asks for: functions like `derive_eq(type Point)` generate
+equality, printing or copying code for any struct while compiling. Because
+a `Type[T]` says which type it holds, generated code still has a known type
+(`Code[(T, T) -> bool]`). Only a spliced field's type is unknown until the
+code is built (a *deferred* type, which the checker lets through, and checks
+when the built code is checked).
+
+Functions can also **compute types**: `$(Stack(type i64))` in a type runs
+while the program is being checked, and `new_struct` makes struct types,
+named after what they are made from, so that asking twice gives the same
+type (as Zig caches comptime calls). That needs the checker and
+compile-time code to take turns: when the checker meets a splice in a
+type, it checks the functions the splice will call (and expands their own
+splices), runs it in the AST interpreter, and goes on with the type it
+gives. Splices of code still run after checking. After expansion, the
+structs that compile-time code made become ordinary definitions in the
+program, so the IR and native code never see a computed type.
+
+Still apart, and the next step if it is wanted: compile-time type
+parameters, `(comptime T: type, x: T)`, with each use checked separately as
+in Zig or C++ templates, so that a generic body can use `+` on `T` if every
+use is with a type that has it. Constraints on type parameters would be the
+other way to get that.
+
+### Structs
+
+A struct is an enum with one variant named after it. Its fields can change
+in place (`set_field`), so structs count as mutable for the copying rules
+of §14, like lists. Assignments to fields and items, and `mut` arguments,
+can go through any mix of indexes and fields (`w.players[i].score += 1`),
+and `+=` on a list anywhere appends in place.
+
+### Pools: an arena per slot
+
+The design gives pooled values size-class slabs for their strings and
+lists (§5). Stage 7 instead gives each slot of a pool an arena of its own,
+a *slot arena*. A value put in a pool is copied into a new slot arena, and
+everything later stored into it (`pool[h].names += [s]`) goes there too.
+Freeing the value frees its whole arena at once, the way a scope arena is
+freed, so there is no need to free a value's parts one by one, or to tell
+static data from pooled data. Replacing a value (`pool[h] = v`) copies the
+new value into a new arena and frees the old one.
+
+The cost is memory: changing a pooled value without replacing it leaves the
+old parts in its arena until the value is freed or replaced (region bloat,
+per value). A handle is one word: the slot and the generation. Freeing a
+value bumps its slot's generation, so a stale handle is always caught, even
+after the slot is reused. Natively, all arenas, scope and slot, are parts of
+one reserved range of address space, so the arena an object is in can be
+worked out from its address: 16384 scope arenas of 1 GiB, and about a
+million slot arenas of 16 MiB. A pool is itself a value that can't be
+copied, and when it dies, it frees its values.
+
+### Non-copyable values and finalizers
+
+`nocopy struct` (§3) marks a type that can't be copied. The checker
+(`check_copies` in ella.checker) allows its values only where they are
+borrowed or moved, never copied, so the compiler never has to copy one.
+Its one special case is a function returning a local variable: the IR
+`move` instruction moves the value to the caller's arena.
+
+Finalizers (§7) are registered in the arena a value is made in, on a
+finalization list. Freeing an arena runs its list newest first, before the
+memory is reused, as Ada's finalization masters do. Moving a value (`move`,
+`alloc`) moves its registrations too. A value given to `return` or `break`
+is made in the arena it goes to, so it is finalized there. The AST
+interpreter, which has no arenas, keeps an owner per function call and
+loop iteration instead, and moves values between owners the same way; the
+tests check that all the interpreters and native code finalize in the same
+order. Nothing is finalized when a program stops with an error.
+
+### Not built
+
+* Sub-arenas (§5) for groups of long-lived values that die together.
+* Owning, non-copyable handles, and an `adjust` hook (§11).
+* Running code built at run time in native code.
+* In the IR, a quote inside a function that is defined inside a splice
+  can't refer to the variables of the quote the splice is in (the AST
+  interpreter can). The checker doesn't catch this yet.

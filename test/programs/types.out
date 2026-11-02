@@ -1,0 +1,7 @@
+Stack[i64]([3, 4], 2)
+4
+["a"]
+Tagged[Point](0.0, 0.0, "origin")
+origin
+Stack[str](["a", "b"], 2)
+Stack[str](["a"], 1)

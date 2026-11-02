@@ -61,12 +61,16 @@ one names the arena, its *region*, written after an `@`:
                    each loop nested in it adds a level for its iterations
     @result        where the caller wants the function's result
     @mut0, ...     where the variable passed to `mut` parameter 0 lives
-    @global        the program's global arena, which is never freed
+    @global        the program's global arena, freed when the program ends
+    @slot          (for changing an object) the arena it is in: a pool's
+                   value, in its slot's own arena, which gets a copy
 
 `reset k` frees levels k and up when control leaves a loop iteration, and
 returning frees all of the function's levels. A value must never be used
 after its arena is freed, and an object must never be stored where it would
-outlive its arena; the IR interpreter checks both at run time.
+outlive its arena; the IR interpreter checks both at run time. Freeing an
+arena first runs the finalizers of the values in it that have them (nocopy
+structs with `finalize`, and pools), newest first.
 
 Operations
 ----------
@@ -88,13 +92,31 @@ Operations
     append xs, ys @r             xs with copies of ys's items added, growing xs in place
                                  if it can; xs lives in region r and isn't used again
     copy v @r                    a deep copy of v in region r
+    move v @r                    v, which can't be copied, moved to region r with
+                                 its finalizers (a returned local variable)
     reset k                      free the function's scope levels k and up
-    len c                        length of a list, string or range
+    pool_new @r                  a new, empty pool
+    alloc pool, v                put v in a new slot of the pool, in the slot's own
+                                 arena; gives its handle
+    pool_get pool, h             the value a handle refers to (checking it isn't stale)
+    pool_set pool, h, v          replace that value, with v in a new arena
+    free pool, h                 free that value, with its arena
+    quote_begin                  start building the code of quote n (in `index`),
+                                 choosing fresh names for its variables
+    quote begin, outer..., v...  the code of quote n: its splices' code and the
+                                 values it carries are the operands (after the
+                                 `quote_begin`s of the quotes it is spliced into)
+    run c @r                     check code made by `quote`, lower it, and run it
+    type_value t...               type n (in `index`) of the module's types, as a value,
+                                 with the types t... spliced into it (`type [$t]`)
+    reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
+    len c                        length of a list, string or range, or a pool's count
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
-    variant Name(a, ...)         make an enum value
+    variant Name(a, ...)         make an enum value or struct (registering its finalizer)
     is_variant v, Name           does v hold that variant?
     variant_field v, Name.n      field n of v, which holds that variant
+    set_field v, x @r            change field n (in `index`) of struct v in place
     closure f(a, ...)            a function value: IR function f with captured values
     call f(a, mut b @r, ...)     call a function value; the result goes in the call's
                                  region. A `mut` argument b, which lives in region r,
@@ -112,7 +134,7 @@ assert, ...) carry the source span to report.
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import assert_never
+from typing import Any, assert_never
 
 from ella.checker import (
     BOOL,
@@ -122,6 +144,7 @@ from ella.checker import (
     RANGE,
     STR,
     UNIT,
+    BuiltinTy,
     EnumInfo,
     EnumTy,
     FuncTy,
@@ -245,20 +268,54 @@ class Function:
 
 @dataclass(slots=True)
 class Module:
-    """A whole program. Running it means calling `entry`, which runs the top-level code."""
+    """A whole program. Running it means calling `entry`, which runs the top-level code.
+
+    Code made at run time with `quote` is checked and lowered into the module
+    when it is `run`, in an interpreter, which needs some of what the
+    lowering knew: the program's checker, the syntax of each quote
+    (`templates`, by number), and the generic functions and their
+    specializations so far.
+    """
 
     functions: dict[str, Function] = field(default_factory=dict)
     globals: dict[str, Type] = field(default_factory=dict)
     enums: dict[str, EnumInfo] = field(default_factory=dict)
     entry: str = "top"
+    checker: Any = None  # ella.checker.Checker
+    tables: Any = None  # ella.staging.Tables
+    templates: dict[int, Any] = field(default_factory=dict)  # number -> its `quote` syntax tree
+    # The types of `type_value`s, by number: as written (which may have splices), and as checked.
+    types: list[tuple[Any, Type]] = field(default_factory=list)
+    generics: dict[str, Any] = field(default_factory=dict)  # name -> (Lambda, type parameters)
+    specializations: dict[tuple[str, tuple[Type, ...]], str] = field(default_factory=dict)
 
 
 # Memory
 
 # Operations that make a new object, and so name a region (when their result is boxed).
 ALLOCATING = frozenset(
-    {"tuple", "list", "variant", "closure", "range", "range_incl", "add", "index", "to_text", "copy", "call", "append"}
+    {
+        "tuple",
+        "list",
+        "variant",
+        "closure",
+        "range",
+        "range_incl",
+        "add",
+        "index",
+        "to_text",
+        "copy",
+        "move",
+        "call",
+        "append",
+        "pool_new",
+        "run",
+        "reflect",
+    }
 )
+
+# Operations that change an object in place, naming the region it lives in.
+CHANGING = frozenset({"set_index", "set_field", "append"})
 
 
 def allocates(instr: Instr) -> bool:
@@ -273,8 +330,11 @@ def allocates(instr: Instr) -> bool:
 
 
 def is_boxed(t: Type) -> bool:
-    """Whether values of type `t` are references to objects in an arena."""
-    return t not in (I64, F64, BOOL, UNIT, NEVER)
+    """Whether values of type `t` are references to objects in an arena.
+
+    A pool's handle is just a number, a slot and a generation, in one word.
+    """
+    return t not in (I64, F64, BOOL, UNIT, NEVER) and not (isinstance(t, BuiltinTy) and t.name == "Handle")
 
 
 def region_level(region: str) -> int | None:
@@ -316,7 +376,7 @@ def trim_levels(function: Function) -> bool:
     used = 0
     for block in function.blocks:
         for instr in block.instrs:
-            level = region_level(instr.region) if instr.op != "set_index" else None
+            level = region_level(instr.region) if instr.op not in ("set_index", "set_field") else None
             if level is not None:
                 used = max(used, level + 1)
     used = max(used, 1)
@@ -683,7 +743,7 @@ class Verifier:
         """Check that an instruction's operands and result have the types its operation needs."""
         args = [a.type for a in instr.args]
         dest = instr.dest.type if instr.dest is not None else None
-        effects = ("store", "global_set", "print", "assert", "set_index", "reset")
+        effects = ("store", "global_set", "print", "assert", "set_index", "set_field", "reset", "free", "pool_set")
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
         self.require(not instr.outs or instr.op == "call", f"{instr.op} can't have extra results", block)
         self.check_region(instr, block)
@@ -722,7 +782,9 @@ class Verifier:
             case "not":
                 need(args == [BOOL] and dest == BOOL)
             case "eq" | "ne":
-                need(len(args) == 2 and args[0] == args[1] and dest == BOOL)
+                # Types as values may only be known once code is built: Type[?] can equal Type[str].
+                types = all(isinstance(a, BuiltinTy) and a.name == "Type" for a in args)
+                need(len(args) == 2 and (args[0] == args[1] or types) and dest == BOOL)
             case "lt" | "le" | "gt" | "ge":
                 need(len(args) == 2 and args[0] == args[1] and args[0] in (I64, F64, STR) and dest == BOOL)
             case "contains":
@@ -739,13 +801,44 @@ class Verifier:
                 need(len(args) == 2 and args[1] == I64 and dest == item_type(args[0]))
             case "set_index":
                 need(len(args) == 3 and isinstance(args[0], ListTy) and args[1:] == [I64, args[0].element])
-            case "append" | "copy":
+            case "append" | "copy" | "move":
                 need(len(args) == (2 if instr.op == "append" else 1) and dest == args[0])
-                need(instr.op == "copy" or (isinstance(dest, ListTy) and args[1] == dest))
+                need(instr.op != "append" or (isinstance(dest, ListTy) and args[1] == dest))
+            case "set_field":
+                need(len(args) == 2 and isinstance(args[0], EnumTy) and args[0].name == instr.name)
+                if isinstance(args[0], EnumTy):
+                    fields = self.field_types(args[0], instr.name, block)
+                    need(instr.index < len(fields) and args[1] == fields[instr.index])
+            case "pool_new":
+                need(not args and isinstance(dest, BuiltinTy) and dest.name == "Pool")
+            case "alloc" | "free" | "pool_get" | "pool_set":
+                need(len(args) >= 2 and isinstance(args[0], BuiltinTy) and args[0].name == "Pool")
+                if isinstance(args[0], BuiltinTy):
+                    item, handle = args[0].args[0], BuiltinTy("Handle", args[0].args)
+                    expected = {
+                        "alloc": ([item], handle),
+                        "free": ([handle], None),
+                        "pool_get": ([handle], item),
+                        "pool_set": ([handle, item], None),
+                    }[instr.op]
+                    need(args[1:] == expected[0] and dest == expected[1])
+            case "quote_begin":
+                need(not args and dest == UNIT and instr.index in self.module.templates)
+            case "quote":
+                need(isinstance(dest, BuiltinTy) and dest.name == "Code" and instr.index in self.module.templates)
+                need(bool(args) and args[0] == UNIT)
+            case "run":
+                need(dest is not None and args == [BuiltinTy("Code", (dest,))])
+            case "type_value":
+                need(dest == BuiltinTy("Type", (self.module.types[instr.index][1],)))
+            case "reflect":
+                first = STR if instr.name == "new_struct" else BuiltinTy("Type", (NEVER,))
+                need(bool(args) and (args[0] == first or (isinstance(args[0], BuiltinTy) and args[0].name == "Type")))
             case "reset":
                 need(not args and 1 <= instr.index < self.function.levels)
             case "len":
-                need(len(args) == 1 and item_type(args[0]) is not None and dest == I64)
+                pool = len(args) == 1 and isinstance(args[0], BuiltinTy) and args[0].name == "Pool"
+                need(len(args) == 1 and (item_type(args[0]) is not None or pool) and dest == I64)
             case "to_text":
                 need(len(args) == 1 and dest == STR)
             case "print":
@@ -777,13 +870,15 @@ class Verifier:
                     need([out.type for out in instr.outs] == mut_types)
                     need(len(instr.out_regions) == len(mut_types))
                     for region in instr.out_regions:
-                        self.require(self.valid_region(region), f"unknown region @{region}", block)
+                        self.require(self.valid_region(region, "call"), f"unknown region @{region}", block)
             case "assert":
                 need(args == [BOOL])
             case _:
                 raise self.fail(f"unknown operation {instr.op}", block)
 
-    def valid_region(self, region: str) -> bool:
+    def valid_region(self, region: str, op: str = "") -> bool:
+        if region == "slot":  # the arena of the object being changed (or passed as mut), a pool's value
+            return op in CHANGING or op == "call"
         level = region_level(region)
         if level is not None:
             return level < self.function.levels
@@ -792,11 +887,10 @@ class Verifier:
         return region in ("result", "global")
 
     def check_region(self, instr: Instr, block: Block) -> None:
-        """Allocating instructions with a boxed result, and `set_index`, name a valid region; others none."""
-        if instr.op == "set_index" or allocates(instr):
-            self.require(
-                self.valid_region(instr.region), f"{instr.op} needs a valid region, not @{instr.region}", block
-            )
+        """Allocating instructions with a boxed result, and those that change an object, name a valid region."""
+        if instr.op in CHANGING or allocates(instr):
+            valid = self.valid_region(instr.region, instr.op)
+            self.require(valid, f"{instr.op} needs a valid region, not @{instr.region}", block)
         else:
             self.require(not instr.region, f"{instr.op} can't have a region", block)
 

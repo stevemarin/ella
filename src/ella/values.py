@@ -12,8 +12,12 @@ Ella values are represented by plain Python values where one fits:
     [T]             list
     a..b, a..=b     range
     enum variants   VariantValue, or Constructor for a variant with fields
+    structs         VariantValue too (a struct is an enum with one variant),
+                    whose fields can change
     functions       Closure (written in Ella) or Builtin (written in Python)
                     in the AST interpreter; FunctionRef in the IR interpreter
+    Pool[T]         PoolValue, and Handle[T] is HandleValue
+    Code[T]         CodeValue, holding the code's syntax tree
 
 Python's `bool` is a subclass of `int`, so code that tells values apart must
 test for `bool` before `int`. `type_name` does that, and the interpreter uses
@@ -31,20 +35,64 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ella.checker import Type, show_type
 from ella.lexer import Span
-from ella.syntax import Lambda
+from ella.syntax import Expr, Lambda, show
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(eq=False, slots=True)
 class VariantValue:
-    """An enum value: `Some(1)` is `VariantValue("Optional", "Some", (1,))`."""
+    """An enum or struct value: `Some(1)` is `VariantValue("Optional", "Some", [1])`.
+
+    A struct's fields can change in place. `nocopy` marks a value of a nocopy
+    struct, which `copy_value` leaves as it is: it is never copied.
+    """
 
     enum: str
     variant: str
-    fields: tuple[Value, ...] = ()
+    fields: list[Value] = field(default_factory=list)
+    nocopy: bool = False
+
+
+@dataclass(eq=False, slots=True)
+class PoolValue:
+    """A `Pool[T]`: slots holding values, each with a generation that goes up when it is freed.
+
+    A slot holds None while it is free. Freed slots are reused, the most
+    recently freed first.
+    """
+
+    slots: list[Value | None] = field(default_factory=list)
+    generations: list[int] = field(default_factory=list)
+    free: list[int] = field(default_factory=list)
+
+    def live(self) -> int:
+        return sum(1 for slot in self.slots if slot is not None)
+
+
+@dataclass(frozen=True, slots=True)
+class HandleValue:
+    """A `Handle[T]`: which slot of a pool, and its generation when the value was put there."""
+
+    slot: int
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class TypeValue:
+    """A `Type[T]`: a type, as a value for code that generates code (`type T`)."""
+
+    type: Type
+
+
+@dataclass(frozen=True, slots=True)
+class CodeValue:
+    """A `Code[T]`: the syntax tree of code for a later stage, made by `quote`."""
+
+    expr: Expr
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +146,10 @@ type Value = (
     | Closure
     | Builtin
     | FunctionRef
+    | PoolValue
+    | HandleValue
+    | CodeValue
+    | TypeValue
 )
 
 UNIT: Value = ()
@@ -169,17 +221,29 @@ def type_name(value: Value) -> str:
             return enum
         case Constructor() | Closure() | Builtin() | FunctionRef():
             return "function"
+        case PoolValue():
+            return "Pool"
+        case HandleValue():
+            return "Handle"
+        case CodeValue():
+            return "Code"
+        case TypeValue():
+            return "Type"
 
 
 def copy_value(value: Value) -> Value:
-    """A copy of `value` that shares no mutable parts with it (only lists are mutable)."""
+    """A copy of `value` that shares no parts that can change with it (lists and structs).
+
+    Values that can't be copied (nocopy structs and pools) are returned as
+    they are.
+    """
     match value:
         case list():
             return [copy_value(item) for item in value]
         case tuple():
             return tuple(copy_value(item) for item in value)
-        case VariantValue(enum, variant, fields) if fields:
-            return VariantValue(enum, variant, tuple(copy_value(item) for item in fields))
+        case VariantValue(enum, variant, fields, nocopy) if fields and not nocopy:
+            return VariantValue(enum, variant, [copy_value(item) for item in fields])
         case _:
             return value
 
@@ -195,6 +259,8 @@ def equal(a: Value, b: Value) -> bool:
         return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
         return a.variant == b.variant and equal(a.fields, b.fields)
+    if isinstance(a, PoolValue | CodeValue):
+        return a is b
     return a == b
 
 
@@ -229,3 +295,11 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"<constructor {variant}>"
         case Closure() | FunctionRef():
             return "<function>"
+        case PoolValue():
+            return f"<pool of {value.live()}>"
+        case HandleValue(slot, generation):
+            return f"<handle {slot}:{generation}>"
+        case CodeValue(expr):
+            return f"<code {show(expr)}>"
+        case TypeValue(t):
+            return f"<type {show_type(t)}>"

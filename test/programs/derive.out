@@ -1,0 +1,8 @@
+true
+false
+true
+false
+true
+Point { x: 1.5, y: -2.0 }
+Person { name: "Ada", age: 36, tags: ["math"] }
+(["Pair[i64]", "enum", "list"], ["Circle", "Square"], true)

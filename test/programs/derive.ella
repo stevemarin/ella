@@ -1,0 +1,69 @@
+# Generating code from types while compiling: types are values (`type T`,
+# of type Type[T]), quotes can splice in a type (`$t`) or a field name
+# (`v.$f`), and built-ins like fields() look at a type.
+
+struct Point
+    x: f64
+    y: f64
+
+struct Person
+    name: str
+    age: i64
+    tags: [str]
+
+struct Pair[T]
+    first: T
+    second: T
+
+# The code `a.f == b.f and ...` for the given fields.
+let all_equal[T] = (names: [str], a: Code[T], b: Code[T]) -> Code[bool] =>
+    let mut test = quote true
+    for name in names
+        test = quote $test and $a.$name == $b.$name
+    test
+
+# An equality function for any struct, comparing it field by field.
+let derive_eq[T] = (t: Type[T]) -> Code[(T, T) -> bool] =>
+    quote (a: $t, b: $t) -> bool => $(all_equal(fields(t), quote a, quote b))
+
+# A function giving a struct's text with its field names: `Point { x: 1.0, y: 2.0 }`.
+let derive_describe[T] = (t: Type[T]) -> Code[(T) -> str] =>
+    quote (v: $t) -> str => $(describe_fields(t, quote v))
+
+let describe_fields[T] = (t: Type[T], v: Code[T]) -> Code[str] =>
+    let name = type_name(t)
+    let mut text = quote "{{name}} {"
+    let mut first = true
+    for field in fields(t)
+        let separator = if first then " " else ", "
+        # Strings are shown quoted; other fields as they are.
+        let shown = if type_kind(field_type(t, field)) == "str" then quote "\"{{ $v.$field }}\"" else quote "{{ $v.$field }}"
+        text = quote $text + "{{separator}}{{field}}: " + $shown
+        first = false
+    quote $text + " }"
+
+let point_eq = $(derive_eq(type Point))
+let person_eq = $(derive_eq(type Person))
+let pair_eq = $(derive_eq(type Pair[str]))
+let describe_point = $(derive_describe(type Point))
+let describe_person = $(derive_describe(type Person))
+
+let ada = Person("Ada", 36, ["math"])
+print(point_eq(Point(1.0, 2.0), Point(1.0, 2.0)))
+print(point_eq(Point(1.0, 2.0), Point(1.0, 3.0)))
+print(person_eq(ada, ada))
+print(person_eq(ada, Person("Ada", 36, [])))
+print(pair_eq(Pair("a", "b"), Pair("a", "b")))
+print(describe_point(Point(1.5, -2.0)))
+print(describe_person(ada))
+
+# Reflection runs while compiling; its results are carried into the program.
+enum Shape
+    Circle(f64)
+    Square(f64)
+let facts = $
+    let names = [type_name(type Pair[i64]), type_kind(type Shape), type_kind(type [str])]
+    let shapes = variants(type Shape)
+    let aged = has_field(type Person, "age")
+    quote (names, shapes, aged)
+print(facts)

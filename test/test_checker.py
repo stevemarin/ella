@@ -17,6 +17,7 @@ from ella.checker import (
 )
 from ella.lexer import EllaError, Span
 from ella.parser import parse
+from ella.staging import prepare
 from ella.syntax import Let
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
@@ -48,7 +49,7 @@ def error(source: str) -> EllaError:
 
 
 def test_example_file_checks() -> None:
-    check(parse(EXAMPLE.read_text()))
+    prepare(parse(EXAMPLE.read_text()))  # it computes a type, which needs its splices run while checking
 
 
 # Types
@@ -144,8 +145,8 @@ def test_error_type_means_str_for_now() -> None:
         ("[1, true]", "list items must have the same type, not i64 and bool"),
         ("[1][true]", "an index must be an i64, not bool"),
         ("5[0]", "can't index a i64"),
-        ("(1, 2).x", "member access ('.name') isn't supported yet"),
-        ("len(5)", "len() needs a list, str or range, not i64"),
+        ("(1, 2).x", "a (i64, i64) has no fields"),
+        ("len(5)", "len() needs a list, str, range or Pool, not i64"),
         ("len()", "len takes 1 argument but was given 0"),
         ("Some(1, 2)", "Some takes 1 argument but was given 2"),
         ("5(1)", "can't call a value of type i64"),
@@ -307,10 +308,10 @@ def test_mut_parameter_types() -> None:
             "argument 1 isn't for a 'mut' parameter, so it can't be 'mut'",
         ),
         ("let v = [1]\npush(mut v, 2)", "can't pass 'v' as 'mut' because it isn't mutable; declare it with 'let mut'"),
-        ("push(mut [1], 2)", "can only pass a variable or an element of one"),
+        ("push(mut [1], 2)", "can only pass a variable or a part of one"),
         ('let mut s = "ab"\nlet f = (mut c: str) -> () => ()\nf(mut s[0])', "can't pass an element of a str"),
         ("let mut v = [true]\npush(mut v, 2)", "argument 1 should be [i64], not [bool]"),
-        ("let mut v = [1]\nprint(mut v)", "'mut' marks an argument for a 'mut' parameter, and only works in a call"),
+        ("let mut v = [1]\nprint(mut v)", "print() has no 'mut' parameter"),
         (
             "let mut v = [1]\nlet f: ([i64], i64) -> () = push",
             "the value of 'f' should be ([i64], i64) -> (), not (mut [i64], i64) -> ()",
@@ -357,3 +358,179 @@ def test_mut_parameters_can_be_assigned_but_others_cant() -> None:
     assert error("let f = (x: i64) -> () =>\n    x += 1").message == (
         "can't assign to 'x' because it isn't mutable; declare it with 'let mut'"
     )
+
+
+# Structs, generics, pools, nocopy values and stages
+
+RES = """\
+nocopy struct Res
+    name: str
+    finalize = (r: Res) -> () => print(r.name)
+"""
+
+
+def test_struct_and_generic_types() -> None:
+    assert type_of("struct P\n    x: i64\nlet p = P(1)\np.x") == "i64"
+    assert type_of("struct B[T]\n    item: T\nB([1]).item") == "[i64]"
+    assert type_of("let first[T] = (xs: [T]) -> T => xs[0]\nfirst([true])") == "bool"
+    assert type_of("let mut p: Pool[str] = pool_new()\nlet h = alloc(mut p, 'x')\nh") == "Handle[str]"
+    assert type_of("let mut p: Pool[str] = pool_new()\nlet h = alloc(mut p, 'x')\np[h]") == "str"
+    assert type_of("quote 1 + 2") == "Code[i64]"
+    assert type_of("run(quote [1])") == "[i64]"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (RES + "let a = Res('a')\nlet b = a", "a Res can't be copied, so it can't be used here"),
+        (RES + "let xs = [Res('a')]", "a list can't hold values that can't be copied; use a Pool"),
+        (
+            RES + "let mut a = Res('a')\na = Res('b')",
+            "a Res can't be copied, so it can't be assigned; change its fields instead",
+        ),
+        (
+            RES + "let f = () -> () =>\n    let a = Res('a')\n    let g = () -> str => a.name\n    ()",
+            "a Res can't be copied, so it can't be captured by a closure",
+        ),
+        (
+            RES + "let f = (r: Res) -> Res => r",
+            "a Res can't be copied, so it can't be returned unless it is a local variable",
+        ),
+        (
+            RES + "let id[T] = (x: T) -> T => x\nlet a = id(Res('a'))",
+            "id can't be used with Res, which can't be copied",
+        ),
+        (RES + "struct Holder\n    r: Res", "field 'r' can't be copied, so Holder must be a nocopy struct too"),
+        (
+            "struct P\n    x: i64\n    finalize = (p: P) -> () => ()",
+            "only a nocopy struct can have a finalize function",
+        ),
+        ("nocopy struct E\n    finalize = (e: E) -> () => ()", "a nocopy struct needs at least one field"),
+        ("let mut p: Pool[str] = pool_new()\nlet q = p", "a Pool[str] can't be copied, so it can't be used here"),
+        (
+            "let mut p: Pool[str] = pool_new()\nlet h = alloc(p, 'x')",
+            "alloc() changes its pool, so mark it: 'alloc(mut pool, ...)'",
+        ),
+        (
+            "let mut p: Pool[str] = pool_new()\nlet mut q: Pool[i64] = pool_new()\nlet h = alloc(mut p, 'x')\nq[h]",
+            "a pool's index should be Handle[i64], not Handle[str]",
+        ),
+        (
+            "let mut p: Pool[str] = pool_new()\nlet h = alloc(mut p, 'x')\nlet f = (mut q: Pool[str], s: str) -> () => ()\nf(mut p, p[h])",
+            "'p' is passed as 'mut', so it can't also be used in another argument of the same call",
+        ),
+        ("struct P\n    x: i64\nP(1).y", "P has no field 'y'"),
+        (
+            "let f = () -> () =>\n    let g[T] = (x: T) -> T => x\n    ()",
+            "only a top-level function can have type parameters",
+        ),
+        ("let add[T] = (a: T, b: T) -> T => a + b", "'+' doesn't work on T"),
+        (
+            "let n = 3\nlet c = $(if n > 2 then quote 1 else quote 2)",
+            "'n' belongs to a later stage, so it can't be used while compiling",
+        ),
+        (
+            "let id = (c: Code[i64]) -> Code[i64] => c\nquote\n    let y = 1\n    $(id(y))",
+            "'y' belongs to a later stage, so it can't be used outside the quote it is bound in",
+        ),
+        (
+            "let f = () -> Code[i64] =>\n    let g = (x: i64) -> i64 => x\n    quote g(1)",
+            "'g' is a (i64) -> i64, which can't be carried into a later stage (only data can)",
+        ),
+        ("quote $(1)", "the spliced value should be Code[?1], not i64"),
+        ("let f = () -> Code[i64] => quote (return 1)", "'return' outside of a function"),
+    ],
+)
+def test_new_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+def test_types_as_values() -> None:
+    assert type_of("type [i64]") == "Type[[i64]]"
+    assert type_of("struct P\n    x: i64\nfields(type P)") == "[str]"
+    assert type_of("struct P\n    x: i64\nfield_type(type P, 'x')") == "Type[?]"
+    # A spliced type is known from the Type[T] it comes from.
+    source = "let f[T] = (t: Type[T]) -> Code[(T) -> T] => quote (x: $t) -> $t => x\nf(type i64)"
+    assert type_of(source) == "Code[(i64) -> i64]"
+    # A spliced field's type is only known once the code is built.
+    assert type_of("struct P\n    x: i64\nlet f = (v: Code[P], n: str) -> Code[bool] => quote $v.$n == 1\nf") == (
+        "(Code[P], str) -> Code[bool]"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "let t = type i64\nlet f = (x: $t) -> i64 => x",
+            "'t' belongs to a later stage, so it can't be used while compiling",
+        ),
+        (
+            "struct P\n    x: i64\nlet f = (p: P) -> i64 => p.$('x')",
+            "a field name can only be spliced into quoted code",
+        ),
+        ("quote (x: $(1)) -> i64 => 1", "the spliced type should be Type[?1], not i64"),
+        ("struct P\n    x: i64\nquote P(1).$(2)", "the spliced field name should be str, not i64"),
+        ("fields(1)", "argument 1 of fields() should be Type[?1], not i64"),
+        (
+            "struct P\n    x: i64\nlet f = (v: Code[P]) -> () => print(run(quote $v.$('x')))",
+            "this code's type is only known once it is built, so it can only run while compiling",
+        ),
+        (
+            "let f = () -> Code[Type[i64]] =>\n    let t = field_type(type i64, 'x')\n    quote t",
+            "'t' is a Type[?], which can't be carried into a later stage (only data can)",
+        ),
+    ],
+)
+def test_type_value_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+STACK = """\
+let Stack = (t: Type) -> Type => new_struct("Stack[{{type_name(t)}}]", ["items"], [type [$t]])
+"""
+
+
+def prepared_type_of(source: str) -> str:
+    """The type of the last top-level expression, after expanding splices (which computed types need)."""
+    program, checker = prepare(parse(source))
+    return show_type(checker.type_of(program.body[-1]))
+
+
+def prepared_error(source: str) -> EllaError:
+    with pytest.raises(EllaError) as info:
+        prepare(parse(source))
+    return info.value
+
+
+def test_computed_types() -> None:
+    # A spliced type is computed while checking, and the same each time.
+    assert prepared_type_of(STACK + "let s: $(Stack(type i64)) = $(Stack(type i64))([1])\ns.items") == "[i64]"
+    assert prepared_type_of(STACK + "let f = (s: $(Stack(type str))) -> [str] => s.items\nf") == (
+        "(Stack[str]) -> [str]"
+    )
+    assert type_of("type [str]") == "Type[[str]]"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            STACK + "let s: $(Stack(type i64)) = $(Stack(type str))(['a'])",
+            "the value of 's' should be Stack[i64], not Stack[str]",
+        ),
+        (STACK + "let s = $(Stack(type i64))(1, 2)", "Stack[i64] takes 1 argument but was given 2"),
+        ("let s = $(type i64)(1)", "only a struct type that isn't generic can be called, not i64"),
+        (
+            "let f = () -> Type => new_struct('Point', ['x'], [type i64])\nstruct Point\n    y: str\nlet p: $(f()) = 1",
+            "there is already a different type named Point",
+        ),
+        ("let f = (n: i64) -> Type => type i64\nlet x: $(f(1 // 0)) = 1", "integer division by zero"),
+        (
+            STACK + "struct S\n    s: $(Stack(type i64))",
+            "a type can't be spliced into a definition yet; use new_struct()",
+        ),
+    ],
+)
+def test_computed_type_errors(source: str, message: str) -> None:
+    assert prepared_error(source).message == message

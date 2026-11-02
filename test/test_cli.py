@@ -106,3 +106,12 @@ def test_prints_profile_after_running(tmp_path: Path, capsys: pytest.CaptureFixt
     assert captured.out == "[1, 2]\n"
     assert captured.err.startswith("Arena profile")
     assert "global" in captured.err and "top level 0" in captured.err
+
+
+def test_prints_expanded_program(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = """\
+let power = (n: i64, x: Code[i64]) -> Code[i64] => if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+let square = (x: i64) -> i64 => $(power(2, quote x))
+"""
+    assert main(["--expanded", write(tmp_path, source)]) == 0
+    assert "(let [square] (lambda (x: i64) -> i64 (* x (* x 1))))" in capsys.readouterr().out

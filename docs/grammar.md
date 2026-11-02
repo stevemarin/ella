@@ -19,8 +19,9 @@ exercised yet. The [open questions](#open-questions) at the end are undecided.
 8. [Operators](#8-operators)
 9. [Types](#9-types)
 10. [Built-ins](#10-built-ins)
-11. [Grammar summary](#11-grammar-summary)
-12. [Open questions](#open-questions)
+11. [Stages](#11-stages)
+12. [Grammar summary](#12-grammar-summary)
+13. [Open questions](#open-questions)
 
 ## 1. Lexical structure
 
@@ -51,12 +52,11 @@ identifiers, not keywords.
 ```text
 and       assert    break     case      comptime  continue  else
 enum      false     for       if        import    in        let
-loop      match     mut       not       or        return    struct
-then      true      type      where     while
+loop      match     mut       nocopy    not       or        quote
+return    struct    then      true      type      where     while
 ```
 
-Reserved for later, not yet given a grammar: `comptime` (staging), `import`,
-`struct`, `type`.
+Reserved for later, not yet given a grammar: `comptime`, `import`.
 
 ### Labels
 
@@ -75,11 +75,11 @@ Longest match wins (`//=` before `//` before `/`).
 ==   !=   <    <=   >    >=
 =    +=   -=   *=   /=   //=  %=
 ->   =>   |>   ..   ..=  ?
-.    ,    :    (    )    [    ]
+.    ,    :    (    )    [    ]    $
 ```
 
-`{`, `}`, `;`, `!` (alone), `@`, `$` and `` ` `` are not tokens; they are
-errors outside strings and comments.
+`{`, `}`, `;`, `!` (alone), `@` and `` ` `` are not tokens; they are errors
+outside strings and comments.
 
 ### Integer literals
 
@@ -256,12 +256,13 @@ let x = x + 1   # new x is 5
 x = 10
 x += 1
 xs[0] = 7
+p.x = 1.5
 ```
 
 * `name = expr` assigns to an **existing** binding, which must be `mut`.
   Assigning to an immutable binding or an undefined name is a compile error.
-* Targets are names and index expressions (`a[i]`). Member targets come with
-  structs.
+* Targets are names, index expressions (`a[i]`, `pool[h]`) and fields
+  (`p.x`), in any combination: `world.players[i].score += 1`.
 * Assignment is right-associative and evaluates to the assigned value.
 * Compound operators: `+= -= *= /= //= %=`. `x op= e` means `x = x op e`, with
   `x` evaluated once.
@@ -566,6 +567,12 @@ i64  f64  bool  str              built-in scalars
 (T, U) -> R                      function (parameters always parenthesized)
 (mut T, U) -> R                  function with a `mut` parameter
 Result[T, E]   Optional[T]       generic types use [ ]
+Point   Pair[T]                  structs and enums, by name
+Pool[T]   Handle[T]              a pool of values, and a handle to one
+Code[T]                          code that gives a T, for a later stage
+Type[T]                          the type T as a value: `type T`
+Type   Code                      a type, or code, whose type is only known later
+$(t)                             a type computed while compiling (§11)
 ```
 
 * All integer types are signed. More widths (`i8`–`i32`, `f32`) and SIMD
@@ -603,8 +610,7 @@ let found = None         # Optional of something; used as Optional[str] later
   used as values (for now).
 * `Error` used as a type means `str` for now **(provisional)**, so
   `Result[f64, Error]` is `Result[f64, str]`; see the open questions.
-* Generic functions don't exist yet (see the open questions); enums can be
-  generic.
+* Enums, structs and top-level functions can be generic.
 
 ### Enums **(provisional syntax)**
 
@@ -623,17 +629,144 @@ Variants are constructed like calls (`Circle(1.0)`, `Empty`) and destructured
 in patterns. `Result` and `Optional` are built-in enums with variants
 `Ok`/`Error` and `Some`/`None`.
 
+### Structs **(provisional syntax)**
+
+```ella
+struct Point
+    x: f64
+    y: f64
+
+struct Pair[T]
+    first: T
+    second: T
+
+let mut p = Point(1.0, 2.0)
+p.x = 3.0
+print(p.x + p.y)       # 5.0
+match p
+    case Point(x, y) => print(x * y)
+```
+
+* A struct is made by calling its name with its fields' values, in order,
+  and its fields are read with `.name`. Changing a field (`p.x = v`)
+  needs a `mut` variable, as changing a list item does.
+* A struct is like an enum with one variant named after it, whose fields
+  have names. So patterns, `==` and the text form (`Point(3.0, 2.0)`) work
+  the same way.
+* Structs are values, like everything else: `let q = p` copies.
+
+### Values that can't be copied **(provisional syntax)**
+
+A `nocopy struct` is for values with an identity, which a copy would
+duplicate: a resource that must be released once, say. Its values are
+never copied, and it may have a `finalize` function, which runs on each
+value when the value dies:
+
+```ella
+nocopy struct Logger
+    name: str
+    finalize = (log: Logger) -> () => print("closing {{log.name}}")
+
+let work = () -> () =>
+    let log = Logger("app")
+    print("working")
+work()                 # prints: working, closing app
+```
+
+* A value of a nocopy type (a nocopy struct, a pool, or anything holding
+  one) is made where it stays. It can be bound with `let`, passed to
+  functions (read-only, or as `mut`), read field by field, compared and
+  printed, held by another nocopy struct, and moved into a pool with
+  `alloc`. A function can return a new one, or one of its own local
+  variables declared outside loops (which moves it to the caller).
+* It can't be copied: not bound from another variable, assigned, put in a
+  list, captured by a closure, returned from a parameter, or used with a
+  generic function.
+* A struct with a nocopy field must be nocopy itself. A nocopy struct needs
+  at least one field; one with a `finalize` function must be top-level and
+  not generic.
+* **When values die.** A value dies at the end of the function call or loop
+  iteration it is made in (a `let` belongs to the iteration it is in), or at
+  the end of the program for top-level variables. A value that is
+  returned, or given to `break`, belongs to the call or loop iteration it
+  goes to; one moved into a pool dies when it is freed, or when the pool
+  dies. Values that die together are finalized newest first: a struct
+  before the fields it holds.
+* If the program stops with an error, finalizers don't run.
+
+### Generic functions **(provisional syntax)**
+
+A top-level function can have type parameters, after its name:
+
+```ella
+let first[T] = (xs: [T]) -> T => xs[0]
+let swap[A, B] = (p: Pair[A, B]) -> Pair[B, A] => Pair(p.second, p.first)
+
+print(first([1, 2]))       # T is i64
+print(first(["a"]))        # T is str
+```
+
+* The type arguments are inferred from each use. Each different set of
+  them makes a separate copy of the function when compiling.
+* Inside the function, a type parameter is a type of its own, which only
+  matches itself: `(a: T, b: T) -> T => a + b` is an error, as nothing says
+  `T` has `+`. Values of type `T` can be passed around, stored, compared and
+  printed.
+* Type parameters can't be values that can't be copied.
+
+### Pools **(provisional syntax)**
+
+A pool holds values that live longer than any one function call, such as
+the nodes of a graph, each found with a handle:
+
+```ella
+struct Node
+    name: str
+    kids: [Handle[Node]]
+
+let mut nodes: Pool[Node] = pool_new()
+let root = alloc(mut nodes, Node("root", []))
+let kid = alloc(mut nodes, Node("kid", []))
+nodes[root].kids += [kid]
+print(nodes[nodes[root].kids[0]].name)    # kid
+free(mut nodes, kid)
+print(nodes[kid])                         # error: the handle is stale
+```
+
+* `pool_new()` makes an empty `Pool[T]`. `alloc(mut pool, value)` puts a
+  copy of the value in the pool (moving one that can't be copied), and
+  returns a `Handle[T]` for it. `free(mut pool, handle)` removes it,
+  finalizing it.
+* `pool[h]` is the value, and `pool[h] = v`, `pool[h].f = v` and so on
+  change it in place. `len(pool)` is how many values it holds.
+* Handles are plain values: they can be copied, stored and compared. Each
+  remembers its slot's *generation*, which goes up when the slot's value
+  is freed, so using a handle to a freed value is a run-time error
+  ("stale"), even after the slot is reused.
+* A pool can't be copied. A handle doesn't say which pool it is for, so
+  using it with the wrong pool of the same type isn't caught.
+
 ## 10. Built-ins
 
 Built-in functions (ordinary names, not keywords):
 
 * `print(value)` prints the text form of `value` and a newline; returns `()`.
-* `len(x)` returns the length of a list, string or range as `i64`.
+* `len(x)` returns the length of a list, string or range as `i64`, or how
+  many values a pool holds.
+* `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
+  pools ([§9](#pools-provisional-syntax)).
+* `run(code)` runs code made with `quote` ([§11](#11-stages)).
+* `fields(t)`, `field_type(t, name)`, `has_field(t, name)`, `type_name(t)`,
+  `type_kind(t)` and `variants(t)` look at a type `t`, and
+  `new_struct(name, fields, types)` makes one
+  ([§11](#types-as-values-and-generated-code)).
 
 The text form of a value (used by `print` and interpolation) is how it would
 be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
-`Some(3)`, `None`. A string is its own text, but is quoted when it appears
-inside another value.
+`Some(3)`, `None`, `Point(1.0, 2.0)`. A string is its own text, but is
+quoted when it appears inside another value. A pool is `<pool of 3>`, a
+handle `<handle 0:1>` (its slot and generation), and code `<code ...>`,
+with the code as an S-expression.
 
 Python-style protocol methods (`len`, indexing, iteration, and so on for user
 types) are planned for when user-defined types exist.
@@ -649,7 +782,132 @@ Type errors such as `1 + true` are found before the program runs. The AST
 interpreter also checks types as it goes, so it can still run programs that
 haven't been checked.
 
-## 11. Grammar summary
+## 11. Stages
+
+Ella programs can build code and run it later: they are *multi-stage*.
+`quote e` doesn't evaluate `e`: its value is the code of `e`, of type
+`Code[T]` when `e` is a `T`. Inside a quote, `$c` (a *splice*) inserts the
+code `c` computed while the quote is built:
+
+```ella
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+
+print(power(2, quote 5))          # <code (* 5 (* 5 1))>
+print(run(power(2, quote 5)))     # 25
+```
+
+* Code belongs to a *stage*. The program is stage 0, the body of a quote is
+  one stage later, and a splice one stage earlier. They nest without limit:
+  `quote quote 1` is code that makes code.
+* `run(c)` runs code at the stage it is used in, and gives its value. Code
+  is checked when it is run; it can use the program's top-level names.
+* A splice outside any quote is stage -1: it runs **while compiling**, and
+  the code it gives becomes part of the program. A splice inside that one
+  runs earlier still, making the code that runs while compiling:
+
+  ```ella
+  let cube = (x: i64) -> i64 => $(power(3, quote x))   # x * (x * (x * 1))
+  ```
+
+  What compile-time code prints comes out before the program runs.
+  `ella --expanded` shows a program with its splices expanded.
+* A variable belongs to the stage it is bound in. It can be used at a later
+  stage, where its value is carried into the code as a constant: with
+  `let n = 3`, `quote n + 1` is `3 + 1`. Only data can be carried, not
+  functions (top-level functions are available at every stage) or values
+  that can't be copied or handles. Using a variable at an earlier stage
+  than its own is an error: it doesn't exist yet.
+* Top-level variables other than functions belong to stage 0, so
+  compile-time code can't read them.
+* Variables bound inside quoted code are renamed when the code is built
+  (`y` becomes `y.1`), so spliced code never captures the wrong variable.
+* `return`, `break` and `continue` can't leave a quote or a splice.
+* `$` applies to the name or parenthesized expression right after it (`$f(x)`
+  calls the spliced `f`), or to an indented block on the next lines.
+  `quote` takes everything to its right, or an indented block.
+* Native code builds and runs code only while compiling. Code built at run
+  time needs an interpreter; native code stops with an error if it gets to
+  a `quote`, `run`, type value or reflection built-in.
+
+### Types as values, and generated code
+
+Code that generates code often depends on a type: an equality test for a
+struct compares its fields. So types are values too:
+
+* `type T` is the type `T` as a value, of type `Type[T]`. `type Point`,
+  `type [str]` and `type Pair[i64]` are examples.
+* Inside a quote, `$t` in a type splices in the type `t` holds. If `t` is a
+  `Type[T]`, the spliced type is `T`, so generated code has a known type.
+* Inside a quote, `v.$f` reads the field whose name the string `f` holds.
+  Its type is only known once the code is built, so until then the checker
+  lets it be used in any way; the code is checked fully once it is built,
+  when it is spliced into the program or run. Code whose type depends on
+  such a field can only be run while compiling.
+* Built-ins look at a type: `fields(t)` (a struct's field names, in order),
+  `field_type(t, name)` (a `Type[?]`), `has_field(t, name)`, `type_name(t)`
+  (as written, like `"Pair[i64]"`), `type_kind(t)` (`"struct"`, `"enum"`,
+  `"list"`, `"i64"`, ...) and `variants(t)` (an enum's variant names).
+* Type values can be compared with `==`, and carried into a later stage
+  like data, but types from `field_type` can't (their type isn't known).
+* `Type`, with no type argument, is a type value whose type is only known
+  when the code runs, and `Code` is code like that. A list holding types of
+  different types is a `[Type]`.
+
+```ella
+# `a.f == b.f and ...` for the given fields
+let all_equal[T] = (names: [str], a: Code[T], b: Code[T]) -> Code[bool] =>
+    let mut test = quote true
+    for name in names
+        test = quote $test and $a.$name == $b.$name
+    test
+
+let derive_eq[T] = (t: Type[T]) -> Code[(T, T) -> bool] =>
+    quote (a: $t, b: $t) -> bool => $(all_equal(fields(t), quote a, quote b))
+
+let point_eq = $(derive_eq(type Point))   # (a: Point, b: Point) -> bool => ...
+```
+
+### Computed types
+
+Outside quotes, `$(...)` in a type runs while the program is being checked
+(at stage -1), and the type it gives is used where it is. Together with
+`new_struct`, which makes a struct type, functions can compute types:
+
+```ella
+let Stack = (t: Type) -> Type =>
+    new_struct("Stack[{{type_name(t)}}]", ["items", "size"], [type [$t], type i64])
+
+let push = (mut s: $(Stack(type i64)), x: i64) -> () =>
+    s.items += [x]
+    s.size += 1
+
+let mut s = $(Stack(type i64))([], 0)    # `$(t)(...)` makes a struct of the type t holds
+push(mut s, 3)
+print(s)                                  # Stack[i64]([3], 1)
+```
+
+* `new_struct(name, fields, types)` makes a struct type with those field
+  names and types. Its name is what makes it the same type: asking again
+  for the same name with the same fields gives the same type, so
+  `$(Stack(type i64))` is one type wherever it is written. A different
+  struct with the same name is an error.
+* `type ...` builds a type from type values: `type [$t]` is a list of the
+  type `t` holds. (`type` is like a quote of a type, so `$t` in it is a value
+  of the current stage.)
+* `$(t)(args)` calls the constructor of the struct type `t` holds, outside
+  or inside quotes.
+* A splice in a type can use top-level functions, which are checked (and
+  their own splices expanded) before it runs, but not top-level variables,
+  which belong to stage 0. It runs once, while checking; what it prints
+  comes out then.
+* After expanding, the structs that compile-time code made are ordinary
+  definitions at the start of the program, and spliced types ordinary
+  types: `ella --expanded` shows them.
+* A type can't be spliced into a struct or enum definition yet; use
+  `new_struct`.
+
+## 12. Grammar summary
 
 Informal EBNF. `NEWLINE`, `INDENT`, `DEDENT` are layout tokens from
 [§2](#2-layout-and-blocks). Binary-operator precedence is in
@@ -661,12 +919,13 @@ block       = NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT ;
 body        = expr | block ;
 
 expr        = let | assignment | lambda | if | match | for | while | loop
-            | break | continue | return | assert | enum | operator_expr ;
+            | break | continue | return | assert | enum | struct | quote
+            | operator_expr ;
 
-let         = "let" binding "=" { binding "=" } expr ;
-binding     = [ "mut" ] IDENT [ ":" type ] ;
+let         = "let" binding [ "[" IDENT { "," IDENT } "]" ] "=" { binding "=" } expr ;
+binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
-target      = IDENT | operator_expr "[" expr "]" ;
+target      = IDENT | operator_expr "[" expr "]" | operator_expr "." IDENT ;
 
 lambda      = "(" [ param { "," param } [ "," ] ] ")" "->" type "=>" lambda_body
             | IDENT "=>" body ;                  (* untyped; rejected for now *)
@@ -691,6 +950,11 @@ assert      = "assert" expr ;
 enum        = "enum" IDENT [ "[" IDENT { "," IDENT } "]" ]
               NEWLINE INDENT variant { NEWLINE variant } NEWLINE DEDENT ;
 variant     = IDENT [ "(" type { "," type } ")" ] ;
+struct      = [ "nocopy" ] "struct" IDENT [ "[" IDENT { "," IDENT } "]" ]
+              NEWLINE INDENT field { NEWLINE field } NEWLINE DEDENT ;
+field       = IDENT ":" type | "finalize" "=" expr ;
+quote       = "quote" body ;
+splice      = "$" ( IDENT | "(" expr ")" | block ) ;
 
 operator_expr = prefix_op operator_expr
             | operator_expr binary_op operator_expr
@@ -699,13 +963,15 @@ operator_expr = prefix_op operator_expr
 call        = "(" [ arg { "," arg } [ "," ] ] ")" ;
 arg         = [ "mut" ] expr ;                   (* `mut` only for a place: a name or an index *)
 index       = "[" expr "]" ;
-member      = "." IDENT ;
+member      = "." ( IDENT | "$" ( IDENT | "(" expr ")" ) ) ;  (* `.$f`: a spliced field name *)
 
 primary     = INT | FLOAT | string | "true" | "false" | IDENT
             | "(" ")"                            (* unit *)
             | "(" expr ")"                       (* grouping *)
             | "(" expr "," [ expr { "," expr } ] [ "," ] ")"  (* tuple *)
-            | "[" [ expr { "," expr } [ "," ] ] "]" ;  (* list *)
+            | "[" [ expr { "," expr } [ "," ] ] "]"  (* list *)
+            | "type" type                        (* a type, as a value *)
+            | splice ;
 string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING_END ;
 
 pattern     = pattern_atom { "|" pattern_atom } ;
@@ -714,6 +980,7 @@ pattern_atom = "_" | IDENT | literal | literal ( ".." | "..=" ) literal
             | "(" pattern "," [ pattern { "," pattern } ] ")" ;
 
 type        = IDENT [ "[" type { "," type } "]" ]
+            | "$" ( IDENT | "(" expr ")" )      (* in a quote: a spliced type *)
             | "[" type "]"
             | "(" ")"
             | "(" [ [ "mut" ] type { "," [ "mut" ] type } ] ")" "->" type
@@ -752,7 +1019,14 @@ Parsing notes:
   `Error` as a type means `str`.
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
-* Struct syntax, member access semantics, and user-defined protocol methods.
-* Generic functions: how type parameters are declared on a lambda.
-* Staging syntax (`comptime` is reserved).
+* User-defined protocol methods (`len`, iteration, ...) for structs.
+* Generic functions inside functions, and constraints on type parameters
+  (so a generic function can use `+` or `<`).
+* Whether `comptime` (still reserved) is worth having as shorthand for a
+  splice, now that staging uses `quote` and `$`.
+* Compile-time type parameters, checked at each use, or constraints on type
+  parameters, so a generic function can use `+` or `<` on `T`. See
+  docs/memory-model.md §15.
+* Generic computed types (`new_struct` makes structs without type
+  parameters) and splicing types into struct definitions.
 * Modules and `import`.

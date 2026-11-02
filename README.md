@@ -65,12 +65,16 @@ must preserve its behavior.
 
 ### Staged programming
 
-Staging is separate from the number of compiler passes. The language should
-eventually distinguish compile-time evaluation from run-time code generation.
-Compile-time evaluation may compute values now; when an expression depends on a
-run-time value, compilation preserves it as residual code to execute later.
-The initial implementation should make this boundary explicit in the language
-and IR rather than treating every compiler pass as a stage of program execution.
+Staging is separate from the number of compiler passes. Ella programs are
+*multi-stage*: `quote e` is the code of `e` as a value, for a later stage,
+and `$c` splices code into a quote, one stage earlier. Stages nest without
+limit in both directions. A splice outside any quote runs while compiling,
+and the code it gives becomes part of the program; code built at run time
+runs with `run`. Compile-time code is evaluated by the AST interpreter, and
+only the residual code it produces reaches the IR, so the boundary is
+explicit in the language rather than tied to compiler passes. See
+[docs/grammar.md](docs/grammar.md) §11 and
+[src/ella/staging.py](src/ella/staging.py).
 
 ## Implementation roadmap
 
@@ -122,13 +126,21 @@ and IR rather than treating every compiler pass as a stage of program execution.
   parameters.
 * Scope arenas, with placement chosen by the compiler, checked by the IR
   interpreter, and implemented natively with reserved address ranges.
-* Later, after stage 7: pools, slabs and sub-arenas for long-lived objects,
-  non-copyable types, and finalization.
+* Pools for long-lived objects, non-copyable types, and finalization came
+  in stage 7, with the generics and structs they need. Sub-arenas are
+  still to come.
 
 ### 7. Staged programming
 
-* Add explicit compile-time and run-time evaluation rules.
-* Represent generated run-time computations as residual IR.
+* Add explicit compile-time and run-time evaluation rules: stages, with
+  `quote`, `$` and `run`.
+* Represent generated run-time computations as residual IR: splices
+  outside quotes run while compiling, and only their code is compiled.
+* With them, the rest of the memory model: structs, generic functions,
+  pools with generation-checked handles, non-copyable types, and
+  finalizers.
+* Later: run code built at run time in native code, which needs the
+  compiler at run time (a JIT).
 
 ## Current status
 
@@ -167,6 +179,17 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   decisions as programs run, and native code allocates in real arenas
   ([src/ella/runtime.c](src/ella/runtime.c)). See
   [docs/memory-model.md](docs/memory-model.md) §14.
+* Stage 7 is done: programs are multi-stage. `quote` makes code, `$` splices
+  code in, and splices outside quotes run while compiling
+  ([src/ella/staging.py](src/ella/staging.py)), so a program can generate
+  its own specialized code. Code made at run time runs with `run`, in the
+  interpreters. Types are values too (`type Point`), so compile-time code
+  can look at a struct's fields and generate code for it, such as an
+  equality test, and functions can compute new types while compiling
+  (`$(Stack(type i64))`). The language also has structs, generic functions, pools of
+  long-lived values with handles that catch use after free, and `nocopy`
+  structs with finalizers. See [docs/memory-model.md](docs/memory-model.md)
+  §15.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)
@@ -180,8 +203,8 @@ uv run ella --ir example_syntax.ella      # print the IR (add -O to optimize it,
 uv run ella --placement example_syntax.ella  # print which arena each object goes in
 uv run ella --profile example_syntax.ella    # run it, then print how much memory each arena used
 uv run ella --ast example_syntax.ella     # print the syntax tree
+uv run ella --expanded example_syntax.ella  # print it after running the splices outside quotes
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-Staged programming (stage 7) is a design goal, not an implemented feature yet.
-Native programs need gcc.
+Native programs need gcc, and can't run code built at run time.

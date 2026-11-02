@@ -1,0 +1,53 @@
+# Values that can't be copied, and finalizers that run when they die.
+
+nocopy struct Res
+    name: str
+    finalize = (r: Res) -> () => print("free {{r.name}}")
+
+nocopy struct Two
+    a: Res
+    b: Res
+    finalize = (t: Two) -> () => print("free two {{t.a.name}}")
+
+nocopy struct Counter
+    hits: i64
+    finalize = (c: Counter) -> () => print("counted {{c.hits}}")
+
+let open = (name: str) -> Res =>
+    let r = Res(name)
+    print("open {{name}}")
+    r
+
+let size = (r: Res) -> i64 => len(r.name)
+
+let hit = (mut c: Counter) -> () =>
+    c.hits += 1
+
+let work = () -> () =>
+    let x = open("x")
+    let t = Two(Res("ta"), open("tb"))
+    let mut c = Counter(0)
+    hit(mut c)
+    hit(mut c)
+    let n = loop
+        let tmp = Res("tmp")
+        break size(tmp)
+    print(n)
+    let kept = loop
+        break Res("kept")
+    for i in 0..2
+        let r = open("r{{i}}")
+        if i == 1 then return
+    print("unreachable")
+
+work()
+let global = Res("global")
+let mut pool: Pool[Res] = pool_new()
+let h1 = alloc(mut pool, Res("p1"))
+let h2 = alloc(mut pool, open("p2"))
+free(mut pool, h1)
+
+let main = () -> () =>
+    let m = Res("main")
+    print("main")
+print("end of top level")

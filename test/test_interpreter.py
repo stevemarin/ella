@@ -45,7 +45,7 @@ def test_i64_range() -> None:
 def test_equal_distinguishes_bool_from_int() -> None:
     assert not equal(1, True)
     assert not equal([1], [True])
-    assert equal(VariantValue("Optional", "Some", (1,)), VariantValue("Optional", "Some", (1,)))
+    assert equal(VariantValue("Optional", "Some", [1]), VariantValue("Optional", "Some", [1]))
 
 
 def test_to_text() -> None:
@@ -134,8 +134,8 @@ def test_and_or_short_circuit() -> None:
         ("[1][-1]", "index -1 is out of range"),
         ("[1][true]", "an index must be an i64, not bool"),
         ("5[0]", "can't index a i64"),
-        ("(1, 2).x", "member access"),
-        ("len(5)", "len() needs a list, str or range"),
+        ("(1, 2).x", "a tuple has no field 'x'"),
+        ("len(5)", "len() needs a list, str, range or Pool"),
         ("len()", "len takes 1 argument but was given 0"),
         ("Some(1, 2)", "Some takes 1 argument but was given 2"),
         ("5(1)", "can't call a value of type i64"),

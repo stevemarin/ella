@@ -46,9 +46,12 @@ def build(module: Module, executable: Path) -> None:
         subprocess.run(["gcc", str(assembly), str(runtime_object()), "-lm", "-o", str(executable)], check=True)
 
 
-def compile_native(source: str, executable: Path, optimized: bool = True) -> None:
-    """Compile Ella source into a native executable. Raises EllaError for errors in the program."""
-    module = compile_program(source)
+def compile_native(source: str, executable: Path, optimized: bool = True, out: TextIO | None = None) -> None:
+    """Compile Ella source into a native executable. Raises EllaError for errors in the program.
+
+    What the program prints while compiling (in splices) goes to `out`.
+    """
+    module = compile_program(source, out)
     if optimized:
         optimize(module)
     build(module, executable)
@@ -65,7 +68,7 @@ def run_native(source: str, out: TextIO, optimized: bool = True) -> None:
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
-        compile_native(source, executable, optimized)
+        compile_native(source, executable, optimized, out)
         env = os.environ | {"ELLA_POISON": "1"}
         result = subprocess.run([str(executable)], check=False, capture_output=True, text=True, env=env)
     out.write(result.stdout)

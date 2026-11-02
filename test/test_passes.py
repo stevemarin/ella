@@ -263,3 +263,18 @@ def test_dce_drops_levels_nothing_allocates_in() -> None:
     function = compiled('let f = () -> () =>\n    for i in 0..3\n        print("a" + "b")\nf()').functions["f"]
     assert function.levels == 1
     assert "reset" not in ops(function)
+
+
+def test_dce_keeps_making_values_with_finalizers() -> None:
+    source = """\
+nocopy struct Res
+    name: str
+    finalize = (r: Res) -> () => print("free {{r.name}}")
+let f = () -> () =>
+    let unused = Res("unused")
+    ()
+f()
+"""
+    module = compiled(source)
+    assert "variant" in ops(module.functions["f"])
+    assert run(module) == ["free unused"]

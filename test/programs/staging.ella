@@ -1,0 +1,38 @@
+# Multi-stage programming: code built and run while compiling.
+
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+
+# `$` outside quotes runs while compiling; the code it gives is compiled in.
+let cube = (x: i64) -> i64 => $(power(3, quote x))
+let fourth = (x: i64) -> i64 => $(power(4, quote x))
+print(cube(3))
+print(fourth(2))
+
+# Values computed while compiling are carried into the program as constants.
+let table = $
+    let mut xs = []
+    for i in 0..5
+        xs += [i * i]
+    print("compiling: {{xs}}")
+    quote xs
+print(table)
+
+let choose = (names: [str], i: Code[i64]) -> Code[str] => quote names[$i]
+let label = (x: i64) -> str => $
+    let names = ["zero", "one"]
+    quote if x < 2 then $(choose(names, quote x)) else "many"
+print(label(1))
+print(label(5))
+
+# Variables bound in quotes get fresh names, so code can't capture them by accident.
+let with_y = (c: Code[i64]) -> Code[i64] => quote
+    let y = 100
+    $c + y
+let add_100 = (y: i64) -> i64 => $(with_y(quote y))
+print(add_100(1))
+
+# Splices nest: this one runs before the splice around it.
+let twice = (c: Code[i64]) -> Code[i64] => quote $c + $c
+let double = (x: i64) -> i64 => $( $(quote twice) (quote x) )
+print(double(5))

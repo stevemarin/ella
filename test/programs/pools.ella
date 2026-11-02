@@ -1,0 +1,48 @@
+# Pools hold long-lived values; handles find them, and catch freed ones.
+
+struct Node
+    name: str
+    kids: [Handle[Node]]
+
+let mut nodes: Pool[Node] = pool_new()
+let root = alloc(mut nodes, Node("root", []))
+for i in 0..3
+    let kid = alloc(mut nodes, Node("kid{{i}}", []))
+    nodes[root].kids += [kid]
+
+let names = (pool: Pool[Node], h: Handle[Node]) -> [str] =>
+    let mut out = [pool[h].name]
+    for k in pool[h].kids
+        out += names(pool, k)
+    out
+print(names(nodes, root))
+print(nodes)
+
+nodes[root].name = nodes[root].name + "!"
+print(nodes[root].name)
+let gone = nodes[root].kids[1]
+free(mut nodes, gone)
+print(len(nodes))
+nodes[root] = Node("new", [])
+print(nodes[root])
+
+# A freed slot is reused, with a new generation.
+let again = alloc(mut nodes, Node("again", []))
+print(again)
+print(nodes[again].name)
+
+# A value copied out of a pool is independent of it.
+struct Bag
+    xs: [str]
+let add = (mut xs: [str], s: str) -> () =>
+    xs += [s + s]
+let mut bags: Pool[Bag] = pool_new()
+let h = alloc(mut bags, Bag([]))
+for i in 0..3
+    add(mut bags[h].xs, "v{{i}}")
+let kept = bags[h]
+free(mut bags, h)
+print(kept)
+
+# The old handle is stale.
+print(nodes[gone])

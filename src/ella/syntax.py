@@ -63,7 +63,15 @@ class FunctionType:
     mutable: tuple[int, ...] = ()
 
 
-type TypeExpr = NamedType | ListType | UnitType | TupleType | FunctionType
+@dataclass(frozen=True, slots=True)
+class TypeSplice:
+    """`$t` in a type, inside a quote: the type that `t`, a `Type[T]`, holds."""
+
+    code: Expr
+    span: Span
+
+
+type TypeExpr = NamedType | ListType | UnitType | TupleType | FunctionType | TypeSplice
 
 
 # Patterns
@@ -139,12 +147,13 @@ type Pattern = (
 
 @dataclass(frozen=True, slots=True)
 class Binding:
-    """One target of a `let`: `x`, `mut x`, or `x: i64`."""
+    """One target of a `let`: `x`, `mut x`, `x: i64`, or a generic function's `first[T]`."""
 
     name: str
     mutable: bool
     type: TypeExpr | None
     span: Span
+    type_params: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +331,7 @@ class Assign:
     """`target = value`, or a compound assignment such as `target += value`."""
 
     op: str
-    target: Name | Index
+    target: Name | Index | Member
     value: Expr
     span: Span
 
@@ -435,11 +444,55 @@ class Assert:
 
 @dataclass(frozen=True, slots=True)
 class EnumDef:
-    """`enum Name[T]` followed by an indented list of variants."""
+    """`enum Name[T]` followed by an indented list of variants, or a struct.
+
+    A struct is an enum with one variant named after it, whose fields have
+    names: `struct Point` with fields `x: f64` and `y: f64` is like `enum
+    Point` with the variant `Point(f64, f64)`, so constructing, matching,
+    comparing and printing work the same way. `nocopy` structs can't be
+    copied, and may have a `finalize` function, run when a value dies.
+    """
 
     name: str
     type_params: tuple[str, ...]
     variants: tuple[Variant, ...]
+    span: Span
+    struct: bool = False
+    field_names: tuple[str, ...] = ()
+    nocopy: bool = False
+    finalize: Expr | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TypeLit:
+    """`type T`: the type T as a value, of type `Type[T]`, for code that works on types."""
+
+    type: TypeExpr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSplice:
+    """`target.$name`, inside a quote: the field whose name `name`, a str, gives."""
+
+    target: Expr
+    code: Expr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class Quote:
+    """`quote expr`: the code of `expr`, as a value, to run at a later stage."""
+
+    body: Expr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class Splice:
+    """`$x` or `$(expr)`: inside a quote, insert the code `expr` gives; outside, run it while compiling."""
+
+    code: Expr
     span: Span
 
 
@@ -474,6 +527,10 @@ type Expr = (
     | Return
     | Assert
     | EnumDef
+    | Quote
+    | Splice
+    | TypeLit
+    | FieldSplice
 )
 
 
@@ -521,6 +578,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return "()"
         case TupleType(items):
             return f"({show(items[0])},)" if len(items) == 1 else f"({show_list(items)})"
+        case TypeSplice(code):
+            return f"$({show(code)})"
         case FunctionType(params, result, mutable=mutable):
             shown = ", ".join(("mut " if i in mutable else "") + show(p) for i, p in enumerate(params))
             return f"({shown}) -> {show(result)}"
@@ -602,11 +661,24 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("return", *([show(value)] if value is not None else []))
         case Assert(expr):
             return sexpr("assert", show(expr))
+        case EnumDef(name, type_params, variants, struct=True, field_names=names, nocopy=nocopy, finalize=finalize):
+            head = f"{name}[{', '.join(type_params)}]" if type_params else name
+            fields = (f"{n}: {show(t)}" for n, t in zip(names, variants[0].fields))
+            extra = [sexpr("finalize", show(finalize))] if finalize is not None else []
+            return sexpr("nocopy struct" if nocopy else "struct", head, *fields, *extra)
         case EnumDef(name, type_params, variants):
             head = f"{name}[{', '.join(type_params)}]" if type_params else name
             return sexpr(
                 "enum", head, *(sexpr(v.name, *map(show, v.fields)) if v.fields else v.name for v in variants)
             )
+        case Quote(body):
+            return sexpr("quote", show(body))
+        case Splice(code):
+            return sexpr("$", show(code))
+        case TypeLit(t):
+            return sexpr("type", show(t))
+        case FieldSplice(target, code):
+            return sexpr(".", show(target), sexpr("$", show(code)))
 
 
 def sexpr(head: str, *items: str) -> str:
@@ -636,6 +708,8 @@ def show_label(label: str | None) -> list[str]:
 
 def show_binding(binding: Binding) -> str:
     text = f"mut {binding.name}" if binding.mutable else binding.name
+    if binding.type_params:
+        text += f"[{', '.join(binding.type_params)}]"
     return text if binding.type is None else f"{text}: {show(binding.type)}"
 
 

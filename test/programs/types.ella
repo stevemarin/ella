@@ -1,0 +1,48 @@
+# Types made while compiling: functions compute types, which are spliced
+# into the program with `$`. Each new struct type is named after what it is
+# made from, so asking for it again gives the same type.
+
+struct Point
+    x: f64
+    y: f64
+
+# A stack of any type of item.
+let Stack = (t: Type) -> Type =>
+    new_struct("Stack[{{type_name(t)}}]", ["items", "size"], [type [$t], type i64])
+
+let empty_ints = () -> $(Stack(type i64)) => $(Stack(type i64))([], 0)
+
+let push_int = (mut s: $(Stack(type i64)), x: i64) -> () =>
+    s.items += [x]
+    s.size += 1
+
+let mut s = empty_ints()
+push_int(mut s, 3)
+push_int(mut s, 4)
+print(s)
+print(s.size + len(s.items))
+
+let words: $(Stack(type str)) = $(Stack(type str))(["a"], 1)
+print(words.items)
+
+# A type made from another one's fields: Point with a tag.
+let Tagged = (t: Type) -> Type =>
+    let mut types = []
+    for field in fields(t)
+        types += [field_type(t, field)]
+    new_struct("Tagged[{{type_name(t)}}]", fields(t) + ["tag"], types + [type str])
+
+let origin: $(Tagged(type Point)) = $(Tagged(type Point))(0.0, 0.0, "origin")
+print(origin)
+print(origin.tag)
+
+# Code generated for a made type: a function that pushes onto any kind of stack.
+let make_push = (t: Type) -> Code =>
+    quote (mut s: $(Stack(t)), x: $t) -> () =>
+        s.items += [x]
+        s.size += 1
+let push_word = $(make_push(type str))
+let mut more = words
+push_word(mut more, "b")
+print(more)
+print(words)

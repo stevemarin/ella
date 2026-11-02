@@ -1,7 +1,7 @@
 """Pratt parser: turns tokens into the syntax tree defined in ella.syntax.
 
 This follows docs/grammar.md: operator precedence from §8, and the grammar
-summary and parsing notes from §11.
+summary and parsing notes from §12.
 
 Most of the parser is "recursive descent": one method per kind of thing
 (`parse_if`, `parse_let`, `parse_type`, ...), each consuming its tokens and
@@ -44,6 +44,7 @@ from ella.syntax import (
     Continue,
     EnumDef,
     Expr,
+    FieldSplice,
     FloatLit,
     For,
     FunctionType,
@@ -67,14 +68,18 @@ from ella.syntax import (
     Param,
     Pattern,
     Program,
+    Quote,
     RangePattern,
     Return,
+    Splice,
     StringLit,
     Try,
     TupleLit,
     TuplePattern,
     TupleType,
     TypeExpr,
+    TypeLit,
+    TypeSplice,
     Unary,
     UnitLit,
     UnitType,
@@ -96,8 +101,8 @@ LOOP_KEYWORDS = ("for", "while", "loop")
 # Keywords that can begin an expression. `break` and `return` use this to
 # decide whether a value follows them.
 EXPR_KEYWORDS = frozenset({
-    "assert", "break", "continue", "enum", "false", "for", "if", "let", "loop", "match", "not", "return", "true",
-    "while",
+    "assert", "break", "continue", "enum", "false", "for", "if", "let", "loop", "match", "nocopy", "not", "quote",
+    "return", "struct", "true", "while",
 })  # fmt: skip
 
 
@@ -356,8 +361,8 @@ class Parser:
         if assoc is Assoc.NONE and (next_op := self.infix_op()) is not None and self.infix[next_op][0] == prec:
             raise EllaError(f"'{next_op}' can't follow '{op}' without parentheses", self.peek().span)
         if op in ASSIGN_OPS:
-            if not isinstance(left, Name | Index):
-                raise EllaError("can only assign to a name or an index like xs[0]", span)
+            if not isinstance(left, Name | Index | Member):
+                raise EllaError("can only assign to a name, an index like xs[0], or a field like p.x", span)
             return Assign(op, left, right, span)
         if op == "|>":
             return self.make_pipe(left, right, span)
@@ -412,6 +417,9 @@ class Parser:
                 self.expect("]")
                 return Index(left, index, token.span)
             case ".":
+                if self.at("$"):
+                    splice = self.parse_splice()
+                    return FieldSplice(left, splice.code, token.span)
                 name = self.expect_kind(TokenKind.NAME, "a member name")
                 return Member(left, name.text, token.span)
             case _:
@@ -476,9 +484,19 @@ class Parser:
                 return self.parse_condition()
             case TokenKind.KEYWORD, "enum":
                 return self.parse_enum()
+            case TokenKind.KEYWORD, ("struct" | "nocopy"):
+                return self.parse_struct()
+            case TokenKind.KEYWORD, "quote":
+                self.advance()
+                return Quote(self.parse_body(), token.span)
+            case TokenKind.OP, "$":
+                return self.parse_splice()
             case TokenKind.KEYWORD, "where":
                 raise EllaError("'where' is only allowed as the first clause of a function's block body", token.span)
-            case TokenKind.KEYWORD, ("comptime" | "import" | "struct" | "type"):
+            case TokenKind.KEYWORD, "type":
+                self.advance()
+                return TypeLit(self.parse_type(), token.span)
+            case TokenKind.KEYWORD, ("comptime" | "import"):
                 raise EllaError(f"'{token.text}' is reserved for later and can't be used yet", token.span)
         raise self.unexpected("an expression")
 
@@ -493,7 +511,7 @@ class Parser:
             case TokenKind.INT | TokenKind.FLOAT | TokenKind.NAME | TokenKind.STRING_START:
                 return True
             case TokenKind.OP:
-                return token.text in ("(", "[", "-", "~")
+                return token.text in ("(", "[", "-", "~", "$")
             case TokenKind.KEYWORD:
                 return token.text in EXPR_KEYWORDS
             case _:
@@ -511,6 +529,25 @@ class Parser:
         if self.accept("mut"):
             return MutArg(self.parse_expr(), token.span)
         return self.parse_expr()
+
+    def parse_splice(self) -> Splice:
+        """`$name`, `$(expr)` or `$` and a block: splice in code.
+
+        It applies to just the name or parentheses that follow. A type (`$t`
+        in a type) or a field name (`v.$f`) is spliced the same way.
+        """
+        token = self.advance()
+        if self.at_block():
+            return Splice(self.parse_block(), token.span)
+        if self.at_kind(TokenKind.NAME):
+            name = self.advance()
+            return Splice(Name(name.text, name.span), token.span)
+        if self.accept("("):
+            # Just one expression: `$(t) => ...` in a lambda's result type isn't a parameter list.
+            code = self.parse_expr()
+            self.expect(")")
+            return Splice(code, token.span)
+        raise self.unexpected("a name or '(' after '$'")
 
     def parse_unary(self) -> Expr:
         """A prefix operator and its operand: `-x`, `~x`, `not x`."""
@@ -679,16 +716,23 @@ class Parser:
         while self.at("mut") or (
             self.at_kind(TokenKind.NAME) and (self.at("=", 1) or self.at(":", 1)) and not self.at_label()
         ):
+            # (A generic function's `f[T] =` can only be the first target.)
             bindings.append(self.parse_binding())
             self.expect("=")
         return Let(tuple(bindings), self.parse_expr(), token.span)
 
     def parse_binding(self) -> Binding:
-        """One `let` target: `x`, `mut x`, `x: i64`."""
+        """One `let` target: `x`, `mut x`, `x: i64`, or `first[T]` for a generic function."""
         mutable = self.accept("mut")
         name = self.expect_kind(TokenKind.NAME, "a name")
+        type_params: list[str] = []
+        if self.accept("["):
+            type_params, _ = self.parse_comma_list(self.parse_type_param, "]")
         type_ = self.parse_type() if self.accept(":") else None
-        return Binding(name.text, mutable, type_, name.span)
+        return Binding(name.text, mutable, type_, name.span, tuple(type_params))
+
+    def parse_type_param(self) -> str:
+        return self.expect_kind(TokenKind.NAME, "a type parameter").text
 
     # Control flow
 
@@ -810,6 +854,40 @@ class Parser:
                 self.advance()
                 return EnumDef(name.text, tuple(type_params), tuple(variants), token.span)
 
+    def parse_struct(self) -> EnumDef:
+        """`struct Name[T, ...]` or `nocopy struct ...`, then an indented list of fields.
+
+        The last line may be `finalize = function`, for a `nocopy` struct.
+        """
+        nocopy = self.accept("nocopy")
+        token = self.expect("struct")
+        name = self.expect_kind(TokenKind.NAME, "a struct name")
+        type_params: list[str] = []
+        if self.accept("["):
+            type_params, _ = self.parse_comma_list(self.parse_type_param, "]")
+        self.expect_kind(TokenKind.NEWLINE, "end of line")
+        self.expect_kind(TokenKind.INDENT, "an indented list of fields")
+        names: list[str] = []
+        types: list[TypeExpr] = []
+        finalize: Expr | None = None
+        while True:
+            field = self.expect_kind(TokenKind.NAME, "a field name")
+            if field.text == "finalize" and self.accept("="):
+                finalize = self.parse_expr()
+            else:
+                if field.text in names:
+                    raise EllaError(f"'{field.text}' is already a field of {name.text}", field.span)
+                self.expect(":")
+                names.append(field.text)
+                types.append(self.parse_type())
+            self.end_of_line()
+            if self.at_kind(TokenKind.DEDENT):
+                self.advance()
+                variant = Variant(name.text, tuple(types), name.span)
+                return EnumDef(
+                    name.text, tuple(type_params), (variant,), token.span, True, tuple(names), nocopy, finalize
+                )
+
     def parse_variant(self) -> Variant:
         """One variant: `Empty`, or `Rect(f64, f64)` with field types."""
         name = self.expect_kind(TokenKind.NAME, "a variant name")
@@ -824,8 +902,11 @@ class Parser:
     # `[str]` here is a list type, while in an expression `[x]` is a list.
 
     def parse_type(self) -> TypeExpr:
-        """`i64`, `Result[T, E]`, `[T]`, `()`, `(T, U)` or `(T, U) -> R`."""
+        """`i64`, `Result[T, E]`, `[T]`, `()`, `(T, U)` or `(T, U) -> R`, or `$t` in a quote."""
         token = self.peek()
+        if self.at("$"):
+            splice = self.parse_splice()
+            return TypeSplice(splice.code, token.span)
         if self.at_kind(TokenKind.NAME):
             self.advance()
             args: list[TypeExpr] = []

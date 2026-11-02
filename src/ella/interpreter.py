@@ -19,11 +19,25 @@ program starts.
 """
 
 import sys
+from collections.abc import Callable, Sequence
 from typing import TextIO
 
+from ella.checker import REFLECTION, Checker, check_code, finish
 from ella.lexer import EllaError, Span
 from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
+from ella.staging import (
+    AnySplice,
+    Tables,
+    has_splices,
+    prepare,
+    reflect,
+    reify,
+    splice_value,
+    start_code,
+    type_from,
+    uses_staging,
+)
 from ella.syntax import (
     Assert,
     Assign,
@@ -37,6 +51,7 @@ from ella.syntax import (
     Continue,
     EnumDef,
     Expr,
+    FieldSplice,
     FloatLit,
     For,
     If,
@@ -55,12 +70,15 @@ from ella.syntax import (
     OrPattern,
     Pattern,
     Program,
+    Quote,
     RangePattern,
     Return,
+    Splice,
     StringLit,
     Try,
     TupleLit,
     TuplePattern,
+    TypeLit,
     Unary,
     UnitLit,
     VariantPattern,
@@ -72,8 +90,12 @@ from ella.values import (
     UNIT,
     Builtin,
     Closure,
+    CodeValue,
     Constructor,
+    HandleValue,
+    PoolValue,
     Scope,
+    TypeValue,
     Value,
     Var,
     VariantValue,
@@ -122,22 +144,51 @@ class ReturnSignal(Exception):
 def run(source: str, out: TextIO | None = None) -> None:
     """Parse and run a program, writing what it prints to `out` (standard output by default).
 
-    Raises EllaError for syntax and run-time errors.
+    Raises EllaError for syntax and run-time errors. The program isn't type
+    checked first, unless it builds code (with `quote` or `$`), which needs
+    the checker.
     """
-    Interpreter(out).run(parse(source))
+    program = parse(source)
+    if uses_staging(program):
+        program, checker = prepare(program, out)
+        Interpreter(out, checker).run(program)
+    else:
+        Interpreter(out).run(program)
 
 
 class Interpreter:
-    def __init__(self, out: TextIO | None = None) -> None:
+    def __init__(
+        self, out: TextIO | None = None, checker: Checker | None = None, tables: Tables | None = None
+    ) -> None:
+        """`checker` is the checked program's checker, which quotes and `run` need; `tables` may share its tables."""
         # Look up sys.stdout now rather than as a default argument, which
         # would be fixed when this module is imported.
         self.out = out if out is not None else sys.stdout
         self.depth = 0  # how many Ella function calls are in progress
+        self.checker = checker
+        self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
+        # While compiling, a top-level function's splices are expanded before it runs.
+        self.prepare_function: Callable[[Lambda], Lambda] | None = None
+        self.structs: dict[str, tuple[str, ...]] = {}  # struct -> its field names
+        self.nocopy: set[str] = set()  # the nocopy structs
+        self.finalizers: dict[str, Value] = {}  # struct -> its finalize function
+        # Values with finalizers, by owner: the program (globals), and each
+        # function call and loop iteration in progress, innermost last. When
+        # an owner ends, it finalizes its values, newest first.
+        self.owners: list[list[Value]] = [[]]
+        self.renamings: list[dict[int, str]] = []  # the fresh names of the quotes being built
 
         # The global scope holds the built-ins and every top-level `let`.
         self.globals = Scope(None)
         self.globals.define("print", Builtin("print", 1, self.builtin_print))
         self.globals.define("len", Builtin("len", 1, self.builtin_len))
+        self.globals.define("run", Builtin("run", 1, self.builtin_run))
+        for name, (params, _) in REFLECTION.items():
+            self.globals.define(name, Builtin(name, len(params), self.builtin_reflect(name)))
+        self.globals.define("pool_new", Builtin("pool_new", 0, lambda args, span: self.new_pool()))
+        # alloc and free change their pool, and are handled in `call_pool`.
+        self.globals.define("alloc", Builtin("alloc", 2, lambda args, span: UNIT))
+        self.globals.define("free", Builtin("free", 2, lambda args, span: UNIT))
         # Result and Optional are ordinary enums that happen to be predefined.
         self.globals.define("Ok", Constructor("Result", "Ok", 1))
         self.globals.define("Error", Constructor("Result", "Error", 1))
@@ -152,11 +203,14 @@ class Interpreter:
         sys.setrecursionlimit(max(limit, MAX_CALL_DEPTH * PYTHON_FRAMES_PER_CALL))
         try:
             self.declare_top_level(program)
+            self.owners.append([])  # the top-level code's own values
             for expr in program.body:
                 self.eval(expr, self.globals)
             main = self.globals.vars.get("main")
             if main is not None:
                 self.call(main.value, [], Span(1, 1))
+            self.close_owner()
+            self.close_owner()  # the globals
         # Signals that escape to the top level weren't inside anything that
         # could catch them.
         except ReturnSignal as signal:
@@ -212,6 +266,8 @@ class Interpreter:
                 return copy_value(self.lookup(name, scope, span).value)
             case Let(bindings, value_expr):
                 value = self.eval(value_expr, scope)
+                if scope is self.globals:
+                    self.adopt(value, -1, 0)  # a global's values live as long as the program
                 for binding in bindings:
                     scope.define(binding.name, copy_value(value), binding.mutable)
                 # A function bound with `let` can call itself by name. Its
@@ -248,9 +304,20 @@ class Interpreter:
                 # Index into the stored list without copying all of it, then
                 # copy just the element.
                 container = self.reference(target, scope, for_assignment=False)
-                return copy_value(index_into(container, self.eval(index, scope), span))
-            case Member(span=span):
-                raise EllaError("member access ('.name') isn't supported yet", span)
+                return copy_value(self.item(container, self.eval(index, scope), span))
+            case Member():
+                return copy_value(self.reference(expr, scope, for_assignment=False))
+            case Quote():
+                return self.quote(expr, scope)
+            case TypeLit(texpr):
+                if not has_splices(texpr):
+                    return TypeValue(finish(self.tables.type_values[id(expr)]))
+                assert self.checker is not None
+                return TypeValue(type_from(texpr, self.checker.enums, lambda node: self.eval(node.code, scope)))
+            case FieldSplice(span=span):
+                raise EllaError("a field name can only be spliced into quoted code", span)
+            case Splice(span=span):
+                raise EllaError("a splice outside a quote runs while compiling, and this one wasn't", span)
             case Try(operand, span):
                 return self.eval_try(self.eval(operand, scope), span)
 
@@ -259,6 +326,8 @@ class Interpreter:
                 return Closure(expr, self.capture(scope))
             case Call(callee, args, span):
                 function = self.eval(callee, scope)
+                if isinstance(function, Builtin) and function.name in ("alloc", "free"):
+                    return self.call_pool(function.name, args, scope, span)
                 if any(isinstance(arg, MutArg) for arg in args):
                     return self.call_with_mut(function, args, scope, span)
                 return self.call(function, [self.eval(arg, scope) for arg in args], span)
@@ -281,8 +350,8 @@ class Interpreter:
             case For(label, pattern, iterable, body, span):
                 return self.eval_for(label, pattern, self.eval(iterable, scope), body, scope, span)
             case While(label, cond, body):
-                while self.eval_bool(cond, scope, "a 'while' condition"):
-                    if (signal := self.run_loop_body(body, scope, label)) is not None:
+                while True:
+                    if (signal := self.run_loop_body(body, scope, label, cond)) is not None:
                         self.check_no_break_value(signal, "while")
                         break
                 return UNIT
@@ -351,13 +420,18 @@ class Interpreter:
                 return var.value
             case Index(target, index, span):
                 container = self.reference(target, scope, for_assignment)
-                return index_into(container, self.eval(index, scope), span)
+                return self.item(container, self.eval(index, scope), span)
+            case Member(target, name, span):
+                struct = self.reference(target, scope, for_assignment)
+                position = self.field_index(struct, name, span)
+                assert isinstance(struct, VariantValue)
+                return struct.fields[position]
             case _ if for_assignment:
-                raise EllaError("can only assign to a variable or an element of one", expr.span)
+                raise EllaError("can only assign to a variable or a part of one", expr.span)
             case _:
                 return self.eval(expr, scope)
 
-    def eval_assign(self, op: str, target: Name | Index, value_expr: Expr, scope: Scope, span: Span) -> Value:
+    def eval_assign(self, op: str, target: Name | Index | Member, value_expr: Expr, scope: Scope, span: Span) -> Value:
         """`target = value`, or `target op= value`, which means `target = target op value`."""
         value = self.eval(value_expr, scope)
         match target:
@@ -369,14 +443,42 @@ class Interpreter:
             case Index(container_expr, index_expr, index_span):
                 container = self.reference(container_expr, scope, for_assignment=True)
                 index = self.eval(index_expr, scope)
-                old = index_into(container, index, index_span)
-                if not isinstance(container, list):
-                    raise EllaError(f"can't assign to an element of a {type_name(container)}", index_span)
-                assert isinstance(index, int)  # checked by index_into
+                old = self.item(container, index, index_span)
                 if op != "=":
                     value = binary(op.removesuffix("="), old, value, span)
-                container[index] = value
+                self.set_item(container, index, value, index_span)
+            case Member(struct_expr, name, member_span):
+                struct = self.reference(struct_expr, scope, for_assignment=True)
+                assert isinstance(struct, VariantValue)
+                i = self.field_index(struct, name, member_span)
+                if op != "=":
+                    value = binary(op.removesuffix("="), struct.fields[i], value, span)
+                struct.fields[i] = value
         return copy_value(value)
+
+    def item(self, container: Value, index: Value, span: Span) -> Value:
+        """`container[index]`: an item of a list or string, or a pool's value."""
+        if isinstance(container, PoolValue):
+            assert isinstance(index, HandleValue)
+            return self.pool_slot(container, index, span)
+        return index_into(container, index, span)
+
+    def set_item(self, container: Value, index: Value, value: Value, span: Span) -> None:
+        if isinstance(container, PoolValue):
+            assert isinstance(index, HandleValue)
+            self.pool_slot(container, index, span)  # check the handle
+            container.slots[index.slot] = value
+            return
+        index_into(container, index, span)  # check that the index is in range
+        if not isinstance(container, list):
+            raise EllaError(f"can't assign to an element of a {type_name(container)}", span)
+        assert isinstance(index, int)
+        container[index] = value
+
+    def field_index(self, struct: Value, name: str, span: Span) -> int:
+        if not isinstance(struct, VariantValue) or name not in self.structs.get(struct.enum, ()):
+            raise EllaError(f"a {type_name(struct)} has no field '{name}'", span)
+        return self.structs[struct.enum].index(name)
 
     # Functions
 
@@ -413,7 +515,9 @@ class Interpreter:
         instead, which no program can tell apart (docs/grammar.md §5).
         """
         values: list[Value] = []
-        places: list[tuple[int, Expr, list[tuple[Value, Span]]]] = []  # argument position, root variable, indexes
+        places: list[
+            tuple[int, Expr, list[tuple[Value | Member, Span]]]
+        ] = []  # argument position, root variable, indexes
         for i, arg in enumerate(args):
             if isinstance(arg, MutArg):
                 root, indexes = self.evaluate_place(arg.target, scope)
@@ -427,22 +531,36 @@ class Interpreter:
             self.write_place(root, indexes, final, scope, args[i].span)
         return result
 
-    def evaluate_place(self, target: Expr, scope: Scope) -> tuple[Expr, list[tuple[Value, Span]]]:
-        """The root variable of `xs[i][j]`, and the values of its indexes, left to right, with their spans."""
+    def evaluate_place(self, target: Expr, scope: Scope) -> tuple[Expr, list[tuple[Value | Member, Span]]]:
+        """The root variable of `xs[i].f[j]`, and its indexes and fields, left to right, with their spans.
+
+        A field is given by its name, as a Member node.
+        """
         if isinstance(target, Index):
             root, indexes = self.evaluate_place(target.target, scope)
             return root, [*indexes, (self.eval(target.index, scope), target.span)]
+        if isinstance(target, Member):
+            root, indexes = self.evaluate_place(target.target, scope)
+            return root, [*indexes, (target, target.span)]
         return target, []
 
-    def read_place(self, root: Expr, indexes: list[tuple[Value, Span]], scope: Scope) -> Value:
+    def step(self, container: Value, index: Value | Member, span: Span) -> Value:
+        """One step into a place: an item, or a field (given as its Member node)."""
+        if isinstance(index, Member):
+            position = self.field_index(container, index.name, span)
+            assert isinstance(container, VariantValue)
+            return container.fields[position]
+        return self.item(container, index, span)
+
+    def read_place(self, root: Expr, indexes: list[tuple[Value | Member, Span]], scope: Scope) -> Value:
         assert isinstance(root, Name)
         value = self.lookup_mutable(root.name, scope, root.span).value
         for index, span in indexes:
-            value = index_into(value, index, span)
+            value = self.step(value, index, span)
         return value
 
     def write_place(
-        self, root: Expr, indexes: list[tuple[Value, Span]], value: Value, scope: Scope, span: Span
+        self, root: Expr, indexes: list[tuple[Value | Member, Span]], value: Value, scope: Scope, span: Span
     ) -> None:
         """Assign to a place found earlier by `evaluate_place`, checking its indexes again."""
         assert isinstance(root, Name)
@@ -452,11 +570,14 @@ class Interpreter:
             return
         container = var.value
         for index, _ in indexes[:-1]:
-            container = index_into(container, index, span)
+            container = self.step(container, index, span)
         last, _ = indexes[-1]
-        index_into(container, last, span)  # check it is still in range
-        assert isinstance(container, list) and isinstance(last, int)
-        container[last] = value
+        if isinstance(last, Member):
+            position = self.field_index(container, last.name, span)
+            assert isinstance(container, VariantValue)
+            container.fields[position] = value
+        else:
+            self.set_item(container, last, value, span)
 
     def call(self, function: Value, args: list[Value], span: Span, finals: list[Value] | None = None) -> Value:
         """Call a function value with already evaluated arguments.
@@ -469,9 +590,14 @@ class Interpreter:
                 return run(args, span)
             case Constructor(enum, variant, arity):
                 self.check_arity(variant, arity, args, span)
-                return VariantValue(enum, variant, tuple(args))
+                value = VariantValue(enum, variant, list(args), nocopy=enum in self.nocopy)
+                if enum in self.finalizers:
+                    self.owners[-1].append(value)
+                return value
             case Closure(lambda_, captured):
                 self.check_arity("function", len(lambda_.params), args, span)
+                if self.prepare_function is not None:
+                    lambda_ = self.prepare_function(lambda_)
                 return self.call_closure(lambda_, captured, args, span, finals)
         raise EllaError(f"can't call a value of type {type_name(function)}", span)
 
@@ -492,6 +618,7 @@ class Interpreter:
             local.define(param.name, arg, param.mutable)
 
         postconditions = [cond for cond in lambda_.where if mentions_return(cond.expr)]
+        self.owners.append([])
         for cond in lambda_.where:
             if cond not in postconditions:
                 self.check_condition(cond, local, "precondition")
@@ -517,7 +644,156 @@ class Interpreter:
                 self.check_condition(cond, result_scope, "postcondition")
         if finals is not None:
             finals.extend(local.vars[param.name].value for param in lambda_.params if param.mutable)
+        self.close_owner(result)  # the result belongs to the caller
         return result
+
+    # Finalizers
+
+    def finalizable(self, value: Value) -> list[Value]:
+        """The values with finalizers that `value` holds, itself included: those that move with it."""
+        match value:
+            case VariantValue(enum, fields=fields):
+                inner = [v for item in fields for v in self.finalizable(item)]
+                return ([value] if enum in self.finalizers else []) + inner
+            case PoolValue():
+                return [value]
+            case list() | tuple():
+                return [v for item in value for v in self.finalizable(item)]
+        return []
+
+    def adopt(self, value: Value, source: int, target: int) -> None:
+        """Move the values with finalizers that `value` holds from one owner to another."""
+        moving = {id(v) for v in self.finalizable(value)}
+        if not moving:
+            return
+        self.owners[target].extend(v for v in self.owners[source] if id(v) in moving)
+        self.owners[source] = [v for v in self.owners[source] if id(v) not in moving]
+
+    def close_owner(self, keep: Value | None = None) -> None:
+        """End the innermost owner, finalizing its values (newest first), except those `keep` holds."""
+        if keep is not None and len(self.owners) > 1:
+            self.adopt(keep, -1, -2)
+        for value in reversed(self.owners.pop()):
+            self.finalize(value)
+
+    def finalize(self, value: Value) -> None:
+        """Run a value's finalizer; a pool finalizes its values, from the last slot to the first."""
+        if isinstance(value, PoolValue):
+            for slot in reversed(value.slots):
+                if slot is not None:
+                    self.finalize_held(slot)
+        elif isinstance(value, VariantValue) and value.enum in self.finalizers:
+            self.call(self.finalizers[value.enum], [value], Span(0, 0))
+
+    def finalize_held(self, value: Value) -> None:
+        """Finalize everything a value holds: itself first, then its parts, last first.
+
+        That is the reverse of the order they were made in, since parts are
+        made before what holds them.
+        """
+        match value:
+            case VariantValue(fields=fields):
+                self.finalize(value)
+                for item in reversed(fields):
+                    self.finalize_held(item)
+            case PoolValue():
+                self.finalize(value)
+            case list() | tuple():
+                for item in reversed(value):
+                    self.finalize_held(item)
+
+    # Pools
+
+    def new_pool(self) -> Value:
+        pool = PoolValue()
+        self.owners[-1].append(pool)
+        return pool
+
+    def pool_slot(self, pool: PoolValue, handle: HandleValue, span: Span) -> Value:
+        """The value a handle refers to, which must still be there."""
+        if handle.slot >= len(pool.slots) or pool.generations[handle.slot] != handle.generation:
+            raise EllaError(f"handle {to_text(handle)} is stale: its value was freed", span)
+        value = pool.slots[handle.slot]
+        assert value is not None
+        return value
+
+    def call_pool(self, name: str, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
+        """`alloc(mut pool, value)` and `free(mut pool, handle)`, which change the pool in place."""
+        pool_arg, value_expr = args
+        assert isinstance(pool_arg, MutArg)
+        root, indexes = self.evaluate_place(pool_arg.target, scope)
+        pool = self.read_place(root, indexes, scope)
+        assert isinstance(pool, PoolValue)
+        value = self.eval(value_expr, scope)
+        if name == "alloc":
+            # The pool owns the value from now on, and finalizes it when it is freed.
+            for owner in range(len(self.owners)):
+                moving = {id(v) for v in self.finalizable(value)}
+                self.owners[owner] = [v for v in self.owners[owner] if id(v) not in moving]
+            if pool.free:
+                slot = pool.free.pop()
+                pool.slots[slot] = value
+            else:
+                slot = len(pool.slots)
+                pool.slots.append(value)
+                pool.generations.append(0)
+            return HandleValue(slot, pool.generations[slot])
+        assert isinstance(value, HandleValue)
+        held = self.pool_slot(pool, value, span)
+        self.finalize_held(held)
+        pool.slots[value.slot] = None
+        pool.generations[value.slot] += 1
+        pool.free.append(value.slot)
+        return UNIT
+
+    # Staging (see ella.staging)
+
+    def quote(self, quote: Quote, scope: Scope) -> Value:
+        """Build the code a `quote` gives, running its splices now."""
+
+        def splice(node: AnySplice) -> object:
+            return splice_value(node, self.eval(node.code, scope))
+
+        def persist(name: Name) -> Expr:
+            return reify(copy_value(self.lookup(name.name, scope, name.span).value), name.span)
+
+        # Quotes inside this one's splices may use its variables, by their fresh names.
+        builder = start_code(quote, self.tables)
+        self.renamings.append(builder.renamed)
+        try:
+            return CodeValue(builder.build(splice, persist, self.renamings[:-1]))
+        finally:
+            self.renamings.pop()
+
+    def builtin_reflect(self, name: str) -> Callable[[list[Value], Span], Value]:
+        def run(args: list[Value], span: Span) -> Value:
+            if self.checker is None:
+                raise EllaError(f"{name}() needs a checked program", span)
+            return reflect(name, args, self.checker.enums, span)
+
+        return run
+
+    def builtin_run(self, args: list[Value], span: Span) -> Value:
+        """`run(code)`: check the code, then run it like the body of a function with no parameters."""
+        code = args[0]
+        assert isinstance(code, CodeValue)
+        if self.checker is None:
+            raise EllaError("run() needs a checked program", span)
+        self.tables.add(check_code(code.expr, self.checker))
+        return self.run_code(code.expr)
+
+    def run_code(self, expr: Expr) -> Value:
+        self.owners.append([])
+        try:
+            result = self.eval(expr, Scope(self.globals))
+        except ReturnSignal as signal:
+            raise EllaError("'return' outside of a function", signal.span) from None
+        self.close_owner(result)
+        return result
+
+    def run_compile_time(self, expr: Expr) -> Value:
+        """Run the code of a splice outside quotes, while compiling (see ella.staging)."""
+        return self.run_code(expr)
 
     def check_condition(self, cond: Assert, scope: Scope, kind: str) -> None:
         """Check an `assert` or `where` condition, reporting its source if it is false."""
@@ -576,7 +852,7 @@ class Interpreter:
                 return self.match_all(items, value, scope)
 
     def match_all(
-        self, patterns: tuple[Pattern, ...], values: tuple[Value, ...], scope: Scope
+        self, patterns: tuple[Pattern, ...], values: Sequence[Value], scope: Scope
     ) -> dict[str, Value] | None:
         """Match each value against the pattern in the same position; all must match."""
         bindings: dict[str, Value] = {}
@@ -605,21 +881,37 @@ class Interpreter:
 
     # Loops
 
-    def run_loop_body(self, body: Expr, scope: Scope, label: str | None) -> BreakSignal | None:
-        """Run one iteration of a loop body. Returns the BreakSignal if the loop should stop.
+    def run_loop_body(
+        self, body: Expr, scope: Scope, label: str | None, cond: Expr | None = None
+    ) -> BreakSignal | None:
+        """Run one iteration of a loop body (after its `while` condition, if any).
 
-        A `break` or `continue` for an outer loop (with a different label)
-        isn't ours, so it is raised again for the outer loop to catch.
+        Returns a BreakSignal if the loop should stop. A `break` or `continue`
+        for an outer loop (with a different label) isn't ours, so it is
+        raised again for the outer loop to catch. The iteration owns the
+        values with finalizers it makes, except a value given to `break` or
+        `return`, which goes to the owner outside it.
         """
+        self.owners.append([])
         try:
+            if cond is not None and not self.eval_bool(cond, scope, "a 'while' condition"):
+                self.close_owner()
+                return BreakSignal(label, None, cond.span)
             self.eval(body, scope)
         except BreakSignal as signal:
+            self.close_owner(signal.value)
             if signal.label not in (None, label):
                 raise
             return signal
         except ContinueSignal as signal:
+            self.close_owner()
             if signal.label not in (None, label):
                 raise
+            return None
+        except ReturnSignal as signal:
+            self.close_owner(signal.value)
+            raise
+        self.close_owner()
         return None
 
     def check_no_break_value(self, signal: BreakSignal, loop: str) -> None:
@@ -654,7 +946,16 @@ class Interpreter:
     # Enums and built-ins
 
     def define_enum(self, enum: EnumDef, scope: Scope) -> None:
-        """Make each variant a name: a value if it has no fields, a constructor if it does."""
+        """Make each variant a name: a value if it has no fields, a constructor if it does.
+
+        A struct also gets its field names, and maybe a finalizer.
+        """
+        if enum.struct:
+            self.structs[enum.name] = enum.field_names
+            if enum.nocopy:
+                self.nocopy.add(enum.name)
+            if enum.finalize is not None:
+                self.finalizers[enum.name] = self.eval(enum.finalize, scope)
         for variant in enum.variants:
             if variant.fields:
                 scope.define(variant.name, Constructor(enum.name, variant.name, len(variant.fields)))
@@ -667,8 +968,10 @@ class Interpreter:
         return UNIT
 
     def builtin_len(self, args: list[Value], span: Span) -> Value:
-        """`len(x)` is the length of a list, string or range."""
+        """`len(x)` is the length of a list, string or range, or how many values a pool holds."""
         value = args[0]
+        if isinstance(value, PoolValue):
+            return value.live()
         if not isinstance(value, list | str | range):
-            raise EllaError(f"len() needs a list, str or range, not {type_name(value)}", span)
+            raise EllaError(f"len() needs a list, str, range or Pool, not {type_name(value)}", span)
         return len(value)

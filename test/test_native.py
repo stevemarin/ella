@@ -331,3 +331,37 @@ let f = () -> () -> str =>
     keep
 print(f()())
 """)
+
+
+def test_pools_free_their_values(tmp_path: Path) -> None:
+    # Each value lives in an arena of its own, freed with it.
+    source = """\
+struct Item
+    name: str
+    tags: [str]
+let mut pool: Pool[Item] = pool_new()
+let mut total = 0
+for i in 0..20000
+    let h = alloc(mut pool, Item("item {{i}}", ["a", "b", "c"]))
+    pool[h].tags += ["d"]
+    total += len(pool[h].tags)
+    free(mut pool, h)
+print(total)
+print(len(pool))
+"""
+    out, peak = arena_peak(source, tmp_path)
+    assert out == "80000\n0\n"
+    assert peak < 10_000
+
+
+def test_finalizers_run_natively(tmp_path: Path) -> None:
+    source = """\
+nocopy struct Res
+    n: i64
+    finalize = (r: Res) -> () => print("free {{r.n}}")
+for i in 0..3
+    let r = Res(i)
+print("done")
+"""
+    out, _ = arena_peak(source, tmp_path)
+    assert out == "free 0\nfree 1\nfree 2\ndone\n"
