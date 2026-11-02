@@ -1,8 +1,9 @@
 """Run every program in test/programs and compare with its expected output (see test/programs/README.md).
 
-Each program is run twice, by the tree-walking interpreter and through the
-IR, and both must give the expected output and error. This is what checks
-that lowering to IR keeps the program's meaning.
+Each program is run three ways: by the tree-walking interpreter, through the
+IR, and through the optimized IR. All must give the expected output and
+error. This is what checks that lowering and optimization keep the program's
+meaning.
 """
 
 import io
@@ -14,9 +15,11 @@ import pytest
 
 from ella.checker import check
 from ella.interpreter import Interpreter
-from ella.ir_interpreter import run_ir
+from ella.ir_interpreter import IRInterpreter, run_ir
 from ella.lexer import EllaError
+from ella.lower import compile_program
 from ella.parser import parse
+from ella.passes import optimize
 
 PROGRAMS = Path(__file__).parent / "programs"
 
@@ -28,7 +31,12 @@ def run_tree(source: str, out: TextIO) -> None:
     Interpreter(out).run(program)
 
 
-RUNNERS: dict[str, Callable[[str, TextIO], None]] = {"tree": run_tree, "ir": run_ir}
+def run_optimized(source: str, out: TextIO) -> None:
+    """Compile to IR, optimize it, and run it."""
+    IRInterpreter(optimize(compile_program(source)), out).run()
+
+
+RUNNERS: dict[str, Callable[[str, TextIO], None]] = {"tree": run_tree, "ir": run_ir, "optimized": run_optimized}
 
 
 @pytest.mark.parametrize("runner", RUNNERS)

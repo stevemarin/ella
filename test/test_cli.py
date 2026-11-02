@@ -68,3 +68,25 @@ def test_reports_type_errors_before_running(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == f"{path}:2:11: '+' needs two values of the same type, not i64 and bool\n"
+
+
+def test_optimizes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "print(6 * 7)\n")
+    assert main(["-O", path]) == 0
+    assert capsys.readouterr().out == "42\n"
+    assert main(["--ir", "-O", path]) == 0
+    out = capsys.readouterr().out
+    assert "const 42" in out and "mul" not in out
+
+
+def test_chooses_passes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "let f = (a: i64) -> i64 => a + 1\n")
+    assert main(["--ir", "--passes", "mem2reg", path]) == 0
+    out = capsys.readouterr().out
+    assert "load" not in out and "store" not in out
+
+
+def test_rejects_unknown_passes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--passes", "mem2reg,nope", write(tmp_path, "1\n")])
+    assert "unknown pass 'nope'" in capsys.readouterr().err

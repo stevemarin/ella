@@ -19,10 +19,11 @@ from ella.ir import (
     format_module,
     verify,
 )
-from ella.ir_interpreter import run_ir
+from ella.ir_interpreter import IRInterpreter, run_ir
 from ella.lexer import EllaError, Span
 from ella.lower import compile_program
 from ella.parser import parse
+from ella.passes import optimize
 
 S = Span(1, 1)
 
@@ -30,6 +31,12 @@ S = Span(1, 1)
 def ir_output(source: str) -> list[str]:
     out = io.StringIO()
     run_ir(source, out)
+    return out.getvalue().splitlines()
+
+
+def optimized_output(source: str) -> list[str]:
+    out = io.StringIO()
+    IRInterpreter(optimize(compile_program(source)), out).run()
     return out.getvalue().splitlines()
 
 
@@ -203,7 +210,9 @@ let later = 1
 
 @pytest.mark.parametrize("source", PROGRAMS.values(), ids=PROGRAMS.keys())
 def test_interpreters_agree(source: str) -> None:
-    assert outcome(ir_output, source) == outcome(tree_output, source)
+    expected = outcome(tree_output, source)
+    assert outcome(ir_output, source) == expected
+    assert outcome(optimized_output, source) == expected
 
 
 def test_some_programs_fail_the_same_way() -> None:

@@ -39,7 +39,7 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Layout (stages 1 to 3 done)
+## Layout (stages 1 to 4 done)
 
 * `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
   `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
@@ -64,11 +64,17 @@ plain:
 * `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
   local slots; lambdas are closure converted.
 * `src/ella/ir_interpreter.py`: runs IR.
+* `src/ella/passes/`: optimization passes, one module each (`mem2reg`, `fold`,
+  `simplify`, `dce`), each `pass(function, module) -> bool` (changed?).
+  `optimize()` in `__init__.py` runs them, verifying the IR after every pass.
+  Passes must keep behavior identical, including run-time errors: never fold
+  or remove an operation that can fail.
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
-  of both interpreters), `test/test_cli.py`. `test/programs/` holds
+  of both interpreters and the optimized IR), `test/test_passes.py`,
+  `test/test_cli.py`. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), run through both interpreters by
-  `test/test_programs.py`.
+  `NAME.err` (expected error), run through both interpreters and the
+  optimized IR by `test/test_programs.py`.
 
-Next is stage 4 (optimization); see README.md.
+Next is stage 5 (x64 code generation); see README.md.

@@ -11,6 +11,7 @@ from ella.ir_interpreter import IRInterpreter
 from ella.lexer import EllaError, tokenize
 from ella.lower import compile_program
 from ella.parser import parse
+from ella.passes import PASSES, optimize
 from ella.syntax import show
 
 
@@ -23,7 +24,18 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--ast", action="store_true", help="print the syntax tree")
     mode.add_argument("--ir", action="store_true", help="print the IR")
     mode.add_argument("--tree", action="store_true", help="run with the tree-walking interpreter instead of the IR")
+    args.add_argument("-O", "--optimize", action="store_true", help="optimize the IR before running or printing it")
+    args.add_argument(
+        "--passes",
+        help=f"run these optimization passes, in order, separated by commas ({', '.join(PASSES)})",
+    )
     options = args.parse_args(argv)
+    passes = None
+    if options.passes is not None:
+        passes = [name.strip() for name in options.passes.split(",") if name.strip()]
+        unknown = [name for name in passes if name not in PASSES]
+        if unknown:
+            args.error(f"unknown pass {unknown[0]!r}; the passes are {', '.join(PASSES)}")
 
     source = options.file.read_text(encoding="utf-8")
     try:
@@ -39,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
             Interpreter().run(program)
         else:
             module = compile_program(source)
+            if options.optimize or passes is not None:
+                optimize(module, passes)
             if options.ir:
                 print(format_module(module), end="")
             else:

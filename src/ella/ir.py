@@ -38,8 +38,9 @@ Variables
 
 Ella variables can change, but values can't. For now, each variable lives
 in a named, typed *local slot* of its function, read with `load` and written
-with `store`. (A later pass can promote slots to values, which is what "SSA
-form" means; it is easier to do as an optimization than in the lowering.)
+with `store`. The mem2reg pass (ella.passes.mem2reg) promotes slots to
+values, which is what "SSA form" means; that is easier to do as an
+optimization than in the lowering.
 Top-level variables are *globals*, read and written by name. Reading a
 global before it is set is a run-time error.
 
@@ -206,6 +207,83 @@ def successors(block: Block) -> list[Block]:
             return [then, else_]
         case _:
             return []
+
+
+# Helpers for passes that change the IR (ella.passes)
+
+
+def predecessors(function: Function) -> dict[Block, list[Block]]:
+    """For each block, the blocks that can go to it next."""
+    result: dict[Block, list[Block]] = {block: [] for block in function.blocks}
+    for block in function.blocks:
+        for successor in successors(block):
+            result[successor].append(block)
+    return result
+
+
+def reachable(function: Function) -> list[Block]:
+    """The blocks that can be reached from the entry, in their current order."""
+    seen = {function.blocks[0]}
+    work = [function.blocks[0]]
+    while work:
+        for successor in successors(work.pop()):
+            if successor not in seen:
+                seen.add(successor)
+                work.append(successor)
+    return [block for block in function.blocks if block in seen]
+
+
+def next_value_id(function: Function) -> int:
+    """A value id not used yet in the function."""
+    ids = [v.id for block in function.blocks for v in block.params]
+    ids += [i.dest.id for block in function.blocks for i in block.instrs if i.dest is not None]
+    return max(ids, default=0) + 1
+
+
+def replace_values(function: Function, replacements: dict[int, Value]) -> None:
+    """Replace every use of a value by another, following chains: if %1 -> %2 and %2 -> %3, uses of %1 become %3."""
+
+    def resolve(value: Value) -> Value:
+        while value.id in replacements:
+            value = replacements[value.id]
+        return value
+
+    for block in function.blocks:
+        for instr in block.instrs:
+            instr.args = [resolve(arg) for arg in instr.args]
+        match block.terminator:
+            case Jump() as jump:
+                jump.args = [resolve(arg) for arg in jump.args]
+            case Branch() as branch:
+                branch.cond = resolve(branch.cond)
+            case Return() as ret:
+                ret.value = resolve(ret.value)
+            case Trap(value=value) as trap if value is not None:
+                trap.value = resolve(value)
+
+
+def used_values(function: Function) -> set[int]:
+    """The ids of all values used as operands anywhere in the function."""
+    used = {arg.id for block in function.blocks for instr in block.instrs for arg in instr.args}
+    for block in function.blocks:
+        match block.terminator:
+            case Jump(_, args):
+                used.update(arg.id for arg in args)
+            case Branch(cond):
+                used.add(cond.id)
+            case Return(value):
+                used.add(value.id)
+            case Trap(value=value) if value is not None:
+                used.add(value.id)
+    return used
+
+
+def remove_param(function: Function, block: Block, index: int) -> None:
+    """Remove a block's parameter, and the matching argument of every jump to it."""
+    del block.params[index]
+    for predecessor in function.blocks:
+        if isinstance(predecessor.terminator, Jump) and predecessor.terminator.target is block:
+            del predecessor.terminator.args[index]
 
 
 # Printing

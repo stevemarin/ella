@@ -49,9 +49,9 @@ The IR is a typed control-flow graph (specified in
 * Values have explicit types and unique IDs, and never change.
 * Control-flow joins use block parameters: `jump join(%4)` passes a value to
   `join(%5: i64)`. They do the job of SSA `phi` nodes.
-* Variables live in named, typed local slots (`load`/`store`) for now.
-  Promoting slots to values (full SSA form) is easier as an optimization pass
-  than in the lowering.
+* The lowering keeps variables in named, typed local slots (`load`/`store`).
+  The mem2reg optimization pass then promotes them to values, giving full SSA
+  form; that is easier as a pass than in the lowering.
 * Lists are values: `set_index` makes a new list, so value semantics are
   explicit and nothing is ever copied behind the scenes.
 * Lambdas are closure converted: each becomes an IR function taking its
@@ -102,7 +102,8 @@ and IR rather than treating every compiler pass as a stage of program execution.
   propagation, and dead-code elimination.
 * Keep passes separate and inspectable; verify IR before and after each pass.
 * Later, experiment with implementing passes in Ella and compiling them with
-  Ella itself.
+  Ella itself. Later still: inlining, loop-invariant code motion, and removing
+  `assert`s that can be proven true.
 
 ### 5. Native code generation
 
@@ -139,14 +140,20 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   ([src/ella/ir.py](src/ella/ir.py), which also has the printer and verifier),
   and the IR interpreter ([src/ella/ir_interpreter.py](src/ella/ir_interpreter.py))
   runs it. Every test program gives the same results through both interpreters.
+* Stage 4 is done: optimization passes in [src/ella/passes/](src/ella/passes/)
+  promote slots to SSA values (mem2reg), fold and propagate constants,
+  simplify the control-flow graph, and remove dead code. The IR is verified
+  after every pass, and every test program also runs through the optimized IR.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)
 uv run ella --tree example_syntax.ella    # check and run it with the AST interpreter
-uv run ella --ir example_syntax.ella      # print the IR
+uv run ella -O example_syntax.ella        # optimize the IR, then run it
+uv run ella --ir example_syntax.ella      # print the IR (add -O to optimize it,
+                                          # or --passes mem2reg,fold to pick passes)
 uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-Optimization, native code generation and the later roadmap items are design
-goals, not implemented features yet.
+Native code generation and the later roadmap items are design goals, not
+implemented features yet.
