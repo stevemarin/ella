@@ -45,3 +45,26 @@ def test_reports_runtime_errors_after_output(tmp_path: Path, capsys: pytest.Capt
 def test_runs_example(capsys: pytest.CaptureFixture[str]) -> None:
     assert main([str(EXAMPLE)]) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "done"
+
+
+def test_prints_ir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--ir", write(tmp_path, "print(1 + 2)\n")]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("function top() -> ()\n")
+    assert "add %" in out and "print %" in out
+
+
+def test_runs_with_tree_interpreter(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--tree", write(tmp_path, 'print("hi {{1 + 2}}")\n')]) == 0
+    assert capsys.readouterr().out == "hi 3\n"
+
+
+@pytest.mark.parametrize("mode", [[], ["--tree"], ["--ir"]])
+def test_reports_type_errors_before_running(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: list[str]
+) -> None:
+    path = write(tmp_path, 'print("never printed")\nlet x = 1 + true\n')
+    assert main([*mode, path]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{path}:2:11: '+' needs two values of the same type, not i64 and bool\n"

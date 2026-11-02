@@ -200,8 +200,12 @@ A source file is a sequence of top-level expressions.
 
 1. Top-level `let` names are visible throughout the file, regardless of order.
    This is what lets top-level functions call each other in any order.
-   Reading a top-level non-function value before its `let` has run is a
-   run-time error.
+   Reading a top-level non-function value before its `let` has run is an
+   error: at compile time when the top-level code itself does it, and at run
+   time when a function that reads it is called too early.
+4. A top-level name keeps one type, even if it is bound again by a later
+   `let`, because functions anywhere in the file may refer to it. (Local
+   names may be rebound with a different type.)
 2. The top-level expressions run in order, like a script.
 3. Afterwards, if the file defines a top-level `main`, it is called.
    `main` has type `() -> ()`. Command-line arguments and exit codes come later.
@@ -353,7 +357,7 @@ else
 * Conditions must be `bool` (only booleans are truthy).
 * `else` may be on the same line as the `then` body or start its own line at
   the same indentation as the `if`.
-* `if` without `else` has type `()` and its `then` body must have type `()`.
+* `if` without `else` has type `()`; the value of its `then` body is discarded.
 
 ### `match`
 
@@ -539,6 +543,35 @@ Result[T, E]   Optional[T]       generic types use [ ]
   `=>`, so a function returning a function is
   `(x: i64) -> (i64) -> i64 => ...`.
 
+### Type checking
+
+Programs are type checked before they run. Function parameters and results
+must be annotated; everything else is inferred from values and how they are
+used:
+
+```ella
+let x = 1 + 2            # i64
+let mut seen = []        # a list of something not known yet...
+seen = seen + [5]        # ...which this decides is [i64]
+let found = None         # Optional of something; used as Optional[str] later
+```
+
+* A type that nothing decides defaults to `()`: `let xs = []` is a `[()]`.
+* An operator whose meaning depends on its operand's type needs that type to
+  be known: with `let xs = []` alone, `-xs[0]` is an error.
+* `return`, `break`, `continue`, and a `loop` that never breaks have no
+  value. They fit wherever a value of any type is expected, as in
+  `if n > 0 then n else return 0`.
+* The bodies of `for`, `while` and `loop`, the `then` of an `if` without
+  `else`, and all but the last line of a block can have any type; their
+  values are discarded.
+* `print`, `len` and variant constructors like `Some` can only be called, not
+  used as values (for now).
+* `Error` used as a type means `str` for now **(provisional)**, so
+  `Result[f64, Error]` is `Result[f64, str]`; see the open questions.
+* Generic functions don't exist yet (see the open questions); enums can be
+  generic.
+
 ### Enums **(provisional syntax)**
 
 ```ella
@@ -578,9 +611,9 @@ Run-time errors (failed `assert`, failed `where`, out-of-range index, no
 matching `case`, division by zero, `i64` overflow) stop the program with a
 message and the source location.
 
-Until there is a type checker, the interpreter also checks types as the
-program runs, so `1 + true` is a run-time error. Type annotations are not yet
-checked.
+Type errors such as `1 + true` are found before the program runs. The AST
+interpreter also checks types as it goes, so it can still run programs that
+haven't been checked.
 
 ## 11. Grammar summary
 
@@ -680,7 +713,8 @@ Parsing notes:
 ## Open questions
 
 * What is the `Error` type in `Result[T, Error]`? `Error` is also the name of
-  the variant. A built-in error type holding a message is likely.
+  the variant. A built-in error type holding a message is likely. For now,
+  `Error` as a type means `str`.
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
 * Struct syntax, member access semantics, and user-defined protocol methods.

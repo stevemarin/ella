@@ -13,6 +13,7 @@ Ella values are represented by plain Python values where one fits:
     a..b, a..=b     range
     enum variants   VariantValue, or Constructor for a variant with fields
     functions       Closure (written in Ella) or Builtin (written in Python)
+                    in the AST interpreter; FunctionRef in the IR interpreter
 
 Python's `bool` is a subclass of `int`, so code that tells values apart must
 test for `bool` before `int`. `type_name` does that, and the interpreter uses
@@ -74,8 +75,27 @@ class Builtin:
     run: Callable[[list[Value], Span], Value]
 
 
+@dataclass(frozen=True, slots=True)
+class FunctionRef:
+    """A function value in the IR interpreter: an IR function and its captured values."""
+
+    name: str
+    captured: tuple[Value, ...] = ()
+
+
 type Value = (
-    int | float | bool | str | tuple[Value, ...] | list[Value] | range | VariantValue | Constructor | Closure | Builtin
+    int
+    | float
+    | bool
+    | str
+    | tuple[Value, ...]
+    | list[Value]
+    | range
+    | VariantValue
+    | Constructor
+    | Closure
+    | Builtin
+    | FunctionRef
 )
 
 UNIT: Value = ()
@@ -145,7 +165,7 @@ def type_name(value: Value) -> str:
             return "range"
         case VariantValue(enum=enum):
             return enum
-        case Constructor() | Closure() | Builtin():
+        case Constructor() | Closure() | Builtin() | FunctionRef():
             return "function"
 
 
@@ -205,5 +225,5 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"<built-in function {name}>"
         case Constructor(variant=variant):
             return f"<constructor {variant}>"
-        case Closure():
+        case Closure() | FunctionRef():
             return "<function>"

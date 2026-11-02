@@ -1,8 +1,9 @@
 # Test programs
 
-Each `NAME.ella` here is a complete Ella program, run by
-[test_programs.py](../test_programs.py). Every interpreter and backend should
-give the same results, so later stages reuse these files.
+Each `NAME.ella` here is a complete, type-correct Ella program, run by
+[test_programs.py](../test_programs.py) with both the AST interpreter and the
+IR interpreter. Every interpreter and backend must give the same results, so
+later stages reuse these files.
 
 * `NAME.out` is exactly what the program prints.
 * `NAME.err`, if present, means the program must stop with that error, as

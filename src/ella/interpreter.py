@@ -18,12 +18,11 @@ true` is a run-time error here, where a later stage will reject it before the
 program starts.
 """
 
-import math
 import sys
-from dataclasses import fields, is_dataclass
 from typing import TextIO
 
 from ella.lexer import EllaError, Span
+from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
 from ella.syntax import (
     Assert,
@@ -66,6 +65,7 @@ from ella.syntax import (
     VariantPattern,
     While,
     WildcardPattern,
+    mentions_return,
 )
 from ella.values import (
     UNIT,
@@ -78,7 +78,6 @@ from ella.values import (
     VariantValue,
     copy_value,
     equal,
-    fits_i64,
     to_text,
     type_name,
 )
@@ -125,47 +124,6 @@ def run(source: str, out: TextIO | None = None) -> None:
     Raises EllaError for syntax and run-time errors.
     """
     Interpreter(out).run(parse(source))
-
-
-def mentions_return(node: object) -> bool:
-    """Does a `where` condition use `return`, making it a postcondition?
-
-    This walks any syntax tree node generically, through its dataclass fields.
-    It doesn't look inside nested lambdas, whose `return` is their own.
-    """
-    match node:
-        case Name(name="return"):
-            return True
-        case Lambda():
-            return False
-        case tuple():
-            return any(mentions_return(item) for item in node)
-        case _ if is_dataclass(node) and not isinstance(node, type):
-            return any(mentions_return(getattr(node, f.name)) for f in fields(node))
-    return False
-
-
-def float_div(a: float, b: float) -> float:
-    """`a / b` as IEEE 754 floating point (and so x64 hardware) defines it: dividing
-    by zero gives an infinity, or NaN for 0 / 0, rather than an error."""
-    if b == 0.0:
-        if a == 0.0 or math.isnan(a):
-            return math.nan
-        return math.copysign(math.inf, a) * math.copysign(1.0, b)
-    return a / b
-
-
-def float_pow(a: float, b: float) -> float:
-    """`a ** b` for f64, giving infinity or NaN where Python would raise an error."""
-    try:
-        result = a**b
-    except ZeroDivisionError:  # 0.0 ** -1.0
-        return math.inf
-    except OverflowError:
-        return -math.inf if a < 0 and b % 2 == 1 else math.inf
-    # A negative number to a fractional power has no real answer; Python
-    # would give a complex number.
-    return math.nan if isinstance(result, complex) else result
 
 
 class Interpreter:
@@ -267,21 +225,21 @@ class Interpreter:
 
             # Operators
             case Unary(op, operand, span):
-                return self.unary(op, self.eval(operand, scope), span)
+                return unary(op, self.eval(operand, scope), span)
             case Binary("and", left, right):
                 # `and` and `or` only evaluate their right side if needed.
                 return self.eval_bool(left, scope, "'and'") and self.eval_bool(right, scope, "'and'")
             case Binary("or", left, right):
                 return self.eval_bool(left, scope, "'or'") or self.eval_bool(right, scope, "'or'")
             case Binary(op, left, right, span):
-                return self.binary(op, self.eval(left, scope), self.eval(right, scope), span)
+                return binary(op, self.eval(left, scope), self.eval(right, scope), span)
             case Compare(first, rest, span):
                 # `a < b <= c` evaluates each operand once, stopping at the
                 # first comparison that is false.
                 left_value = self.eval(first, scope)
                 for op, operand in rest:
                     right_value = self.eval(operand, scope)
-                    if not self.compare(op, left_value, right_value, span):
+                    if not compare(op, left_value, right_value, span):
                         return False
                     left_value = right_value
                 return True
@@ -289,7 +247,7 @@ class Interpreter:
                 # Index into the stored list without copying all of it, then
                 # copy just the element.
                 container = self.reference(target, scope, for_assignment=False)
-                return copy_value(self.index_into(container, self.eval(index, scope), span))
+                return copy_value(index_into(container, self.eval(index, scope), span))
             case Member(span=span):
                 raise EllaError("member access ('.name') isn't supported yet", span)
             case Try(operand, span):
@@ -388,7 +346,7 @@ class Interpreter:
                 return var.value
             case Index(target, index, span):
                 container = self.reference(target, scope, for_assignment)
-                return self.index_into(container, self.eval(index, scope), span)
+                return index_into(container, self.eval(index, scope), span)
             case _ if for_assignment:
                 raise EllaError("can only assign to a variable or an element of one", expr.span)
             case _:
@@ -401,17 +359,17 @@ class Interpreter:
             case Name(name, name_span):
                 var = self.lookup_mutable(name, scope, name_span)
                 if op != "=":
-                    value = self.binary(op.removesuffix("="), var.value, value, span)
+                    value = binary(op.removesuffix("="), var.value, value, span)
                 var.value = value
             case Index(container_expr, index_expr, index_span):
                 container = self.reference(container_expr, scope, for_assignment=True)
                 index = self.eval(index_expr, scope)
-                old = self.index_into(container, index, index_span)
+                old = index_into(container, index, index_span)
                 if not isinstance(container, list):
                     raise EllaError(f"can't assign to an element of a {type_name(container)}", index_span)
                 assert isinstance(index, int)  # checked by index_into
                 if op != "=":
-                    value = self.binary(op.removesuffix("="), old, value, span)
+                    value = binary(op.removesuffix("="), old, value, span)
                 container[index] = value
         return copy_value(value)
 
@@ -506,157 +464,6 @@ class Interpreter:
             case VariantValue("Result", "Error") | VariantValue("Optional", "None"):
                 raise ReturnSignal(value, span)
         raise EllaError(f"'?' needs a Result or Optional, not {type_name(value)}", span)
-
-    # Operators
-
-    def unary(self, op: str, value: Value, span: Span) -> Value:
-        match op, value:
-            case "not", bool():
-                return not value
-            case _, bool():
-                pass  # bools aren't numbers, though Python thinks they are
-            case "-", int():
-                return self.check_i64(-value, span)
-            case "-", float():
-                return -value
-            case "~", int():
-                return ~value
-        raise EllaError(f"'{op}' doesn't work on {type_name(value)}", span)
-
-    def binary(self, op: str, a: Value, b: Value, span: Span) -> Value:
-        """Apply an arithmetic, bitwise or range operator to two values."""
-        # There are no implicit conversions, so both sides must have the same type.
-        if type_name(a) != type_name(b):
-            raise EllaError(f"'{op}' needs two values of the same type, not {type_name(a)} and {type_name(b)}", span)
-        match a, b:
-            case bool(), bool():
-                pass
-            case int(), int() if op in ("..", "..="):
-                return range(a, b + 1 if op == "..=" else b)
-            case int(), int():
-                return self.int_op(op, a, b, span)
-            case float(), float():
-                return self.float_op(op, a, b, span)
-            case (str(), str()) | (list(), list()) if op == "+":
-                return a + b  # type: ignore[operator]  # mypy can't pair the cases up
-        raise EllaError(f"'{op}' doesn't work on {type_name(a)}", span)
-
-    def check_i64(self, n: int, span: Span) -> int:
-        """i64 arithmetic traps on overflow: a result that doesn't fit is an error."""
-        if not fits_i64(n):
-            raise EllaError(f"i64 overflow: the result {n} doesn't fit in 64 bits", span)
-        return n
-
-    def int_op(self, op: str, a: int, b: int, span: Span) -> Value:
-        """i64 arithmetic. Python computes the exact result, then we check it fits."""
-        match op:
-            case "+":
-                return self.check_i64(a + b, span)
-            case "-":
-                return self.check_i64(a - b, span)
-            case "*":
-                return self.check_i64(a * b, span)
-            case "/":
-                return float_div(float(a), float(b))  # `/` always gives f64
-            case "//" | "%":
-                if b == 0:
-                    raise EllaError("integer division by zero", span)
-                # Python's // and % already round toward negative infinity, as
-                # Ella's do. Only `I64_MIN // -1` can overflow.
-                return self.check_i64(a // b, span) if op == "//" else a % b
-            case "**":
-                if b < 0:
-                    raise EllaError("an i64 can't be raised to a negative power", span)
-                # Any base other than -1, 0 or 1 overflows long before an
-                # exponent of 64, so don't compute an enormous number first.
-                if abs(a) > 1 and b >= 64:
-                    raise EllaError(f"i64 overflow: {a} ** {b} doesn't fit in 64 bits", span)
-                return self.check_i64(a**b, span)
-            case "&":
-                return a & b
-            case "|":
-                return a | b
-            case "^":
-                return a ^ b
-            case "<<" | ">>":
-                if not 0 <= b < 64:
-                    raise EllaError(f"shift amount must be between 0 and 63, not {b}", span)
-                # `a << b` is `a * 2**b`, so like `*` it traps if the result
-                # doesn't fit: shifting a bit into or past the sign bit is an
-                # error, not a silent change of sign. `>>` can't overflow;
-                # Python's >> on a negative number is an arithmetic shift, as
-                # Ella's is.
-                return self.check_i64(a << b, span) if op == "<<" else a >> b
-        raise EllaError(f"'{op}' doesn't work on i64", span)
-
-    def float_op(self, op: str, a: float, b: float, span: Span) -> Value:
-        """f64 arithmetic, following IEEE 754: no errors, but infinities and NaNs."""
-        match op:
-            case "+":
-                return a + b
-            case "-":
-                return a - b
-            case "*":
-                return a * b
-            case "/":
-                return float_div(a, b)
-            case "**":
-                return float_pow(a, b)
-        raise EllaError(f"'{op}' doesn't work on f64", span)
-
-    def compare(self, op: str, a: Value, b: Value, span: Span) -> bool:
-        """One comparison of a chain: `==`, `<`, `in` and so on."""
-        if op in ("in", "not in"):
-            return self.contains(b, a, span) == (op == "in")
-        if type_name(a) != type_name(b):
-            raise EllaError(f"'{op}' needs two values of the same type, not {type_name(a)} and {type_name(b)}", span)
-        if type_name(a) == "function":
-            raise EllaError("functions can't be compared", span)
-        if op == "==":
-            return equal(a, b)
-        if op == "!=":
-            return not equal(a, b)
-        # Ordering works on numbers and strings (strings compare by code point).
-        match a, b:
-            case bool(), bool():
-                pass
-            case (int(), int()) | (float(), float()) | (str(), str()):
-                match op:
-                    case "<":
-                        return a < b  # type: ignore[operator]  # mypy can't pair the cases up
-                    case "<=":
-                        return a <= b  # type: ignore[operator]
-                    case ">":
-                        return a > b  # type: ignore[operator]
-                    case ">=":
-                        return a >= b  # type: ignore[operator]
-        raise EllaError(f"'{op}' doesn't work on {type_name(a)}", span)
-
-    def contains(self, container: Value, item: Value, span: Span) -> bool:
-        """`item in container` for a list, a string (substring) or a range."""
-        match container:
-            case list():
-                return any(equal(element, item) for element in container)
-            case str() if isinstance(item, str):
-                return item in container
-            case range() if isinstance(item, int) and not isinstance(item, bool):
-                return item in container
-            case str() | range():
-                raise EllaError(f"'in' can't look for a {type_name(item)} in a {type_name(container)}", span)
-        raise EllaError(f"'in' needs a list, str or range on the right, not {type_name(container)}", span)
-
-    def index_into(self, container: Value, index: Value, span: Span) -> Value:
-        """`container[index]` for a list, or a string (giving a one-character string)."""
-        if not isinstance(index, int) or isinstance(index, bool):
-            raise EllaError(f"an index must be an i64, not {type_name(index)}", span)
-        if not isinstance(container, list | str):
-            raise EllaError(f"can't index a {type_name(container)}", span)
-        # No Python-style negative indexes: -1 is an error, not the last element.
-        if not 0 <= index < len(container):
-            raise EllaError(
-                f"index {index} is out of range for a {type_name(container)} of length {len(container)}", span
-            )
-        return container[index]
 
     # Patterns
 

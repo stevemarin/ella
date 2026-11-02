@@ -14,7 +14,7 @@ For example, `let x = 1 + 2 * 3` is shown as `(let [x] (+ 1 (* 2 3)))`.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from ella.lexer import Span
 
@@ -465,6 +465,27 @@ class Program:
 
     body: tuple[Expr, ...]
     span: Span
+
+
+# Helpers
+
+
+def mentions_return(node: object) -> bool:
+    """Does a `where` condition use `return`, making it a postcondition?
+
+    This walks any syntax tree node generically, through its dataclass fields.
+    It doesn't look inside nested lambdas, whose `return` is their own.
+    """
+    match node:
+        case Name(name="return"):
+            return True
+        case Lambda():
+            return False
+        case tuple():
+            return any(mentions_return(item) for item in node)
+        case _ if is_dataclass(node) and not isinstance(node, type):
+            return any(mentions_return(getattr(node, f.name)) for f in fields(node))
+    return False
 
 
 # Printing

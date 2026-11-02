@@ -31,26 +31,35 @@ The language itself is described in [docs/grammar.md](docs/grammar.md), and
 ### Initial compiler pipeline
 
 ```text
-source → tokenizer → parser → AST → IR → IR interpreter
-                                    └→ optimizer → x64 code generation
+source → tokenizer → parser → AST → type checker → IR → IR interpreter
+                                ↓                     └→ optimizer → x64 code generation
+                                AST interpreter
 ```
 
 Start with one IR. Add another representation only when a later lowering needs
 to make a real change in abstraction, such as replacing structured operations
 with explicit memory and machine-level operations.
 
-The initial IR will be a typed control-flow graph:
+The IR is a typed control-flow graph (specified in
+[src/ella/ir.py](src/ella/ir.py)):
 
 * Functions contain basic blocks.
 * Blocks contain simple, three-address instructions and end in a terminator
-  (`branch`, `jump`, or `return`).
-* Values have explicit types and unique IDs.
-* Control-flow joins use explicit value merges (eventually SSA `phi` nodes, or
-  block parameters if that proves simpler).
-* Side effects such as calls and memory writes are explicit operations.
+  (`branch`, `jump`, `return`, or `trap` for run-time errors).
+* Values have explicit types and unique IDs, and never change.
+* Control-flow joins use block parameters: `jump join(%4)` passes a value to
+  `join(%5: i64)`. They do the job of SSA `phi` nodes.
+* Variables live in named, typed local slots (`load`/`store`) for now.
+  Promoting slots to values (full SSA form) is easier as an optimization pass
+  than in the lowering.
+* Lists are values: `set_index` makes a new list, so value semantics are
+  explicit and nothing is ever copied behind the scenes.
+* Lambdas are closure converted: each becomes an IR function taking its
+  captured variables as extra parameters.
+* Side effects such as calls, printing and global writes are explicit operations.
 
-The IR interpreter defines and exercises the meaning of these operations. An
-IR verifier will check structural and type rules before interpretation,
+The IR interpreter defines and exercises the meaning of these operations. The
+IR verifier checks structural, dominance and type rules before interpretation,
 optimization, or code generation. Optimization passes operate on the IR and
 must preserve its behavior.
 
@@ -88,6 +97,7 @@ and IR rather than treating every compiler pass as a stage of program execution.
 
 ### 4. Optimization
 
+* Promote local slots to SSA values (the classic "mem2reg" pass).
 * Add small, understandable passes such as constant folding, constant
   propagation, and dead-code elimination.
 * Keep passes separate and inspectable; verify IR before and after each pass.
@@ -106,8 +116,10 @@ and IR rather than treating every compiler pass as a stage of program execution.
 * Represent generated run-time computations as residual IR.
 * Explore memory management without a garbage collector: stack-first
   allocation, arenas for objects with related lifetimes, and pools for
-  long-lived fixed-size objects. Until then, the interpreters back lists with
-  Python lists and copy them to get value semantics.
+  long-lived fixed-size objects. The design is in
+  [docs/memory-model.md](docs/memory-model.md). Until then, the interpreters back lists with
+  Python lists: the AST interpreter copies them to get value semantics, and
+  the IR builds new lists instead of changing them.
 
 ## Current status
 
@@ -118,15 +130,23 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   syntax tree in [src/ella/syntax.py](src/ella/syntax.py).
 * Stage 2 is done: the tree-walking interpreter
   ([src/ella/interpreter.py](src/ella/interpreter.py), with values in
-  [src/ella/values.py](src/ella/values.py)) runs programs, checking types as
-  it goes. [test/programs/](test/programs/) holds programs with their expected
-  output, for every later interpreter and backend to share.
+  [src/ella/values.py](src/ella/values.py)) runs programs.
+  [test/programs/](test/programs/) holds programs with their expected
+  output, for every interpreter and backend to share.
+* Stage 3 is done: the type checker ([src/ella/checker.py](src/ella/checker.py))
+  works out every expression's type, the lowering
+  ([src/ella/lower.py](src/ella/lower.py)) turns the checked tree into IR
+  ([src/ella/ir.py](src/ella/ir.py), which also has the printer and verifier),
+  and the IR interpreter ([src/ella/ir_interpreter.py](src/ella/ir_interpreter.py))
+  runs it. Every test program gives the same results through both interpreters.
 
 ```sh
-uv run ella example_syntax.ella           # run a program
+uv run ella example_syntax.ella           # check and run a program (through the IR)
+uv run ella --tree example_syntax.ella    # check and run it with the AST interpreter
+uv run ella --ir example_syntax.ella      # print the IR
 uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-A static type checker, the IR and the later roadmap items are design goals,
-not implemented features yet.
+Optimization, native code generation and the later roadmap items are design
+goals, not implemented features yet.

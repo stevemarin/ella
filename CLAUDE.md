@@ -39,7 +39,7 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Layout (stages 1 and 2 done)
+## Layout (stages 1 to 3 done)
 
 * `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
   `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
@@ -49,15 +49,26 @@ plain:
 * `src/ella/syntax.py`: AST node dataclasses, and `show()` for S-expressions.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
   parsing notes in §11.
+* `src/ella/checker.py`: static type checker with simple inference
+  (unification of type variables). Records each node's type and what each
+  name refers to, in tables keyed by `id(node)`, for the lowering.
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters.
-* `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2).
-  It defines the language's behavior; later stages are checked against it.
-  Types are checked at run time until there is a type checker.
-* Tests: `test/test_lexer.py`, `test/test_parser.py`,
-  `test/test_interpreter.py`, `test/test_cli.py`. `test/programs/` holds
+* `src/ella/operators.py`: operator semantics on run-time values, shared by
+  both interpreters so results and error messages match exactly.
+* `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
+  the reference for the language's behavior.
+* `src/ella/ir.py`: the IR (typed CFG: functions, blocks with parameters,
+  three-address instructions, terminators), its printer and its verifier.
+  The module docstring specifies every operation.
+* `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
+  local slots; lambdas are closure converted.
+* `src/ella/ir_interpreter.py`: runs IR.
+* Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
+  `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
+  of both interpreters), `test/test_cli.py`. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), run by `test/test_programs.py` and shared by
-  every interpreter and backend.
+  `NAME.err` (expected error), run through both interpreters by
+  `test/test_programs.py`.
 
-Next is stage 3 (IR and IR interpreter); see README.md.
+Next is stage 4 (optimization); see README.md.
