@@ -203,11 +203,11 @@ A source file is a sequence of top-level expressions.
    Reading a top-level non-function value before its `let` has run is an
    error: at compile time when the top-level code itself does it, and at run
    time when a function that reads it is called too early.
-4. A top-level name keeps one type, even if it is bound again by a later
+2. A top-level name keeps one type, even if it is bound again by a later
    `let`, because functions anywhere in the file may refer to it. (Local
    names may be rebound with a different type.)
-2. The top-level expressions run in order, like a script.
-3. Afterwards, if the file defines a top-level `main`, it is called.
+3. The top-level expressions run in order, like a script.
+4. Afterwards, if the file defines a top-level `main`, it is called.
    `main` has type `() -> ()`. Command-line arguments and exit codes come later.
 
 ## 4. Bindings and assignment
