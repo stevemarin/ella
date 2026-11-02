@@ -1048,8 +1048,8 @@ Parsing notes:
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
 * User-defined protocol methods (`len`, iteration, ...) for structs.
-* Generic functions inside functions, and constraints on type parameters
-  (so a generic function can use `+` or `<`).
+* Generic functions inside functions. Generic functions currently support
+  the built-in constraints `Eq`, `Ord`, `Add` and `Num`.
 * Whether `comptime` (still reserved) is worth having as shorthand for a
   splice, now that staging uses `quote` and `$`.
 * User-defined constraints (with the protocol methods above), and

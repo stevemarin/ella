@@ -320,8 +320,9 @@ code only after the rules are settled and tested.
    of size-class slabs; see §15.)*
 8. **Non-copyable types and finalization lists** (§3, §7). *(Done in stage 7.)*
 9. **Native runtime** for x64: real virtual-range reservations with
-   `mmap`/`madvise`, bump allocation, pools, slabs. Compare results against
-   the IR interpreter on the same test programs. *(Done in stages 6 and 7.)*
+   `mmap`/`madvise`, bump allocation and pools. Compare results against the
+   IR interpreter on the same test programs. *(Done in stages 6 and 7;
+   pool slots use arenas instead of size-class slabs; see §15.)*
 
 Each step should keep every test program producing the same output through
 both interpreters, as the README requires today.

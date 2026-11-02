@@ -1,27 +1,25 @@
 # Ella
 
-A Linux, x64 statically-typed language for fun and learning, implemented in pure Python.
+A Linux, x64 statically typed language for fun and learning, implemented in
+pure Python, with a small C runtime for native executables.
 
-Ella is an experiment in building a language from the tokenizer through to native
-code generation. The compiler will use a sequence of representations, starting
-with one small intermediate representation (IR). The first consumer of that IR
-will be an interpreter; a later compiler will lower it to x64 assembly.
+Ella has a tokenizer, parser, type checker, tree-walking interpreter, typed
+intermediate representation (IR), IR interpreter and optimizer, and an x64
+native code generator.
 
 ## Goals
 
 * Keep the implementation as simple as possible without hiding important ideas.
 * Use a lightweight, extensible syntax and grammar.
 * Learn how interpreters, IRs, optimization, and native code generation fit together.
-* Explore memory safety without GC
+* Explore memory safety without GC.
 * Compile to x64 on Linux.
-* Leverage modern Python as much as possible in the design
-* All user-facing integer types are signed
-* Everything is an expression
-* Only booleans are truthy
-* Built-in vector types
-* No implicit type conversions
-* SIMD everywhere
-* Pass-by-value semantics; immutable bindings unless marked `mut`
+* Leverage modern Python in the design.
+* All user-facing integer types are signed.
+* Everything is an expression; only booleans are truthy.
+* No implicit type conversions.
+* Pass-by-value semantics; bindings are immutable unless marked `mut`.
+* Future goals include built-in vector types and SIMD.
 
 The language itself is described in [docs/grammar.md](docs/grammar.md), and
 [example_syntax.ella](example_syntax.ella) is a tour of the syntax.
@@ -52,8 +50,9 @@ The IR is a typed control-flow graph (specified in
 * The lowering keeps variables in named, typed local slots (`load`/`store`).
   The mem2reg optimization pass then promotes them to values, giving full SSA
   form; that is easier as a pass than in the lowering.
-* Lists are values: `set_index` makes a new list, so value semantics are
-  explicit and nothing is ever copied behind the scenes.
+* Lists and structs have value semantics, but their objects can be changed
+  in place. The lowering inserts explicit copies where needed to preserve
+  value semantics.
 * Lambdas are closure converted: each becomes an IR function taking its
   captured variables as extra parameters.
 * Side effects such as calls, printing and global writes are explicit operations.
@@ -76,71 +75,48 @@ explicit in the language rather than tied to compiler passes. See
 [docs/grammar.md](docs/grammar.md) §11 and
 [src/ella/staging.py](src/ella/staging.py).
 
-## Implementation roadmap
+## Implementation history and remaining work
 
 ### 1. Language front end
 
-* Define token types and a tokenizer.
-* Build a small expression language with a Pratt (TDOP) parser.
-* Add functions, and types incrementally.
-* Done when [example_syntax.ella](example_syntax.ella) tokenizes and parses.
-* Keep syntax and operator definitions modular where that helps experimentation.
+Done: the tokenizer and Pratt parser handle the language documented in
+[docs/grammar.md](docs/grammar.md). The syntax tour
+[example_syntax.ella](example_syntax.ella) is tested to tokenize and parse.
 
 ### 2. Source interpreter
 
-* Evaluate the initial expression language directly from its AST.
-* Use it to settle basic language behavior before introducing IR.
+Done: the tree-walking interpreter is the reference for program behavior and
+also evaluates compile-time splices.
 
 ### 3. IR and IR interpreter
 
-* Specify the first IR operations, types, blocks, and terminators.
-* Lower the supported AST into IR.
-* Implement an IR verifier and a readable IR printer.
-* Interpret IR and compare its results with the AST interpreter.
-* Add branches, loops, calls, and side effects to the IR as the language gains them.
+Done: checked programs lower to a typed control-flow IR, which has a verifier
+and printer and is run by the IR interpreter.
 
 ### 4. Optimization
 
-* Promote local slots to SSA values (the classic "mem2reg" pass).
-* Add small, understandable passes such as constant folding, constant
-  propagation, and dead-code elimination.
-* Keep passes separate and inspectable; verify IR before and after each pass.
-* Later, experiment with implementing passes in Ella and compiling them with
-  Ella itself. Later still: inlining, loop-invariant code motion, and removing
-  `assert`s that can be proven true.
+Done: separate passes promote local slots to SSA values, fold constants,
+simplify control flow, and remove dead code; the IR is verified after each
+pass. Further optimizations remain future work.
 
 ### 5. Native code generation
 
-* Lower the verified IR to x64 assembly.
-* Define the calling convention and runtime support needed by generated code.
-* Compare native execution against the IR interpreter on the same programs.
-* Later: register allocation, instead of a stack slot for every value.
+Done: the x64 backend and C runtime build native executables. Register
+allocation is future work; currently every IR value has a stack slot.
 
 ### 6. Memory model
 
-* Explore memory management without a garbage collector: stack-first
-  allocation, arenas for objects with related lifetimes, and pools for
-  long-lived fixed-size objects. The design is in
-  [docs/memory-model.md](docs/memory-model.md).
-* Make copies explicit in the IR, change lists in place, and add `mut`
-  parameters.
-* Scope arenas, with placement chosen by the compiler, checked by the IR
-  interpreter, and implemented natively with reserved address ranges.
-* Pools for long-lived objects, non-copyable types, and finalization came
-  in stage 7, with the generics and structs they need. Sub-arenas are
-  still to come.
+Done: explicit copies, in-place mutation, `mut` parameters, scope arenas,
+compiler-chosen placement, pools, non-copyable types, and finalization are
+implemented. Sub-arenas are not implemented. See
+[docs/memory-model.md](docs/memory-model.md) for the design and limitations.
 
 ### 7. Staged programming
 
-* Add explicit compile-time and run-time evaluation rules: stages, with
-  `quote`, `$` and `run`.
-* Represent generated run-time computations as residual IR: splices
-  outside quotes run while compiling, and only their code is compiled.
-* With them, the rest of the memory model: structs, generic functions,
-  pools with generation-checked handles, non-copyable types, and
-  finalizers.
-* Later: run code built at run time in native code, which needs the
-  compiler at run time (a JIT).
+Done: `quote`, `$`, compile-time splices, generated types, structs, and
+generic functions are implemented. Runtime-built code works in the
+interpreters; running it in native code (which would require a JIT) remains
+future work.
 
 ## Current status
 
