@@ -77,18 +77,19 @@ if x == 4 then print("x={{x}}") else print("not 4")
 (x: i64, y: i64) -> i64 => x + y
 
 # no implicit type conversions
-# Result (Ok / Error) and Optional (Some / None) are built-in enums
+# Result (Ok / Err) and Optional (Some / None) are built-in enums, and
+# Error is a built-in struct holding a message
 let invert = (n: f64) -> Result[f64, Error] =>
-    if n == 0.0 then Error("divide by zero") else Ok(1.0 / n)
+    if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
 
 # match destructures enum variants, with optional guards and one-line arms
 let describe = (r: Result[f64, Error]) -> str =>
     match r
         case Ok(v) if v > 1.0 => "big"
         case Ok(v) => "small"
-        case Error(e) => "error"
+        case Err(e) => "error: {{e.message}}"
 
-# ? propagates errors: Error(e)? returns Error(e) from the enclosing function
+# ? propagates errors: Err(e)? returns Err(e) from the enclosing function
 let double_inverse = (n: f64) -> Result[f64, Error] =>
     let v = invert(n)?
     Ok(v * 2.0)
@@ -194,6 +195,41 @@ assert swap(Pair(1, 2)) == Pair(2, 1)
 # a constraint says what a generic function does with its type parameter
 let bigger[T: Ord] = (a: T, b: T) -> T => if a > b then a else b
 assert bigger(2, 7) == 7 and bigger("b", "a") == "b"
+
+# structs and enums can have methods, which take the value first; `add`,
+# `compare` and the like give them operators, and `mut` marks a change
+struct Vec2
+    x: f64
+    y: f64
+    length2 = (v: Vec2) -> f64 => v.x * v.x + v.y * v.y
+    add = (a: Vec2, b: Vec2) -> Vec2 => Vec2(a.x + b.x, a.y + b.y)
+    compare = (a: Vec2, b: Vec2) -> i64 => if a.length2() < b.length2() then -1 else 1
+    flip = (mut v: Vec2) -> () =>
+        v = Vec2(v.y, v.x)
+let mut arrow = Vec2(1.0, 0.0) + Vec2(0.0, 2.0)
+mut arrow.flip()
+assert arrow.length2() == 5.0 and arrow.x == 2.0
+assert bigger(arrow, Vec2(1.0, 1.0)) == arrow   # Vec2 has compare, so it is Ord
+
+# a user-defined constraint lists methods; any type that has them meets it
+constraint Sized
+    length2: (Self) -> f64
+let longest[T: Sized] = (a: T, b: T) -> f64 =>
+    if a.length2() > b.length2() then a.length2() else b.length2()
+assert longest(Vec2(3.0, 4.0), arrow) == 25.0
+
+# protocol methods: get and set give v[k], iter gives `for`, contains gives `in`
+struct Row
+    cells: [str]
+    get = (r: Row, i: i64) -> str => r.cells[i]
+    set = (mut r: Row, i: i64, s: str) -> () =>
+        r.cells[i] = s
+    iter = (r: Row) -> [str] => r.cells
+    contains = (r: Row, s: str) -> bool => s in r.cells
+let mut row = Row(["a", "b"])
+row[1] = "c"
+for cell in row
+    assert cell in row and cell != "b"
 
 # a nocopy struct is never copied, and its finalizer runs when it dies
 nocopy struct Session

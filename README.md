@@ -114,7 +114,8 @@ implemented. Sub-arenas are not implemented. See
 ### 7. Staged programming
 
 Done: `quote`, `$`, compile-time splices, generated types, structs, and
-generic functions are implemented. Runtime-built code works in the
+generic functions are implemented, and since then methods and user-defined
+constraints. Runtime-built code works in the
 interpreters; running it in native code (which would require a JIT) remains
 future work.
 
@@ -167,6 +168,12 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   structs with finalizers. Generic functions can constrain their type
   parameters (`let largest[T: Ord]`) to use operators on them. See [docs/memory-model.md](docs/memory-model.md)
   §15.
+* Structs and enums have methods (`p.norm()`, `mut s.push(3)`), which can
+  give them operators, `len`, indexing (`get`, `set`), iteration (`iter`)
+  and `in` (`contains`), and programs can define their own
+  constraints, which any type with the right methods meets
+  (`constraint Shape` with `area: (Self) -> f64`, then `let total[T: Shape]`).
+  See [docs/grammar.md](docs/grammar.md) §9.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

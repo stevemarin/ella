@@ -54,7 +54,8 @@ plain:
   (unification of type variables). Records each node's type and what each
   name refers to, in tables keyed by `id(node)`, for the lowering. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
-  level), generic functions, and the rules for `nocopy` values
+  level), generic functions, methods and constraints (built-in and
+  user-defined, met structurally), and the rules for `nocopy` values
   (`check_copies`). Splices in types run while checking, through
   `compile_time` (set by `staging.Expander`).
 * `src/ella/staging.py`: multi-stage programming: building code from quotes
@@ -79,7 +80,8 @@ plain:
   region (arena) each object is made in, and where `copy` is needed, by
   tracking what each value borrows and how long it lives (see its docstring
   and docs/memory-model.md §14). Generic functions are specialized per type
-  arguments.
+  arguments, and so are methods (functions named `Type.method`); operators
+  on structs with methods like `add` become calls.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
   ("memory check failed" means a compiler bug), and keeps the `--profile`
