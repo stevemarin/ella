@@ -1,0 +1,54 @@
+# Generic functions whose type parameters have constraints, which say what
+# the body may do with their values: Eq (==, !=, in), Ord (<, <=, >, >=),
+# Add (+) and Num (+, -, *, /, **, unary -).
+
+let sum[T: Add] = (first: T, rest: [T]) -> T =>
+    let mut total = first
+    for x in rest
+        total = total + x
+    total
+
+let largest[T: Ord] = (xs: [T]) -> T =>
+    let mut best = xs[0]
+    for x in xs
+        if x > best then best = x
+    best
+
+let count[T: Eq] = (xs: [T], wanted: T) -> i64 =>
+    let mut n = 0
+    for x in xs
+        if x == wanted then n += 1
+    n
+
+let contains_all[T: Eq] = (xs: [T], wanted: [T]) -> bool =>
+    for w in wanted
+        if w not in xs then return false
+    true
+
+let negate_all[T: Num] = (xs: [T]) -> [T] =>
+    let mut out = []
+    for x in xs
+        out += [-x]
+    out
+
+let square[T: Num] = (x: T) -> T => x * x
+
+# Constraints combine with +, and a Num type is also Ord, Add and Eq.
+let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T =>
+    if x < low then low else if x > high then high else x
+
+print(sum(1, [2, 3]))
+print(sum(0.5, [0.25]))
+print(sum("a", ["b", "c"]))
+print(sum([1], [[2], [3]]))
+print(largest([3, 9, 2]))
+print(largest(["pear", "apple"]))
+print(count([1, 2, 1], 1))
+print(count([Some("x"), None, Some("x")], Some("x")))
+print(contains_all([(1, "a"), (2, "b")], [(2, "b")]))
+print(square(7))
+print(square(1.5))
+print(clamp(15, 0, 10))
+print(clamp("m", "a", "k"))
+print(largest([square(3), square(-4)]))
+print(negate_all([1.5, -2.0]))

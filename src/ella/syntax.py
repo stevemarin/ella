@@ -147,13 +147,18 @@ type Pattern = (
 
 @dataclass(frozen=True, slots=True)
 class Binding:
-    """One target of a `let`: `x`, `mut x`, `x: i64`, or a generic function's `first[T]`."""
+    """One target of a `let`: `x`, `mut x`, `x: i64`, or a generic function's `sum[T: Add]`.
+
+    `constraints` has the constraints of each type parameter: `[T: Ord + Add]`
+    has (("Ord", "Add"),).
+    """
 
     name: str
     mutable: bool
     type: TypeExpr | None
     span: Span
     type_params: tuple[str, ...] = ()
+    constraints: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,7 +714,9 @@ def show_label(label: str | None) -> list[str]:
 def show_binding(binding: Binding) -> str:
     text = f"mut {binding.name}" if binding.mutable else binding.name
     if binding.type_params:
-        text += f"[{', '.join(binding.type_params)}]"
+        constraints = binding.constraints or tuple(() for _ in binding.type_params)
+        shown = (f"{p}: {' + '.join(c)}" if c else p for p, c in zip(binding.type_params, constraints))
+        text += f"[{', '.join(shown)}]"
     return text if binding.type is None else f"{text}: {show(binding.type)}"
 
 

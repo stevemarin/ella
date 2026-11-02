@@ -188,12 +188,28 @@ DEFERRED = DeferredTy()
 
 @dataclass(frozen=True, slots=True)
 class ParamTy:
-    """A type parameter inside an enum definition, like the `T` of `enum Optional[T]`.
+    """A type parameter, like the `T` of `enum Optional[T]` or `let sum[T: Add]`.
 
-    It is replaced by the actual type argument wherever the enum is used.
+    It is replaced by the actual type argument wherever the enum or function
+    is used. A generic function's type parameter has `constraints`: what its
+    body may do with values of it (CONSTRAINTS), with the ones they imply.
     """
 
     name: str
+    constraints: frozenset[str] = frozenset()
+
+
+# The constraints a generic function's type parameters can have
+# (docs/grammar.md §9), and the constraints each one implies, itself included.
+CONSTRAINTS = {
+    "Eq": frozenset({"Eq"}),  # `==`, `!=`, `in`
+    "Ord": frozenset({"Ord", "Eq"}),  # `<`, `<=`, `>`, `>=`
+    "Add": frozenset({"Add"}),  # `+`: numbers, strings and lists
+    "Num": frozenset({"Num", "Add", "Ord", "Eq"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: i64 and f64
+}
+
+# The constraint each operator needs of a type parameter.
+NEEDS = {"+": "Add", "-": "Num", "*": "Num", "/": "Num", "**": "Num"}
 
 
 @dataclass(eq=False, slots=True)
@@ -356,6 +372,7 @@ class VarInfo:
     level: int | None = None
     binder: object = None  # the node that binds a local variable
     type_params: tuple[str, ...] = ()  # a generic function's
+    constraints: tuple[tuple[str, ...], ...] = ()  # and theirs
 
 
 @dataclass(slots=True)
@@ -462,7 +479,9 @@ class Checker:
         self.type_params: dict[str, Type] = {}  # in a generic function's body: T -> ParamTy("T")
         # Checks that need final types, made once everything has been checked.
         self.later_stage_uses: list[tuple[str, Type, Span]] = []  # variables used in a later stage
-        self.generic_uses: list[tuple[str, tuple[Type, ...], Span]] = []
+        # Uses of generic functions: the function, its type arguments, the
+        # constraints of each type parameter, and where.
+        self.generic_uses: list[tuple[str, tuple[Type, ...], tuple[tuple[str, tuple[str, ...]], ...], Span]] = []
 
         self.globals = Env(None)
         for name in (*BUILTINS, *REFLECTION):
@@ -587,6 +606,7 @@ class Checker:
         binder: object = None,
         function: bool = False,
         type_params: tuple[str, ...] = (),
+        constraints: tuple[tuple[str, ...], ...] = (),
     ) -> None:
         """Add a variable. A top-level name keeps one type, even when bound again.
 
@@ -602,7 +622,9 @@ class Checker:
                     span,
                 )
             level = None if function and not mutable else 0
-            env.vars[name] = VarInfo(t, mutable, "global", level=level, binder=binder, type_params=type_params)
+            env.vars[name] = VarInfo(
+                t, mutable, "global", level=level, binder=binder, type_params=type_params, constraints=constraints
+            )
         else:
             env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=binder)
 
@@ -732,8 +754,8 @@ class Checker:
         for expr in [e for e in program.body if not any(e is f for f in later)] + later:
             match expr:
                 case Let(bindings, Lambda() as function):
-                    type_params = bindings[0].type_params
-                    t = self.lambda_type(function, type_params)
+                    type_params, constraints = bindings[0].type_params, bindings[0].constraints
+                    t = self.lambda_type(function, type_params, constraints)
                     for binding in bindings:
                         self.bind_name(
                             self.globals,
@@ -744,6 +766,7 @@ class Checker:
                             binding,
                             function=True,
                             type_params=type_params,
+                            constraints=constraints,
                         )
                 case Let(bindings):
                     self.pending_globals.update(b.name for b in bindings if b.name not in self.globals.vars)
@@ -768,10 +791,14 @@ class Checker:
                 raise EllaError(
                     f"'{name}' is a {show_type(t)}, which can't be carried into a later stage (only data can)", span
                 )
-        for name, args, span in self.generic_uses:
-            for arg in args:
-                if is_nocopy(finish(arg), self.enums):
-                    raise EllaError(f"{name} can't be used with {show_type(finish(arg))}, which can't be copied", span)
+        for name, args, constraints, span in self.generic_uses:
+            for arg, (param, needs) in zip(args, constraints):
+                arg = finish(arg)
+                if is_nocopy(arg, self.enums):
+                    raise EllaError(f"{name} can't be used with {show_type(arg)}, which can't be copied", span)
+                for constraint in needs:
+                    if not satisfies(arg, constraint, self.enums):
+                        raise EllaError(f"{name} needs {param} to be {constraint}, and {show_type(arg)} isn't", span)
 
     # Expressions
 
@@ -832,7 +859,10 @@ class Checker:
                             # Each use of a generic function gets its own type arguments.
                             type_args: dict[str, Type] = {param: self.fresh() for param in info.type_params}
                             self.instances[id(expr)] = tuple(type_args.values())
-                            self.generic_uses.append((name, tuple(type_args.values()), span))
+                            needs = info.constraints or tuple(() for _ in info.type_params)
+                            self.generic_uses.append(
+                                (name, tuple(type_args.values()), tuple(zip(info.type_params, needs)), span)
+                            )
                             return substitute(info.type, type_args)
                         return info.type
             case Let(bindings, value_expr):
@@ -843,7 +873,7 @@ class Checker:
                     # A `let`-bound function can call itself by name. (A generic
                     # function's own name is its top-level name.)
                     self_names = [] if type_params else list(bindings)
-                    t: Type = self.check_lambda(value_expr, env, self_names, type_params)
+                    t: Type = self.check_lambda(value_expr, env, self_names, type_params, bindings[0].constraints)
                     self.types[id(value_expr)] = t
                 else:
                     t = self.check(value_expr, env)
@@ -855,7 +885,15 @@ class Checker:
                     self.types[id(binding)] = binding_type
                     function = isinstance(value_expr, Lambda)
                     self.bind_name(
-                        env, binding.name, binding_type, binding.mutable, binding.span, binding, function, type_params
+                        env,
+                        binding.name,
+                        binding_type,
+                        binding.mutable,
+                        binding.span,
+                        binding,
+                        function,
+                        type_params,
+                        bindings[0].constraints,
                     )
                 return t
             case Assign(op, target, value_expr, span):
@@ -874,6 +912,9 @@ class Checker:
                 return BOOL
             case Unary(op, operand, span):
                 t = self.check(operand, env)
+                if isinstance(param := resolve(t), ParamTy) and op != "not":
+                    self.require_constraint(param, "Num" if op == "-" else None, op, span)
+                    return t
                 kind = describe_kind(self.known(t, operand.span))
                 if (op == "-" and kind in ("i64", "f64", "?")) or (op == "~" and kind in ("i64", "?")):
                     return t
@@ -1084,7 +1125,7 @@ class Checker:
         if let is None:
             return  # a function made at run time of the compile-time code: already checked
         self_names = [] if let.bindings[0].type_params else list(let.bindings)
-        self.check_lambda(function, self.globals, self_names, let.bindings[0].type_params)
+        self.check_lambda(function, self.globals, self_names, let.bindings[0].type_params, let.bindings[0].constraints)
         self.check_now(function)
 
     # Structs
@@ -1111,6 +1152,9 @@ class Checker:
             raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
         if isinstance(resolve(a), DeferredTy) or isinstance(resolve(b), DeferredTy):
             return DEFERRED if op not in ("/", "..", "..=") else (F64 if op == "/" else RANGE)
+        if isinstance(param := resolve(a), ParamTy):
+            self.require_constraint(param, NEEDS.get(op), op, span)
+            return F64 if op == "/" else a
         kind = describe_kind(self.known(a, span))
         # Which kinds of operands each operator accepts (docs/grammar.md §8).
         allowed = {
@@ -1138,6 +1182,8 @@ class Checker:
             match self.known(b, span):
                 case ListTy(element):
                     self.expect(a, element, span, f"the value looked for with '{op}'")
+                    if isinstance(param := resolve(element), ParamTy):
+                        self.require_constraint(param, "Eq", op, span)
                 case PrimTy("str"):
                     self.expect(a, STR, span, f"the value looked for with '{op}'")
                 case PrimTy("range"):
@@ -1147,6 +1193,9 @@ class Checker:
             return
         if not self.unify(a, b):
             raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
+        if isinstance(param := resolve(a), ParamTy):
+            self.require_constraint(param, "Eq" if op in ("==", "!=") else "Ord", op, span)
+            return
         kind = describe_kind(self.known(a, span))
         if kind in ("function", "Pool", "Code"):
             raise EllaError(
@@ -1154,6 +1203,15 @@ class Checker:
             )
         if op not in ("==", "!=") and kind not in ("i64", "f64", "str"):
             raise EllaError(f"'{op}' doesn't work on {show_type(a)}", span)
+
+    def require_constraint(self, param: ParamTy, constraint: str | None, op: str, span: Span) -> None:
+        """An operator on a value of a type parameter: the parameter needs the constraint that allows it."""
+        if constraint is None:
+            raise EllaError(f"'{op}' doesn't work on {param.name}", span)
+        if constraint not in param.constraints:
+            raise EllaError(
+                f"'{op}' on {param.name} needs the constraint {constraint}, like [{param.name}: {constraint}]", span
+            )
 
     def check_try(self, t: Type, span: Span) -> Type:
         """Postfix `?`: the function must return the same kind of enum, so the error can pass through."""
@@ -1216,14 +1274,32 @@ class Checker:
 
     # Functions
 
-    def lambda_type(self, function: Lambda, type_params: tuple[str, ...] = ()) -> FuncTy:
+    def param_types(
+        self, type_params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...], span: Span
+    ) -> dict[str, Type]:
+        """A generic function's type parameters, as types, with what their constraints imply."""
+        result: dict[str, Type] = {}
+        for i, name in enumerate(type_params):
+            implied: frozenset[str] = frozenset()
+            for constraint in constraints[i] if constraints else ():
+                if constraint not in CONSTRAINTS:
+                    raise EllaError(
+                        f"unknown constraint '{constraint}'; the constraints are {', '.join(CONSTRAINTS)}", span
+                    )
+                implied |= CONSTRAINTS[constraint]
+            result[name] = ParamTy(name, implied)
+        return result
+
+    def lambda_type(
+        self, function: Lambda, type_params: tuple[str, ...] = (), constraints: tuple[tuple[str, ...], ...] = ()
+    ) -> FuncTy:
         """A function's type, from its annotations, which are required for now.
 
         A generic function's type parameters stand for themselves: `T` is
         ParamTy("T"), which only matches itself until a use fills it in.
         """
         outer = self.type_params
-        self.type_params = outer | {name: ParamTy(name) for name in type_params}
+        self.type_params = outer | self.param_types(type_params, constraints, function.span)
         try:
             params = []
             for param in function.params:
@@ -1239,17 +1315,22 @@ class Checker:
             self.type_params = outer
 
     def check_lambda(
-        self, function: Lambda, env: Env, self_names: list[Binding], type_params: tuple[str, ...] = ()
+        self,
+        function: Lambda,
+        env: Env,
+        self_names: list[Binding],
+        type_params: tuple[str, ...] = (),
+        constraints: tuple[tuple[str, ...], ...] = (),
     ) -> FuncTy:
         """A lambda's type. Its body is checked later, once all top-level names are known.
 
         `self_names` are the `let` bindings it can call itself by.
         """
-        t = self.lambda_type(function, type_params)
+        t = self.lambda_type(function, type_params, constraints)
         captured = self.capture(env)
         for binding in self_names:
             captured.vars[binding.name] = VarInfo(t, False, "local", level=self.level, binder=binding)
-        params = self.type_params | {name: ParamTy(name) for name in type_params}
+        params = self.type_params | self.param_types(type_params, constraints, function.span)
         if id(function) not in self.checked:
             self.pending_bodies.append(PendingBody(function, captured, t, self.level, params, self.quotes))
         return t
@@ -1820,3 +1901,27 @@ def has_type_splice(node: object) -> bool:
         case _ if dataclasses.is_dataclass(node) and not isinstance(node, type | Span):
             return any(has_type_splice(getattr(node, f.name)) for f in dataclasses.fields(node))
     return False
+
+
+def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
+    """Whether a type meets a constraint of a generic function's type parameter (CONSTRAINTS)."""
+    t = finish(t)
+    if isinstance(t, DeferredTy):
+        return True  # checked once the code is built
+    if isinstance(t, ParamTy):
+        return constraint in t.constraints
+    match constraint:
+        case "Eq":
+            # Anything but functions, pools and code, and type parameters that aren't Eq themselves.
+            def unequal(part: Type) -> bool:
+                if isinstance(part, ParamTy):
+                    return "Eq" not in part.constraints
+                return isinstance(part, FuncTy) or (isinstance(part, BuiltinTy) and part.name in ("Pool", "Code"))
+
+            return not any_part(t, enums, unequal)
+        case "Ord":
+            return t in (I64, F64, STR)
+        case "Add":
+            return t in (I64, F64, STR) or isinstance(t, ListTy)
+        case _:  # Num
+            return t in (I64, F64)

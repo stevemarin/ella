@@ -709,10 +709,37 @@ print(first(["a"]))        # T is str
 * The type arguments are inferred from each use. Each different set of
   them makes a separate copy of the function when compiling.
 * Inside the function, a type parameter is a type of its own, which only
-  matches itself: `(a: T, b: T) -> T => a + b` is an error, as nothing says
-  `T` has `+`. Values of type `T` can be passed around, stored, compared and
-  printed.
+  matches itself. Values of type `T` can be passed around, stored and
+  printed; anything more needs a *constraint*.
 * Type parameters can't be values that can't be copied.
+
+**Constraints.** A type parameter can name what its function does with it,
+from a fixed set, combined with `+`:
+
+```ella
+let largest[T: Ord] = (xs: [T]) -> T =>
+    let mut best = xs[0]
+    for x in xs
+        if x > best then best = x
+    best
+
+let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
+```
+
+| Constraint | Allows on `T` | Met by |
+| --- | --- | --- |
+| `Eq` | `==`, `!=`, `in` | every type except functions, pools and code |
+| `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str` |
+| `Add` | `+` | `i64`, `f64`, `str`, lists |
+| `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `f64` |
+
+* The body is checked once, against the constraints: `(a: T, b: T) -> T =>
+  a + b` needs `[T: Add]`. `/` on a `Num` gives an `f64`, as it does on
+  `i64` and `f64`.
+* Each use is checked against them: `largest([true])` is an error, as
+  `bool` isn't `Ord`. A type parameter meets the constraints it has, so a
+  generic function can call another one with its own `T`.
+* There are no user-defined constraints yet.
 
 ### Pools **(provisional syntax)**
 
@@ -922,7 +949,8 @@ expr        = let | assignment | lambda | if | match | for | while | loop
             | break | continue | return | assert | enum | struct | quote
             | operator_expr ;
 
-let         = "let" binding [ "[" IDENT { "," IDENT } "]" ] "=" { binding "=" } expr ;
+let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr ;
+type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* a constraint: Eq, Ord, Add or Num *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
 target      = IDENT | operator_expr "[" expr "]" | operator_expr "." IDENT ;
@@ -1024,9 +1052,9 @@ Parsing notes:
   (so a generic function can use `+` or `<`).
 * Whether `comptime` (still reserved) is worth having as shorthand for a
   splice, now that staging uses `quote` and `$`.
-* Compile-time type parameters, checked at each use, or constraints on type
-  parameters, so a generic function can use `+` or `<` on `T`. See
-  docs/memory-model.md §15.
+* User-defined constraints (with the protocol methods above), and
+  compile-time type parameters checked at each use, for template-style code
+  that constraints can't express. See docs/memory-model.md §15.
 * Generic computed types (`new_struct` makes structs without type
   parameters) and splicing types into struct definitions.
 * Modules and `import`.

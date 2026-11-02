@@ -424,7 +424,7 @@ def test_struct_and_generic_types() -> None:
             "let f = () -> () =>\n    let g[T] = (x: T) -> T => x\n    ()",
             "only a top-level function can have type parameters",
         ),
-        ("let add[T] = (a: T, b: T) -> T => a + b", "'+' doesn't work on T"),
+        ("let add[T] = (a: T, b: T) -> T => a + b", "'+' on T needs the constraint Add, like [T: Add]"),
         (
             "let n = 3\nlet c = $(if n > 2 then quote 1 else quote 2)",
             "'n' belongs to a later stage, so it can't be used while compiling",
@@ -534,3 +534,38 @@ def test_computed_types() -> None:
 )
 def test_computed_type_errors(source: str, message: str) -> None:
     assert prepared_error(source).message == message
+
+
+def test_constrained_generics() -> None:
+    assert type_of("let sum[T: Add] = (a: T, b: T) -> T => a + b\nsum(1, 2)") == "i64"
+    assert type_of("let half[T: Num] = (a: T) -> f64 => a / a\nhalf(1.5)") == "f64"
+    assert type_of("let max[T: Ord] = (a: T, b: T) -> T => if a < b then b else a\nmax('a', 'b')") == "str"
+    # A constrained type parameter meets the constraints it implies, in a nested use.
+    source = "let sum[T: Add] = (a: T, b: T) -> T => a + b\nlet twice[T: Num] = (a: T) -> T => sum(a, a)\ntwice(2)"
+    assert type_of(source) == "i64"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("let sum[T] = (a: T, b: T) -> T => a + b", "'+' on T needs the constraint Add, like [T: Add]"),
+        ("let same[T] = (a: T, b: T) -> bool => a == b", "'==' on T needs the constraint Eq, like [T: Eq]"),
+        ("let less[T: Eq] = (a: T, b: T) -> bool => a < b", "'<' on T needs the constraint Ord, like [T: Ord]"),
+        ("let neg[T: Add] = (a: T) -> T => -a", "'-' on T needs the constraint Num, like [T: Num]"),
+        ("let f[T: Num] = (a: T) -> T => a // a", "'//' doesn't work on T"),
+        ("let has[T] = (xs: [T], x: T) -> bool => x in xs", "'in' on T needs the constraint Eq, like [T: Eq]"),
+        ("let f[T: Big] = (a: T) -> T => a", "unknown constraint 'Big'; the constraints are Eq, Ord, Add, Num"),
+        ("let sum[T: Add] = (a: T, b: T) -> T => a + b\nsum(true, false)", "sum needs T to be Add, and bool isn't"),
+        ("let max[T: Ord] = (a: T, b: T) -> T => a\nmax([1], [2])", "max needs T to be Ord, and [i64] isn't"),
+        (
+            "let same[T: Eq] = (a: T, b: T) -> bool => a == b\nlet f = () -> () => ()\nsame(f, f)",
+            "same needs T to be Eq, and () -> () isn't",
+        ),
+        (
+            "let sum[T: Add] = (a: T, b: T) -> T => a + b\nlet twice[T] = (a: T) -> T => sum(a, a)",
+            "sum needs T to be Add, and T isn't",
+        ),
+    ],
+)
+def test_constraint_errors(source: str, message: str) -> None:
+    assert error(source).message == message

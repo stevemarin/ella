@@ -191,6 +191,10 @@ struct Pair[T]
 let swap[T] = (p: Pair[T]) -> Pair[T] => Pair(p.second, p.first)
 assert swap(Pair(1, 2)) == Pair(2, 1)
 
+# a constraint says what a generic function does with its type parameter
+let bigger[T: Ord] = (a: T, b: T) -> T => if a > b then a else b
+assert bigger(2, 7) == 7 and bigger("b", "a") == "b"
+
 # a nocopy struct is never copied, and its finalizer runs when it dies
 nocopy struct Session
     user: str

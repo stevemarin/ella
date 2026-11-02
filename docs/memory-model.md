@@ -557,11 +557,15 @@ gives. Splices of code still run after checking. After expansion, the
 structs that compile-time code made become ordinary definitions in the
 program, so the IR and native code never see a computed type.
 
-Still apart, and the next step if it is wanted: compile-time type
-parameters, `(comptime T: type, x: T)`, with each use checked separately as
-in Zig or C++ templates, so that a generic body can use `+` on `T` if every
-use is with a type that has it. Constraints on type parameters would be the
-other way to get that.
+The last step chose **constraints** over compile-time type parameters
+checked at each use (as in Zig or C++ templates): `let sum[T: Add]` names
+what the body does with `T`, from a fixed set (`Eq`, `Ord`, `Add`, `Num`).
+The body is checked once, against the constraints, and each use against
+them, so errors point at the use that breaks a rule rather than into the
+body, and generic functions are still checked when they are defined.
+Specialization is unchanged: each use is still compiled for its own types.
+Template-style parameters checked at each use remain possible later, for
+code that constraints can't express.
 
 ### Structs
 

@@ -725,11 +725,23 @@ class Parser:
         """One `let` target: `x`, `mut x`, `x: i64`, or `first[T]` for a generic function."""
         mutable = self.accept("mut")
         name = self.expect_kind(TokenKind.NAME, "a name")
-        type_params: list[str] = []
+        params: list[tuple[str, tuple[str, ...]]] = []
         if self.accept("["):
-            type_params, _ = self.parse_comma_list(self.parse_type_param, "]")
+            params, _ = self.parse_comma_list(self.parse_constrained_param, "]")
         type_ = self.parse_type() if self.accept(":") else None
-        return Binding(name.text, mutable, type_, name.span, tuple(type_params))
+        names = tuple(name for name, _ in params)
+        constraints = tuple(c for _, c in params) if any(c for _, c in params) else ()
+        return Binding(name.text, mutable, type_, name.span, names, constraints)
+
+    def parse_constrained_param(self) -> tuple[str, tuple[str, ...]]:
+        """A generic function's type parameter, with its constraints if any: `T`, `T: Ord + Add`."""
+        name = self.parse_type_param()
+        constraints: list[str] = []
+        if self.accept(":"):
+            constraints.append(self.expect_kind(TokenKind.NAME, "a constraint").text)
+            while self.accept("+"):
+                constraints.append(self.expect_kind(TokenKind.NAME, "a constraint").text)
+        return name, tuple(constraints)
 
     def parse_type_param(self) -> str:
         return self.expect_kind(TokenKind.NAME, "a type parameter").text

@@ -188,7 +188,8 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   equality test, and functions can compute new types while compiling
   (`$(Stack(type i64))`). The language also has structs, generic functions, pools of
   long-lived values with handles that catch use after free, and `nocopy`
-  structs with finalizers. See [docs/memory-model.md](docs/memory-model.md)
+  structs with finalizers. Generic functions can constrain their type
+  parameters (`let largest[T: Ord]`) to use operators on them. See [docs/memory-model.md](docs/memory-model.md)
   §15.
 
 ```sh

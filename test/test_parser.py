@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 79
+    assert len(program.body) == 81
 
 
 # Precedence (docs/grammar.md §8)
@@ -461,3 +461,9 @@ def test_types_as_values_and_splices() -> None:
     assert one("type [Pair[i64]]") == "(type [Pair[i64]])"
     assert one("quote (a: $t) -> $u => a.$f") == "(quote (lambda (a: $(t)) -> $(u) (. a ($ f))))"
     assert one("quote $v.$(names[0])") == "(quote (. ($ v) ($ (index names 0))))"
+
+
+def test_constrained_type_parameters() -> None:
+    assert one("let max[T: Ord, U: Add + Eq] = (a: T) -> T => a") == (
+        "(let [max[T: Ord, U: Add + Eq]] (lambda (a: T) -> T a))"
+    )
