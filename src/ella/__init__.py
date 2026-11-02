@@ -9,7 +9,7 @@ from pathlib import Path
 from ella.checker import check
 from ella.codegen import generate
 from ella.interpreter import Interpreter
-from ella.ir import Module, format_module
+from ella.ir import Module, format_module, format_placement
 from ella.ir_interpreter import IRInterpreter
 from ella.lexer import EllaError, tokenize
 from ella.lower import compile_program
@@ -28,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--ast", action="store_true", help="print the syntax tree")
     mode.add_argument("--ir", action="store_true", help="print the IR")
     mode.add_argument("--asm", action="store_true", help="print the x64 assembly")
+    mode.add_argument("--placement", action="store_true", help="print which arena each allocation goes to")
+    mode.add_argument(
+        "--profile", action="store_true", help="run through the IR, then print how much memory each arena used"
+    )
     mode.add_argument("--tree", action="store_true", help="run with the tree-walking interpreter instead of the IR")
     mode.add_argument("--native", action="store_true", help="compile to a native executable and run it")
     mode.add_argument("-o", "--output", type=Path, help="compile to a native executable with this name")
@@ -62,12 +66,21 @@ def main(argv: list[str] | None = None) -> int:
                 optimize(module, passes)
             if options.ir:
                 print(format_module(module), end="")
+            elif options.placement:
+                print(format_placement(module), end="")
             elif options.asm:
                 print(generate(module), end="")
             elif options.output is not None:
                 build(module, options.output)
             elif options.native:
                 run_executable(module)
+            elif options.profile:
+                interpreter = IRInterpreter(module)
+                try:
+                    interpreter.run()
+                finally:
+                    sys.stdout.flush()
+                    print(interpreter.format_profile(), end="", file=sys.stderr)
             else:
                 IRInterpreter(module).run()
     except EllaError as error:

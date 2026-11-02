@@ -40,7 +40,7 @@ plain:
   prefer `lexer.py`, `syntax.py` over `token.py`, `ast.py`).
 * Favor the simplest workable design, even if it uses more memory.
 
-## Layout (stages 1 to 5 done)
+## Layout (stages 1 to 6 done)
 
 * `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
   `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
@@ -52,21 +52,29 @@ plain:
   parsing notes in §11.
 * `src/ella/checker.py`: static type checker with simple inference
   (unification of type variables). Records each node's type and what each
-  name refers to, in tables keyed by `id(node)`, for the lowering.
+  name refers to, in tables keyed by `id(node)`, for the lowering. Also the
+  `mut` argument rules and their exclusivity check.
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
-  the reference for the language's behavior.
+  the reference for the language's behavior. It copies eagerly, and passes
+  `mut` arguments in and out (value-result).
 * `src/ella/ir.py`: the IR (typed CFG: functions, blocks with parameters,
   three-address instructions, terminators), its printer and its verifier.
   The module docstring specifies every operation.
 * `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
-  local slots; lambdas are closure converted.
-* `src/ella/ir_interpreter.py`: runs IR.
-* `src/ella/passes/`: optimization passes, one module each (`mem2reg`, `fold`,
-  `simplify`, `dce`), each `pass(function, module) -> bool` (changed?).
+  local slots; lambdas are closure converted. It also decides memory: which
+  region (arena) each object is made in, and where `copy` is needed, by
+  tracking what each value borrows and how long it lives (see its docstring
+  and docs/memory-model.md §14).
+* `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas, checks every
+  use and store against them ("memory check failed" means a compiler bug),
+  and keeps the `--profile` numbers.
+* `src/ella/passes/`: optimization passes, one module each (`mem2reg`,
+  `moves`, `fold`, `simplify`, `dce`), each `pass(function, module) -> bool`
+  (changed?).
   `optimize()` in `__init__.py` runs them, verifying the IR after every pass.
   Passes must keep behavior identical, including run-time errors: never fold
   or remove an operation that can fail.
@@ -75,9 +83,11 @@ plain:
   docstring), C calling convention for runtime calls.
 * `src/ella/runtime.c`: the C runtime linked into native programs. It must
   match `operators.py` and `values.py` exactly, including error messages and
-  float formatting (Python's `repr`).
+  float formatting (Python's `repr`). Objects live in arenas: one reserved
+  address range per depth, bump allocated, freed by scope.
 * `src/ella/native.py`: builds executables with gcc (the compiled runtime is
-  cached in the temp directory) and runs them (`run_native`).
+  cached in the temp directory) and runs them (`run_native`, which sets
+  `ELLA_POISON` so freed arena memory is overwritten).
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
   of both interpreters, the optimized IR and native code), `test/test_passes.py`,
@@ -87,5 +97,5 @@ plain:
   `NAME.err` (expected error), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized).
 
-Next is stage 6 (memory model), then stage 7 (staged programming); see
-README.md.
+Next is stage 7 (staged programming); see README.md. Pools, slabs and
+non-copyable types (the rest of docs/memory-model.md) come after it.

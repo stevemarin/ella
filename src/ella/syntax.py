@@ -55,11 +55,12 @@ class TupleType:
 
 @dataclass(frozen=True, slots=True)
 class FunctionType:
-    """`(T, U) -> R`"""
+    """`(T, U) -> R`, or `(mut T, U) -> R`; `mutable` lists the positions of `mut` parameters."""
 
     params: tuple[TypeExpr, ...]
     result: TypeExpr
     span: Span
+    mutable: tuple[int, ...] = ()
 
 
 type TypeExpr = NamedType | ListType | UnitType | TupleType | FunctionType
@@ -148,11 +149,15 @@ class Binding:
 
 @dataclass(frozen=True, slots=True)
 class Param:
-    """A lambda parameter. `type` is None only in untyped lambdas like `x => x + 1`."""
+    """A lambda parameter: `x: i64`, or `mut xs: [i64]`.
+
+    `type` is None only in untyped lambdas like `x => x + 1`.
+    """
 
     name: str
     type: TypeExpr | None
     span: Span
+    mutable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +267,18 @@ class Call:
 
     callee: Expr
     args: tuple[Expr, ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class MutArg:
+    """`mut target` as a call argument, for a `mut` parameter: `push(mut xs, 5)`.
+
+    The target must be a `mut` variable or an element of one. The parser
+    allows any expression here; the checker enforces that.
+    """
+
+    target: Expr
     span: Span
 
 
@@ -439,6 +456,7 @@ type Expr = (
     | Binary
     | Compare
     | Call
+    | MutArg
     | Index
     | Member
     | Try
@@ -503,8 +521,9 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return "()"
         case TupleType(items):
             return f"({show(items[0])},)" if len(items) == 1 else f"({show_list(items)})"
-        case FunctionType(params, result):
-            return f"({show_list(params)}) -> {show(result)}"
+        case FunctionType(params, result, mutable=mutable):
+            shown = ", ".join(("mut " if i in mutable else "") + show(p) for i, p in enumerate(params))
+            return f"({shown}) -> {show(result)}"
 
         # Patterns
         case WildcardPattern():
@@ -545,6 +564,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("compare", show(first), *(f"{op} {show(operand)}" for op, operand in rest))
         case Call(callee, args):
             return sexpr("call", show(callee), *map(show, args))
+        case MutArg(target):
+            return sexpr("mut", show(target))
         case Index(target, index):
             return sexpr("index", show(target), show(index))
         case Member(target, name):
@@ -619,7 +640,8 @@ def show_binding(binding: Binding) -> str:
 
 
 def show_param(param: Param) -> str:
-    return param.name if param.type is None else f"{param.name}: {show(param.type)}"
+    text = f"mut {param.name}" if param.mutable else param.name
+    return text if param.type is None else f"{text}: {show(param.type)}"
 
 
 def show_case(case: Case) -> str:

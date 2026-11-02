@@ -117,9 +117,13 @@ and IR rather than treating every compiler pass as a stage of program execution.
 * Explore memory management without a garbage collector: stack-first
   allocation, arenas for objects with related lifetimes, and pools for
   long-lived fixed-size objects. The design is in
-  [docs/memory-model.md](docs/memory-model.md). Until then, the interpreters back lists with
-  Python lists: the AST interpreter copies them to get value semantics, and
-  the IR builds new lists instead of changing them.
+  [docs/memory-model.md](docs/memory-model.md).
+* Make copies explicit in the IR, change lists in place, and add `mut`
+  parameters.
+* Scope arenas, with placement chosen by the compiler, checked by the IR
+  interpreter, and implemented natively with reserved address ranges.
+* Later, after stage 7: pools, slabs and sub-arenas for long-lived objects,
+  non-copyable types, and finalization.
 
 ### 7. Staged programming
 
@@ -154,6 +158,15 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   ([src/ella/native.py](src/ella/native.py)). Every value gets a stack slot,
   and Ella functions pass arguments on the stack. Every test program runs
   natively too, and must print the same output and errors byte for byte.
+* Stage 6 is done: values are copied only where a program could tell, lists
+  change in place, and functions can take `mut` parameters. Every object
+  lives in an arena: one per function call and per loop iteration, freed
+  when the call returns or the iteration ends, so there is no garbage
+  collector. The compiler decides which arena each object goes in
+  ([src/ella/lower.py](src/ella/lower.py)), the IR interpreter checks its
+  decisions as programs run, and native code allocates in real arenas
+  ([src/ella/runtime.c](src/ella/runtime.c)). See
+  [docs/memory-model.md](docs/memory-model.md) §14.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)
@@ -164,10 +177,11 @@ uv run ella -o tour example_syntax.ella   # compile to a native executable named
 uv run ella --asm example_syntax.ella     # print the x64 assembly
 uv run ella --ir example_syntax.ella      # print the IR (add -O to optimize it,
                                           # or --passes mem2reg,fold to pick passes)
+uv run ella --placement example_syntax.ella  # print which arena each object goes in
+uv run ella --profile example_syntax.ella    # run it, then print how much memory each arena used
 uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
-Memory management (stage 6) and staged programming (stage 7) are design goals,
-not implemented features yet. Native programs need gcc; memory is allocated and
-never freed until stage 6.
+Staged programming (stage 7) is a design goal, not an implemented feature yet.
+Native programs need gcc.

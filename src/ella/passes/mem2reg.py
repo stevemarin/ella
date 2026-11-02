@@ -111,7 +111,7 @@ def promote_slots(function: Function, module: Module) -> bool:
                 kept.append(instr)
         block.instrs = kept
     replace_values(function, replacements)
-    function.locals = {}
+    function.locals, function.local_regions = {}, {}
     remove_trivial_params(function)
     return True
 

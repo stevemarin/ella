@@ -68,7 +68,7 @@ def fold_once(function: Function) -> bool:
             result = evaluate(instr, [known[a.id] for a in instr.args])
             if result is not None:
                 # The instruction becomes a constant, keeping its result value.
-                instr.op, instr.args, instr.const = "const", [], result
+                instr.op, instr.args, instr.const, instr.region = "const", [], result, ""
                 assert instr.dest is not None
                 known[instr.dest.id] = result
                 changed = True

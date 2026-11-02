@@ -59,6 +59,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    MutArg,
     Name,
     NamedType,
     NamePattern,
@@ -404,7 +405,7 @@ class Parser:
         token = self.advance()
         match token.text:
             case "(":
-                args, _ = self.parse_comma_list(self.parse_expr, ")")
+                args, _ = self.parse_comma_list(self.parse_arg, ")")
                 return Call(left, tuple(args), token.span)
             case "[":
                 index = self.parse_expr()
@@ -504,6 +505,13 @@ class Parser:
             raise EllaError("integer literal doesn't fit in i64", span)
         return value
 
+    def parse_arg(self) -> Expr:
+        """A call argument: an expression, or `mut target` for a `mut` parameter."""
+        token = self.peek()
+        if self.accept("mut"):
+            return MutArg(self.parse_expr(), token.span)
+        return self.parse_expr()
+
     def parse_unary(self) -> Expr:
         """A prefix operator and its operand: `-x`, `~x`, `not x`."""
         token = self.advance()
@@ -559,9 +567,8 @@ class Parser:
         exprs: list[Expr] = []
         for item in items:
             if isinstance(item, Param):
-                raise EllaError(
-                    f"'{item.name}: ...' type annotations are only allowed on lambda parameters", item.span
-                )
+                what = f"'mut {item.name}'" if item.mutable else f"'{item.name}: ...' type annotations"
+                raise EllaError(f"{what} only allowed on lambda parameters", item.span)
             exprs.append(item)
         if not exprs:
             return UnitLit(open_paren.span)
@@ -570,7 +577,11 @@ class Parser:
         return TupleLit(tuple(exprs), open_paren.span)
 
     def parse_paren_item(self) -> Expr | Param:
-        """One item inside `(...)`: an expression, or `name: type` in case this is a lambda."""
+        """One item inside `(...)`: an expression, or `name: type` or `mut name: type` in case this is a lambda."""
+        if self.accept("mut"):
+            name = self.expect_kind(TokenKind.NAME, "a parameter name")
+            self.expect(":")
+            return Param(name.text, self.parse_type(), name.span, mutable=True)
         if self.at_kind(TokenKind.NAME) and self.at(":", 1) and not self.at_label():
             name = self.advance()
             self.advance()
@@ -827,15 +838,26 @@ class Parser:
             return ListType(element, token.span)
         if self.accept("("):
             # `(...)` is a function type if `->` follows, otherwise unit or a tuple.
-            items, trailing_comma = self.parse_comma_list(self.parse_type, ")")
+            # Only a function type's parameters may be marked `mut`.
+            marked = self.parse_comma_list(self.parse_param_type, ")")
+            pairs, trailing_comma = marked
+            items = [item for _, item in pairs]
+            mutable = tuple(i for i, (is_mut, _) in enumerate(pairs) if is_mut)
             if self.accept("->"):
-                return FunctionType(tuple(items), self.parse_type(), token.span)
+                return FunctionType(tuple(items), self.parse_type(), token.span, mutable)
+            if mutable:
+                raise EllaError("only a function type's parameters can be marked 'mut'", token.span)
             if not items:
                 return UnitType(token.span)
             if len(items) == 1 and not trailing_comma:
                 raise EllaError("a one-element tuple type needs a trailing comma, like (i64,)", token.span)
             return TupleType(tuple(items), token.span)
         raise self.unexpected("a type")
+
+    def parse_param_type(self) -> tuple[bool, TypeExpr]:
+        """An item of `(...)` in a type: a type, possibly marked `mut` if this turns out to be a function type."""
+        is_mut = self.accept("mut")
+        return is_mut, self.parse_type()
 
     # Patterns
     #

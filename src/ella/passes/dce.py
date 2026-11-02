@@ -22,10 +22,13 @@ error. Only instructions that can never fail are removed:
 Unused block parameters are removed too, along with the values jumps pass
 to them, which may then become unused in turn. The pass repeats until
 nothing more can go.
+
+Finally, scope levels that nothing allocates in any more are dropped, with
+the `reset`s that free them (ella.ir.trim_levels).
 """
 
 from ella.checker import F64, STR, ListTy
-from ella.ir import Function, Instr, Module, remove_param, used_values
+from ella.ir import Function, Instr, Module, remove_param, trim_levels, used_values
 
 # Operations that never fail and have no effect.
 SAFE = frozenset(
@@ -55,6 +58,7 @@ SAFE = frozenset(
         "bitor",
         "bitxor",
         "div",  # always f64, so it never fails
+        "copy",
     }
 )
 
@@ -88,4 +92,4 @@ def eliminate_dead_code(function: Function, module: Module) -> bool:
                     remove_param(function, block, index)
                     changed = True
         changed_any |= changed
-    return changed_any
+    return trim_levels(function) or changed_any

@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 51
+    assert len(program.body) == 57
 
 
 # Precedence (docs/grammar.md §8)
@@ -411,3 +411,23 @@ def test_unclosed_paren_reports_its_position() -> None:
 def test_pipe_in_call_node() -> None:
     [expr] = parse("x |> f(1)").body
     assert isinstance(expr, Call) and expr.args[0] == Name("x", Span(1, 1))
+
+
+def test_mut_parameters_and_arguments() -> None:
+    assert one("let f = (mut xs: [i64], x: i64) -> () => push(mut xs, x)") == (
+        "(let [f] (lambda (mut xs: [i64], x: i64) -> () (call push (mut xs) x)))"
+    )
+    assert one("f(mut grid[i][j], 1)") == "(call f (mut (index (index grid i) j)) 1)"
+    assert one("let f: (mut [i64], i64) -> () = g") == "(let [f: (mut [i64], i64) -> ()] g)"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("(mut x: i64)", "'mut x' only allowed on lambda parameters"),
+        ("let t: (mut i64, str) = x", "only a function type's parameters can be marked 'mut'"),
+        ("(mut 1) => 1", "expected a parameter name, found '1'"),
+    ],
+)
+def test_mut_errors(source: str, message: str) -> None:
+    assert error(source).message == message

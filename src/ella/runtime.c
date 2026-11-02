@@ -9,7 +9,7 @@
 //
 // All values are 64-bit words. Numbers and bools are the word itself (an f64
 // is its raw bits); everything else is a pointer to one of the structs
-// below. Memory is allocated and never freed: managing it properly is stage 6.
+// below, which live in arenas (see "Arenas" below, and docs/memory-model.md).
 
 #include <inttypes.h>
 #include <math.h>
@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 typedef int64_t word;
 
@@ -27,9 +28,11 @@ typedef struct {
     uint32_t chars[];
 } Str;
 
-// A list or a tuple: a length and that many words.
+// A list or a tuple: a length and that many words. A list may have room
+// for more items after them: `cap` is how many fit. (A tuple's is its length.)
 typedef struct {
     word len;
+    word cap;
     word items[];
 } List;
 
@@ -47,10 +50,13 @@ typedef struct {
     word fields[];
 } Variant;
 
-// A function value: the code to run and the values it captured.
+// A function value: the code to run and the values it captured, with their
+// types (a tuple type descriptor), which copying a closure needs.
+typedef struct Type Type;
 typedef struct {
     void *code;
     word count;
+    const Type *types;
     word captured[];
 } Closure;
 
@@ -58,13 +64,13 @@ typedef struct {
 // and the text form of a list of enums of floats need to know all of that.
 enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM };
 
-typedef struct Type {
+struct Type {
     word kind;
     word count;  // tuple items or enum variants
     // list: parts[0] is the element type; tuple: the item types;
     // enum: VariantType descriptors.
     const void *parts[];
-} Type;
+};
 
 typedef struct {
     const char *name;
@@ -109,13 +115,115 @@ _Noreturn void ella_unset_global(const char *name, word line, word column) {
     fail(line, column, "'%s' is used before its 'let' has run", name);
 }
 
-static void *alloc(size_t size) {
-    void *memory = malloc(size ? size : 1);
-    if (memory == NULL) {
-        fputs("out of memory\n", stderr);
-        exit(2);
+_Noreturn static void out_of_memory(const char *what) {
+    fflush(stdout);
+    fprintf(stderr, "out of memory: %s\n", what);
+    exit(2);
+}
+
+// Arenas
+//
+// Every object lives in an arena, numbered by depth. Depth 0 is the global
+// arena, which is never freed. Each Ella call takes the next few depths for
+// its scope levels (its body, and one more for each loop nested in it) and
+// frees them when it returns; a loop frees its level after each iteration.
+// The generated code passes the depth to every function here that makes an
+// object.
+//
+// An arena is a range of address space, reserved the first time its depth is
+// used and never moved, so its objects never move either. Making an object
+// just bumps the arena's `top` pointer; pages are made usable ("committed")
+// as `top` passes them. Freeing an arena sets `top` back to the start.
+
+#define MAX_DEPTHS 65536
+#define ARENA_RESERVE ((size_t)4 << 30)  // address space per arena: 4 GiB
+#define COMMIT_STEP ((size_t)1 << 20)  // commit pages 1 MiB at a time
+#define KEEP_COMMITTED ((size_t)16 << 20)  // when freeing, give memory beyond 16 MiB back to the OS
+
+typedef struct {
+    char *start, *top, *committed, *end;
+} Arena;
+
+static Arena arenas[MAX_DEPTHS];
+
+// The first depth not taken by a call in progress (depth 0 is global).
+word ella_next_depth = 1;
+
+// With ELLA_POISON set, freed memory is overwritten, so that reading an
+// object after its arena is freed (a bug in the compiler) shows up as
+// nonsense rather than going unnoticed. The tests set it.
+static int poison;
+
+// With ELLA_ARENA_STATS set, the program reports the most memory its arenas
+// ever held at once when it finishes.
+static size_t in_use, peak;
+
+static size_t round16(size_t size) { return (size + 15) & ~(size_t)15; }
+
+static void commit(Arena *a, char *new_top) {
+    if (new_top > a->end) out_of_memory("an arena is full");
+    if (new_top <= a->committed) return;
+    char *limit = a->start + (new_top - a->start + COMMIT_STEP - 1) / COMMIT_STEP * COMMIT_STEP;
+    if (limit > a->end) limit = a->end;
+    if (mprotect(a->committed, (size_t)(limit - a->committed), PROT_READ | PROT_WRITE) != 0) {
+        out_of_memory("can't commit arena memory");
     }
-    return memory;
+    a->committed = limit;
+}
+
+static Arena *arena(word depth) {
+    if (depth < 0 || depth >= MAX_DEPTHS) out_of_memory("too many nested scopes");
+    Arena *a = &arenas[depth];
+    if (a->start == NULL) {
+        void *range = mmap(NULL, ARENA_RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (range == MAP_FAILED) out_of_memory("can't reserve address space for an arena");
+        a->start = a->top = a->committed = range;
+        a->end = a->start + ARENA_RESERVE;
+    }
+    return a;
+}
+
+static void *alloc(size_t size, word depth) {
+    Arena *a = arena(depth);
+    char *object = a->top;
+    commit(a, object + round16(size));
+    a->top = object + round16(size);
+    in_use += round16(size);
+    if (in_use > peak) peak = in_use;
+    return object;
+}
+
+static void free_arena(word depth) {
+    Arena *a = &arenas[depth];
+    if (a->start == NULL) return;
+    size_t used = (size_t)(a->top - a->start);
+    in_use -= used;
+    if (poison) memset(a->start, 0xA5, used);
+    a->top = a->start;
+    // Memory well beyond what the arena usually needs goes back to the OS.
+    // It reads as zeros if it is used again.
+    size_t committed = (size_t)(a->committed - a->start);
+    if (committed > KEEP_COMMITTED) madvise(a->start + KEEP_COMMITTED, committed - KEEP_COMMITTED, MADV_DONTNEED);
+}
+
+// Free the arenas at depths first, ..., end - 1: a loop's levels when an
+// iteration ends.
+void ella_reset(word first, word end) {
+    for (word depth = first; depth < end; depth++) free_arena(depth);
+}
+
+// A call starts: take `levels` depths, and return the first.
+word ella_enter(word levels) {
+    word base = ella_next_depth;
+    if (base + levels > MAX_DEPTHS) out_of_memory("too many nested scopes");
+    ella_next_depth = base + levels;
+    return base;
+}
+
+// A call returns: free its levels, and give back their depths.
+void ella_leave(word base) {
+    ella_reset(base, ella_next_depth);
+    ella_next_depth = base;
 }
 
 // Integer arithmetic. `+`, `-` and `*` are done by generated code directly;
@@ -191,14 +299,14 @@ word ella_pow_f64(word a_bits, word b_bits) {
 
 // Strings
 
-Str *ella_str_alloc(word len) {
-    Str *s = alloc(sizeof(Str) + (size_t)len * sizeof(uint32_t));
+static Str *str_alloc(word len, word depth) {
+    Str *s = alloc(sizeof(Str) + (size_t)len * sizeof(uint32_t), depth);
     s->len = len;
     return s;
 }
 
-Str *ella_str_concat(const Str *a, const Str *b) {
-    Str *s = ella_str_alloc(a->len + b->len);
+Str *ella_str_concat(const Str *a, const Str *b, word depth) {
+    Str *s = str_alloc(a->len + b->len, depth);
     memcpy(s->chars, a->chars, (size_t)a->len * sizeof(uint32_t));
     memcpy(s->chars + a->len, b->chars, (size_t)b->len * sizeof(uint32_t));
     return s;
@@ -213,10 +321,10 @@ word ella_str_compare(const Str *a, const Str *b) {
     return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
 }
 
-Str *ella_str_index(const Str *s, word i, word line, word column) {
+Str *ella_str_index(const Str *s, word i, word line, word column, word depth) {
     if (i < 0 || i >= s->len)
         fail(line, column, "index %" PRId64 " is out of range for a str of length %" PRId64, i, s->len);
-    Str *c = ella_str_alloc(1);
+    Str *c = str_alloc(1, depth);
     c->chars[0] = s->chars[i];
     return c;
 }
@@ -230,14 +338,14 @@ word ella_str_contains(const Str *haystack, const Str *needle) {
 
 // Lists (and tuples, which have the same layout)
 
-List *ella_list_alloc(word len) {
-    List *xs = alloc(sizeof(List) + (size_t)len * sizeof(word));
-    xs->len = len;
+List *ella_list_alloc(word len, word depth) {
+    List *xs = alloc(sizeof(List) + (size_t)len * sizeof(word), depth);
+    xs->len = xs->cap = len;
     return xs;
 }
 
-List *ella_list_concat(const List *a, const List *b) {
-    List *xs = ella_list_alloc(a->len + b->len);
+List *ella_list_concat(const List *a, const List *b, word depth) {
+    List *xs = ella_list_alloc(a->len + b->len, depth);
     memcpy(xs->items, a->items, (size_t)a->len * sizeof(word));
     memcpy(xs->items + a->len, b->items, (size_t)b->len * sizeof(word));
     return xs;
@@ -253,26 +361,23 @@ word ella_list_index(const List *xs, word i, word line, word column) {
     return xs->items[i];
 }
 
-// Lists are values: setting an item makes a new list.
-List *ella_list_set(const List *xs, word i, word value, word line, word column) {
+// `xs[i] = value`, in place. The compiler made sure nothing else shares xs.
+void ella_list_set(List *xs, word i, word value, word line, word column) {
     check_index(xs, i, line, column);
-    List *copy = ella_list_alloc(xs->len);
-    memcpy(copy->items, xs->items, (size_t)xs->len * sizeof(word));
-    copy->items[i] = value;
-    return copy;
+    xs->items[i] = value;
 }
 
 // Ranges
 
-Range *ella_range(word start, word stop) {
-    Range *r = alloc(sizeof(Range));
+Range *ella_range(word start, word stop, word depth) {
+    Range *r = alloc(sizeof(Range), depth);
     r->start = start;
     r->stop = stop;
     return r;
 }
 
-Range *ella_range_incl(word start, word last) {
-    Range *r = ella_range(start, last);
+Range *ella_range_incl(word start, word last, word depth) {
+    Range *r = ella_range(start, last, depth);
     r->stop = (__int128)last + 1;
     return r;
 }
@@ -285,18 +390,106 @@ word ella_range_contains(const Range *r, word x) { return x >= r->start && x < r
 
 // Enums and closures
 
-Variant *ella_variant_alloc(word tag, word count) {
-    Variant *v = alloc(sizeof(Variant) + (size_t)count * sizeof(word));
+Variant *ella_variant_alloc(word tag, word count, word depth) {
+    Variant *v = alloc(sizeof(Variant) + (size_t)count * sizeof(word), depth);
     v->tag = tag;
     v->count = count;
     return v;
 }
 
-Closure *ella_closure_alloc(void *code, word count) {
-    Closure *c = alloc(sizeof(Closure) + (size_t)count * sizeof(word));
+Closure *ella_closure_alloc(void *code, word count, const Type *types, word depth) {
+    Closure *c = alloc(sizeof(Closure) + (size_t)count * sizeof(word), depth);
     c->code = code;
     c->count = count;
+    c->types = types;
     return c;
+}
+
+// Copying: `copy v @r` makes a deep copy of v in the arena at `depth`, so that
+// it shares nothing with v. Strings are copied too, since v's may be in an
+// arena that is freed sooner.
+
+static int is_boxed(const Type *t) { return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL; }
+
+word ella_copy(word v, const Type *t, word depth) {
+    switch (t->kind) {
+    case K_STR: {
+        const Str *s = (const Str *)v;
+        Str *copy = str_alloc(s->len, depth);
+        memcpy(copy->chars, s->chars, (size_t)s->len * sizeof(uint32_t));
+        return (word)copy;
+    }
+    case K_RANGE: {
+        const Range *r = (const Range *)v;
+        Range *copy = alloc(sizeof(Range), depth);
+        *copy = *r;
+        return (word)copy;
+    }
+    case K_LIST:
+    case K_TUPLE: {
+        const List *xs = (const List *)v;
+        List *copy = ella_list_alloc(xs->len, depth);
+        for (word i = 0; i < xs->len; i++) {
+            const Type *item = t->kind == K_LIST ? t->parts[0] : t->parts[i];
+            copy->items[i] = is_boxed(item) ? ella_copy(xs->items[i], item, depth) : xs->items[i];
+        }
+        return (word)copy;
+    }
+    case K_ENUM: {
+        const Variant *x = (const Variant *)v;
+        const VariantType *variant = t->parts[x->tag];
+        Variant *copy = ella_variant_alloc(x->tag, x->count, depth);
+        for (word i = 0; i < x->count; i++) {
+            const Type *field = variant->fields[i];
+            copy->fields[i] = is_boxed(field) ? ella_copy(x->fields[i], field, depth) : x->fields[i];
+        }
+        return (word)copy;
+    }
+    case K_FUNCTION: {
+        const Closure *c = (const Closure *)v;
+        Closure *copy = ella_closure_alloc(c->code, c->count, c->types, depth);
+        for (word i = 0; i < c->count; i++) {
+            const Type *item = c->types->parts[i];
+            copy->captured[i] = is_boxed(item) ? ella_copy(c->captured[i], item, depth) : c->captured[i];
+        }
+        return (word)copy;
+    }
+    default:  // (), i64, f64, bool
+        return v;
+    }
+}
+
+// `xs += ys`: add copies of ys's items to xs, which lives in the arena at
+// `depth`, and return xs, which may have moved. If xs is the last object in
+// its arena, it grows in place; otherwise it moves to a new home with room
+// for twice as many items. Either way, adding an item costs O(1) on average.
+List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
+    word n = ys->len, len = xs->len;  // ys may be xs, so read its length first
+    if (len + n > xs->cap) {
+        word cap = len + n > 2 * xs->cap ? len + n : 2 * xs->cap;
+        if (cap < 4) cap = 4;
+        Arena *a = arena(depth);
+        char *end = (char *)xs + round16(sizeof(List) + (size_t)xs->cap * sizeof(word));
+        if (end == a->top) {
+            char *new_end = (char *)xs + round16(sizeof(List) + (size_t)cap * sizeof(word));
+            commit(a, new_end);
+            in_use += (size_t)(new_end - end);
+            if (in_use > peak) peak = in_use;
+            a->top = new_end;
+            xs->cap = cap;
+        } else {
+            List *moved = alloc(sizeof(List) + (size_t)cap * sizeof(word), depth);
+            memcpy(moved->items, xs->items, (size_t)len * sizeof(word));
+            moved->len = len;
+            moved->cap = cap;
+            xs = moved;
+        }
+    }
+    for (word i = 0; i < n; i++) {
+        xs->items[len + i] = is_boxed(item) ? ella_copy(ys->items[i], item, depth) : ys->items[i];
+    }
+    xs->len = len + n;
+    return xs;
 }
 
 // Equality, like ella.values.equal: lists, tuples and enum values are equal
@@ -360,12 +553,12 @@ typedef struct {
     uint32_t *chars;
 } Buffer;
 
+// Buffers are scratch space, not Ella values, so they use malloc and free.
 static void put(Buffer *b, uint32_t c) {
     if (b->len == b->capacity) {
         b->capacity = b->capacity ? b->capacity * 2 : 32;
-        uint32_t *bigger = alloc((size_t)b->capacity * sizeof(uint32_t));
-        if (b->len) memcpy(bigger, b->chars, (size_t)b->len * sizeof(uint32_t));
-        b->chars = bigger;  // the old buffer is never freed, like everything else
+        b->chars = realloc(b->chars, (size_t)b->capacity * sizeof(uint32_t));
+        if (b->chars == NULL) out_of_memory("can't grow a text buffer");
     }
     b->chars[b->len++] = c;
 }
@@ -532,11 +725,12 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
     }
 }
 
-Str *ella_to_text(word v, const Type *t) {
+Str *ella_to_text(word v, const Type *t, word depth) {
     Buffer b = {0};
     put_value(&b, v, t, 0);
-    Str *s = ella_str_alloc(b.len);
+    Str *s = str_alloc(b.len, depth);
     if (b.len) memcpy(s->chars, b.chars, (size_t)b.len * sizeof(uint32_t));
+    free(b.chars);
     return s;
 }
 
@@ -568,6 +762,7 @@ void ella_print(word v, const Type *t) {
     put_value(&b, v, t, 0);
     write_utf8(stdout, b.chars, b.len);
     fputc('\n', stdout);
+    free(b.chars);
 }
 
 // A trap whose message shows a value: "no case matches {}".
@@ -587,7 +782,9 @@ _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word 
 extern void ella_main(void);
 
 int main(void) {
+    poison = getenv("ELLA_POISON") != NULL;
     ella_main();
     fflush(stdout);
+    if (getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);
     return 0;
 }

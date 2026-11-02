@@ -283,3 +283,77 @@ def test_name_patterns_can_be_variants() -> None:
 def test_generic_enum() -> None:
     source = 'enum Pair[A, B]\n    Pair(A, B)\nlet p = Pair(1, "x")\nmatch p\n    case Pair(n, s) => s'
     assert type_of(source) == "str"
+
+
+# mut parameters
+
+PUSH = "let push = (mut xs: [i64], x: i64) -> () =>\n    xs = xs + [x]\n"
+
+
+def test_mut_parameter_types() -> None:
+    assert type_of(PUSH + "push") == "(mut [i64], i64) -> ()"
+    assert type_of(PUSH + "let mut v = [1]\npush(mut v, 2)") == "()"
+    assert type_of(PUSH + "let mut g = [[1]]\npush(mut g[0], 2)") == "()"
+    # Function types with and without mut parameters are different types.
+    assert type_of(PUSH + "let f: (mut [i64], i64) -> () = push\nf") == "(mut [i64], i64) -> ()"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("let mut v = [1]\npush(v, 2)", "argument 1 is for a 'mut' parameter, so mark it: 'mut ...'"),
+        (
+            "let mut v = 1\nlet f = (x: i64) -> i64 => x\nf(mut v)",
+            "argument 1 isn't for a 'mut' parameter, so it can't be 'mut'",
+        ),
+        ("let v = [1]\npush(mut v, 2)", "can't pass 'v' as 'mut' because it isn't mutable; declare it with 'let mut'"),
+        ("push(mut [1], 2)", "can only pass a variable or an element of one"),
+        ('let mut s = "ab"\nlet f = (mut c: str) -> () => ()\nf(mut s[0])', "can't pass an element of a str"),
+        ("let mut v = [true]\npush(mut v, 2)", "argument 1 should be [i64], not [bool]"),
+        ("let mut v = [1]\nprint(mut v)", "'mut' marks an argument for a 'mut' parameter, and only works in a call"),
+        (
+            "let mut v = [1]\nlet f: ([i64], i64) -> () = push",
+            "the value of 'f' should be ([i64], i64) -> (), not (mut [i64], i64) -> ()",
+        ),
+        (
+            "let f = (mut x: i64) -> () => ()\nlet x = 1\nf(mut x)",
+            "can't pass 'x' as 'mut' because it isn't mutable; declare it with 'let mut'",
+        ),
+    ],
+)
+def test_mut_errors(source: str, message: str) -> None:
+    assert error(PUSH + source).message == message
+
+
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        ("swap(mut a, mut a)", "'a' can't be passed as 'mut' twice in one call"),
+        ("swap_rows(mut a[0], mut a[1])", "'a' can't be passed as 'mut' twice in one call"),
+        ("both(mut a, a)", "'a' is passed as 'mut', so it can't also be used in another argument of the same call"),
+        (
+            "both(mut a, [a[0]])",
+            "'a' is passed as 'mut', so it can't also be used in another argument of the same call",
+        ),
+    ],
+)
+def test_mut_arguments_must_not_overlap(call: str, message: str) -> None:
+    source = """\
+let swap = (mut x: [[i64]], mut y: [[i64]]) -> () => ()
+let swap_rows = (mut x: [i64], mut y: [i64]) -> () => ()
+let both = (mut x: [[i64]], y: [[i64]]) -> () => ()
+let mut a = [[1]]
+"""
+    assert error(source + call).message == message
+
+
+def test_mut_arguments_may_share_values_without_lists() -> None:
+    # A length or a string can't change when the list does, so they don't overlap.
+    check(parse(PUSH + "let mut v = [1]\npush(mut v, len(v))\npush(mut v, v[0])"))
+
+
+def test_mut_parameters_can_be_assigned_but_others_cant() -> None:
+    check(parse("let f = (mut x: i64) -> () =>\n    x += 1"))
+    assert error("let f = (x: i64) -> () =>\n    x += 1").message == (
+        "can't assign to 'x' because it isn't mutable; declare it with 'let mut'"
+    )

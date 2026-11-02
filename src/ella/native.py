@@ -9,6 +9,7 @@ so that building many programs (as the tests do) stays quick.
 """
 
 import hashlib
+import os
 import re
 import subprocess
 import tempfile
@@ -57,12 +58,16 @@ def run_native(source: str, out: TextIO, optimized: bool = True) -> None:
     """Compile a program to a native executable and run it, like the interpreters' `run`.
 
     What the program prints goes to `out`. If it stops with a run-time
-    error, that is raised as an EllaError, as an interpreter would.
+    error, that is raised as an EllaError, as an interpreter would. Freed
+    arena memory is overwritten (ELLA_POISON), so that a program that uses
+    an object after its arena is freed prints nonsense instead of passing
+    by luck.
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
         compile_native(source, executable, optimized)
-        result = subprocess.run([str(executable)], check=False, capture_output=True, text=True)  # it may fail
+        env = os.environ | {"ELLA_POISON": "1"}
+        result = subprocess.run([str(executable)], check=False, capture_output=True, text=True, env=env)
     out.write(result.stdout)
     if result.returncode != 0:
         raise parse_error(result.stderr)

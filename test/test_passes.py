@@ -204,3 +204,62 @@ def test_broken_pass_is_caught_by_the_verifier() -> None:
             compiled("print(1)", ["broken"])
     finally:
         del PASSES["broken"]
+
+
+# Moves
+
+
+def test_moves_turns_a_copy_into_a_move() -> None:
+    source = """\
+let f = () -> [i64] =>
+    let a = [1, 2]
+    let mut b = a
+    b[0] = 5
+    b
+print(f())
+"""
+    before = compiled(source, ["mem2reg"]).functions["f"]
+    assert "copy" in ops(before)
+    module = compiled(source, ["mem2reg", "moves"])
+    function = module.functions["f"]
+    assert "copy" not in ops(function)
+    # The list is now made where the copy was going: the caller's arena.
+    assert "= list %4, %5 @result" in format_function(function)
+    assert run(module) == ["[5, 2]"]
+
+
+def test_moves_keeps_a_copy_made_in_a_loop() -> None:
+    source = """\
+let f = () -> () =>
+    let base = [0, 0]
+    for i in 0..3
+        let mut row = base
+        row[0] += i
+        print(row)
+f()
+"""
+    module = compiled(source)
+    assert "copy" in ops(module.functions["f"])
+    assert run(module) == ["[0, 0]", "[1, 0]", "[2, 0]"]
+
+
+def test_moves_keeps_a_copy_of_shared_parts() -> None:
+    # The list holds `row`, which is also a variable, so copying it copies `row` too.
+    source = """\
+let f = (row: [i64]) -> [[i64]] =>
+    let rows = [row]
+    let mut copied = rows
+    copied[0][0] = 9
+    copied
+print(f([1]))
+"""
+    module = compiled(source)
+    assert "copy" in ops(module.functions["f"])
+    assert run(module) == ["[[9]]"]
+
+
+def test_dce_drops_levels_nothing_allocates_in() -> None:
+    # The loop made a string until folding turned it into a constant.
+    function = compiled('let f = () -> () =>\n    for i in 0..3\n        print("a" + "b")\nf()').functions["f"]
+    assert function.levels == 1
+    assert "reset" not in ops(function)

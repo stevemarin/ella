@@ -270,8 +270,11 @@ xs[0] = 7
 ### Values
 
 Ella uses **pass-by-value**. Binding, passing an argument, returning, and
-capturing in a closure all copy. The interpreters copy eagerly for now
-(lists are Python lists that get copied); optimization can remove copies later.
+capturing in a closure all copy, as far as any program can tell. The AST
+interpreter copies eagerly (lists are Python lists that get copied). The
+compiler copies only where a program could tell the difference, and
+otherwise shares values and changes lists in place; see
+[memory-model.md](memory-model.md).
 
 Concretely, reading a variable or a list element gives a copy, so changing a
 list through one name is never visible through another:
@@ -300,7 +303,8 @@ let fibonacci = (n: i64) -> i64 =>
 
 * The form is `( params ) -> ReturnType => body`. The parameter list is always
   parenthesized, even with one parameter.
-* Each parameter is `name: Type`. Parameters are immutable.
+* Each parameter is `name: Type`. Parameters are immutable, except `mut`
+  ones (below).
 * Functions take multiple arguments; there is no currying.
 * `-> ReturnType` is required for now. Untyped lambdas such as `x => x + 2`
   parse, but the type checker rejects them until there is type inference.
@@ -314,6 +318,35 @@ let fibonacci = (n: i64) -> i64 =>
   captured: a function sees their current values when it runs, which is what
   lets top-level functions refer to each other.
 * A `break` or `continue` can't leave the function it is in.
+
+### `mut` parameters
+
+A parameter marked `mut` can be changed by the function, and the caller
+sees the change. The argument is marked `mut` too:
+
+```ella
+let push_twice = (mut xs: [i64], x: i64) -> () =>
+    xs += [x, x]
+
+let mut nums = [1]
+push_twice(mut nums, 5)   # nums is now [1, 5, 5]
+```
+
+* The argument for a `mut` parameter must be marked `mut`, and other
+  arguments must not be. It must be a `mut` variable or an element of one
+  (`mut grid[i]`), and its type must be exactly the parameter's.
+* Arguments are passed in and out ("value-result"). The parameter starts
+  with the argument's value, and when the function returns, its final
+  value is assigned back to the argument as `place = value` would, using
+  the indexes evaluated for the call (and checking them again). Compiled
+  code passes the variable itself instead, which only a global variable
+  could tell apart, so a global is passed as a copy.
+* A variable passed as `mut` can't be used in any other argument of the
+  same call, unless that argument's type has no lists: `f(mut xs, len(xs))`
+  is fine, `f(mut xs, xs)` isn't. This is checked by name, so
+  `swap(mut a[0], mut a[1])` is rejected too **(provisional)**.
+* `mut` parameters are part of a function's type: `(mut [i64], i64) -> ()`.
+* A closure captures a `mut` parameter by copy, like any other variable.
 
 ### `where` clauses
 
@@ -531,6 +564,7 @@ i64  f64  bool  str              built-in scalars
 [T]                              list of T
 (T, U)                           tuple
 (T, U) -> R                      function (parameters always parenthesized)
+(mut T, U) -> R                  function with a `mut` parameter
 Result[T, E]   Optional[T]       generic types use [ ]
 ```
 
@@ -636,7 +670,7 @@ target      = IDENT | operator_expr "[" expr "]" ;
 
 lambda      = "(" [ param { "," param } [ "," ] ] ")" "->" type "=>" lambda_body
             | IDENT "=>" body ;                  (* untyped; rejected for now *)
-param       = IDENT ":" type ;
+param       = [ "mut" ] IDENT ":" type ;
 lambda_body = expr
             | NEWLINE INDENT [ where NEWLINE ] expr { NEWLINE expr } NEWLINE DEDENT ;
 where       = "where" block ;
@@ -662,7 +696,8 @@ operator_expr = prefix_op operator_expr
             | operator_expr binary_op operator_expr
             | operator_expr ( call | index | member | "?" )
             | primary ;
-call        = "(" [ expr { "," expr } [ "," ] ] ")" ;
+call        = "(" [ arg { "," arg } [ "," ] ] ")" ;
+arg         = [ "mut" ] expr ;                   (* `mut` only for a place: a name or an index *)
 index       = "[" expr "]" ;
 member      = "." IDENT ;
 
@@ -681,7 +716,7 @@ pattern_atom = "_" | IDENT | literal | literal ( ".." | "..=" ) literal
 type        = IDENT [ "[" type { "," type } "]" ]
             | "[" type "]"
             | "(" ")"
-            | "(" [ type { "," type } ] ")" "->" type
+            | "(" [ [ "mut" ] type { "," [ "mut" ] type } ] ")" "->" type
             | "(" type "," [ type { "," type } ] ")" ;
 ```
 
@@ -690,8 +725,8 @@ Parsing notes:
 * **Lambdas vs. grouping/tuples.** `(` can start a grouping, tuple, unit, or
   lambda parameter list. Parse the parenthesized contents as expressions,
   allowing `name: type` items; if `->` or `=>` follows the `)`, convert the
-  items into parameters (each must be `name: type`), otherwise reject any
-  `name: type` items. No backtracking needed.
+  items into parameters (each must be `name: type` or `mut name: type`),
+  otherwise reject any such items. No backtracking needed.
 * **`let` chains.** After `let binding =`, another target follows if the next
   tokens are `mut`, or `IDENT` followed by `=` or `:` (but not a labeled loop,
   `IDENT ":" for`).

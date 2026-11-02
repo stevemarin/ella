@@ -5,6 +5,7 @@ which changes one IR function in place and says whether it changed anything.
 Each keeps the program's behavior exactly the same, including its errors:
 
 * `mem2reg`: promote local slots to SSA values (ella.passes.mem2reg)
+* `moves`: turn copies of values nothing else uses into moves (ella.passes.moves)
 * `fold`: constant folding and propagation (ella.passes.fold)
 * `simplify`: simplify the control-flow graph (ella.passes.simplify)
 * `dce`: dead-code elimination (ella.passes.dce)
@@ -21,12 +22,14 @@ from ella.ir import Function, IRError, Module, verify
 from ella.passes.dce import eliminate_dead_code
 from ella.passes.fold import fold_constants
 from ella.passes.mem2reg import promote_slots
+from ella.passes.moves import move_copies
 from ella.passes.simplify import simplify_cfg
 
 type Pass = Callable[[Function, Module], bool]
 
 PASSES: dict[str, Pass] = {
     "mem2reg": promote_slots,
+    "moves": move_copies,
     "fold": fold_constants,
     "simplify": simplify_cfg,
     "dce": eliminate_dead_code,
@@ -34,8 +37,9 @@ PASSES: dict[str, Pass] = {
 
 # The passes that clean up after each other. Each can make work for the
 # others (folding a branch makes code unreachable, removing it makes values
-# unused, ...), so they repeat until none changes anything.
-CLEANUP = ["fold", "simplify", "dce"]
+# unused, merging blocks puts a copy next to its original, ...), so they
+# repeat until none changes anything.
+CLEANUP = ["moves", "fold", "simplify", "dce"]
 MAX_ROUNDS = 10
 
 

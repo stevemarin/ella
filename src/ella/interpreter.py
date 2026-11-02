@@ -49,6 +49,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    MutArg,
     Name,
     NamePattern,
     OrPattern,
@@ -258,7 +259,11 @@ class Interpreter:
                 return Closure(expr, self.capture(scope))
             case Call(callee, args, span):
                 function = self.eval(callee, scope)
+                if any(isinstance(arg, MutArg) for arg in args):
+                    return self.call_with_mut(function, args, scope, span)
                 return self.call(function, [self.eval(arg, scope) for arg in args], span)
+            case MutArg(span=span):
+                raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
             case Return(returned, span):
                 raise ReturnSignal(UNIT if returned is None else self.eval(returned, scope), span)
 
@@ -397,8 +402,67 @@ class Interpreter:
                 captured.define(name, copy_value(var.value))
         return captured
 
-    def call(self, function: Value, args: list[Value], span: Span) -> Value:
-        """Call a function value with already evaluated arguments."""
+    def call_with_mut(self, function: Value, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
+        """A call with `mut` arguments, which are passed in and out ("value-result").
+
+        Each `mut` argument's place is found when the arguments are evaluated:
+        the variable, and the values of any indexes. The function gets a copy
+        of the place's value in a `mut` parameter, and when it returns, the
+        parameter's final value is assigned back to the place, as `place =
+        value` would. The compiled code passes the variable by reference
+        instead, which no program can tell apart (docs/grammar.md §5).
+        """
+        values: list[Value] = []
+        places: list[tuple[int, Expr, list[tuple[Value, Span]]]] = []  # argument position, root variable, indexes
+        for i, arg in enumerate(args):
+            if isinstance(arg, MutArg):
+                root, indexes = self.evaluate_place(arg.target, scope)
+                places.append((i, root, indexes))
+                values.append(copy_value(self.read_place(root, indexes, scope)))
+            else:
+                values.append(self.eval(arg, scope))
+        finals: list[Value] = []
+        result = self.call(function, values, span, finals)
+        for (i, root, indexes), final in zip(places, finals):
+            self.write_place(root, indexes, final, scope, args[i].span)
+        return result
+
+    def evaluate_place(self, target: Expr, scope: Scope) -> tuple[Expr, list[tuple[Value, Span]]]:
+        """The root variable of `xs[i][j]`, and the values of its indexes, left to right, with their spans."""
+        if isinstance(target, Index):
+            root, indexes = self.evaluate_place(target.target, scope)
+            return root, [*indexes, (self.eval(target.index, scope), target.span)]
+        return target, []
+
+    def read_place(self, root: Expr, indexes: list[tuple[Value, Span]], scope: Scope) -> Value:
+        assert isinstance(root, Name)
+        value = self.lookup_mutable(root.name, scope, root.span).value
+        for index, span in indexes:
+            value = index_into(value, index, span)
+        return value
+
+    def write_place(
+        self, root: Expr, indexes: list[tuple[Value, Span]], value: Value, scope: Scope, span: Span
+    ) -> None:
+        """Assign to a place found earlier by `evaluate_place`, checking its indexes again."""
+        assert isinstance(root, Name)
+        var = self.lookup_mutable(root.name, scope, root.span)
+        if not indexes:
+            var.value = value
+            return
+        container = var.value
+        for index, _ in indexes[:-1]:
+            container = index_into(container, index, span)
+        last, _ = indexes[-1]
+        index_into(container, last, span)  # check it is still in range
+        assert isinstance(container, list) and isinstance(last, int)
+        container[last] = value
+
+    def call(self, function: Value, args: list[Value], span: Span, finals: list[Value] | None = None) -> Value:
+        """Call a function value with already evaluated arguments.
+
+        The final values of `mut` parameters are appended to `finals`.
+        """
         match function:
             case Builtin(name, arity, run):
                 self.check_arity(name, arity, args, span)
@@ -408,7 +472,7 @@ class Interpreter:
                 return VariantValue(enum, variant, tuple(args))
             case Closure(lambda_, captured):
                 self.check_arity("function", len(lambda_.params), args, span)
-                return self.call_closure(lambda_, captured, args, span)
+                return self.call_closure(lambda_, captured, args, span, finals)
         raise EllaError(f"can't call a value of type {type_name(function)}", span)
 
     def check_arity(self, name: str, arity: int, args: list[Value], span: Span) -> None:
@@ -416,14 +480,16 @@ class Interpreter:
             plural = "" if arity == 1 else "s"
             raise EllaError(f"{name} takes {arity} argument{plural} but was given {len(args)}", span)
 
-    def call_closure(self, lambda_: Lambda, captured: Scope, args: list[Value], span: Span) -> Value:
+    def call_closure(
+        self, lambda_: Lambda, captured: Scope, args: list[Value], span: Span, finals: list[Value] | None = None
+    ) -> Value:
         """Run a function's body with its parameters bound, checking its `where` conditions."""
         if self.depth >= MAX_CALL_DEPTH:
             raise EllaError(f"stack overflow: more than {MAX_CALL_DEPTH} nested calls", span)
-        # Parameters live in a new scope inside the captured one. They are immutable.
+        # Parameters live in a new scope inside the captured one. Only `mut` ones can change.
         local = Scope(captured)
         for param, arg in zip(lambda_.params, args):
-            local.define(param.name, arg)
+            local.define(param.name, arg, param.mutable)
 
         postconditions = [cond for cond in lambda_.where if mentions_return(cond.expr)]
         for cond in lambda_.where:
@@ -449,6 +515,8 @@ class Interpreter:
             result_scope.define("return", result)
             for cond in postconditions:
                 self.check_condition(cond, result_scope, "postcondition")
+        if finals is not None:
+            finals.extend(local.vars[param.name].value for param in lambda_.params if param.mutable)
         return result
 
     def check_condition(self, cond: Assert, scope: Scope, kind: str) -> None:

@@ -124,6 +124,17 @@ let mut xs: [i64] = [1, 2, 3]
 xs[0] = 7
 assert xs[0] == 7 and len(xs) == 3
 
+# values are copied: changing xs doesn't change ys
+let ys = xs
+xs += [4]
+assert ys == [7, 2, 3]
+
+# a mut parameter changes the caller's variable; the call marks it mut too
+let push_twice = (mut list: [i64], x: i64) -> () =>
+    list += [x, x]
+push_twice(mut xs, 5)
+assert xs == [7, 2, 3, 4, 5, 5]
+
 # while, loop, and labeled break/continue
 let mut count = 0
 while count < 3

@@ -90,3 +90,19 @@ def test_rejects_unknown_passes(tmp_path: Path, capsys: pytest.CaptureFixture[st
     with pytest.raises(SystemExit):
         main(["--passes", "mem2reg,nope", write(tmp_path, "1\n")])
     assert "unknown pass 'nope'" in capsys.readouterr().err
+
+
+def test_prints_placement(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = "let f = () -> [i64] =>\n    let mut xs = []\n    for i in 0..3\n        xs += [i]\n    xs\nprint(f())\n"
+    assert main(["--placement", write(tmp_path, source)]) == 0
+    out = capsys.readouterr().out
+    assert "function f\n" in out
+    assert "append    @result  [i64]  <- in a loop (level 1), but outlives the iteration" in out
+
+
+def test_prints_profile_after_running(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--profile", write(tmp_path, 'let xs = [1, 2]\nprint("{{xs}}")\n')]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "[1, 2]\n"
+    assert captured.err.startswith("Arena profile")
+    assert "global" in captured.err and "top level 0" in captured.err

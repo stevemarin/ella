@@ -7,7 +7,9 @@ moment, so related checks share one program where they can.
 
 import io
 import math
+import os
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -20,7 +22,7 @@ from ella.codegen import generate
 from ella.ir_interpreter import run_ir
 from ella.lexer import EllaError
 from ella.lower import compile_program
-from ella.native import run_native
+from ella.native import compile_native, run_native
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="native code needs gcc")
 
@@ -236,3 +238,96 @@ def test_cli_native_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     captured = capsys.readouterr()
     assert captured.out == "before\n"
     assert captured.err == f"{path}:2:8: assertion failed: false\n"
+
+
+# Arenas
+
+
+def arena_peak(source: str, tmp_path: Path) -> tuple[str, int]:
+    """Run a program natively, returning what it prints and the most arena memory it held at once."""
+    executable = tmp_path / "program"
+    compile_native(source, executable)
+    env = os.environ | {"ELLA_ARENA_STATS": "1", "ELLA_POISON": "1"}
+    result = subprocess.run([str(executable)], capture_output=True, text=True, check=True, env=env)
+    match = re.fullmatch(r"arena peak: (\d+) bytes\n", result.stderr)
+    assert match is not None, result.stderr
+    return result.stdout, int(match[1])
+
+
+def test_loops_free_their_temporaries(tmp_path: Path) -> None:
+    # Each iteration makes a list and a string, about 300 bytes; 100,000 of
+    # them would be 30 MB, but each iteration's are freed when it ends.
+    source = """\
+let work = (n: i64) -> i64 =>
+    let mut total = 0
+    for i in 0..n
+        let row = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i]
+        total += len("row {{row}}")
+    total
+print(work(100000))
+"""
+    out, peak = arena_peak(source, tmp_path)
+    assert out == "11422240\n"
+    assert peak < 10_000
+
+
+def test_calls_free_their_arenas(tmp_path: Path) -> None:
+    source = """\
+let temp = (i: i64) -> i64 => len([i, i, i, i] + [i, i, i, i])
+let mut total = 0
+for i in 0..50000
+    total += temp(i)
+print(total)
+"""
+    out, peak = arena_peak(source, tmp_path)
+    assert out == "400000\n"
+    assert peak < 1_000
+
+
+def test_appending_grows_lists_in_place(tmp_path: Path) -> None:
+    # A list that is the last object in its arena grows where it is, so
+    # appending 100,000 items needs about 800 KB, not the sum of every
+    # intermediate list.
+    source = """\
+let mut xs = []
+for i in 0..100000
+    xs += [i]
+print(len(xs))
+print(xs[99999])
+"""
+    out, peak = arena_peak(source, tmp_path)
+    assert out == "100000\n99999\n"
+    assert peak < 1_100_000
+
+
+def test_appending_moves_lists_that_cant_grow() -> None:
+    # Two lists growing in turn in the same arena: each move makes room for
+    # twice the items, so this still takes O(n) time.
+    assert native_lines("""\
+let mut a = []
+let mut b = []
+for i in 0..1000
+    a += [i]
+    b += [-i, i]
+print(len(a))
+print(len(b))
+print(a[999] + b[1999])
+""") == ["1000", "2000", "1998"]
+
+
+def test_copies_are_deep() -> None:
+    # Closures, variants, tuples and strings made inside a loop are copied out
+    # to the variable outside it, with everything they hold.
+    assert_same_as_interpreter("""\
+let f = () -> () -> str =>
+    let mut keep = () -> str => ""
+    let mut found = (Some(["none"]), 0..1)
+    for i in 0..3
+        let word = "w{{i}}"
+        let words = [word, word + word]
+        keep = () -> str => words[1]
+        found = (Some(words), i..i + 1)
+    print(found)
+    keep
+print(f()())
+""")

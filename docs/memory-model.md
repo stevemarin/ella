@@ -1,11 +1,19 @@
-# Ella memory model (design draft)
+# Ella memory model
 
-**Status:** design only. Nothing here is implemented yet. This is roadmap
-stage 6 in the [README](../README.md). It records decisions made while
-exploring the design, so an implementation can start from them without
-repeating the discussion. Items marked **(provisional)** are syntax or
-details that are expected to change. [Open questions](#11-open-questions)
-lists what is still undecided.
+**Status:** partly implemented. This is roadmap stage 6 in the
+[README](../README.md), which built steps 1 to 5 and 9 of the
+[plan](#9-implementation-plan): explicit copies, lists that change in place,
+`mut` parameters, scope arenas whose placement the compiler chooses and the
+IR interpreter checks, and real arenas in native code. Pools, slabs,
+sub-arenas, non-copyable types and finalization wait until after staging
+(stage 7), since they need generics and user-defined types.
+[What stage 6 built](#14-what-stage-6-built) describes the implementation,
+and where it settles or departs from this design.
+
+The rest of this document is the design, recorded so an implementation can
+start from it without repeating the discussion. Items marked
+**(provisional)** are syntax or details that are expected to change.
+[Open questions](#11-open-questions) lists what is still undecided.
 
 ## 1. Goals and priorities
 
@@ -55,8 +63,8 @@ that binding, passing, returning and capturing all copy.
   cannot observe the difference. (Ada does this: parameter modes state intent,
   and the compiler chooses the mechanism.)
 * **In-place mutation is always safe for a `mut` binding**, because nothing
-  else can alias its storage. This replaces the current IR rule that
-  `set_index` makes a new list (see §9, phase 2).
+  else can alias its storage. (Before stage 6, the IR's `set_index` made a
+  new list instead.)
 * Large values that would overflow the stack are placed in the scope arena
   automatically (see §5). The threshold is a compile-time constant, starting
   at 4 KiB **(provisional)**.
@@ -88,7 +96,7 @@ Parameter modes **(provisional syntax)**:
 | Mode | Meaning | Mechanism |
 |---|---|---|
 | (default) | read-only input | copy or hidden reference, chosen by the compiler |
-| `mut` | read and write the caller's variable (like Ada `in out`, Swift `inout`) | always a reference |
+| `mut` | read and write the caller's variable (like Ada `in out`, Swift `inout`) | a reference (defined as value-result; see §14) |
 | `out` | the callee must initialize it (maybe; see the open questions) | always a reference |
 
 ```ella
@@ -99,8 +107,7 @@ let mut nums = [1]
 push_twice(nums, 5)       # nums is now [1, 5, 5]
 ```
 
-Whether the call site also has to mark the argument (`push_twice(mut nums, 5)`)
-is an open question.
+The call site marks the argument too: `push_twice(mut nums, 5)`.
 
 ### Exclusivity
 
@@ -284,31 +291,35 @@ code only after the rules are settled and tested.
 
 1. **Make copies explicit in the IR.** Add a `copy` operation, and have the
    lowering insert it at every semantic copy point (binding, argument,
-   return, capture). The program's behavior does not change.
+   return, capture). The program's behavior does not change. *(Done in
+   stage 6.)*
 2. **In-place mutation.** Change `set_index` (and list append) to mutate in
    place. This is correct because step 1 made every copy explicit. Then add
    a pass that removes copies at last uses (copy → move). The test programs
    in [test/programs/](../test/programs/) must still give the same output.
+   *(Done in stage 6.)*
 3. **Parameter modes.** Add `mut` parameters to the grammar, checker,
    lowering and IR (a reference-typed parameter), with the static
-   exclusivity check.
+   exclusivity check. *(Done in stage 6, with `mut` results instead of
+   reference types; see §14.)*
 4. **Simulated arenas in the IR interpreter.** Model scope arenas as Python
    objects tagged with a depth. Have the interpreter implement the placement
    rules (§6), check them at run time (a reference or stored value must never
    point to a deeper depth than its location), and `trap` on violation.
    Report high-water marks per scope and per allocation site; this is the
-   first version of the arena profiler.
+   first version of the arena profiler. *(Done in stage 6.)*
 5. **Placement inference in the compiler.** Annotate IR allocations with
    their chosen depth or result region. The interpreter's run-time checks
-   from step 4 then verify the compiler's choices.
+   from step 4 then verify the compiler's choices. *(Done in stage 6.)*
 6. **Comptime and generics** (§8), including `needs_cleanup` and generated
-   copy functions.
+   copy functions. *(Stage 7.)*
 7. **Pools, handles and slabs**, simulated in the interpreter with
-   generation checks.
-8. **Non-copyable types and finalization lists** (§3, §7).
+   generation checks. *(After stage 7.)*
+8. **Non-copyable types and finalization lists** (§3, §7). *(After stage 7.)*
 9. **Native runtime** for x64: real virtual-range reservations with
    `mmap`/`madvise`, bump allocation, pools, slabs. Compare results against
-   the IR interpreter on the same test programs.
+   the IR interpreter on the same test programs. *(Done in stage 6 for scope
+   arenas; pools and slabs come with step 7.)*
 
 Each step should keep every test program producing the same output through
 both interpreters, as the README requires today.
@@ -327,17 +338,18 @@ Out of scope for now. The intended direction:
 
 ## 11. Open questions
 
-* Syntax for non-copyable types, parameter modes, and whether call sites mark
-  `mut` arguments.
+* Syntax for non-copyable types. (Parameter modes are `mut name: T`, and
+  call sites mark `mut` arguments: settled in stage 6.)
 * Whether `out` parameters are worth having, or whether returning tuples is
   enough.
 * A shared, non-owning handle type for pools, and what copying an owning
   handle means (forbidden, or a deep copy of the target?).
 * Whether types need an `adjust` hook after copies.
 * What exactly a "scope" is for placement: a function, any block, or a loop
-  iteration. Blocks and loop iterations are currently assumed.
-* How to report placement decisions: compiler warnings, an `--placement`
-  flag next to `--ir`, or both.
+  iteration. Stage 6 uses function bodies and loop iterations only (§14);
+  whether other blocks are worth their own arenas is still open.
+* How to report placement decisions. Stage 6 has an `--placement` flag next
+  to `--ir`, and no warnings; whether warnings are worth adding is open.
 * Whether stored, dependent references (Swift-style lifetime dependence) are
   ever needed, once real programs are written.
 * FFI: pinning memory that C holds a pointer to, and wrapping C libraries
@@ -372,3 +384,122 @@ Out of scope for now. The intended direction:
 * **Zig**: `comptime` generics, explicit allocators.
 * **Cyclone**: safe regions. Lesson: an annotation burden hurts adoption.
 * **Vale**: generational references.
+
+## 14. What stage 6 built
+
+Stage 6 implemented the core of this design. The code is in
+[src/ella/lower.py](../src/ella/lower.py) (copies and placement),
+[src/ella/ir_interpreter.py](../src/ella/ir_interpreter.py) (simulated
+arenas and checks), [src/ella/passes/moves.py](../src/ella/passes/moves.py)
+(copy → move), and [src/ella/runtime.c](../src/ella/runtime.c) with
+[src/ella/codegen.py](../src/ella/codegen.py) (native arenas). The IR
+module docstring ([src/ella/ir.py](../src/ella/ir.py)) specifies the new
+operations.
+
+### Scopes and regions
+
+* A **scope** is a function body (level 0) or a loop's iterations (one level
+  deeper per nested loop). Other blocks, such as `if` branches, share their
+  function's or loop's level. A loop frees its level after each iteration
+  and when it ends (`reset k` in the IR); returning frees all of a
+  function's levels.
+* Every instruction that makes an object names its **region**: a level
+  (`@0`, `@1`, ...), `@result` (the arena the caller chose for the result,
+  passed as a hidden argument), `@mut0`, ... (the arena of the variable
+  passed to a `mut` parameter, also passed by the caller), or `@global`.
+  String constants are static, and i64, f64, bool and () aren't objects.
+* There is **no stack allocation** of objects yet: every list, string, tuple,
+  range, enum value and closure lives in an arena. Numbers and bools are
+  never boxed.
+* Arenas are numbered by **depth**, not by call: each call takes the next
+  `levels` depths for its scope levels, so a function with a loop uses two.
+  Depth 0 is the global arena.
+
+### Placement
+
+The lowering chooses regions as it goes, rather than in a separate
+inference pass. Each expression is lowered with a *destination* region,
+where its value will end up: the variable's region for `let`, the result
+region for a returned value, the level outside a loop for a `break` value.
+New objects are made there directly, which is the doc's rule 2 (§6): a
+returned list is built in the caller's arena, and a string assigned to a
+variable outside a loop is built in that variable's level. A local
+variable that the function returns (as its last value or in a `return`)
+lives in the result region from the start, so `let mut out = []; for ...:
+out += [x]; out` builds `out` in the caller's arena with no copy.
+
+`--placement` prints each allocating instruction and its region, marking
+allocations inside a loop that go to an arena outside it (region bloat).
+
+### Copies and sharing
+
+Values are references to objects, and reading a variable doesn't copy. The
+lowering tracks, for each value, which variables it may share objects with
+(*borrows*) and a region all its objects outlive (*lives*), and inserts
+`copy v @r` (a deep copy into region r) when storing a value would either:
+
+* share a list that can change: the value has lists in it and borrows
+  from a variable that is changed in place somewhere (an item assignment,
+  `+=` on a list, or a `mut` argument), or it is stored into a `mut`
+  variable, which could change it; or
+* outlive its objects: it doesn't live as long as the place it is stored in.
+
+A returned value is copied only if it borrows from something other than
+the function's own local variables, which die anyway. A value read from a
+variable is also copied if a later part of the same expression changes
+that variable in place (`xs + [(xs[0] = 5)]`), so that a read always gives
+the value at the time of reading, as in the AST interpreter.
+
+`set_index` changes a list in place. `xs += ys` and `xs = xs + ys` become
+`append`, which adds copies of ys's items to xs in place: in native code
+the list grows where it is if it is the last object in its arena, and
+otherwise moves to a new home with room for twice as many items.
+
+The `moves` pass removes a copy whose original has no other use, in the
+same block, when the original is made entirely of new objects; the
+original is then made in the copy's region. General last-use analysis
+(liveness) is not done yet.
+
+### `mut` parameters
+
+`mut` parameters are defined as **value-result** (copy in, copy back), so
+that the AST interpreter can implement them simply, and implemented by
+reference wherever no program can tell the difference: the caller passes
+its variable's object, the function changes it in place, and returns it as
+an extra result (`return %r, mut %xs`) for the caller to store back. In
+native code the function writes it over its own argument on the stack. A
+global is the one case a function could tell apart, by reading the global
+directly, so a global is copied in. The exclusivity check (§4) works by
+name: a variable passed as `mut` can't appear in another argument of the
+same call unless that argument's type has no lists.
+
+### Checks and the profiler
+
+The IR interpreter tags each value with the depth and generation of the
+shortest-lived arena it may have objects in, and checks every use (the
+arena must not have been freed since) and every store into a variable,
+list, global or result (the value must live at least as long as the
+place). A failure is a compiler bug, reported as "memory check failed".
+`--profile` runs a program through the IR and prints the high-water mark
+of each scope level and the bytes made at each allocation site, estimated
+from native object sizes.
+
+### Native arenas
+
+Each depth's arena reserves 4 GiB of address space with `mmap` the first
+time it is used, and commits pages 1 MiB at a time as its top pointer
+grows. Freeing an arena resets the pointer and returns memory beyond
+16 MiB to the OS with `madvise`. Objects are aligned to 16 bytes. With
+`ELLA_POISON` set, freed memory is overwritten, so a dangling reference
+shows up as nonsense; the tests set it. With `ELLA_ARENA_STATS` set, a
+program reports its peak arena use when it finishes.
+
+### Known limitations
+
+* Strings and other values rebuilt in a loop and kept outside it pile up in
+  the outer arena until it is freed (§6, region bloat). Lists appended to
+  in place don't.
+* Copies are deep: copying a list of strings copies the strings too, even
+  when they would live long enough.
+* The exclusivity check, and the analysis of which variables change in
+  place, go by name, so shadowed names make them more cautious than needed.

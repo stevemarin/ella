@@ -20,9 +20,11 @@ test for `bool` before `int`. `type_name` does that, and the interpreter uses
 it for every type check.
 
 Ella has value semantics: binding, passing and returning all copy. Lists are
-mutable Python lists, so the interpreter calls `copy_value` whenever it reads a
-value out of a variable or a list. The copies cost memory and time, but they
-make the rules easy to see. Avoiding copies is a job for the optimizer later.
+mutable Python lists, so the AST interpreter calls `copy_value` whenever it
+reads a value out of a variable or a list. The copies cost memory and time,
+but they make the rules easy to see. The compiler copies only where a
+program could tell (see ella.lower), and the IR interpreter runs its `copy`
+instructions with `copy_value` too.
 """
 
 import json

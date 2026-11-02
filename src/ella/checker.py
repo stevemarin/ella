@@ -32,6 +32,7 @@ after it, as long as it is called after they are defined, so its body is only
 checked once every top-level name's type is known. See `check_program`.
 """
 
+import dataclasses
 from dataclasses import dataclass, field
 from itertools import count
 
@@ -63,6 +64,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    MutArg,
     Name,
     NamedType,
     NamePattern,
@@ -126,10 +128,11 @@ class TupleTy:
 
 @dataclass(frozen=True, slots=True)
 class FuncTy:
-    """`(T, U) -> R`"""
+    """`(T, U) -> R`. `mutable` holds the positions of `mut` parameters: `(mut [i64]) -> ()` has (0,)."""
 
     params: tuple[Type, ...]
     result: Type
+    mutable: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,8 +187,8 @@ def finish(t: Type) -> Type:
             return ListTy(finish(element))
         case TupleTy(items):
             return TupleTy(tuple(finish(item) for item in items))
-        case FuncTy(params, result):
-            return FuncTy(tuple(finish(param) for param in params), finish(result))
+        case FuncTy(params, result, mutable):
+            return FuncTy(tuple(finish(param) for param in params), finish(result), mutable)
         case EnumTy(name, args):
             return EnumTy(name, tuple(finish(arg) for arg in args))
         case other:
@@ -203,8 +206,9 @@ def show_type(t: Type) -> str:
             return f"({show_type(items[0])},)"
         case TupleTy(items):
             return "(" + ", ".join(map(show_type, items)) + ")"
-        case FuncTy(params, result):
-            return "(" + ", ".join(map(show_type, params)) + f") -> {show_type(result)}"
+        case FuncTy(params, result, mutable):
+            shown = (("mut " if i in mutable else "") + show_type(p) for i, p in enumerate(params))
+            return "(" + ", ".join(shown) + f") -> {show_type(result)}"
         case EnumTy(name, args) if args:
             return f"{name}[" + ", ".join(map(show_type, args)) + "]"
         case EnumTy(name):
@@ -224,8 +228,8 @@ def substitute(t: Type, params: dict[str, Type]) -> Type:
             return ListTy(substitute(element, params))
         case TupleTy(items):
             return TupleTy(tuple(substitute(item, params) for item in items))
-        case FuncTy(args, result):
-            return FuncTy(tuple(substitute(arg, params) for arg in args), substitute(result, params))
+        case FuncTy(args, result, mutable):
+            return FuncTy(tuple(substitute(arg, params) for arg in args), substitute(result, params), mutable)
         case EnumTy(name, args):
             return EnumTy(name, tuple(substitute(arg, params) for arg in args))
         case _:
@@ -373,8 +377,13 @@ class Checker:
                 return self.unify(x, y)
             case TupleTy(xs), TupleTy(ys):
                 return len(xs) == len(ys) and all(self.unify(x, y) for x, y in zip(xs, ys))
-            case FuncTy(xs, x), FuncTy(ys, y):
-                return len(xs) == len(ys) and all(self.unify(p, q) for p, q in zip(xs, ys)) and self.unify(x, y)
+            case FuncTy(xs, x, xm), FuncTy(ys, y, ym):
+                return (
+                    len(xs) == len(ys)
+                    and xm == ym
+                    and all(self.unify(p, q) for p, q in zip(xs, ys))
+                    and self.unify(x, y)
+                )
             case EnumTy(n, xs), EnumTy(m, ys):
                 return n == m and all(self.unify(x, y) for x, y in zip(xs, ys))
             case _:
@@ -473,8 +482,10 @@ class Checker:
                 return UNIT
             case TupleType(items):
                 return TupleTy(tuple(self.annotation(item, params) for item in items))
-            case FunctionType(args, result):
-                return FuncTy(tuple(self.annotation(arg, params) for arg in args), self.annotation(result, params))
+            case FunctionType(args, result, _, mutable):
+                return FuncTy(
+                    tuple(self.annotation(arg, params) for arg in args), self.annotation(result, params), mutable
+                )
 
     # Enums
 
@@ -652,6 +663,8 @@ class Checker:
                 raise EllaError(f"can't index a {show_type(container)}", span)
             case Member(span=span):
                 raise EllaError("member access ('.name') isn't supported yet", span)
+            case MutArg(span=span):
+                raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
             case Try(operand, span):
                 return self.check_try(self.check(operand, env), span)
 
@@ -807,19 +820,18 @@ class Checker:
                 return value
         raise EllaError(f"'?' needs a Result or Optional, not {show_type(t)}", span)
 
-    def check_place(self, target: Expr, env: Env) -> Type:
-        """The type of something being assigned to: a `mut` variable, or an element of one."""
+    def check_place(self, target: Expr, env: Env, verb: str = "assign to") -> Type:
+        """The type of something being assigned to (or passed as `mut`): a `mut` variable, or an element of one."""
         match target:
             case Name(name, span):
                 info = self.lookup(name, env, span)
                 self.kinds[id(target)] = info.kind
                 if info.kind not in ("local", "global") or not info.mutable:
-                    raise EllaError(
-                        f"can't assign to '{name}' because it isn't mutable; declare it with 'let mut'", span
-                    )
+                    action = f"pass '{name}' as 'mut'" if verb == "pass" else f"assign to '{name}'"
+                    raise EllaError(f"can't {action} because it isn't mutable; declare it with 'let mut'", span)
                 t = info.type
             case Index(container_expr, index, span):
-                container = self.known(self.check_place(container_expr, env), container_expr.span)
+                container = self.known(self.check_place(container_expr, env, verb), container_expr.span)
                 index_type = self.check(index, env)
                 if not self.unify(index_type, I64):
                     raise EllaError(f"an index must be an i64, not {show_type(index_type)}", index.span)
@@ -827,9 +839,9 @@ class Checker:
                     case ListTy(element):
                         t = element
                     case _:
-                        raise EllaError(f"can't assign to an element of a {show_type(container)}", span)
+                        raise EllaError(f"can't {verb} an element of a {show_type(container)}", span)
             case _:
-                raise EllaError("can only assign to a variable or an element of one", target.span)
+                raise EllaError(f"can only {verb} a variable or an element of one", target.span)
         self.types[id(target)] = t
         return t
 
@@ -845,7 +857,8 @@ class Checker:
             self.types[id(param)] = params[-1]
         if function.return_type is None:
             raise EllaError("a lambda needs a return type, like '(x: i64) -> i64 => ...'", function.span)
-        return FuncTy(tuple(params), self.annotation(function.return_type))
+        mutable = tuple(i for i, param in enumerate(function.params) if param.mutable)
+        return FuncTy(tuple(params), self.annotation(function.return_type), mutable)
 
     def check_lambda(self, function: Lambda, env: Env, self_names: list[str]) -> FuncTy:
         """A lambda's type. Its body is checked later, once all top-level names are known."""
@@ -881,7 +894,9 @@ class Checker:
 
         local = Env(pending.captured)
         for param, param_type in zip(function.params, t.params):
-            local.vars[param.name] = VarInfo(param_type, False, "local")
+            # A `mut` parameter is a variable the function may change; the
+            # caller's variable gets its final value (docs/grammar.md §5).
+            local.vars[param.name] = VarInfo(param_type, param.mutable, "local")
         for cond in function.where:
             if mentions_return(cond.expr):
                 result_env = Env(local)
@@ -920,9 +935,44 @@ class Checker:
         if not isinstance(function, FuncTy):
             raise EllaError(f"can't call a value of type {show_type(function)}", span)
         self.check_arity("function", len(function.params), args, span)
-        for i, (arg, param_type) in enumerate(zip(args, function.params), 1):
-            self.expect(self.check(arg, env), param_type, arg.span, f"argument {i}")
+        for i, (arg, param_type) in enumerate(zip(args, function.params)):
+            if i in function.mutable:
+                if not isinstance(arg, MutArg):
+                    raise EllaError(f"argument {i + 1} is for a 'mut' parameter, so mark it: 'mut ...'", arg.span)
+                arg_type = self.check_place(arg.target, env, "pass")
+                self.types[id(arg)] = arg_type
+                # The function changes the variable itself, so the types must match exactly.
+                self.expect(arg_type, param_type, arg.span, f"argument {i + 1}")
+            else:
+                if isinstance(arg, MutArg):
+                    raise EllaError(f"argument {i + 1} isn't for a 'mut' parameter, so it can't be 'mut'", arg.span)
+                self.expect(self.check(arg, env), param_type, arg.span, f"argument {i + 1}")
+        self.check_exclusive(callee, args)
         return function.result
+
+    def check_exclusive(self, callee: Expr, args: tuple[Expr, ...]) -> None:
+        """A variable passed as `mut` can't be used in any other argument of the same call.
+
+        The function changes its `mut` parameters in place, so another argument
+        that shared their storage would see the changes. Arguments without
+        lists are fine, because they can't share anything mutable (a str or an
+        i64 read from the variable is unaffected). This is checked by name, so
+        it rejects some safe calls, such as `swap(mut a[0], mut a[1])`; see
+        docs/memory-model.md §4.
+        """
+        roots = [(arg, place_root(arg.target)) for arg in args if isinstance(arg, MutArg)]
+        for arg, root in roots:
+            for other in (callee, *args):
+                if other is arg:
+                    continue
+                if isinstance(other, MutArg):
+                    if place_root(other.target) == root:
+                        raise EllaError(f"'{root}' can't be passed as 'mut' twice in one call", other.span)
+                elif root in names_used(other) and has_list(self.type_of(other), self.enums):
+                    raise EllaError(
+                        f"'{root}' is passed as 'mut', so it can't also be used in another argument of the same call",
+                        other.span,
+                    )
 
     def check_arity(self, name: str, arity: int, args: tuple[Expr, ...], span: Span) -> None:
         if len(args) != arity:
@@ -1009,3 +1059,49 @@ def literal_type(value: LiteralValue) -> Type:
             return F64
         case str():
             return STR
+
+
+def place_root(place: Expr) -> str:
+    """The variable at the root of an assignment target: `xs` in `xs[i][j]`."""
+    while isinstance(place, Index):
+        place = place.target
+    assert isinstance(place, Name), "the checker only accepts names and indexes as places"
+    return place.name
+
+
+def names_used(node: object) -> set[str]:
+    """Every name an expression reads, not looking inside nested lambdas."""
+    match node:
+        case Name(name):
+            return {name}
+        case Lambda():
+            return set()
+        case tuple():
+            return set().union(*(names_used(item) for item in node))
+        case _ if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            return set().union(*(names_used(getattr(node, f.name)) for f in dataclasses.fields(node)))
+    return set()
+
+
+def has_list(t: Type, enums: dict[str, EnumInfo] | None = None, seen: frozenset[str] = frozenset()) -> bool:
+    """Whether values of type `t` contain a list, the only thing Ella can change in place.
+
+    Values without lists can be shared freely: nothing can change them. A
+    function value counts as having no list: its captured values can never
+    change. `enums` gives the definitions of enum types (the built-in ones by
+    default), whose variants may hold lists.
+    """
+    enums = enums if enums is not None else BUILTIN_ENUMS
+    match resolve(t):
+        case ListTy():
+            return True
+        case TupleTy(items):
+            return any(has_list(item, enums, seen) for item in items)
+        case EnumTy(name, args) if name not in seen and name in enums:
+            enum = enums[name]
+            mapping = dict(zip(enum.params, args))
+            return any(
+                has_list(substitute(f, mapping), enums, seen | {name}) for fs in enum.variants.values() for f in fs
+            )
+        case _:
+            return False

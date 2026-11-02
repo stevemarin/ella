@@ -1,8 +1,8 @@
 """The intermediate representation (IR): a typed control-flow graph.
 
 The lowering (ella.lower) turns a checked syntax tree into this IR, and
-ella.ir_interpreter runs it. Later stages will optimize it and compile it to
-x64.
+ella.ir_interpreter runs it. The passes in ella.passes optimize it, and
+ella.codegen compiles it to x64.
 
 Structure
 ---------
@@ -44,13 +44,34 @@ optimization than in the lowering.
 Top-level variables are *globals*, read and written by name. Reading a
 global before it is set is a run-time error.
 
-Lists are values too: `set_index` gives a new list rather than changing one,
-which is exactly Ella's value semantics. Reading never needs a copy.
+Memory
+------
+
+Lists, strings, tuples, ranges, enum values and closures are *boxed*: a
+value is a reference to an object in memory. (i64, f64, bool and () are
+not.) Ella has value semantics, so no two variables may share an object
+that can change; the only objects that ever change are lists, through
+`set_index` and `append`. The lowering makes this safe with explicit `copy`
+instructions wherever a value gets a second owner (docs/memory-model.md §3).
+
+Every boxed object lives in an *arena*, and every instruction that makes
+one names the arena, its *region*, written after an `@`:
+
+    @0, @1, ...    the function's scope levels: 0 is the function body, and
+                   each loop nested in it adds a level for its iterations
+    @result        where the caller wants the function's result
+    @mut0, ...     where the variable passed to `mut` parameter 0 lives
+    @global        the program's global arena, which is never freed
+
+`reset k` frees levels k and up when control leaves a loop iteration, and
+returning frees all of the function's levels. A value must never be used
+after its arena is freed, and an object must never be stored where it would
+outlive its arena; the IR interpreter checks both at run time.
 
 Operations
 ----------
 
-    const c                      a literal: i64, f64, bool, str or ()
+    const c                      a literal: i64, f64, bool, str or () (strings are static)
     load slot, store slot, v     read or write a local variable
     global_get name, global_set name, v
     add sub mul div floordiv mod pow    arithmetic (`div` always gives f64;
@@ -63,7 +84,11 @@ Operations
     tuple a, b, ...              build a tuple; `tuple_get t, n` reads item n
     list a, b, ...               build a list
     index c, i                   item i of a list,string (a 1-char string) or range
-    set_index xs, i, v           a copy of list xs with item i replaced by v
+    set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
+    append xs, ys @r             xs with copies of ys's items added, growing xs in place
+                                 if it can; xs lives in region r and isn't used again
+    copy v @r                    a deep copy of v in region r
+    reset k                      free the function's scope levels k and up
     len c                        length of a list, string or range
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
@@ -71,13 +96,20 @@ Operations
     is_variant v, Name           does v hold that variant?
     variant_field v, Name.n      field n of v, which holds that variant
     closure f(a, ...)            a function value: IR function f with captured values
-    call f(a, ...)               call a function value
+    call f(a, mut b @r, ...)     call a function value; the result goes in the call's
+                                 region. A `mut` argument b, which lives in region r,
+                                 is passed in and its new value comes back as an extra
+                                 result: `%5: (), %6: [i64] = call %1(mut %2 @0) @0`.
     assert c, "message"          stop with the message if c is false
+
+A function with `mut` parameters returns their final values along with its
+result: `return %9, mut %7`.
 
 Operations that fail at run time (overflow, an index out of range, a failed
 assert, ...) carry the source span to report.
 """
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import assert_never
@@ -86,6 +118,7 @@ from ella.checker import (
     BOOL,
     F64,
     I64,
+    NEVER,
     RANGE,
     STR,
     UNIT,
@@ -119,11 +152,14 @@ class Value:
 
 @dataclass(slots=True)
 class Instr:
-    """One instruction. Which of `name`, `index` and `const` matter depends on `op`.
+    """One instruction. Which of the optional fields matter depends on `op`.
 
     * `name`: the slot, global, variant, function or assert message.
-    * `index`: the item of `tuple_get` or field of `variant_field`.
+    * `index`: the item of `tuple_get`, field of `variant_field`, or level of `reset`.
     * `const`: the literal of `const`.
+    * `region`: where an allocating instruction puts its result (see "Memory").
+    * `outs`, `out_regions`: a call's `mut` arguments: their new values, and
+      the regions they live in.
     """
 
     op: str
@@ -133,6 +169,9 @@ class Instr:
     name: str = ""
     index: int = 0
     const: Constant = ()
+    region: str = ""
+    outs: list[Value] = field(default_factory=list)
+    out_regions: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -150,7 +189,10 @@ class Branch:
 
 @dataclass(slots=True)
 class Return:
+    """Leave the function with `value`, and the final values of its `mut` parameters."""
+
     value: Value
+    outs: list[Value] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -167,10 +209,13 @@ type Terminator = Jump | Branch | Return | Trap
 
 @dataclass(eq=False, slots=True)
 class Block:
+    """A basic block. `level` is the scope level it runs at (until a `reset` in it), for reports."""
+
     name: str
     params: list[Value] = field(default_factory=list)
     instrs: list[Instr] = field(default_factory=list)
     terminator: Terminator | None = None
+    level: int = 0
 
 
 @dataclass(slots=True)
@@ -178,7 +223,9 @@ class Function:
     """A function. Its parameters are the entry block's parameters.
 
     The first `captures` parameters are the variables a closure captured;
-    the rest are the declared parameters.
+    the rest are the declared parameters. `mut_params` are the positions of
+    the `mut` ones among the declared parameters. `levels` is how many scope
+    levels the function has (see "Memory").
     """
 
     name: str
@@ -186,7 +233,10 @@ class Function:
     span: Span
     blocks: list[Block] = field(default_factory=list)
     locals: dict[str, Type] = field(default_factory=dict)  # slot name -> type
+    local_regions: dict[str, str] = field(default_factory=dict)  # slot name -> where its value lives
     captures: int = 0
+    mut_params: tuple[int, ...] = ()
+    levels: int = 1
 
     @property
     def params(self) -> list[Value]:
@@ -201,6 +251,82 @@ class Module:
     globals: dict[str, Type] = field(default_factory=dict)
     enums: dict[str, EnumInfo] = field(default_factory=dict)
     entry: str = "top"
+
+
+# Memory
+
+# Operations that make a new object, and so name a region (when their result is boxed).
+ALLOCATING = frozenset(
+    {"tuple", "list", "variant", "closure", "range", "range_incl", "add", "index", "to_text", "copy", "call", "append"}
+)
+
+
+def allocates(instr: Instr) -> bool:
+    """Whether an instruction makes a new object, and so names the region to put it in.
+
+    Indexing a list gives an item that is already in the list; indexing a
+    string makes a new one-character string.
+    """
+    if instr.op not in ALLOCATING or instr.dest is None or not is_boxed(instr.dest.type):
+        return False
+    return instr.op != "index" or instr.args[0].type == STR
+
+
+def is_boxed(t: Type) -> bool:
+    """Whether values of type `t` are references to objects in an arena."""
+    return t not in (I64, F64, BOOL, UNIT, NEVER)
+
+
+def region_level(region: str) -> int | None:
+    """The scope level a region names (`"2"` is level 2), or None for result, global and mut regions."""
+    return int(region) if region.isdigit() else None
+
+
+def outlives(a: str, b: str) -> bool:
+    """Whether region `a` is certain to last at least as long as region `b`.
+
+    The global region outlives everything. The result and `mut` regions
+    belong to the caller, so they outlive every level of the function, but
+    nothing says which of them outlives the others. Level k outlives the
+    deeper levels k+1, k+2, ...
+    """
+    if a == b or a == "global":
+        return True
+    level_a, level_b = region_level(a), region_level(b)
+    if level_b is None:
+        return False
+    return level_a is None or level_a <= level_b
+
+
+def shortest(a: str, b: str) -> str:
+    """A region that both `a` and `b` outlive: where something holding parts from both must count as living."""
+    if outlives(a, b):
+        return b
+    if outlives(b, a):
+        return a
+    return "0"  # two of the caller's regions: both outlive the function's own level 0
+
+
+def trim_levels(function: Function) -> bool:
+    """Drop scope levels nothing allocates in, and the `reset`s that free them. Returns whether anything changed.
+
+    Freeing an empty arena does nothing, so a loop that makes no objects
+    needs no level of its own.
+    """
+    used = 0
+    for block in function.blocks:
+        for instr in block.instrs:
+            level = region_level(instr.region) if instr.op != "set_index" else None
+            if level is not None:
+                used = max(used, level + 1)
+    used = max(used, 1)
+    changed = used < function.levels
+    for block in function.blocks:
+        kept = [i for i in block.instrs if not (i.op == "reset" and i.index >= used)]
+        changed |= len(kept) != len(block.instrs)
+        block.instrs = kept
+    function.levels = used
+    return changed
 
 
 def successors(block: Block) -> list[Block]:
@@ -241,8 +367,13 @@ def reachable(function: Function) -> list[Block]:
 def next_value_id(function: Function) -> int:
     """A value id not used yet in the function."""
     ids = [v.id for block in function.blocks for v in block.params]
-    ids += [i.dest.id for block in function.blocks for i in block.instrs if i.dest is not None]
+    ids += [v.id for block in function.blocks for i in block.instrs for v in defined_by(i)]
     return max(ids, default=0) + 1
+
+
+def defined_by(instr: Instr) -> list[Value]:
+    """The values an instruction defines: its result, and a call's new values of `mut` arguments."""
+    return ([instr.dest] if instr.dest is not None else []) + instr.outs
 
 
 def replace_values(function: Function, replacements: dict[int, Value]) -> None:
@@ -263,6 +394,7 @@ def replace_values(function: Function, replacements: dict[int, Value]) -> None:
                 branch.cond = resolve(branch.cond)
             case Return() as ret:
                 ret.value = resolve(ret.value)
+                ret.outs = [resolve(out) for out in ret.outs]
             case Trap(value=value) as trap if value is not None:
                 trap.value = resolve(value)
 
@@ -276,11 +408,30 @@ def used_values(function: Function) -> set[int]:
                 used.update(arg.id for arg in args)
             case Branch(cond):
                 used.add(cond.id)
-            case Return(value):
+            case Return(value, outs):
                 used.add(value.id)
+                used.update(out.id for out in outs)
             case Trap(value=value) if value is not None:
                 used.add(value.id)
     return used
+
+
+def count_uses(function: Function) -> Counter[int]:
+    """How many times each value is used, by instructions and terminators."""
+    uses: Counter[int] = Counter()
+    for block in function.blocks:
+        for instr in block.instrs:
+            uses.update(arg.id for arg in instr.args)
+        match block.terminator:
+            case Jump(_, args):
+                uses.update(arg.id for arg in args)
+            case Branch(cond):
+                uses[cond.id] += 1
+            case Return(value, outs):
+                uses.update([value.id, *(out.id for out in outs)])
+            case Trap(value=value) if value is not None:
+                uses[value.id] += 1
+    return uses
 
 
 def remove_param(function: Function, block: Block, index: int) -> None:
@@ -299,10 +450,16 @@ def format_module(module: Module) -> str:
 
 
 def format_function(function: Function) -> str:
-    params = ", ".join(f"{p}: {show_type(p.type)}" for p in function.params)
-    lines = [f"function {function.name}({params}) -> {show_type(function.result)}"]
+    def param(i: int, p: Value) -> str:
+        is_mut = i - function.captures in function.mut_params and i >= function.captures
+        return f"{'mut ' if is_mut else ''}{p}: {show_type(p.type)}"
+
+    params = ", ".join(param(i, p) for i, p in enumerate(function.params))
+    levels = f"  # levels: {function.levels}" if function.levels > 1 else ""
+    lines = [f"function {function.name}({params}) -> {show_type(function.result)}{levels}"]
     for slot, t in function.locals.items():
-        lines.append(f"    local {slot}: {show_type(t)}")
+        region = function.local_regions.get(slot, "") if is_boxed(t) else ""
+        lines.append(f"    local {slot}: {show_type(t)}" + (f" @{region}" if region else ""))
     for block in function.blocks:
         block_params = ", ".join(f"{p}: {show_type(p.type)}" for p in block.params)
         lines.append(f"  {block.name}({block_params}):" if block.params else f"  {block.name}:")
@@ -332,15 +489,23 @@ def format_instr(instr: Instr) -> str:
             operands = f"{instr.name}({args})"
         case "call":
             callee, *rest = instr.args
-            operands = f"{callee}(" + ", ".join(map(str, rest)) + ")"
+            mutable = callee.type.mutable if isinstance(callee.type, FuncTy) else ()
+            regions = iter(instr.out_regions)
+            shown = [f"mut {arg} @{next(regions, '?')}" if i in mutable else str(arg) for i, arg in enumerate(rest)]
+            operands = f"{callee}(" + ", ".join(shown) + ")"
         case "assert":
             operands = f"{args}, {show_literal(instr.name)}"
+        case "reset":
+            operands = str(instr.index)
         case _:
             operands = args
     text = f"{instr.op} {operands}".rstrip()
+    if instr.region:
+        text += f" @{instr.region}"
     if instr.dest is None:
         return text
-    return f"{instr.dest}: {show_type(instr.dest.type)} = {text}"
+    results = ", ".join(f"{v}: {show_type(v.type)}" for v in [instr.dest, *instr.outs])
+    return f"{results} = {text}"
 
 
 def format_terminator(terminator: Terminator | None) -> str:
@@ -349,14 +514,44 @@ def format_terminator(terminator: Terminator | None) -> str:
             return f"jump {target.name}(" + ", ".join(map(str, args)) + ")" if args else f"jump {target.name}"
         case Branch(cond, then, else_):
             return f"branch {cond}, {then.name}, {else_.name}"
-        case Return(value):
-            return f"return {value}"
+        case Return(value, outs):
+            return f"return {value}" + "".join(f", mut {out}" for out in outs)
         case Trap(message, value):
             return f"trap {show_literal(message)}" + (f", {value}" if value is not None else "")
         case None:
             return "<missing terminator>"
         case _:
             assert_never(terminator)
+
+
+def format_placement(module: Module) -> str:
+    """Where each allocating instruction puts its object, for `ella --placement`.
+
+    An allocation inside a loop that goes to an arena outside the loop is
+    marked: it isn't freed when the iteration ends, so a long loop can pile
+    up objects there ("region bloat", docs/memory-model.md §6). Growing a
+    list with `append` is the usual exception, as it reuses its space.
+    """
+    lines = []
+    for function in module.functions.values():
+        sites = []
+        for block in function.blocks:
+            level = block.level
+            for instr in block.instrs:
+                if instr.op == "reset":
+                    level = instr.index - 1
+                if not allocates(instr):
+                    continue
+                assert instr.dest is not None
+                site = f"{instr.span.line}:{instr.span.column}"
+                region = f"@{instr.region}"
+                text = f"  {site:<8} {instr.op:<9} {region:<8} {show_type(instr.dest.type)}"
+                if level > 0 and region_level(instr.region) != level:
+                    text += f"  <- in a loop (level {level}), but outlives the iteration"
+                sites.append(text)
+        if sites:
+            lines += [f"function {function.name}", *sites, ""]
+    return "\n".join(lines)
 
 
 # Verifying
@@ -396,7 +591,7 @@ class Verifier:
         # Each value is defined exactly once: as a block parameter or by an instruction.
         defined_in: dict[int, Block] = {}
         for block in blocks:
-            for value in [*block.params, *(i.dest for i in block.instrs if i.dest is not None)]:
+            for value in [*block.params, *(v for i in block.instrs for v in defined_by(i))]:
                 if value.id in defined_in:
                     raise self.fail(f"{value} is defined twice", block)
                 defined_in[value.id] = block
@@ -422,8 +617,7 @@ class Verifier:
                 for arg in instr.args:
                     check_use(arg)
                 self.check_instr(instr, block)
-                if instr.dest is not None:
-                    seen.add(instr.dest.id)
+                seen.update(v.id for v in defined_by(instr))
             self.check_terminator(block, check_use)
 
     def dominators(self) -> dict[Block, set[Block]]:
@@ -469,9 +663,14 @@ class Verifier:
                 self.require(cond.type == BOOL, "branch condition isn't a bool", block)
                 if then.params or else_.params:
                     raise self.fail("branch targets can't take parameters", block)
-            case Return(value):
+            case Return(value, outs):
                 check_use(value)
                 self.require(value.type == self.function.result, "returns a value of the wrong type", block)
+                for out in outs:
+                    check_use(out)
+                declared = self.function.params[self.function.captures :]
+                expected = [declared[i].type for i in self.function.mut_params]
+                self.require([out.type for out in outs] == expected, "returns the wrong mut parameters", block)
             case Trap(_, value):
                 if value is not None:
                     check_use(value)
@@ -484,8 +683,10 @@ class Verifier:
         """Check that an instruction's operands and result have the types its operation needs."""
         args = [a.type for a in instr.args]
         dest = instr.dest.type if instr.dest is not None else None
-        effects = ("store", "global_set", "print", "assert")
+        effects = ("store", "global_set", "print", "assert", "set_index", "reset")
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
+        self.require(not instr.outs or instr.op == "call", f"{instr.op} can't have extra results", block)
+        self.check_region(instr, block)
 
         def need(condition: bool) -> None:
             self.require(condition, f"bad operand or result types for {format_instr(instr)}", block)
@@ -538,7 +739,11 @@ class Verifier:
                 need(len(args) == 2 and args[1] == I64 and dest == item_type(args[0]))
             case "set_index":
                 need(len(args) == 3 and isinstance(args[0], ListTy) and args[1:] == [I64, args[0].element])
-                need(dest == args[0])
+            case "append" | "copy":
+                need(len(args) == (2 if instr.op == "append" else 1) and dest == args[0])
+                need(instr.op == "copy" or (isinstance(dest, ListTy) and args[1] == dest))
+            case "reset":
+                need(not args and 1 <= instr.index < self.function.levels)
             case "len":
                 need(len(args) == 1 and item_type(args[0]) is not None and dest == I64)
             case "to_text":
@@ -563,15 +768,37 @@ class Verifier:
                 need(len(args) == function.captures)
                 captured = [p.type for p in function.params[: len(args)]]
                 rest = tuple(p.type for p in function.params[len(args) :])
-                need(captured == args and dest == FuncTy(rest, function.result))
+                need(captured == args and dest == FuncTy(rest, function.result, function.mut_params))
             case "call":
                 need(len(args) >= 1 and isinstance(args[0], FuncTy))
                 if isinstance(args[0], FuncTy):
                     need(tuple(args[1:]) == args[0].params and dest == args[0].result)
+                    mut_types = [args[0].params[i] for i in args[0].mutable]
+                    need([out.type for out in instr.outs] == mut_types)
+                    need(len(instr.out_regions) == len(mut_types))
+                    for region in instr.out_regions:
+                        self.require(self.valid_region(region), f"unknown region @{region}", block)
             case "assert":
                 need(args == [BOOL])
             case _:
                 raise self.fail(f"unknown operation {instr.op}", block)
+
+    def valid_region(self, region: str) -> bool:
+        level = region_level(region)
+        if level is not None:
+            return level < self.function.levels
+        if region.startswith("mut"):
+            return region[3:].isdigit() and int(region[3:]) in self.function.mut_params
+        return region in ("result", "global")
+
+    def check_region(self, instr: Instr, block: Block) -> None:
+        """Allocating instructions with a boxed result, and `set_index`, name a valid region; others none."""
+        if instr.op == "set_index" or allocates(instr):
+            self.require(
+                self.valid_region(instr.region), f"{instr.op} needs a valid region, not @{instr.region}", block
+            )
+        else:
+            self.require(not instr.region, f"{instr.op} can't have a region", block)
 
     def field_types(self, enum_type: EnumTy, variant: str, block: Block) -> tuple[Type, ...]:
         enum = self.module.enums.get(enum_type.name)

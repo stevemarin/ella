@@ -1,0 +1,176 @@
+# Value semantics with lists that change in place, and objects that live in
+# arenas of different lifetimes (docs/memory-model.md).
+
+# Copies are independent, however deep.
+let mut a = [[1, 2], [3]]
+let b = a
+let mut c = a[0]
+a[0][0] = 10
+c[1] = 20
+a += [[4]]
+print(a)
+print(b)
+print(c)
+
+# Appending in place, to itself, and with the old value read first.
+let mut xs = [1]
+xs += xs
+xs = xs + [3]
+xs += [4, 5]
+print(xs)
+let mut words = ["a"]
+for i in 0..3
+    words += ["w{{i}}"]
+print(words)
+
+# A read value keeps the value it had when it was read.
+let mut ys = [1, 2]
+print(ys + [(ys[0] = 9)])
+print(ys)
+let mut grid = [[0, 0], [0, 0]]
+print([grid[0], [(grid[0][0] = 7)]])
+print(grid)
+
+# Values built in a loop, kept after it.
+let squares = (n: i64) -> [i64] =>
+    let mut out = []
+    for i in 0..n
+        let square = i * i
+        out += [square]
+    out
+print(squares(6))
+
+let joined = (parts: [str]) -> str =>
+    let mut text = ""
+    for part in parts
+        let piece = "<{{part}}>"
+        text = text + piece
+    text
+print(joined(["x", "y", "z"]))
+
+let longest = (lines: [str]) -> str =>
+    let mut best = ""
+    for line in lines
+        let shouted = line + "!"
+        if len(shouted) > len(best) then best = shouted
+    best
+print(longest(["hi", "hello", "hey"]))
+
+let first_pair = (limit: i64) -> (i64, [str]) =>
+    let mut i = 0
+    loop
+        i += 1
+        let names = ["n{{i}}", "m{{i}}"]
+        if i * i > limit then break (i, names)
+print(first_pair(10))
+
+let found = (rows: [[i64]]) -> [i64] =>
+    let mut result = []
+    outer: for row in rows
+        for x in row
+            if x < 0 then
+                result = row + [x]
+                break outer
+    result
+print(found([[1, 2], [3, -4, 5], [-6]]))
+
+# Changing a list while looping over it doesn't change the loop.
+let mut items = [1, 2, 3]
+for item in items
+    items[0] = items[0] + item
+    items += [item]
+print(items)
+
+# Changing the matched value in a case.
+let mut box = [Some([1]), None]
+match box[0]
+    case Some(inner)
+        box[0] = Some([2])
+        print(inner)
+    case None => print("none")
+print(box)
+
+# mut parameters change the caller's variable.
+let push = (mut list: [i64], x: i64) -> () =>
+    list += [x]
+
+let push_many = (mut list: [i64], n: i64) -> i64 =>
+    for i in 0..n
+        push(mut list, i)
+    len(list)
+
+let mut nums = [100]
+print(push_many(mut nums, 3))
+print(nums)
+
+let mut table = [[1], [2]]
+push(mut table[1], 5)
+print(table)
+
+let rename = (mut name: str, suffix: str) -> () =>
+    name = name + suffix
+
+let mut label = "x"
+rename(mut label, "-1")
+rename(mut label, "-2")
+print(label)
+
+let fill = (mut grid: [[str]], text: str) -> () =>
+    for i in 0..len(grid)
+        for j in 0..len(grid[i])
+            grid[i][j] = "{{text}}{{i}}{{j}}"
+
+let make_grid = () -> [[str]] =>
+    let mut g = [["", ""], [""]]
+    fill(mut g, "g")
+    g
+print(make_grid())
+
+# A global passed as mut gets the final value; the function sees the old one.
+let mut counter = [0]
+let bump = (mut c: [i64]) -> () =>
+    c[0] = c[0] + 1
+    print(counter)
+bump(mut counter)
+print(counter)
+
+# A function that changes a global sees its own argument unchanged.
+let mut shared = [1, 2]
+let reset_shared = (old: [i64]) -> [i64] =>
+    shared[0] = 0
+    old
+print(reset_shared(shared))
+print(shared)
+
+# Closures keep copies.
+let mut seen = [1]
+let get_seen = () -> [i64] => seen
+let keep = (xs: [i64]) -> () -> [i64] => () -> [i64] => xs
+seen += [2]
+let kept = keep(seen)
+seen[0] = 99
+print(get_seen())
+print(kept())
+print(seen)
+
+# Returning parameters and parts of them.
+let tail = (xs: [[i64]]) -> [i64] => xs[len(xs) - 1]
+let mut nested = [[1], [2, 3]]
+let mut last = tail(nested)
+last[0] = 0
+print(nested)
+print(last)
+
+# Error values pass through `?` with lists in them.
+let parse = (s: str) -> Result[[str], [str]] =>
+    if s == "" then Error(["empty"]) else Ok([s, s])
+let twice = (s: str) -> Result[[str], [str]] =>
+    let parts = parse(s)?
+    Ok(parts + parts)
+print(twice("ab"))
+print(twice(""))
+
+# Recursion that builds lists in its callers' arenas.
+let build = (n: i64) -> [str] =>
+    if n == 0 then [] else build(n - 1) + ["{{n}}"]
+print(build(5))
