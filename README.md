@@ -216,8 +216,13 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   body a step at a time as `next(mut g)` or a `for` loop asks for items,
   and types with a `next` method are iterators. The `iters` module has
   lazy `map`, `filter`, `take`, `zip`, ... on generators. A generator's
-  frame and arenas live in its `Gen` (docs/memory-model.md §17). See
-  [TODO.md](TODO.md) for what could come next.
+  frame and arenas live in its `Gen` (docs/memory-model.md §17).
+* The standard library grows: a `sets` module (`Set[T]`, `new_set`,
+  `set_of`, with `union`, `intersection`, ...), `fold`, `flatten`,
+  `flat_map` and `position` on lists, the constants `tau`, `e`, `inf` and
+  `nan`, and the library functions `tan`, `asin`, `acos`, `atan`, `atan2`,
+  `log10` and `log2`. `hash` works on any value with `==`, and `Map` and
+  `Set` use it with `==` rather than comparing text forms. See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

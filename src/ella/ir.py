@@ -977,7 +977,7 @@ class Verifier:
                 )
             case "builtin":
                 library: Type | None = LIBRARY.get(instr.name)
-                if library is not None and instr.name in GENERIC_LIBRARY and args and args[0] in (I64, F64):
+                if library is not None and instr.name in GENERIC_LIBRARY and args:
                     library = substitute(library, {"T": args[0]})
                 need(library is not None and dest is not None and FuncTy(tuple(args), dest) == library)
             case "set_index":

@@ -14,12 +14,15 @@ import math
 import os
 import re
 import string
+import struct
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import BinaryIO, TextIO
 
 from ella.lexer import EllaError, Span
-from ella.values import Value, VariantValue, fits_i64, make_error, to_text
+from ella.syntax import bare_name
+from ella.values import HandleValue, RefValue, Value, VariantValue, fits_i64, make_error, to_text
 
 MAX_CODE_POINT = 0x10FFFF
 SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and can't be written in UTF-8
@@ -28,6 +31,15 @@ SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and ca
 I64_TEXT = re.compile(r"[+-]?[0-9]+")
 F64_TEXT = re.compile(r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf|nan)")
 WHITESPACE = " \t\n\r\v\f"  # what `trim` removes
+# Library functions that are the C library's (through Python's math module), but for their errors.
+F64_FUNCTIONS: dict[str, Callable[[float], float]] = {
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "log10": math.log10,
+    "log2": math.log2,
+}
 MAX_DIGITS = 100  # how many decimals format_f64 can write
 
 
@@ -151,6 +163,17 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             if math.isinf(x):
                 return math.nan
             return math.sin(x) if name == "sin" else math.cos(x)
+        case "tan" | "asin" | "acos" | "atan", [float() as x]:
+            try:
+                return F64_FUNCTIONS[name](x)
+            except ValueError:  # outside its domain (tan(inf), asin(2.0)): NaN, as in C
+                return math.nan
+        case "atan2", [float() as y, float() as x]:
+            return math.atan2(y, x)
+        case "log10" | "log2", [float() as x]:
+            if x == 0:
+                return -math.inf
+            return F64_FUNCTIONS[name](x) if x > 0 else math.nan  # NaN stays NaN, and inf inf
         case "upper", [str() as text]:
             return text.translate(UPPER)
         case "lower", [str() as text]:
@@ -181,8 +204,8 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             if not 0 <= status <= 255:
                 raise EllaError(f"exit() needs a status from 0 to 255, not {status}", span)
             raise Exit(status, span)
-        case "hash", [str() as text]:
-            return hash_str(text)
+        case "hash", [value]:
+            return hash_value(value)
         case "abs", [int() as n]:
             if not fits_i64(abs(n)):
                 raise EllaError(f"i64 overflow: abs({n}) doesn't fit in 64 bits", span)
@@ -196,16 +219,51 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
     raise AssertionError(f"no library function {name} for {args}")
 
 
-# hash() is FNV-1a over a string's code points, as a signed i64.
+# hash() is 64-bit FNV-1a, as a signed i64: over a string's code points, and
+# over the hashes of the parts of other values, so that equal values (by `==`)
+# hash the same. The runtime's ella_lib_hash must match it exactly.
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
+CANONICAL_NAN = 0x7FF8000000000000
 
 
-def hash_str(text: str) -> int:
-    h = FNV_OFFSET
-    for c in text:
-        h = ((h ^ ord(c)) * FNV_PRIME) % 2**64
+def hash_value(value: Value) -> int:
+    h = hash_bits(value)
     return h - 2**64 if h >= 2**63 else h
+
+
+def hash_bits(value: Value) -> int:
+    match value:
+        case str():
+            return fnv(FNV_OFFSET, (ord(c) for c in value))
+        case bool() | int():
+            return fnv(FNV_OFFSET, [value % 2**64])
+        case float():
+            # 0.0 and -0.0 are equal, so they hash the same; NaNs are never equal, but hash alike.
+            bits = CANONICAL_NAN if math.isnan(value) else struct.unpack("<Q", struct.pack("<d", value + 0.0))[0]
+            return fnv(FNV_OFFSET, [bits])
+        case tuple() | list():  # () too
+            return fnv(FNV_OFFSET, (hash_bits(item) for item in value))
+        case range():
+            # Ranges are equal when they hold the same numbers.
+            size = max(0, value.stop - value.start) % 2**64
+            return fnv(FNV_OFFSET, [size, value.start % 2**64] if size else [size])
+        case VariantValue(variant=variant, fields=fields, error=error):
+            # Its variant's name, without its module or type arguments; an Error without where it was made.
+            name = bare_name(variant).partition("[")[0]
+            h = fnv(FNV_OFFSET, name.encode())
+            return fnv(h, (hash_bits(field) for field in (fields[:2] if error else fields)))
+        case HandleValue(slot, generation):
+            return fnv(FNV_OFFSET, [slot | generation << 32])
+        case RefValue(index=index):
+            return fnv(FNV_OFFSET, [index])
+    raise AssertionError(f"hash() of {value!r}")
+
+
+def fnv(h: int, words: Iterable[int]) -> int:
+    for word in words:
+        h = ((h ^ word) * FNV_PRIME) % 2**64
+    return h
 
 
 # upper and lower change ASCII letters only, as the runtime does.

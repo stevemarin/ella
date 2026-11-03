@@ -1,3 +1,7 @@
 # Mathematical constants. Part of the prelude: every module sees these names.
 
 let pi = 3.141592653589793
+let tau = 6.283185307179586
+let e = 2.718281828459045
+let inf = 1.0 / 0.0
+let nan = 0.0 / 0.0

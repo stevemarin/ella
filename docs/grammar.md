@@ -1355,7 +1355,7 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 | `upper(s)`, `lower(s)` | `(str) -> str` | `s` with its ASCII letters in upper (or lower) case; other characters stay as they are |
 | `starts_with(s, part)`, `ends_with(s, part)` | `(str, str) -> bool` | whether `s` starts (or ends) with `part` |
 | `pad_left(s, width, fill)`, `pad_right(s, width, fill)` | `(str, i64, str) -> str` | `s` with copies of `fill`, which must be one character, before (or after) it to make it `width` characters long; `s` itself if it is that long already |
-| `hash(s)` | `(str) -> i64` | a number made from the characters of `s` (64-bit FNV-1a over its code points), the same in every run and backend |
+| `hash(x)` | `[T: Eq] (T) -> i64` | a number made from `x`, the same in every run and backend, and the same for values that are `==` (below) |
 | `format_f64(x, digits)` | `(f64, i64) -> str` | `x` with `digits` decimals (from 0 to 100), rounded: `format_f64(2.5, 2)` is `"2.50"`; `nan`, `inf` and `-inf` as `print` writes them |
 | `env(name)` | `(str) -> Optional[str]` | the environment variable `name`; `None` if there is none |
 | `write_file(path, text)` | `(str, str) -> Result[(), Error]` | writes `text` to the file in UTF-8, replacing what it held, or gives why it can't |
@@ -1365,11 +1365,20 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 | `ceil(x)` | `(f64) -> f64` | the smallest whole number not below `x` |
 | `round(x)` | `(f64) -> f64` | the nearest whole number; halfway cases go away from zero (`round(-2.5)` is `-3.0`) |
 | `exp(x)`, `ln(x)` | `(f64) -> f64` | e to the power `x`, and the natural logarithm of `x` (`-inf` for 0, NaN below it) |
-| `sin(x)`, `cos(x)` | `(f64) -> f64` | the sine and cosine of `x` radians |
+| `sin(x)`, `cos(x)`, `tan(x)` | `(f64) -> f64` | the sine, cosine and tangent of `x` radians; NaN for an infinite `x` |
+| `asin(x)`, `acos(x)`, `atan(x)` | `(f64) -> f64` | the angle in radians whose sine, cosine or tangent is `x`; NaN for `asin` and `acos` outside -1 to 1 |
+| `atan2(y, x)` | `(f64, f64) -> f64` | the angle in radians, from -π to π, of the point (`x`, `y`) |
+| `log10(x)`, `log2(x)` | `(f64) -> f64` | the logarithm of `x` in base 10 or 2 (`-inf` for 0, NaN below it) |
 | `abs(x)` | `[T: Num] (T) -> T` | `x` without its sign; an `i64` error for the smallest `i64` |
 | `min(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b < a`, otherwise `a` |
 | `max(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b > a`, otherwise `a` |
 
+* `hash` is 64-bit FNV-1a: over the code points of a string, and over
+  the hashes of the parts of other values (the items of a list or tuple;
+  a variant's name, then its fields). Numbers, `bool`s and handles are
+  one part each; `0.0` and `-0.0` hash the same, as do all NaNs; a range
+  is its length and, unless empty, its start; a ref is its index; and an
+  `Error` leaves out where it was made, as `==` does.
 * Numbers are written in ASCII only, with no `_` and no spaces around them:
   `parse_i64(trim(line))` reads a number on a line of its own.
 * Text read from outside the program must be UTF-8: `read_line` stops with
@@ -1450,8 +1459,9 @@ haven't been checked.
 A few library functions, and a type, are written in Ella itself, in the
 modules of the *standard library* (src/ella/lib/): functions that take
 other functions, or work on lists of any type. Its modules are `lists`
-(every function below but `new_map`), `maps` (`Map` and `new_map`),
-`math` (`pi`) and `iters` (below). Their public names, but those of
+(the functions in the table down to `range`), `maps` (`Map` and `new_map`),
+`sets` (`Set`, `new_set` and `set_of`), `math` (the constants) and `iters`
+(below). Their public names, but those of
 `iters`, are the *prelude*: every module sees
 them without importing them, unless it defines or imports the same name
 itself. They can also be imported like any module
@@ -1466,12 +1476,19 @@ itself. They can also be imported like any module
 | `map(xs, f)` | `[T, U] ([T], (T) -> U) -> [U]` | `f` of each item of `xs`, called in order |
 | `filter(xs, keep)` | `[T] ([T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
 | `sum(xs, start)` | `[T: Add] ([T], T) -> T` | `start + xs[0] + xs[1] + ...`: `sum(xs, 0)`, `sum(prices, 0.0)`, `sum(words, "")` |
+| `fold(xs, start, f)` | `[T, A] ([T], A, (A, T) -> A) -> A` | `f(... f(f(start, xs[0]), xs[1]) ..., xs[n - 1])`, or `start` for no items |
+| `flatten(xss)` | `[T] ([[T]]) -> [T]` | the items of each list in `xss`, one list after another |
+| `flat_map(xs, f)` | `[T, U] ([T], (T) -> [U]) -> [U]` | the items of `f`'s list for each item of `xs`, called in order |
+| `position(xs, test)` | `[T] ([T], (T) -> bool) -> Optional[i64]` | where the first item for which `test` is true is; `test` is called in order, until it is |
 | `any(xs, test)`, `all(xs, test)` | `[T] ([T], (T) -> bool) -> bool` | whether `test` is true for some (or every) item; it is called in order, until the answer is known |
 | `zip(xs, ys)` | `[T, U] ([T], [U]) -> [(T, U)]` | pairs of the items at each position, as many as the shorter list has |
 | `enumerate(xs)` | `[T] ([T]) -> [(i64, T)]` | each item with its position: `[(0, xs[0]), (1, xs[1]), ...]` |
 | `range(start, stop, step)` | `(i64, i64, i64) -> [i64]` | `start`, `start + step`, ... while before `stop` (below it, or above it if `step` is negative); `step` can't be 0 |
 | `new_map()` | `[K: Eq, V] () -> Map[K, V]` | an empty `Map` (below) |
-| `pi` | `f64` | 3.141592653589793 |
+| `new_set()` | `[T: Eq] () -> Set[T]` | an empty `Set` (below) |
+| `set_of(xs)` | `[T: Eq] ([T]) -> Set[T]` | a `Set` of the items of `xs`, in the order they first appear |
+| `pi`, `tau`, `e` | `f64` | 3.141592653589793, 6.283185307179586 (2π) and 2.718281828459045 |
+| `inf`, `nan` | `f64` | infinity (`1.0 / 0.0`) and not a number (`0.0 / 0.0`) |
 
 They are ordinary generic functions ([§9](#generic-functions-provisional-syntax)),
 so they are values too, and a type given to `sort` must be `Ord`: a
@@ -1498,12 +1515,36 @@ for name in ages               # the keys, in order
 * `mut m.remove(k)` removes a key, giving its value if it had one.
 * `m.keys()`, `m.values()` and `m.items()` give lists of the keys, the
   values, and `(key, value)` pairs, in order.
-* Keys are told apart by their text forms (`"{{key}}"`), which are hashed
-  with `hash`: they are the same key exactly when they print the same. (So
-  `0.0` and `-0.0` are different keys, though they are `==`.)
+* Keys are told apart by `==`, finding them by their `hash`. So `0.0` and
+  `-0.0` are the same key, and a NaN key is never found (`nan != nan`):
+  setting one adds a new key each time.
 * A `Map` is a value like any other: it is copied, compared with `==` (its
   order too) and printed field by field. Its fields are private: they are
   how it works inside.
+
+`Set[T]` is a struct holding a `Map[T, ()]`: a set of values, kept in the
+order they were first inserted, told apart as a `Map`'s keys are (by
+`==`).
+
+```ella
+let mut seen = new_set()       # a Set[str], once it is used
+print(mut seen.insert("a"))    # true: it is new
+print(mut seen.insert("a"))    # false
+print("a" in seen, len(seen))  # true 1
+let odd = set_of([1, 3, 5, 3]) # 1, 3, 5
+for n in odd                   # the items, in order
+    print(n)
+```
+
+* `mut s.insert(x)` adds `x`, and `mut s.remove(x)` takes it out; each
+  gives whether it changed the set.
+* `s.items()` gives a list of the items, in order.
+* `s.union(t)` has the items of `s`, then those of `t` that aren't in `s`;
+  `s.intersection(t)` and `s.difference(t)` the items of `s` that are (or
+  aren't) in `t`, in `s`'s order. `s.is_subset(t)` tells whether every
+  item of `s` is in `t`.
+* Like a `Map`, a `Set` is copied, compared with `==` (its order too) and
+  printed field by field.
 
 The module `iters` has lazy versions of the list functions, on generators
 ([§9](#generators-provisional-syntax)). They share names with those of

@@ -771,12 +771,16 @@ class CodeGen:
                 self.store(dest)
             case "builtin":
                 # Library functions take their arguments, the call's place for errors, and where the result goes.
-                # abs, min and max have one for each number type: ella_lib_abs_i64, ...
+                # abs, min and max have one for each number type: ella_lib_abs_i64, ...; hash takes its
+                # argument's type too.
                 result_region = Region(instr.region) if instr.region else 0
                 symbol = f"ella_lib_{instr.name}"
-                if instr.name in GENERIC_LIBRARY:
+                if GENERIC_LIBRARY.get(instr.name) == "Num":
                     symbol += f"_{show_type(args[0].type)}"
-                self.call_c(symbol, *args, line, column, result_region)
+                if GENERIC_LIBRARY.get(instr.name) == "Eq":
+                    self.call_c(symbol, *args, self.type_descriptor(args[0].type), line, column, result_region)
+                else:
+                    self.call_c(symbol, *args, line, column, result_region)
                 self.store(dest)
             case "set_index":
                 self.slot_value(instr, args[0], args[2])

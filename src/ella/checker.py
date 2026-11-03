@@ -472,8 +472,10 @@ class PendingBody:
 
 # The library: built-in functions with fixed types (see ella.library). A few
 # work on either number type: their T is a type parameter that must be Num.
+# `hash` works on any type with `==`: its T must be Eq.
 ERROR = EnumTy("Error")
 NUM_T = ParamTy("T", CONSTRAINTS["Num"])
+EQ_T = ParamTy("T", CONSTRAINTS["Eq"])
 LIBRARY: dict[str, FuncTy] = {
     "to_f64": FuncTy((I64,), F64),
     "to_i64": FuncTy((F64,), I64),
@@ -498,6 +500,13 @@ LIBRARY: dict[str, FuncTy] = {
     "ln": FuncTy((F64,), F64),
     "sin": FuncTy((F64,), F64),
     "cos": FuncTy((F64,), F64),
+    "tan": FuncTy((F64,), F64),
+    "asin": FuncTy((F64,), F64),
+    "acos": FuncTy((F64,), F64),
+    "atan": FuncTy((F64,), F64),
+    "atan2": FuncTy((F64, F64), F64),
+    "log10": FuncTy((F64,), F64),
+    "log2": FuncTy((F64,), F64),
     "upper": FuncTy((STR,), STR),
     "lower": FuncTy((STR,), STR),
     "starts_with": FuncTy((STR, STR), BOOL),
@@ -505,7 +514,7 @@ LIBRARY: dict[str, FuncTy] = {
     "pad_left": FuncTy((STR, I64, STR), STR),
     "pad_right": FuncTy((STR, I64, STR), STR),
     "format_f64": FuncTy((F64, I64), STR),
-    "hash": FuncTy((STR,), I64),
+    "hash": FuncTy((EQ_T,), I64),
     "env": FuncTy((STR,), EnumTy("Optional", (STR,))),
     "write_file": FuncTy((STR, STR), EnumTy("Result", (UNIT, ERROR))),
     "exit": FuncTy((I64,), NEVER),
@@ -513,7 +522,10 @@ LIBRARY: dict[str, FuncTy] = {
     "min": FuncTy((NUM_T, NUM_T), NUM_T),
     "max": FuncTy((NUM_T, NUM_T), NUM_T),
 }
-GENERIC_LIBRARY = frozenset(name for name, t in LIBRARY.items() if NUM_T in t.params)
+# The generic library functions, with the constraint on their T.
+GENERIC_LIBRARY = {
+    name: "Num" if NUM_T in t.params else "Eq" for name, t in LIBRARY.items() if NUM_T in t.params or EQ_T in t.params
+}
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
 BUILTINS = ("print", "eprint", "len", "run", "next", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
@@ -522,7 +534,7 @@ WRAPPED = frozenset({"print", "eprint", "len"})  # other built-ins that are valu
 
 def show_library(name: str) -> str:
     """A library function's type, for hover text: `(str) -> str`, or `[T: Num] (T) -> T`."""
-    return ("[T: Num] " if name in GENERIC_LIBRARY else "") + show_type(LIBRARY[name])
+    return (f"[T: {GENERIC_LIBRARY[name]}] " if name in GENERIC_LIBRARY else "") + show_type(LIBRARY[name])
 
 
 # Built-ins that look at types, and make them, for code that generates code
@@ -2357,7 +2369,7 @@ class Checker:
         return t
 
     def library_type(self, name: str, span: Span) -> FuncTy:
-        """The type of a library function at one use: abs, min and max get their own T, which must be Num."""
+        """The type of a library function at one use: abs, min and max get their own T, which must be Num (Eq for hash)."""
         function = LIBRARY[name]
         # The runtime makes the built-in Optional, Result and Error, which a program may replace.
         for part, info in BUILTIN_ENUMS.items():
@@ -2366,7 +2378,7 @@ class Checker:
         if name not in GENERIC_LIBRARY:
             return function
         arg = self.fresh()
-        self.generic_uses.append((name, (arg,), (("T", ("Num",)),), span))
+        self.generic_uses.append((name, (arg,), (("T", (GENERIC_LIBRARY[name],)),), span))
         t = substitute(function, {"T": arg})
         assert isinstance(t, FuncTy)
         return t

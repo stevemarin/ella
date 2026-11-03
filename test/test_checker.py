@@ -959,6 +959,8 @@ def test_library_types(source: str, t: str) -> None:
         ('abs("a")', "abs needs T to be Num, and str isn't"),
         ("min(1, 2.5)", "argument 2 of min() should be i64, not f64"),
         ("let f = abs\nf(true)", "abs needs T to be Num, and bool isn't"),
+        ("hash([(x: i64) -> i64 => x])", "hash needs T to be Eq, and [(i64) -> i64] isn't"),
+        ("hash(pool_new())", "hash can't be used with Pool[()], which can't be copied"),
         ("let f = pool_new", "'pool_new' can only be called, not used as a value"),
         ("let x = 1\nprint(mut x)", "print() has no 'mut' parameter"),
         (

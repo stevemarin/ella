@@ -1811,12 +1811,65 @@ List *ella_lib_chars(const Str *s, word line, word column, word depth) {
     return chars;
 }
 
-// FNV-1a over the code points (library.py's hash_str).
-word ella_lib_hash(const Str *s, word line, word column, word depth) {
+// hash(x), like ella.library.hash_value: 64-bit FNV-1a over a string's code
+// points, and over the hashes of the parts of other values, so that values
+// ella_equal says are equal hash the same.
+static const uint64_t FNV_OFFSET = 0xCBF29CE484222325u, FNV_PRIME = 0x100000001B3u;
+
+static uint64_t fnv(uint64_t h, uint64_t word) { return (h ^ word) * FNV_PRIME; }
+
+static uint64_t hash_value(word v, const Type *t) {
+    uint64_t h = FNV_OFFSET;
+    switch (t->kind) {
+    case K_UNIT:
+        return h;
+    case K_F64: {
+        // 0.0 and -0.0 are equal, so they hash the same; NaNs are never equal, but hash alike.
+        double x = as_f64(v) + 0.0;
+        return fnv(h, isnan(x) ? 0x7FF8000000000000u : (uint64_t)f64_bits(x));
+    }
+    case K_STR: {
+        const Str *s = (const Str *)v;
+        for (word i = 0; i < s->len; i++) h = fnv(h, s->chars[i]);
+        return h;
+    }
+    case K_RANGE: {
+        // Ranges are equal when they hold the same numbers.
+        const Range *r = (const Range *)v;
+        word size = ella_range_len(r);
+        h = fnv(h, (uint64_t)size);
+        return size ? fnv(h, (uint64_t)r->start) : h;
+    }
+    case K_LIST: {
+        const List *xs = (const List *)v;
+        for (word i = 0; i < xs->len; i++) h = fnv(h, hash_value(xs->items[i], t->parts[0]));
+        return h;
+    }
+    case K_TUPLE: {
+        const Tuple *x = (const Tuple *)v;
+        for (word i = 0; i < t->count; i++) h = fnv(h, hash_value(x->items[i], t->parts[i]));
+        return h;
+    }
+    case K_ENUM: {
+        // Its variant's name, without type arguments; an Error without where it was made.
+        const Variant *x = (const Variant *)v;
+        const VariantType *variant = t->parts[x->tag];
+        for (const char *c = variant->name; *c && *c != '['; c++) h = fnv(h, (unsigned char)*c);
+        for (word i = 0; i < (variant->error ? 2 : variant->count); i++) {
+            h = fnv(h, hash_value(x->fields[i], variant->fields[i]));
+        }
+        return h;
+    }
+    case K_REF:
+        return fnv(h, (uint64_t)ref_index(v));
+    default:  // i64, bool and handles
+        return fnv(h, (uint64_t)v);
+    }
+}
+
+word ella_lib_hash(word v, const Type *t, word line, word column, word depth) {
     UNUSED(line), UNUSED(column), UNUSED(depth);
-    uint64_t h = 0xCBF29CE484222325u;
-    for (word i = 0; i < s->len; i++) h = (h ^ s->chars[i]) * 0x100000001B3u;
-    return (word)h;
+    return (word)hash_value(v, t);
 }
 
 word ella_lib_ord(const Str *s, word line, word column, word depth) {
@@ -1880,6 +1933,41 @@ word ella_lib_sin(word bits, word line, word column, word depth) {
 word ella_lib_cos(word bits, word line, word column, word depth) {
     UNUSED(line), UNUSED(column), UNUSED(depth);
     return f64_bits(cos(as_f64(bits)));
+}
+
+word ella_lib_tan(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(tan(as_f64(bits)));
+}
+
+word ella_lib_asin(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(asin(as_f64(bits)));
+}
+
+word ella_lib_acos(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(acos(as_f64(bits)));
+}
+
+word ella_lib_atan(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(atan(as_f64(bits)));
+}
+
+word ella_lib_atan2(word y, word x, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(atan2(as_f64(y), as_f64(x)));
+}
+
+word ella_lib_log10(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(log10(as_f64(bits)));
+}
+
+word ella_lib_log2(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(log2(as_f64(bits)));
 }
 
 // upper and lower change ASCII letters only.

@@ -19,7 +19,7 @@ and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
 and iterators, then direct calls, inlining and register allocation, then
 stack traces, errors with causes and locations, and `main` giving a
-`Result`). `make check` passes (1234 tests, ruff, strict mypy).
+`Result`, then sets and more of the standard library). `make check` passes (1236 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -31,7 +31,7 @@ stack traces, errors with causes and locations, and `main` giving a
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers, generators that keep their frame and levels in the `Gen` |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
-| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]`; lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
+| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `log10`, `log2`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `sets`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `fold`, `flatten`, `flat_map`, `position`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, `tau`, `e`, `inf`, `nan`, `Map[K, V]` and `Set[T]`; lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
@@ -54,21 +54,20 @@ reflection, and the library (docs/grammar.md §10): number conversions and
 parsing, math, code points, string functions, `hash`, files, arguments,
 the environment and `exit`. The standard library's modules (src/ella/lib/,
 whose names are the prelude) add list functions (`map`, `filter`, `sort`,
-`sort_by`, `sum`, `zip`, ...), `pi`, and `Map[K, V]`, written in Ella.
+`sort_by`, `sum`, `fold`, `zip`, ...), constants, `Map[K, V]` and
+`Set[T]`, written in Ella.
 
-- No set type, and no map literal (`{` is an unexpected character). A
-  `Set[T]` would be a small layer over `Map`.
-- `Map` tells keys apart by their text forms, so each lookup builds the
-  key's text: simple, and right for every `Eq` type, but slow for big
-  keys, and `0.0` and `-0.0` are different keys. A `Hash` constraint (a
-  `hash` method) would let a type do better. A `Map` also prints, and
-  compares with `==`, by its inner fields.
+- No map or set literals (`{` is an unexpected character).
+- `hash` is structural, like `==`, and can't be customized: a type
+  can't hash only the fields that matter, and since `==` can't be
+  customized either, there is no use for a `Hash` constraint yet. A `Map`
+  (or `Set`) also prints, and compares with `==`, by its inner fields.
 - `sum` takes a start value (`sum(xs, 0)`): a generic function has no way
   to make the zero of a `Num` type.
 - `upper` and `lower` only change ASCII letters; the rest of Unicode would
   need case tables in the runtime.
-- Missing math: `tan`, `atan2`, `log10`, `f64` powers other than `**`,
-  and constants besides `pi`.
+- No string functions beyond the built-in ones (no `strings` module:
+  `repeat`, `lines`, `is_digit`, ...), and no hyperbolic functions.
 - A run-time error always gives status 1; there's no way to choose
   another.
 
@@ -315,13 +314,29 @@ runtime; new functions with fixed types are cheap to add that way.
 
 Small steps that build on the above:
 
-1. `Set[T]` in the prelude, on top of `Map`, and a `Hash` constraint so
-   that a key type can hash itself without building its text.
-2. Take a top-level function's missing types from its `let`'s declared
+1. Take a top-level function's missing types from its `let`'s declared
    type: `let inc: (i64) -> i64 = (x) => x + 1`.
-3. A way for generic code to make the zero of a `Num` type, so that
+2. A way for generic code to make the zero of a `Num` type, so that
    `sum(xs)` needs no start value.
-4. Warnings for unused methods, enum variants and top-level variables.
+3. Warnings for unused methods, enum variants and top-level variables.
+
+### Done (2026-11-02, tenth round): a bigger standard library
+
+1. A `sets` module in the prelude: `Set[T]`, a `Map[T, ()]` inside, made
+   by `new_set()` or `set_of(xs)`, with `insert`, `remove`, `in`, `len`,
+   `for`, `items`, `union`, `intersection`, `difference` and `is_subset`,
+   keeping items in the order they were first inserted.
+2. List functions: `fold`, `flatten`, `flat_map` and `position`.
+3. Math: the library functions `tan`, `asin`, `acos`, `atan`, `atan2`,
+   `log10` and `log2` (NaN outside their domains, as in C, in every
+   backend), and the constants `tau`, `e`, `inf` and `nan` in `math`.
+4. `hash` works on any `Eq` type, `[T: Eq] (T) -> i64`, structurally
+   (the runtime walks the type descriptor, as `==` does) and the same in
+   every backend, so that equal values hash the same. `Map` and `Set`
+   find keys by `hash` and `==` instead of building each key's text form:
+   a map with `(i64, i64)` keys runs 1.8× faster natively, and `0.0` and
+   `-0.0` are now one key. A separate `Hash` constraint turned out
+   unneeded, since every `Eq` type can be hashed.
 
 ### Done (2026-11-02, ninth round): errors and diagnostics
 
@@ -416,14 +431,13 @@ Ella's goals: learning, simplicity first, no GC, x64.
 
 The protocols, constraints and methods are strong enough to write
 collections in Ella itself, and the standard library (src/ella/lib/) now
-has list functions and `Map[K, V]`, with C runtime primitives underneath
+has list functions, `Map[K, V]` and `Set[T]`, with C runtime primitives underneath
 (I/O, math, `hash`) added as library functions (src/ella/library.py and
 the runtime). Growing it tests the language on real code, finds rough
 edges in the type system, and makes example programs possible. Writing
-`Map` showed some: `sum` can't make a zero, `==` and printing can't be
-customized, there is no `Map.new()` (so `new_map()`), and keys are told
-apart by their text forms for lack of a `Hash` constraint. Now that it is
-made of modules, it can grow by topic (`strings`, `sets`, ...).
+`Map` and `Set` showed some: `sum` can't make a zero, `==` and printing can't be
+customized, and there is no `Map.new()` (so `new_map()`). Now that it is
+made of modules, it can grow by topic (`strings`, ...).
 
 ### 2. Packages
 

@@ -1,8 +1,5 @@
 # Math and code points, and library functions used as values.
 
-let inf = 1.0e308 * 10.0
-let nan = inf - inf
-
 # sqrt and floor work on f64; NaN for the square root of a negative number.
 for x in [2.0, 0.0, -0.0, 16.0, -1.0, inf, nan]
     print(sqrt(x))
@@ -68,6 +65,16 @@ print(exp(0.0), exp(1.0), exp(1000.0), exp(-1000.0))
 print(ln(1.0), ln(exp(2.0)), ln(0.0), ln(-1.0), ln(inf))
 print(sin(0.0), sin(pi / 2.0), cos(0.0), cos(pi), sin(inf), cos(nan))
 print(pi, round(pi * 100.0) / 100.0)
+
+# tan, the inverses, and logarithms in bases 10 and 2: NaN outside their domains, as in C.
+print(tan(0.0), tan(pi / 4.0), tan(-1.0), tan(inf), tan(nan))
+print(asin(1.0), asin(-0.0), asin(2.0), acos(-1.0), acos(1.0), acos(-inf))
+print(atan(1.0), atan(inf), atan(-inf), atan(nan))
+print(atan2(1.0, 1.0), atan2(0.0, -1.0), atan2(-0.0, -1.0), atan2(-0.0, 0.0), atan2(inf, -inf), atan2(nan, 1.0))
+print(log10(1000.0), log10(2.0), log10(0.0), log10(-1.0), log10(inf), log10(nan))
+print(log2(1024.0), log2(3.0), log2(-0.0), log2(-inf), log2(inf))
+# The constants of the prelude's math module.
+print(tau, e, inf, -inf, nan, ln(e), tau == 2.0 * pi, nan == nan)
 
 let main = () -> () =>
     let half = (x: f64) -> f64 => x / 2.0

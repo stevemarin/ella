@@ -1,0 +1,53 @@
+# Sets of values. Part of the prelude: every module sees these names.
+
+# A set of values, which keeps them in the order they were first inserted.
+# It is a Map from its items to nothing, so items are told apart as a Map's
+# keys are: by `==`, through `hash`.
+struct Set[T: Eq]
+    _map: Map[T, ()]
+    contains = (s: Set[T], item: T) -> bool => item in s._map
+    len = (s: Set[T]) -> i64 => len(s._map)
+    iter = (s: Set[T]) -> [T] => s._map.keys()
+    items = (s: Set[T]) -> [T] => s._map.keys()
+    # Adds an item, giving whether it is new.
+    insert = (mut s: Set[T], item: T) -> bool =>
+        if item in s._map then return false
+        s._map[item] = ()
+        true
+    # Takes an item out, giving whether it was there.
+    remove = (mut s: Set[T], item: T) -> bool =>
+        if item not in s._map then return false
+        mut s._map.remove(item)
+        true
+    # The items of either set: those of s, then the new ones of t.
+    union = (s: Set[T], t: Set[T]) -> Set[T] =>
+        let mut result = s
+        for item in t
+            mut result.insert(item)
+        result
+    # The items of s that are also in t.
+    intersection = (s: Set[T], t: Set[T]) -> Set[T] =>
+        let mut result = new_set()
+        for item in s
+            if item in t then mut result.insert(item)
+        result
+    # The items of s that aren't in t.
+    difference = (s: Set[T], t: Set[T]) -> Set[T] =>
+        let mut result = new_set()
+        for item in s
+            if item not in t then mut result.insert(item)
+        result
+    # Whether every item of s is in t.
+    is_subset = (s: Set[T], t: Set[T]) -> bool =>
+        for item in s
+            if item not in t then return false
+        true
+
+let new_set[T: Eq] = () -> Set[T] => Set(new_map())
+
+# The items of a list, each once, in the order they first appear.
+let set_of[T: Eq] = (xs: [T]) -> Set[T] =>
+    let mut result = new_set()
+    for x in xs
+        mut result.insert(x)
+    result

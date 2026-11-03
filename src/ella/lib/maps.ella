@@ -1,30 +1,31 @@
 # Maps from keys to values. Part of the prelude: every module sees these names.
 
 # A map from keys to values, which keeps its keys in the order they were
-# first set. Keys are told apart by their text forms: `_texts` has each
-# key's, and `_buckets` the positions of the keys whose text forms hash to
-# each bucket. There are more buckets than keys, or none while it is empty.
+# first set. `_hashes` has each key's hash, and `_buckets` the positions of
+# the keys whose hashes fall in each bucket. There are more buckets than
+# keys, or none while it is empty.
 struct Map[K: Eq, V]
     _order: [K]
     _stored: [V]
-    _texts: [str]
+    _hashes: [i64]
     _buckets: [[i64]]
     get = (m: Map[K, V], key: K) -> V =>
         where
             key in m
         m._stored[m._position(key)]
     set = (mut m: Map[K, V], key: K, value: V) -> () =>
-        let i = m._position(key)
+        let h = hash(key)
+        let i = m._find(key, h)
         if i >= 0 then
             m._stored[i] = value
         else
             m._order += [key]
             m._stored += [value]
-            m._texts += ["{{key}}"]
+            m._hashes += [h]
             if len(m._order) > len(m._buckets) then
                 mut m._rehash()
             else
-                m._buckets[m._bucket("{{key}}")] += [len(m._order) - 1]
+                m._buckets[m._bucket(h)] += [len(m._order) - 1]
     contains = (m: Map[K, V], key: K) -> bool => m._position(key) >= 0
     len = (m: Map[K, V]) -> i64 => len(m._order)
     iter = (m: Map[K, V]) -> [K] => m._order
@@ -45,24 +46,24 @@ struct Map[K: Eq, V]
         let n = len(m._order)
         m._order = m._order[0..i] + m._order[i + 1..n]
         m._stored = m._stored[0..i] + m._stored[i + 1..n]
-        m._texts = m._texts[0..i] + m._texts[i + 1..n]
+        m._hashes = m._hashes[0..i] + m._hashes[i + 1..n]
         mut m._rehash()
         Some(value)
     # Where the key is in `_order`, or -1.
-    _position = (m: Map[K, V], key: K) -> i64 =>
+    _position = (m: Map[K, V], key: K) -> i64 => m._find(key, hash(key))
+    _find = (m: Map[K, V], key: K, h: i64) -> i64 =>
         if len(m._buckets) == 0 then return -1
-        let text = "{{key}}"
-        for i in m._buckets[m._bucket(text)]
-            if m._texts[i] == text then return i
+        for i in m._buckets[m._bucket(h)]
+            if m._hashes[i] == h and m._order[i] == key then return i
         -1
-    _bucket = (m: Map[K, V], text: str) -> i64 => hash(text) % len(m._buckets)
+    _bucket = (m: Map[K, V], h: i64) -> i64 => h % len(m._buckets)
     # Puts every key in a bucket again, with twice as many buckets as keys (and a few more).
     _rehash = (mut m: Map[K, V]) -> () =>
         let mut buckets: [[i64]] = []
         for _ in 0..2 * len(m._order) + 8
             buckets += [[]]
         m._buckets = buckets
-        for i in 0..len(m._texts)
-            m._buckets[m._bucket(m._texts[i])] += [i]
+        for i in 0..len(m._hashes)
+            m._buckets[m._bucket(m._hashes[i])] += [i]
 
 let new_map[K: Eq, V] = () -> Map[K, V] => Map([], [], [], [])

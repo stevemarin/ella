@@ -99,6 +99,33 @@ let all[T] = (xs: [T], test: (T) -> bool) -> bool =>
         if not test(x) then return false
     true
 
+# f of the start and the first item, then of that and the second item, and so on.
+let fold[T, A] = (xs: [T], start: A, f: (A, T) -> A) -> A =>
+    let mut result = start
+    for x in xs
+        result = f(result, x)
+    result
+
+# The items of each list, one list after another.
+let flatten[T] = (xss: [[T]]) -> [T] =>
+    let mut result: [T] = []
+    for xs in xss
+        result += xs
+    result
+
+# The items of the lists that f gives for each item, in order.
+let flat_map[T, U] = (xs: [T], f: (T) -> [U]) -> [U] =>
+    let mut result: [U] = []
+    for x in xs
+        result += f(x)
+    result
+
+# Where the first item for which `test` is true is, if any.
+let position[T] = (xs: [T], test: (T) -> bool) -> Optional[i64] =>
+    for i in 0..len(xs)
+        if test(xs[i]) then return Some(i)
+    None
+
 let zip[T, U] = (xs: [T], ys: [U]) -> [(T, U)] =>
     let n = min(len(xs), len(ys))
     let mut pairs: [(T, U)] = []
