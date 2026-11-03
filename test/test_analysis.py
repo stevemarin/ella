@@ -182,8 +182,41 @@ def test_hover_on_library_functions_and_let_patterns() -> None:
     assert found[(3, 9)].definition == Location(1, 6, 1)
 
 
+def test_hover_on_generic_library_functions() -> None:
+    found = symbols("let f = abs\nprint(min(1, 2))\n")
+    assert found[(1, 9)].hover == "abs: [T: Num] (T) -> T"
+    assert found[(2, 7)].hover == "min: [T: Num] (T, T) -> T"
+
+
+def test_cases_that_never_match_are_warnings() -> None:
+    found = analyze("match true\n    case _ => 1\n    case true => 2\n").problems
+    assert [(p.line, p.column, p.warning) for p in found] == [(3, 5, True)]
+
+
 def test_errors_in_a_let_pattern_leave_its_names_defined() -> None:
     assert problems("let (a, b) = nope\nprint(a)\nprint(c)\n") == [
         "1:14: undefined name 'nope'",
         "3:7: undefined name 'c'",
     ]
+
+
+def test_prelude_functions() -> None:
+    found = symbols("let xs = sort([2, 1])\nprint(xs, pi)\n")
+    assert found[(1, 10)].hover == "sort: ([i64]) -> [i64]"
+    assert found[(1, 10)].modifiers == ("defaultLibrary", "readonly")
+    assert found[(1, 10)].definition is None  # the prelude isn't in the file
+    assert found[(2, 11)].hover == "pi: f64"
+    assert {"map", "filter", "sort", "reverse", "pi"} <= set(names("let x = 1\nprint()\n", 2, 7))
+    assert problems("let x = 1\n") == []  # nothing from the prelude, though all of it is checked
+
+
+def test_mut_names_in_patterns() -> None:
+    found = symbols("let (mut a, b) = (1, 2)\na += b\n")
+    assert found[(1, 10)].hover == "mut a: i64"
+    assert found[(1, 10)].modifiers == ("declaration",)
+    assert found[(1, 13)].modifiers == ("declaration", "readonly")
+
+
+def test_unused_variables_and_unreachable_code_are_warnings() -> None:
+    found = analyze("let f = () -> i64 =>\n    let a = 1\n    return 2\n    3\nf()\n").problems
+    assert [(p.line, p.column, p.warning) for p in found] == [(2, 9, True), (4, 5, True)]

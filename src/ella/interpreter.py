@@ -24,10 +24,11 @@ from typing import TextIO
 
 from ella.checker import LIBRARY, OPERATOR_METHODS, REFLECTION, Checker, check_code, finish, pattern_names
 from ella.lexer import EllaError, Span
-from ella.library import Host
+from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
+from ella.prelude import with_prelude
 from ella.staging import (
     AnySplice,
     Tables,
@@ -104,6 +105,7 @@ from ella.values import (
     Value,
     Var,
     VariantValue,
+    check_status,
     copy_value,
     equal,
     run_deep,
@@ -157,19 +159,18 @@ class ReturnSignal(Exception):
         self.span = span
 
 
-def run(source: str, out: TextIO | None = None, host: Host | None = None) -> None:
-    """Parse and run a program, writing what it prints to `out` (standard output by default).
+def run(source: str, out: TextIO | None = None, host: Host | None = None) -> int:
+    """Parse and run a program, writing what it prints to `out` (standard output by default). Returns its exit status.
 
     Raises EllaError for syntax and run-time errors. The program isn't type
     checked first, unless it builds code (with `quote` or `$`), which needs
     the checker.
     """
-    program = parse(source)
+    program = with_prelude(parse(source))
     if uses_staging(program):
         program, checker = prepare(program, out)
-        Interpreter(out, checker, host=host).run(program)
-    else:
-        Interpreter(out, host=host).run(program)
+        return Interpreter(out, checker, host=host).run(program)
+    return Interpreter(out, host=host).run(program)
 
 
 class Interpreter:
@@ -208,7 +209,8 @@ class Interpreter:
 
         # The global scope holds the built-ins and every top-level `let`.
         self.globals = Scope(None)
-        self.globals.define("print", Builtin("print", 1, self.builtin_print))
+        self.globals.define("print", Builtin("print", -1, self.builtin_print))
+        self.globals.define("eprint", Builtin("eprint", -1, self.builtin_eprint))
         self.globals.define("len", Builtin("len", 1, self.builtin_len))
         self.globals.define("run", Builtin("run", 1, self.builtin_run))
         for name, (params, _) in REFLECTION.items():
@@ -228,11 +230,12 @@ class Interpreter:
 
     # Programs
 
-    def run(self, program: Program) -> None:
-        """Run the top-level expressions in order, then `main` if there is one."""
-        run_deep(lambda: self.run_program(program), self.max_depth, PYTHON_FRAMES_PER_CALL)
+    def run(self, program: Program) -> int:
+        """Run the top-level expressions in order, then `main` if there is one. Returns the exit status."""
+        return run_deep(lambda: self.run_program(program), self.max_depth, PYTHON_FRAMES_PER_CALL)
 
-    def run_program(self, program: Program) -> None:
+    def run_program(self, program: Program) -> int:
+        status = 0
         try:
             self.declare_top_level(program)
             self.owners.append([])  # the top-level code's own values
@@ -240,9 +243,15 @@ class Interpreter:
                 self.eval(expr, self.globals)
             main = self.globals.vars.get("main")
             if main is not None:
-                self.call(main.value, [], Span(1, 1))
+                result = self.call(main.value, [], Span(1, 1))
+                if isinstance(result, int) and not isinstance(result, bool):  # main gave an exit status
+                    status = check_status(result, program.span)
             self.close_owner()
             self.close_owner()  # the globals
+            return status
+        except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
+            self.out.flush()
+            return stop.status
         # Signals that escape to the top level weren't inside anything that
         # could catch them.
         except ReturnSignal as signal:
@@ -311,15 +320,16 @@ class Interpreter:
                     for binding in bindings:
                         value.scope.define(binding.name, value)
                 return value
-            case LetPattern(pattern, value_expr, span):
+            case LetPattern(pattern, value_expr, span, mutable):
                 value = self.eval(value_expr, scope)
                 bound = self.match_pattern(pattern, value, scope)
                 if bound is None:
                     raise EllaError(f"the 'let' pattern doesn't match {to_text(value, nested=True)}", span)
                 if scope is self.globals:
                     self.adopt(value, -1, 0)
+                mutables = mutable_names(pattern)
                 for name, part in bound.items():
-                    scope.define(name, copy_value(part))
+                    scope.define(name, copy_value(part), mutable or name in mutables)
                 return value
             case Assign(op, target, value_expr, span):
                 return self.eval_assign(op, target, value_expr, scope, span)
@@ -723,7 +733,8 @@ class Interpreter:
         """
         match function:
             case Builtin(name, arity, run):
-                self.check_arity(name, arity, args, span)
+                if arity >= 0:  # print and eprint take any number
+                    self.check_arity(name, arity, args, span)
                 return run(args, span)
             case Constructor(enum, variant, arity):
                 self.check_arity(variant, arity, args, span)
@@ -933,7 +944,10 @@ class Interpreter:
 
     def run_compile_time(self, expr: Expr) -> Value:
         """Run the code of a splice outside quotes, while compiling (see ella.staging)."""
-        return run_deep(lambda: self.run_code(expr), self.max_depth, PYTHON_FRAMES_PER_CALL)
+        try:
+            return run_deep(lambda: self.run_code(expr), self.max_depth, PYTHON_FRAMES_PER_CALL)
+        except Exit as stop:
+            raise EllaError("exit() can't stop the program while it is being compiled", stop.span) from None
 
     def check_condition(self, cond: Assert, scope: Scope, kind: str) -> None:
         """Check an `assert` or `where` condition, reporting its source if it is false."""
@@ -1012,8 +1026,7 @@ class Interpreter:
                 continue
             # The pattern's variables are visible in the guard and the body.
             case_scope = Scope(scope)
-            for name, value in bindings.items():
-                case_scope.define(name, value)
+            define_all(case_scope, bindings, mutable_names(case.pattern))
             if case.guard is not None and not self.eval_bool(case.guard, case_scope, "a case guard"):
                 continue
             return self.eval(case.body, case_scope)
@@ -1078,8 +1091,7 @@ class Interpreter:
                 raise EllaError(f"the 'for' pattern doesn't match {to_text(item, nested=True)}", span)
             # Each iteration gets a fresh scope for the pattern's variables.
             loop_scope = Scope(scope)
-            for name, value in bindings.items():
-                loop_scope.define(name, value)
+            define_all(loop_scope, bindings, mutable_names(pattern))
             if (signal := self.run_loop_body(body, loop_scope, label)) is not None:
                 self.check_no_break_value(signal, "for")
                 break
@@ -1108,8 +1120,16 @@ class Interpreter:
                 scope.define(variant.name, VariantValue(enum.name, variant.name))
 
     def builtin_print(self, args: list[Value], span: Span) -> Value:
-        """`print(value)` writes the value's text and a newline."""
-        self.out.write(to_text(args[0]) + "\n")
+        """`print(a, b, ...)` writes the values' text, with spaces between them, and a newline."""
+        self.out.write(" ".join(map(to_text, args)) + "\n")
+        return UNIT
+
+    def builtin_eprint(self, args: list[Value], span: Span) -> Value:
+        """`eprint(a, b, ...)` writes like `print`, to standard error (after what was printed so far)."""
+        self.out.flush()
+        stderr = self.host.stderr if self.host.stderr is not None else sys.stderr
+        stderr.write(" ".join(map(to_text, args)) + "\n")
+        stderr.flush()
         return UNIT
 
     def builtin_len(self, args: list[Value], span: Span) -> Value:
@@ -1122,3 +1142,15 @@ class Interpreter:
         if not isinstance(value, list | str | range):
             raise EllaError(f"len() needs a list, str, range or Pool, not {type_name(value)}", span)
         return len(value)
+
+
+def mutable_names(pattern: Pattern) -> set[str]:
+    """The names a pattern binds as `mut x`."""
+    return {node.name for node in pattern_names(pattern) if node.mutable}
+
+
+def define_all(scope: Scope, bindings: dict[str, Value], mutables: set[str]) -> None:
+    """Define the variables a pattern bound. A `mut` one gets a copy of its value, which it may change."""
+    for name, value in bindings.items():
+        mutable = name in mutables
+        scope.define(name, copy_value(value) if mutable else value, mutable)

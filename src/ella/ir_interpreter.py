@@ -70,7 +70,7 @@ from ella.ir import (
 )
 from ella.ir import Value as IRValue
 from ella.lexer import EllaError, Span
-from ella.library import Host
+from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
 from ella.operators import binary, compare, contains, index_into, slice_of, unary
@@ -105,9 +105,9 @@ SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
 POOL = "<pool>"  # the finalizer of a pool: free its values
 
 
-def run_ir(source: str, out: TextIO | None = None, host: Host | None = None) -> None:
-    """Compile a program to IR and run it. Raises EllaError."""
-    IRInterpreter(compile_program(source, out), out, host).run()
+def run_ir(source: str, out: TextIO | None = None, host: Host | None = None) -> int:
+    """Compile a program to IR and run it, returning its exit status. Raises EllaError."""
+    return IRInterpreter(compile_program(source, out), out, host).run()
 
 
 @dataclass(slots=True)
@@ -160,12 +160,19 @@ class IRInterpreter:
         self.high_water: dict[tuple[str, int], int] = defaultdict(int)
         self.sites: dict[tuple[str, Span, str], Site] = defaultdict(Site)
 
-    def run(self) -> None:
-        run_deep(self.run_program, self.max_depth, PYTHON_FRAMES_PER_CALL)
+    def run(self) -> int:
+        """Run the program, returning its exit status."""
+        return run_deep(self.run_program, self.max_depth, PYTHON_FRAMES_PER_CALL)
 
-    def run_program(self) -> None:
-        self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
+    def run_program(self) -> int:
+        try:
+            status, _, _ = self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
+        except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
+            self.out.flush()
+            return stop.status
         self.free(0, 1)  # the globals, at the end of the program
+        assert isinstance(status, int)
+        return status
 
     # Arenas
 
@@ -454,6 +461,11 @@ class IRInterpreter:
                 result = to_text(args[0])
             case "print":
                 self.out.write(to_text(args[0]) + "\n")
+            case "eprint":
+                self.out.flush()
+                stderr = self.host.stderr if self.host.stderr is not None else sys.stderr
+                stderr.write(to_text(args[0]) + "\n")
+                stderr.flush()
             case "variant":
                 assert instr.dest is not None and isinstance(instr.dest.type, EnumTy)
                 enum = self.module.enums[instr.dest.type.name]

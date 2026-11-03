@@ -1,0 +1,14 @@
+# print and eprint take any number of values, and main can give an exit status.
+
+print(1, "two", 3.0, [4], (5, "six"), Some("x"))
+print()
+print("one")
+let name = "Ella"
+eprint("warning:", name, [1, 2])
+print("after the warning")
+eprint()
+eprint("done")
+
+let main = () -> i64 =>
+    print("in main")
+    3

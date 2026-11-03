@@ -72,6 +72,7 @@ from ella.checker import (
     substitute,
 )
 from ella.lexer import EllaError, Span
+from ella.prelude import with_prelude
 from ella.syntax import (
     Binary,
     Binding,
@@ -492,8 +493,10 @@ def prepare(program: Program, out: TextIO | None = None) -> tuple[Program, Check
 
     A splice in a type runs while the program is being checked, since the
     checker needs the type; other splices run after checking. What the
-    compile-time code prints goes to `out`. Raises EllaError.
+    compile-time code prints goes to `out`. The program gets the prelude
+    definitions it uses (see ella.prelude). Raises EllaError.
     """
+    program = with_prelude(program)
     if not uses_staging(program):
         return program, check(program)
     checker = Checker()

@@ -90,7 +90,7 @@ let invert = (n: f64) -> Result[f64, Error] =>
 let describe = (r: Result[f64, Error]) -> str =>
     match r
         case Ok(v) if v > 1.0 => "big"
-        case Ok(v) => "small"
+        case Ok(_) => "small"
         case Err(e) => "error: {{e.message}}"
 
 # ? propagates errors: Err(e)? returns Err(e) from the enclosing function
@@ -135,10 +135,30 @@ assert "hello"[1..=2] == "el"
 assert join(split("a,b,c", ","), "-") == "a-b-c"
 assert find("hello", "ll") == Some(2)
 
+# math and code points; library functions are values too
+assert sqrt(16.0) == 4.0 and floor(-2.5) == -3.0
+assert abs(-3) == 3 and min(2.5, 1.5) == 1.5 and max(1, 2) == 2
+assert chr(ord("a") + 1) == "b"
+let tidy: (str) -> str = trim
+assert tidy("  x ") == "x"
+assert round(2.5) == 3.0 and ceil(0.2) == 1.0 and cos(pi) == -1.0
+assert upper("ab") == "AB" and starts_with("ella", "el")
+assert pad_left("7", 3, "0") == "007" and format_f64(2.0 / 3.0, 2) == "0.67"
+
+# the prelude has list functions written in Ella: map, filter, sort, reverse
+let squares = [3, 1, 2] |> map((n: i64) -> i64 => n * n)
+assert sort(squares) == [1, 4, 9] and reverse(squares) == [4, 1, 9]
+assert filter(squares, (n: i64) -> bool => n > 3) == [9, 4]
+
 # tuples: items by position, or taken apart with a pattern in let
 let pair = (1, "one")
 let (number, name) = pair
 assert pair.0 == number and pair.1 == name
+let mut (low, high): (i64, i64) = (0, 10)
+low += 1
+let (mut step, limit) = (1, high)   # mut can mark one name of a pattern
+step *= 2
+assert step < limit
 
 # values are copied: changing xs doesn't change ys
 let ys = xs
@@ -280,6 +300,10 @@ let Stack = (t: Type) -> Type => new_struct("Stack[{{type_name(t)}}]", ["items"]
 let numbers: $(Stack(type i64)) = $(Stack(type i64))([1, 2])
 assert len(numbers.items) == 2
 
-# if main is defined, it runs after the top-level code
+# print takes any number of values; eprint writes to standard error
+print("low", low, "high", high)
+
+# if main is defined, it runs after the top-level code (main can also be
+# () -> i64, giving the program's exit status; exit(status) stops anywhere)
 let main = () -> () =>
     print("done")

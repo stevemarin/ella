@@ -1,0 +1,21 @@
+# Strings: case, prefixes and suffixes, padding, and formatting numbers.
+
+print(upper("Hello, World! é"))
+print(lower("Hello, World! É"))
+print(starts_with("prefix", "pre"), starts_with("prefix", "fix"), starts_with("x", ""), starts_with("", "x"))
+print(ends_with("suffix", "fix"), ends_with("suffix", "suf"), ends_with("fix", "suffix"), ends_with("", ""))
+print(pad_left("7", 3, "0"), pad_right("ab", 4, "."), pad_left("long", 2, " "), pad_left("x", -1, "y"))
+print(pad_left("é", 3, "😀"))
+
+let inf = 1.0e308 * 10.0
+for x in [3.14159, 2.675, 0.5, 1.5, -0.0, -1.25, 1.0e22, inf, -inf, inf - inf]
+    print(format_f64(x, 2), format_f64(x, 0))
+print(format_f64(1.0 / 3.0, 20))
+
+# A table, lined up.
+let rows = [("apples", 3, 0.5), ("kiwis", 12, 0.25), ("melons", 1, 3.0)]
+for (name, count, price) in rows
+    print(pad_right(name, 8, " ") + pad_left("{{count}}", 3, " ") + pad_left(format_f64(price, 2), 7, " "))
+
+let main = () -> () =>
+    print(pad_left("x", 3, "ab"))

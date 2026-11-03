@@ -11,3 +11,8 @@ later stages reuse these files.
   `line:column: message`, after printing `NAME.out`.
 * `NAME.in`, if present, is the program's standard input, and `NAME.args`
   its command-line arguments, one per line.
+* `NAME.stderr`, if present, is exactly what the program prints to
+  standard error (with `eprint`); without it, the program must print
+  nothing there. A run-time error isn't part of it.
+* `NAME.status`, if present, is the exit status the program must give (its
+  `main` returns it); without it, the status must be 0.

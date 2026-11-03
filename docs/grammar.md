@@ -213,8 +213,11 @@ A source file is a sequence of top-level expressions.
    names may be rebound with a different type.)
 3. The top-level expressions run in order, like a script.
 4. Afterwards, if the file defines a top-level `main`, it is called.
-   `main` has type `() -> ()`. The program's command-line arguments are
-   `args()` ([§10](#10-built-ins)); exit codes come later.
+   `main` has type `() -> ()`, or `() -> i64` to give the program's exit
+   status, which must be from 0 to 255 (anything else is a run-time error).
+   Without it the status is 0, and a run-time error makes it 1.
+   `exit(status)` stops the program anywhere, with that status. The
+   program's command-line arguments are `args()` ([§10](#10-built-ins)).
 5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
    structs and enums with methods, can only be defined at the top level.
 
@@ -244,16 +247,19 @@ each name in it:
 let (q, r) = divmod(17, 5)
 let (name, (x, y)) = ("origin", (0.0, 0.0))
 let Point(px, py) = p
+let mut (low, high): (i64, i64) = (0, 10)
+let (mut total, step) = (0, 5)
 ```
 
 * The pattern must match every value of the type: a tuple of names, a
   struct, `_` and so on, never a literal or one variant of an enum (use
   `match` for those). The checker rejects others, with an example of a
   value they miss.
-* The pattern starts with `(` or a name and `(`; the value's type comes
-  from the value (there is no annotation).
-* The names are immutable (`let mut x = x` makes a changeable copy), and
-  there are no chains.
+* The pattern starts with `(` or a name and `(`, perhaps after `mut`. A
+  type after the pattern is the value's type, as for any `let`.
+* The names are immutable, unless the `let` is `let mut`, which makes all
+  of them mutable, or a name has `mut` before it, which makes that one
+  mutable (each is a copy, as with `let mut x = y`). There are no chains.
 
 ### `let` chains
 
@@ -443,6 +449,10 @@ match result
   whole `i64`, `f64` or `str`, so a match on one of those needs a `case _`
   or a name. Enums, structs, tuples and `bool` are covered by naming each
   variant (or `true` and `false`).
+* A case that can never match, because the unguarded cases before it
+  match every value it does, is a warning ([§9](#warnings)). A literal only
+  counts as covered by a wildcard, a name or the same literal, so a case
+  covered by ranges (`case 1` after `case 0..5`) isn't reported.
 
 ### Loops
 
@@ -494,6 +504,7 @@ they must match every value ([§4](#destructuring)).
 | literal | `0`, `"x"`, `true` | an equal value |
 | range | `0..10`, `0..=9` | a value in the range |
 | binding | `n` | anything, binds it to `n` |
+| mutable binding | `mut n` | anything, binds it to a variable `n` that can change |
 | alternatives | `0 \| 1` | either side; both sides must bind the same names |
 | variant | `Ok(v)`, `Some(x)`, `None` | an enum variant, destructuring its fields |
 | tuple | `(a, b)` | a tuple, element-wise |
@@ -503,6 +514,11 @@ name resolution after parsing, as in Rust: the parser produces a name
 pattern, and the resolver checks whether the name refers to a variant.
 
 Negative literal patterns (`-1`) are allowed as a special case.
+
+`mut n` works in every pattern: `let (mut a, b) = ...`, `for (i, mut row)
+in rows` and `case Some(mut items)`. The variable holds a copy of the
+value, so changing it never changes the value matched. The alternatives of
+`|` must agree on which names are `mut`, and a variant can't be `mut`.
 
 ## 8. Operators
 
@@ -647,15 +663,33 @@ let found = None         # Optional of something; used as Optional[str] later
 * A type that nothing decides defaults to `()`: `let xs = []` is a `[()]`.
 * An operator whose meaning depends on its operand's type needs that type to
   be known: with `let xs = []` alone, `-xs[0]` is an error.
-* `return`, `break`, `continue`, and a `loop` that never breaks have no
-  value. They fit wherever a value of any type is expected, as in
-  `if n > 0 then n else return 0`.
+* `return`, `break`, `continue`, `exit(status)`, and a `loop` that never
+  breaks have no value. They fit wherever a value of any type is expected,
+  as in `if n > 0 then n else return 0`.
 * The bodies of `for`, `while` and `loop`, the `then` of an `if` without
   `else`, and all but the last line of a block can have any type; their
   values are discarded.
 * `print`, `len` and variant constructors like `Some` can only be called, not
-  used as values (for now).
+  used as values (for now). Library functions like `trim` can be both
+  ([§10](#10-built-ins)).
 * Enums, structs and top-level functions can be generic.
+
+### Warnings
+
+Some mistakes don't stop a program, but probably aren't what was meant.
+They are **warnings**: `ella` prints them to standard error (as
+`file:line:column: warning: ...`) and runs the program anyway, and
+editors show them.
+
+* A `match` case that can never match ([§6](#match)).
+* A local variable that is never used: a `let`, or a name in a pattern.
+  A name that starts with `_`, like `_guard`, says that is on purpose (for
+  a value kept only for its finalizer, say). Parameters and top-level
+  names aren't reported.
+* Code that never runs, after a line that never finishes: `return`,
+  `break`, `continue`, `exit(...)`, an `if` or `match` whose every branch
+  is one of those, or a `loop` that never breaks. Only the first such line
+  of a block is reported.
 
 ### Enums **(provisional syntax)**
 
@@ -1004,20 +1038,26 @@ print(nodes[kid])                         # error: the handle is stale
 
 Built-in functions (ordinary names, not keywords):
 
-* `print(value)` prints the text form of `value` and a newline; returns `()`.
+* `print(a, b, ...)` prints the text forms of its values, with a space
+  between each two, and a newline; returns `()`. `print()` prints an empty
+  line, and `print("x", 1)` prints `x 1`.
+* `eprint(a, b, ...)` prints the same way to standard error, after
+  everything printed so far.
 * `len(x)` returns the length of a list, string or range as `i64`, or how
   many values a pool holds. On a struct or enum, it calls its `len` method.
 * `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
   pools ([§9](#pools-provisional-syntax)).
 * `run(code)` runs code made with `quote` ([§11](#11-stages)).
-* The library functions below.
+* The library functions below, and the prelude's ([below](#the-prelude)).
 * `fields(t)`, `field_type(t, name)`, `has_field(t, name)`, `type_name(t)`,
   `type_kind(t)` and `variants(t)` look at a type `t`, and
   `new_struct(name, fields, types)` makes one
   ([§11](#types-as-values-and-generated-code)).
 
-The library: functions with fixed types. They can only be called, like the
-other built-ins, and a program may use their names for its own variables.
+The library: functions with fixed types. A program may use their names for
+its own variables. Unlike the other built-ins they are values too, so
+`apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
+`let parse = parse_i64` work; such a value prints as `<function>`.
 
 | Function | Type | Gives |
 | --- | --- | --- |
@@ -1034,6 +1074,24 @@ other built-ins, and a program may use their names for its own variables.
 | `replace(s, old, new)` | `(str, str, str) -> str` | `s` with each `old` (left to right, not overlapping) replaced; `old` can't be empty |
 | `trim(s)` | `(str) -> str` | `s` without spaces, tabs, `\n`, `\r`, `\v` and `\f` at either end |
 | `chars(s)` | `(str) -> [str]` | the characters of `s`, as one-character strings |
+| `ord(c)` | `(str) -> i64` | the code point of `c`, which must be one character |
+| `chr(n)` | `(i64) -> str` | the character with code point `n`: from 0 to 0x10FFFF, but not a surrogate (0xD800 to 0xDFFF) |
+| `upper(s)`, `lower(s)` | `(str) -> str` | `s` with its ASCII letters in upper (or lower) case; other characters stay as they are |
+| `starts_with(s, part)`, `ends_with(s, part)` | `(str, str) -> bool` | whether `s` starts (or ends) with `part` |
+| `pad_left(s, width, fill)`, `pad_right(s, width, fill)` | `(str, i64, str) -> str` | `s` with copies of `fill`, which must be one character, before (or after) it to make it `width` characters long; `s` itself if it is that long already |
+| `format_f64(x, digits)` | `(f64, i64) -> str` | `x` with `digits` decimals (from 0 to 100), rounded: `format_f64(2.5, 2)` is `"2.50"`; `nan`, `inf` and `-inf` as `print` writes them |
+| `env(name)` | `(str) -> Optional[str]` | the environment variable `name`; `None` if there is none |
+| `write_file(path, text)` | `(str, str) -> Result[(), Error]` | writes `text` to the file in UTF-8, replacing what it held, or gives why it can't |
+| `exit(status)` | `(i64) -> never` | stops the program at once with `status`, from 0 to 255 |
+| `sqrt(x)` | `(f64) -> f64` | the square root of `x`; NaN if `x` is negative |
+| `floor(x)` | `(f64) -> f64` | the largest whole number not above `x` (`to_i64(floor(x))` makes it an `i64`) |
+| `ceil(x)` | `(f64) -> f64` | the smallest whole number not below `x` |
+| `round(x)` | `(f64) -> f64` | the nearest whole number; halfway cases go away from zero (`round(-2.5)` is `-3.0`) |
+| `exp(x)`, `ln(x)` | `(f64) -> f64` | e to the power `x`, and the natural logarithm of `x` (`-inf` for 0, NaN below it) |
+| `sin(x)`, `cos(x)` | `(f64) -> f64` | the sine and cosine of `x` radians |
+| `abs(x)` | `[T: Num] (T) -> T` | `x` without its sign; an `i64` error for the smallest `i64` |
+| `min(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b < a`, otherwise `a` |
+| `max(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b > a`, otherwise `a` |
 
 * Numbers are written in ASCII only, with no `_` and no spaces around them:
   `parse_i64(trim(line))` reads a number on a line of its own.
@@ -1045,6 +1103,20 @@ other built-ins, and a program may use their names for its own variables.
   `Error`, so these functions can't be used in a program that defines its
   own.
 * Strings count characters (code points), so `find` and slices do too.
+* `exit` stops the program as a run-time error does, after what it has
+  printed: nothing more runs, not even finalizers. It can only be called,
+  not used as a value, and not while compiling (in a splice outside
+  quotes).
+* `upper` and `lower` only change `a` to `z` and `A` to `Z`, so that every
+  backend agrees without tables of the Unicode alphabets.
+* `format_f64` rounds the exact value of `x`, so a halfway case that a
+  float holds exactly goes to the even digit (`format_f64(0.5, 0)` is
+  `"0"`), and one it can't hold exactly goes by the value it does hold
+  (`format_f64(2.675, 2)` is `"2.67"`).
+* `abs`, `min` and `max` work on two `i64`s or two `f64`s, like a generic
+  function with `[T: Num]` ([§9](#generic-functions-provisional-syntax)).
+  Their definitions say what happens with NaN and `-0.0`: `min(nan, 1.0)`
+  is NaN, `min(1.0, nan)` is `1.0`, and `min(0.0, -0.0)` is `0.0`.
 
 The text form of a value (used by `print` and interpolation) is how it would
 be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
@@ -1072,6 +1144,26 @@ two scope levels, a function body and one loop, per nested call.)
 Type errors such as `1 + true` are found before the program runs. The AST
 interpreter also checks types as it goes, so it can still run programs that
 haven't been checked.
+
+### The prelude
+
+A few library functions are written in Ella itself, in the *prelude*
+(src/ella/prelude.py): functions that take other functions, or work on
+lists of any type. A program sees them as if it had defined them at its
+start, unless it defines the same name at the top level itself.
+
+| Name | Type | Gives |
+| --- | --- | --- |
+| `reverse(xs)` | `[T] ([T]) -> [T]` | the items of `xs` in the opposite order |
+| `sort(xs)` | `[T: Ord] ([T]) -> [T]` | the items of `xs` from smallest to largest, by `<`; equal items keep their order |
+| `map(xs, f)` | `[T, U] ([T], (T) -> U) -> [U]` | `f` of each item of `xs`, called in order |
+| `filter(xs, keep)` | `[T] ([T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
+| `pi` | `f64` | 3.141592653589793 |
+
+They are ordinary generic functions ([§9](#generic-functions-provisional-syntax)),
+so they are values too, and a type given to `sort` must be `Ord`: a
+number, a string, or a struct or enum with a `compare` method. With pipes
+they read left to right: `words |> filter(long) |> map(upper)`.
 
 ## 11. Stages
 
@@ -1217,7 +1309,7 @@ expr        = let | assignment | lambda | if | match | for | while | loop
             | quote | mut_call | operator_expr ;
 
 let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr
-            | "let" pattern "=" expr ;            (* destructuring: the pattern starts with "(" or IDENT "(" *)
+            | "let" [ "mut" ] pattern [ ":" type ] "=" expr ;  (* destructuring: the pattern starts with "(" or IDENT "(" *)
 type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* built-in or user-defined constraints *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
@@ -1275,7 +1367,7 @@ primary     = INT | FLOAT | string | "true" | "false" | IDENT
 string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING_END ;
 
 pattern     = pattern_atom { "|" pattern_atom } ;
-pattern_atom = "_" | IDENT | literal | literal ( ".." | "..=" ) literal
+pattern_atom = "_" | [ "mut" ] IDENT | literal | literal ( ".." | "..=" ) literal
             | IDENT "(" pattern { "," pattern } ")"
             | "(" pattern "," [ pattern { "," pattern } ] ")" ;
 

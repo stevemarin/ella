@@ -1,0 +1,4 @@
+# An exit status must fit in a byte.
+let main = () -> i64 =>
+    print("about to return 256")
+    256

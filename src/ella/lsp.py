@@ -201,7 +201,7 @@ class EllaServer(LanguageServer):
             types.Diagnostic(
                 range=document.range_to_client_units(error_range(lines, p.line, p.column)),
                 message=p.message,
-                severity=types.DiagnosticSeverity.Error,
+                severity=types.DiagnosticSeverity.Warning if p.warning else types.DiagnosticSeverity.Error,
                 source="ella",
             )
             for p in analysis.problems

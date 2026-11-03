@@ -1,0 +1,45 @@
+# The prelude's list functions: reverse, sort, map and filter.
+
+let numbers = [5, 3, 8, 1, 9, 2, 7]
+print(reverse(numbers))
+print(sort(numbers))
+print(numbers)
+print(numbers |> map((n: i64) -> str => "<{{n}}>"))
+print(numbers |> filter((n: i64) -> bool => n % 2 == 1))
+print(sort(["pear", "apple", "fig", "apple"]))
+print(sort([2.5, -1.0, 0.0, -0.0]))
+let empty: [i64] = []
+print(reverse(empty), sort(empty), map(empty, abs), filter(empty, (n: i64) -> bool => n > 0))
+print(sort([4]))
+
+# Library functions, and these, are values.
+print(map([" a ", "b  "], trim))
+print(map([-2, 3], abs))
+let flip: ([str]) -> [str] = reverse
+print(flip(["x", "y"]))
+
+# sort compares with `<`, so a struct with compare works; equal items keep their order.
+struct Card
+    rank: i64
+    suit: str
+    compare = (a: Card, b: Card) -> i64 => a.rank - b.rank
+print(sort([Card(3, "hearts"), Card(1, "spades"), Card(3, "clubs"), Card(2, "hearts"), Card(1, "clubs")]))
+
+# The function given to map and filter runs once per item, in order.
+let noisy = (n: i64) -> i64 =>
+    print("visit {{n}}")
+    n * n
+print(map([1, 2, 3], noisy))
+
+# A program may define its own functions with these names.
+let main = () -> () =>
+    let reverse = (s: str) -> str =>
+        let mut result = ""
+        for c in chars(s)
+            result = c + result
+        result
+    print(reverse("stressed"))
+    let words = split("the quick brown fox jumps", " ")
+    let long = words |> filter((w: str) -> bool => len(w) > 3) |> map(upper)
+    print(sort(long))
+    print(sort(map(words, (w: str) -> i64 => len(w))))

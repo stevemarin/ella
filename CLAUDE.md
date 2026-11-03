@@ -60,10 +60,14 @@ plain:
   user-defined, met structurally), and the rules for `nocopy` values
   (`check_copies`). Splices in types run while checking, through
   `compile_time` (set by `staging.Expander`). `LIBRARY` has the types of
-  the library functions.
+  the library functions. `Checker.warnings` has the problems that don't
+  stop a program: unused local variables (`warn_unused`, skipped after an
+  error), code after a line of type never, and cases that never match.
 * `src/ella/exhaustive.py`: whether patterns cover every value of a type
   (`match` cases, and `let`/`for` patterns), with an example of one they
-  miss. The checker runs it once types are final.
+  miss, and which `match` cases can never match. The checker runs it once
+  types are final; never-matching cases become warnings, which the CLI
+  prints and editors show.
 * `src/ella/staging.py`: multi-stage programming: building code from quotes
   (fresh names, constants, and splices of code, types and field names),
   reflection on types (`fields(t)`, ...), and expanding splices outside quotes
@@ -75,8 +79,18 @@ plain:
   `run_deep` (runs an interpreter on a thread with a big stack).
 * `src/ella/library.py`: the library functions (`split`, `read_line`,
   `parse_i64`, ...) on run-time values, shared by both interpreters; the
-  runtime's `ella_lib_NAME` functions must match them exactly. `Host` has a
-  program's standard input and arguments.
+  runtime's `ella_lib_NAME` functions must match them exactly (`abs`,
+  `min` and `max` have one per number type: `ella_lib_abs_i64`). `Host` has
+  a program's standard input, arguments and standard error. `exit` raises
+  `Exit`, which the interpreters catch at the top (finalizers don't run).
+  A library function used as a value becomes a small IR function
+  (`trim(str)`) made by the lowering.
+* `src/ella/prelude.py`: library functions written in Ella (`map`,
+  `filter`, `sort`, `reverse`, `pi`). `with_prelude` puts the ones a
+  program uses (and doesn't define itself) at its start; `prepare` and the
+  interpreter's `run` call it, and the analysis adds them all. Prelude
+  code uses no built-ins and binds no names in patterns, so a program's
+  own names can't change it.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
@@ -139,8 +153,9 @@ plain:
   `test/test_vscode.py`. Native tests need
   gcc and are skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), `NAME.in` (standard input) and `NAME.args`
-  (arguments, one per line), run by `test/test_programs.py` through both
+  `NAME.err` (expected error), `NAME.in` (standard input), `NAME.args`
+  (arguments, one per line), `NAME.stderr` (expected standard error) and
+  `NAME.status` (expected exit status), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized).
 
 Stage 7 (staged programming, structs, generics, pools, nocopy and

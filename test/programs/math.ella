@@ -1,0 +1,79 @@
+# Math and code points, and library functions used as values.
+
+let inf = 1.0e308 * 10.0
+let nan = inf - inf
+
+# sqrt and floor work on f64; NaN for the square root of a negative number.
+for x in [2.0, 0.0, -0.0, 16.0, -1.0, inf, nan]
+    print(sqrt(x))
+for x in [2.5, -2.5, -0.5, 0.3, -0.0, 3.0, 1.0e300, -inf, nan]
+    print(floor(x))
+print(to_i64(floor(7.9)))
+
+# abs, min and max take two i64s or two f64s.
+print(abs(-3))
+print(abs(3))
+print(abs(-9223372036854775807))
+print(abs(-2.5))
+print(abs(-0.0))
+print(min(3, -7))
+print(max(3, -7))
+print(min(2.5, 1.5))
+print(max(2.5, 1.5))
+print(min(0.0, -0.0))
+print(max(-0.0, 0.0))
+print(min(nan, 1.0))
+print(min(1.0, nan))
+print(max(nan, 1.0))
+
+# Inside a generic function, T is a number.
+let distance[T: Num] = (a: T, b: T) -> T => abs(a - b)
+print(distance(3, 10))
+print(distance(2.5, -1.0))
+
+# ord and chr convert between characters and code points.
+print(ord("a"))
+print(ord("é"))
+print(ord("😀"))
+print(chr(97))
+print(chr(233))
+print([chr(128512), chr(10)])
+let shift = (text: str, by: i64) -> str =>
+    let mut result = ""
+    for c in chars(text)
+        result += chr(ord(c) + by)
+    result
+print(shift("HAL", 1))
+
+# A library function is a value like any function.
+let apply = (f: (str) -> str, text: str) -> str => f(text)
+print(apply(trim, "  padded  "))
+let ops: [(i64, i64) -> i64] = [min, max]
+for op in ops
+    print(op(3, 7))
+let magnitude: (f64) -> f64 = abs
+print(magnitude(-1.5))
+let parse = parse_i64
+print(parse("12"))
+print(parse("twelve"))
+let pieces = split
+print(pieces("a b", " "))
+print(trim)
+# ceil and round, like floor, give whole numbers as f64; round takes halves away from zero.
+for x in [2.5, -2.5, 0.5, -0.4, 0.49999999999999994, 1.2, -1.2, 1.0e300, -inf, nan]
+    print(ceil(x), round(x))
+
+# exp, ln, sin and cos, and pi.
+print(exp(0.0), exp(1.0), exp(1000.0), exp(-1000.0))
+print(ln(1.0), ln(exp(2.0)), ln(0.0), ln(-1.0), ln(inf))
+print(sin(0.0), sin(pi / 2.0), cos(0.0), cos(pi), sin(inf), cos(nan))
+print(pi, round(pi * 100.0) / 100.0)
+
+let main = () -> () =>
+    let half = (x: f64) -> f64 => x / 2.0
+    let steps = [sqrt, floor, half]
+    let mut x = 10.0
+    for step in steps
+        x = step(x)
+        print(x)
+    print(abs(-9223372036854775807 - 1))

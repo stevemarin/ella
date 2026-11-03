@@ -1023,6 +1023,25 @@ void ella_print(word v, const Type *t) {
     free(b.chars);
 }
 
+// `eprint`: the same on standard error, after what was printed so far.
+void ella_eprint(word v, const Type *t) {
+    fflush(stdout);
+    Buffer b = {0};
+    put_value(&b, v, t, 0);
+    write_utf8(stderr, b.chars, b.len);
+    fputc('\n', stderr);
+    free(b.chars);
+}
+
+// Stop with a run-time error whose message is in a buffer.
+_Noreturn static void fail_with(word line, word column, Buffer *message) {
+    fflush(stdout);
+    fprintf(stderr, "%" PRId64 ":%" PRId64 ": ", line, column);
+    write_utf8(stderr, message->chars, message->len);
+    fputc('\n', stderr);
+    exit(1);
+}
+
 // A trap whose message shows a value: "no case matches {}".
 _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word line, word column) {
     Buffer b = {0};
@@ -1141,8 +1160,9 @@ static Str *decode(const unsigned char *bytes, size_t n, word depth) {
     return s;
 }
 
-// A string as a C string in UTF-8, for file names. The caller frees it.
-static char *encode(const Str *s) {
+// A string in UTF-8, with a 0 after it, for file names and file contents.
+// Its length in bytes goes to *len, if len isn't NULL. The caller frees it.
+static char *encode_len(const Str *s, size_t *len) {
     char *text = malloc((size_t)s->len * 4 + 1), *p = text;
     if (text == NULL) out_of_memory("can't encode a string");
     for (word i = 0; i < s->len; i++) {
@@ -1164,8 +1184,11 @@ static char *encode(const Str *s) {
         }
     }
     *p = 0;
+    if (len != NULL) *len = (size_t)(p - text);
     return text;
 }
+
+static char *encode(const Str *s) { return encode_len(s, NULL); }
 
 static int is_digit(uint32_t c) { return c >= '0' && c <= '9'; }
 
@@ -1418,6 +1441,238 @@ List *ella_lib_chars(const Str *s, word line, word column, word depth) {
     return chars;
 }
 
+word ella_lib_ord(const Str *s, word line, word column, word depth) {
+    UNUSED(depth);
+    if (s->len != 1) {
+        Buffer message = {0};
+        put_ascii(&message, "ord() needs one character, not ");
+        put_quoted(&message, s);
+        fail_with(line, column, &message);
+    }
+    return s->chars[0];
+}
+
+Str *ella_lib_chr(word n, word line, word column, word depth) {
+    if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n < 0xE000)) {  // surrogates aren't characters
+        fail(line, column, "chr() can't make a character from %" PRId64, n);
+    }
+    Str *s = str_alloc(1, depth);
+    s->chars[0] = (uint32_t)n;
+    return s;
+}
+
+// NaN for a negative number, as in ella/library.py.
+word ella_lib_sqrt(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    double x = as_f64(bits);
+    return f64_bits(x >= 0 ? sqrt(x) : NAN);
+}
+
+word ella_lib_floor(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(floor(as_f64(bits)));
+}
+
+word ella_lib_ceil(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(ceil(as_f64(bits)));
+}
+
+// Halfway cases round away from zero.
+word ella_lib_round(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(round(as_f64(bits)));
+}
+
+word ella_lib_exp(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(exp(as_f64(bits)));
+}
+
+word ella_lib_ln(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(log(as_f64(bits)));
+}
+
+word ella_lib_sin(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(sin(as_f64(bits)));
+}
+
+word ella_lib_cos(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(cos(as_f64(bits)));
+}
+
+// upper and lower change ASCII letters only.
+static Str *change_case(const Str *s, uint32_t from, word depth) {
+    Str *result = str_alloc(s->len, depth);
+    for (word i = 0; i < s->len; i++) {
+        uint32_t c = s->chars[i];
+        result->chars[i] = c >= from && c < from + 26 ? c ^ 0x20 : c;
+    }
+    return result;
+}
+
+Str *ella_lib_upper(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    return change_case(s, 'a', depth);
+}
+
+Str *ella_lib_lower(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    return change_case(s, 'A', depth);
+}
+
+word ella_lib_starts_with(const Str *s, const Str *part, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return matches_at(s, 0, part);
+}
+
+word ella_lib_ends_with(const Str *s, const Str *part, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return s->len >= part->len && matches_at(s, s->len - part->len, part);
+}
+
+// s with copies of fill before it (or after it) to make it width characters long.
+static Str *pad(const char *name, const Str *s, word width, const Str *fill, int left, word line, word column,
+                word depth) {
+    if (fill->len != 1) {
+        Buffer message = {0};
+        put_ascii(&message, name);
+        put_ascii(&message, "() needs one character to fill with, not ");
+        put_quoted(&message, fill);
+        fail_with(line, column, &message);
+    }
+    word padding = width > s->len ? width - s->len : 0;
+    Str *result = str_alloc(s->len + padding, depth);
+    word start = left ? padding : 0;
+    memcpy(result->chars + start, s->chars, (size_t)s->len * sizeof(uint32_t));
+    for (word i = 0; i < padding; i++) result->chars[left ? i : s->len + i] = fill->chars[0];
+    return result;
+}
+
+Str *ella_lib_pad_left(const Str *s, word width, const Str *fill, word line, word column, word depth) {
+    return pad("pad_left", s, width, fill, 1, line, column, depth);
+}
+
+Str *ella_lib_pad_right(const Str *s, word width, const Str *fill, word line, word column, word depth) {
+    return pad("pad_right", s, width, fill, 0, line, column, depth);
+}
+
+#define MAX_DIGITS 100  // as in ella/library.py
+
+// x with a fixed number of decimals, as printf (and Python's format) writes it, but NaN is always "nan".
+Str *ella_lib_format_f64(word bits, word digits, word line, word column, word depth) {
+    if (digits < 0 || digits > MAX_DIGITS) {
+        fail(line, column, "format_f64() can write from 0 to %d decimals, not %" PRId64, MAX_DIGITS, digits);
+    }
+    double x = as_f64(bits);
+    if (isnan(x)) x = NAN;  // not "-nan"
+    int len = snprintf(NULL, 0, "%.*f", (int)digits, x);
+    char *text = malloc((size_t)len + 1);
+    if (text == NULL) out_of_memory("can't format a number");
+    snprintf(text, (size_t)len + 1, "%.*f", (int)digits, x);
+    Str *s = str_alloc(len, depth);
+    for (int i = 0; i < len; i++) s->chars[i] = (unsigned char)text[i];
+    free(text);
+    return s;
+}
+
+word ella_lib_env(const Str *name, word line, word column, word depth) {
+    if (name->len == 0) return none(depth);
+    for (word i = 0; i < name->len; i++) {
+        if (name->chars[i] == '=' || name->chars[i] == 0) return none(depth);
+    }
+    char *text = encode(name);
+    const char *value = getenv(text);
+    free(text);
+    if (value == NULL) return none(depth);
+    Str *s = decode((const unsigned char *)value, strlen(value), depth);
+    if (s == NULL) {
+        Buffer message = {0};
+        put_ascii(&message, "env(): the value of ");
+        for (word i = 0; i < name->len; i++) put(&message, name->chars[i]);
+        put_ascii(&message, " isn't valid UTF-8");
+        fail_with(line, column, &message);
+    }
+    return some((word)s, depth);
+}
+
+word ella_lib_write_file(const Str *path, const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    int error = 0;
+    for (word i = 0; i < path->len; i++) {
+        if (path->chars[i] == 0) error = EINVAL;  // as open() would say, given the whole name
+    }
+    if (!error) {
+        char *name = encode(path);
+        int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        free(name);
+        if (fd < 0) error = errno;
+        size_t len = 0, done = 0;
+        char *data = fd < 0 ? NULL : encode_len(s, &len);
+        while (!error && done < len) {
+            ssize_t wrote = write(fd, data + done, len - done);
+            if (wrote < 0) error = errno;
+            if (wrote > 0) done += (size_t)wrote;
+        }
+        free(data);
+        if (fd >= 0 && close(fd) != 0 && !error) error = errno;
+    }
+    if (error) {
+        Buffer message = {0};
+        put_ascii(&message, "can't write ");
+        put_quoted(&message, path);
+        put_ascii(&message, ": ");
+        put_ascii(&message, strerror(error));
+        return err(&message, depth);
+    }
+    return ok(0, depth);  // Ok(())
+}
+
+// Stop the program at once, without running finalizers.
+word ella_lib_exit(word status, word line, word column, word depth) {
+    UNUSED(depth);
+    if (status < 0 || status > 255) fail(line, column, "exit() needs a status from 0 to 255, not %" PRId64, status);
+    fflush(stdout);
+    exit((int)status);
+}
+
+// abs, min and max, for each number type.
+
+word ella_lib_abs_i64(word n, word line, word column, word depth) {
+    UNUSED(depth);
+    if (n == INT64_MIN) fail(line, column, "i64 overflow: abs(%" PRId64 ") doesn't fit in 64 bits", n);
+    return n < 0 ? -n : n;
+}
+
+word ella_lib_abs_f64(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits(fabs(as_f64(bits)));
+}
+
+// min(a, b) is a unless b is less, and max(a, b) a unless b is greater (so a NaN a is kept).
+word ella_lib_min_i64(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return b < a ? b : a;
+}
+
+word ella_lib_max_i64(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return b > a ? b : a;
+}
+
+word ella_lib_min_f64(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return as_f64(b) < as_f64(a) ? b : a;
+}
+
+word ella_lib_max_f64(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return as_f64(b) > as_f64(a) ? b : a;
+}
+
 // The program starts here, and runs the top-level code (generated as
 // ella_main) on a stack of its own, big enough for ella_max_depth nested
 // calls. Only the parts it uses take memory. A page at its end that can't
@@ -1426,7 +1681,7 @@ List *ella_lib_chars(const Str *s, word line, word column, word depth) {
 
 #define STACK_PER_CALL ((size_t)256 << 10)
 
-extern void ella_main(char *stack);
+extern word ella_main(char *stack);  // gives the exit status
 
 int main(int argc, char **argv) {
     poison = getenv("ELLA_POISON") != NULL;
@@ -1436,9 +1691,9 @@ int main(int argc, char **argv) {
     size_t stack_size = (size_t)ella_max_depth * STACK_PER_CALL + ((size_t)1 << 30);
     char *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (stack == MAP_FAILED || mprotect(stack, 4096, PROT_NONE) != 0) out_of_memory("can't make the stack");
-    ella_main(stack + stack_size);
+    word status = ella_main(stack + stack_size);
     ella_reset(0, 1);  // the globals, and their finalizers
     fflush(stdout);
     if (getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);
-    return 0;
+    return (int)status;
 }

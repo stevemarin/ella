@@ -180,7 +180,19 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   ([src/ella/library.py](src/ella/library.py)). `let (a, b) = pair` takes
   values apart, `pair.0` reads a tuple's item, and the checker makes sure
   every `match` covers every value ([src/ella/exhaustive.py](src/ella/exhaustive.py)).
-  See [TODO.md](TODO.md) for what could come next.
+* The library also has math (`sqrt`, `floor`, `abs`, `min`, `max`) and code
+  points (`ord`, `chr`), and its functions are values (`apply(trim, s)`).
+  `print` takes any number of values, `eprint` writes to standard error,
+  `main` can return the exit status, `let mut (a, b): (i64, i64) = ...`
+  makes changeable names, and the checker warns about `match` cases that
+  can never match.
+* A prelude written in Ella ([src/ella/prelude.py](src/ella/prelude.py))
+  gives `map`, `filter`, `sort` and `reverse`. The library adds more math
+  (`round`, `ceil`, `exp`, `ln`, `sin`, `cos`, `pi`), strings (`upper`,
+  `lower`, `starts_with`, `ends_with`, padding, `format_f64`), `env`,
+  `write_file` and `exit`. `mut` can mark one name in a pattern
+  (`let (mut a, b)`), and the checker also warns about unused variables
+  and code that never runs. See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

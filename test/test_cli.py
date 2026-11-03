@@ -44,6 +44,23 @@ def test_reports_runtime_errors_after_output(tmp_path: Path, capsys: pytest.Capt
     assert captured.err == f"{path}:2:8: assertion failed: 1 == 2\n"
 
 
+@pytest.mark.parametrize("mode", [[], ["--tree"], ["-O"]])
+def test_main_gives_the_exit_status(tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: list[str]) -> None:
+    path = write(tmp_path, 'let main = () -> i64 =>\n    eprint("failing", 42)\n    42\n')
+    assert main([*mode, path]) == 42
+    assert capsys.readouterr().err == "failing 42\n"
+
+
+def test_prints_warnings(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "match 1\n    case _ => print(1)\n    case 2 => print(2)\n")
+    assert main([path]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "1\n"
+    assert captured.err == (
+        f"{path}:3:5: warning: this case can never match: the cases before it match every value it does\n"
+    )
+
+
 def test_runs_example(capsys: pytest.CaptureFixture[str]) -> None:
     assert main([str(EXAMPLE)]) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "done"
@@ -52,7 +69,7 @@ def test_runs_example(capsys: pytest.CaptureFixture[str]) -> None:
 def test_prints_ir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--ir", write(tmp_path, "print(1 + 2)\n")]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("function top() -> ()\n")
+    assert out.startswith("function top() -> i64\n")
     assert "add %" in out and "print %" in out
 
 
@@ -145,3 +162,48 @@ def test_max_depth(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         assert capsys.readouterr().out == "50\n"
         assert main([*mode, "--max-depth", "20", path]) == 1
         assert capsys.readouterr().err == f"{path}:1:61: stack overflow: more than 20 nested calls\n"
+
+
+NEEDS_GCC = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
+MODES = [[], ["--tree"], ["-O"], pytest.param(["--native"], marks=NEEDS_GCC)]
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_environment_and_writing_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, mode: list[str]
+) -> None:
+    monkeypatch.setenv("ELLA_TEST_VALUE", "héllo")
+    monkeypatch.delenv("ELLA_TEST_MISSING", raising=False)
+    output = tmp_path / "out.txt"
+    source = f"""\
+print(env("ELLA_TEST_VALUE"), env("ELLA_TEST_MISSING"), env(""), env("A=B"))
+print(write_file("{output}", "line 1\\nline 2 é\\n"))
+print(read_file("{output}"))
+print(write_file("{tmp_path}", "x"))
+print(write_file("{tmp_path}/missing/x.txt", "x"))
+"""
+    assert main([*mode, write(tmp_path, source)]) == 0
+    assert capsys.readouterr().out == (
+        'Some("héllo") None None None\n'
+        "Ok(())\n"
+        'Ok("line 1\\nline 2 é\\n")\n'
+        f'Err(Error("can\'t write \\"{tmp_path}\\": Is a directory"))\n'
+        f'Err(Error("can\'t write \\"{tmp_path}/missing/x.txt\\": No such file or directory"))\n'
+    )
+    assert output.read_text() == "line 1\nline 2 é\n"
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_exit_stops_the_program(tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: list[str]) -> None:
+    path = write(tmp_path, 'print("before")\nexit(7)\nprint("after")\n')
+    assert main([*mode, path]) == 7
+    assert capsys.readouterr().out == "before\n"
+    path = write(tmp_path, "exit(256)\n")
+    assert main([*mode, path]) == 1
+    assert capsys.readouterr().err == f"{path}:1:5: exit() needs a status from 0 to 255, not 256\n"
+
+
+def test_exit_cant_stop_the_compiler(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "let f = () -> Code[i64] =>\n    exit(1)\nlet x = $(f())\n")
+    assert main([path]) == 1
+    assert capsys.readouterr().err == f"{path}:2:9: exit() can't stop the program while it is being compiled\n"

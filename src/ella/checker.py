@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 
-from ella.exhaustive import missing
+from ella.exhaustive import missing, redundant
 from ella.lexer import EllaError, Span
 from ella.syntax import (
     Assert,
@@ -55,6 +55,7 @@ from ella.syntax import (
     BoolLit,
     Break,
     Call,
+    Case,
     Compare,
     ConstraintDef,
     Continue,
@@ -444,8 +445,10 @@ class PendingBody:
     quotes: int
 
 
-# The library: built-in functions with fixed types (see ella.library).
+# The library: built-in functions with fixed types (see ella.library). A few
+# work on either number type: their T is a type parameter that must be Num.
 ERROR = EnumTy("Error")
+NUM_T = ParamTy("T", CONSTRAINTS["Num"])
 LIBRARY: dict[str, FuncTy] = {
     "to_f64": FuncTy((I64,), F64),
     "to_i64": FuncTy((F64,), I64),
@@ -460,9 +463,40 @@ LIBRARY: dict[str, FuncTy] = {
     "replace": FuncTy((STR, STR, STR), STR),
     "trim": FuncTy((STR,), STR),
     "chars": FuncTy((STR,), ListTy(STR)),
+    "ord": FuncTy((STR,), I64),
+    "chr": FuncTy((I64,), STR),
+    "sqrt": FuncTy((F64,), F64),
+    "floor": FuncTy((F64,), F64),
+    "ceil": FuncTy((F64,), F64),
+    "round": FuncTy((F64,), F64),
+    "exp": FuncTy((F64,), F64),
+    "ln": FuncTy((F64,), F64),
+    "sin": FuncTy((F64,), F64),
+    "cos": FuncTy((F64,), F64),
+    "upper": FuncTy((STR,), STR),
+    "lower": FuncTy((STR,), STR),
+    "starts_with": FuncTy((STR, STR), BOOL),
+    "ends_with": FuncTy((STR, STR), BOOL),
+    "pad_left": FuncTy((STR, I64, STR), STR),
+    "pad_right": FuncTy((STR, I64, STR), STR),
+    "format_f64": FuncTy((F64, I64), STR),
+    "env": FuncTy((STR,), EnumTy("Optional", (STR,))),
+    "write_file": FuncTy((STR, STR), EnumTy("Result", (UNIT, ERROR))),
+    "exit": FuncTy((I64,), NEVER),
+    "abs": FuncTy((NUM_T,), NUM_T),
+    "min": FuncTy((NUM_T, NUM_T), NUM_T),
+    "max": FuncTy((NUM_T, NUM_T), NUM_T),
 }
+GENERIC_LIBRARY = frozenset(name for name, t in LIBRARY.items() if NUM_T in t.params)
+NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
-BUILTINS = ("print", "len", "run", "pool_new", "alloc", "free", *LIBRARY)
+BUILTINS = ("print", "eprint", "len", "run", "pool_new", "alloc", "free", *LIBRARY)
+
+
+def show_library(name: str) -> str:
+    """A library function's type, for hover text: `(str) -> str`, or `[T: Num] (T) -> T`."""
+    return ("[T: Num] " if name in GENERIC_LIBRARY else "") + show_type(LIBRARY[name])
+
 
 # Built-ins that look at types, and make them, for code that generates code
 # (docs/grammar.md §11), with the types of their arguments and results.
@@ -538,6 +572,10 @@ class Checker:
         self.later_stage_uses: list[tuple[str, Type, Span]] = []  # variables used in a later stage
         # Patterns that must match every value of a type: a match's cases, a let's or a for's pattern.
         self.coverage: list[tuple[str, list[Pattern], Type, Span]] = []
+        self.matches: list[tuple[tuple[Case, ...], Type]] = []  # every match's cases, to find ones that never match
+        # Problems that don't stop the program, such as a case that can never match.
+        self.warnings: list[EllaError] = []
+        self.declared: dict[int, Binding | NamePattern] = {}  # local variables, to find the ones never used
         # Uses of generic functions: the function, its type arguments, the
         # constraints of each type parameter, and where.
         self.generic_uses: list[tuple[str, tuple[Type, ...], tuple[tuple[str, tuple[str, ...]], ...], Span]] = []
@@ -694,6 +732,8 @@ class Checker:
             )
         else:
             env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=binder)
+            if isinstance(binder, Binding | NamePattern):
+                self.declared[id(binder)] = binder
 
     def annotation(self, texpr: TypeExpr, params: dict[str, Type] | None = None) -> Type:
         """The type a type annotation stands for. `params` are an enum's type parameters.
@@ -917,8 +957,20 @@ class Checker:
 
         self.attempt(None, [], partial(self.check_main, program))
         self.attempt(None, [], self.finish_checks)
+        if not self.errors:  # after an error, some uses may not have been found
+            self.warn_unused()
+        self.warnings.sort(key=lambda warning: (warning.span.line, warning.span.column))
         if not self.errors:  # the copy rules need everything checked
             self.attempt(None, [], partial(check_copies, program.body, self))
+
+    def warn_unused(self) -> None:
+        """Warn about local variables that are never used, unless their names start with `_`."""
+        used = {id(info.binder) for info in self.resolved.values()}
+        for node in self.declared.values():
+            if id(node) not in used and not node.name.startswith("_"):
+                self.warnings.append(
+                    EllaError(f"'{node.name}' is never used; start its name with '_' if that is on purpose", node.span)
+                )
 
     def declare_function(self, let: Let) -> None:
         """Give a top-level function's names its type, from its annotations, before anything is checked."""
@@ -939,9 +991,15 @@ class Checker:
             )
 
     def check_main(self, program: Program) -> None:
+        """`main` is `() -> ()`, or `() -> i64` to give the program's exit status."""
         main = self.globals.vars.get("main")
-        if main is not None and main.kind == "global" and not self.unify(main.type, FuncTy((), UNIT)):
-            raise EllaError(f"main must have type () -> (), not {show_type(main.type)}", program.span)
+        if main is None or main.kind != "global":
+            return
+        t = resolve(main.type)
+        if isinstance(t, FuncTy) and not t.params and resolve(t.result) == I64:
+            return
+        if not self.unify(main.type, FuncTy((), UNIT)):
+            raise EllaError(f"main must have type () -> () or () -> i64, not {show_type(main.type)}", program.span)
 
     def attempt(self, node: object, defines: Iterable[str], step: Callable[[], object]) -> bool:
         """Take one step of checking a program, about `node`, which defines the names `defines`. Did it work?
@@ -991,15 +1049,25 @@ class Checker:
                 for binding in bindings:
                     if not (top and binding.name in env.vars):
                         self.bind_name(env, binding.name, self.fresh(), binding.mutable, binding.span, binding)
-            case LetPattern(pattern):
+            case LetPattern(pattern, mutable=mutable):
                 for node in pattern_names(pattern):
                     info = env.lookup(node.name)
                     if not (info is not None and (top or info.kind == "variant")):
-                        self.bind_name(env, node.name, self.fresh(), False, node.span, node)
+                        self.bind_name(env, node.name, self.fresh(), mutable or node.mutable, node.span, node)
 
     def finish_checks(self) -> None:
         """The checks that need every type decided."""
         variants = {node for node, kind in self.kinds.items() if kind == "variant"}
+        for cases, t in self.matches:
+            t = finish(t)
+            if any_part(t, self.enums, lambda part: isinstance(part, DeferredTy)):
+                continue
+            for i in redundant([(c.pattern, c.guard is not None) for c in cases], t, self.constructors, variants):
+                self.warnings.append(
+                    EllaError(
+                        "this case can never match: the cases before it match every value it does", cases[i].span
+                    )
+                )
         for what, patterns, t, span in self.coverage:
             t = finish(t)
             if any_part(t, self.enums, lambda part: isinstance(part, DeferredTy)):
@@ -1114,6 +1182,8 @@ class Checker:
                 self.kinds[id(expr)] = info.kind
                 self.resolved[id(expr)] = info
                 match info.kind:
+                    case "builtin" if name in LIBRARY and name not in NOT_VALUES:
+                        return self.library_type(name, span)
                     case "builtin" | "constructor":
                         raise EllaError(f"'{name}' can only be called, not used as a value", span)
                     case "variant":
@@ -1168,14 +1238,18 @@ class Checker:
                         bindings[0].constraints,
                     )
                 return t
-            case LetPattern(pattern, value_expr, span):
+            case LetPattern(pattern, value_expr, span, mutable, type_expr):
                 t = self.check(value_expr, env)
+                if type_expr is not None:
+                    declared = self.annotation(type_expr)
+                    self.expect(t, declared, value_expr.span, "the value of the 'let'")
+                    t = declared
                 bound = Env(env)
                 self.check_pattern(pattern, t, bound)
                 self.coverage.append(("let", [pattern], t, span))
                 for name, info in bound.vars.items():
                     assert isinstance(info.binder, NamePattern)
-                    self.bind_name(env, name, info.type, False, info.binder.span, info.binder)
+                    self.bind_name(env, name, info.type, mutable or info.mutable, info.binder.span, info.binder)
                 return t
             case Assign(op, target, value_expr, span):
                 value_type = self.check(value_expr, env)
@@ -1294,7 +1368,12 @@ class Checker:
             case Block(exprs):
                 local = Env(env)
                 t = UNIT
+                finished = True  # whether the lines so far can finish, so that the next one runs
                 for line in exprs:
+                    if finished and resolve(t) is NEVER:
+                        finished = False
+                        message = "this code never runs: the line before it never finishes"
+                        self.warnings.append(EllaError(message, start_of(line)))
                     t = self.check_line(line, local)
                 # A block that ends with an assignment has the value ().
                 return UNIT if isinstance(exprs[-1], Assign) else t
@@ -1317,6 +1396,7 @@ class Checker:
                     )
                 unguarded = [case.pattern for case in cases if case.guard is None]
                 self.coverage.append(("match", unguarded, subject_type, span))
+                self.matches.append((cases, subject_type))
                 return match_type
             case For(label, pattern, iterable, body, span):
                 iterable_type = self.known(self.check(iterable, env), iterable.span)
@@ -1948,16 +2028,12 @@ class Checker:
     def check_builtin(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
         """`print`, `len`, `run`, the pool functions `pool_new`, `alloc` and `free`, reflection, and the library."""
         if name in LIBRARY:
-            function = LIBRARY[name]
+            function = self.library_type(name, span)
             self.check_arity(name, len(function.params), args, span)
             for i, (arg, t) in enumerate(zip(args, function.params), 1):
                 if isinstance(arg, MutArg):
                     raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
                 self.expect(self.check(arg, env), t, arg.span, f"argument {i} of {name}()")
-            # The runtime makes the built-in Optional, Result and Error, which a program may replace.
-            for part, info in BUILTIN_ENUMS.items():
-                if self.enums[part] != info and part in enum_names(function.result):
-                    raise EllaError(f"{name}() needs the built-in {part}, which this program replaces", span)
             return function.result
         if name in REFLECTION:
             params, reflected = REFLECTION[name]
@@ -1967,7 +2043,14 @@ class Checker:
                     t = BuiltinTy("Type", (self.fresh(),))  # any type will do
                 self.expect(self.check(arg, env), t, arg.span, f"argument {i} of {name}()")
             return reflected
-        arity = {"print": 1, "len": 1, "run": 1, "pool_new": 0, "alloc": 2, "free": 2}[name]
+        if name in ("print", "eprint"):
+            # Any number of values, written with spaces between them.
+            for arg in args:
+                if isinstance(arg, MutArg):
+                    raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
+                self.check(arg, env)
+            return UNIT
+        arity = {"len": 1, "run": 1, "pool_new": 0, "alloc": 2, "free": 2}[name]
         self.check_arity(name, arity, args, span)
         if name in ("alloc", "free"):
             # alloc(mut pool, value) -> handle, and free(mut pool, handle).
@@ -2007,6 +2090,21 @@ class Checker:
             return I64
         return UNIT
 
+    def library_type(self, name: str, span: Span) -> FuncTy:
+        """The type of a library function at one use: abs, min and max get their own T, which must be Num."""
+        function = LIBRARY[name]
+        # The runtime makes the built-in Optional, Result and Error, which a program may replace.
+        for part, info in BUILTIN_ENUMS.items():
+            if self.enums[part] != info and part in enum_names(function.result):
+                raise EllaError(f"{name}() needs the built-in {part}, which this program replaces", span)
+        if name not in GENERIC_LIBRARY:
+            return function
+        arg = self.fresh()
+        self.generic_uses.append((name, (arg,), (("T", ("Num",)),), span))
+        t = substitute(function, {"T": arg})
+        assert isinstance(t, FuncTy)
+        return t
+
     def check_arity(self, name: str, arity: int, args: tuple[Expr, ...], span: Span) -> None:
         if len(args) != arity:
             plural = "" if arity == 1 else "s"
@@ -2034,16 +2132,19 @@ class Checker:
         match pattern:
             case WildcardPattern():
                 pass
-            case NamePattern(name, span):
+            case NamePattern(name, span, mutable):
                 # A name is a variant (like `None`) if one is in scope, and otherwise a new variable.
                 info = env.lookup(name)
                 if info is not None and info.kind == "variant":
+                    if mutable:
+                        raise EllaError(f"'mut' marks a variable, and '{name}' is a variant", span)
                     self.kinds[id(pattern)] = "variant"
                     enum_type, _ = self.instantiate(info.enum, name)
                     self.expect(enum_type, t, span, f"the pattern '{name}'")
                 else:
                     self.kinds[id(pattern)] = "binding"
-                    env.vars[name] = VarInfo(t, False, "local", level=self.level, binder=pattern)
+                    env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=pattern)
+                    self.declared[id(pattern)] = pattern
             case LiteralPattern(value, span):
                 self.expect(literal_type(value), t, span, "this pattern")
             case RangePattern(low, high, _, span):
@@ -2064,7 +2165,13 @@ class Checker:
                         raise EllaError("each alternative of '|' must bind the same names", span)
                     for name, info in other.vars.items():
                         self.expect(info.type, first[name].type, span, f"'{name}' in each alternative")
+                        if info.mutable != first[name].mutable:
+                            raise EllaError(f"'{name}' must be 'mut' in every alternative of '|', or in none", span)
                 env.vars.update(first)
+                # Uses of the names find the first alternative's, so only those can be unused.
+                for alternative in alternatives[1:]:
+                    for node in pattern_names(alternative):
+                        self.declared.pop(id(node), None)
             case VariantPattern(name, args, span):
                 info = env.lookup(name)
                 if info is None or info.kind not in ("variant", "constructor"):
@@ -2114,6 +2221,20 @@ def names_used(node: object, inside_lambdas: bool = False) -> set[str]:
         case _ if dataclasses.is_dataclass(node) and not isinstance(node, type):
             return set().union(*(names_used(getattr(node, f.name), inside_lambdas) for f in dataclasses.fields(node)))
     return set()
+
+
+def start_of(node: object) -> Span:
+    """Where an expression starts: the first of its parts' spans (a call's own span is its `(`)."""
+    spans = []
+    for f in dataclasses.fields(node):  # type: ignore[arg-type]
+        part = getattr(node, f.name)
+        if isinstance(part, Span):
+            spans.append(part)
+        elif isinstance(part, tuple):
+            spans += [start_of(item) for item in part if dataclasses.is_dataclass(item)]
+        elif dataclasses.is_dataclass(part) and not isinstance(part, type):
+            spans.append(start_of(part))
+    return min(spans, key=lambda span: (span.line, span.column))
 
 
 def defined_names(expr: object) -> list[str]:

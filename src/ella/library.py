@@ -13,25 +13,42 @@ import errno
 import math
 import os
 import re
+import string
 import sys
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, TextIO
 
 from ella.lexer import EllaError, Span
 from ella.values import Value, VariantValue, fits_i64, to_text
+
+MAX_CODE_POINT = 0x10FFFF
+SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and can't be written in UTF-8
 
 # What `parse_i64` and `parse_f64` accept.
 I64_TEXT = re.compile(r"[+-]?[0-9]+")
 F64_TEXT = re.compile(r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf|nan)")
 WHITESPACE = " \t\n\r\v\f"  # what `trim` removes
+MAX_DIGITS = 100  # how many decimals format_f64 can write
+
+
+class Exit(Exception):
+    """`exit(status)`: the program stops at once. The interpreters catch it at the top."""
+
+    def __init__(self, status: int, span: Span) -> None:
+        super().__init__(status)
+        self.status = status
+        self.span = span
 
 
 @dataclass(slots=True)
 class Host:
-    """What a running program can read: its standard input (as bytes; None for this process's) and its arguments."""
+    """What a running program can use besides standard output: its standard input (as bytes), its
+    arguments, and standard error (for `eprint`). None means this process's.
+    """
 
     stdin: BinaryIO | None = None
     args: list[str] = field(default_factory=list)
+    stderr: TextIO | None = None
 
 
 def some(value: Value) -> Value:
@@ -99,7 +116,91 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             return text.strip(WHITESPACE)
         case "chars", [str() as text]:
             return list(text)
+        case "ord", [str() as text]:
+            if len(text) != 1:
+                raise EllaError(f"ord() needs one character, not {quoted(text)}", span)
+            return ord(text)
+        case "chr", [int() as n]:
+            if not 0 <= n <= MAX_CODE_POINT or n in SURROGATES:
+                raise EllaError(f"chr() can't make a character from {n}", span)
+            return chr(n)
+        case "sqrt", [float() as x]:
+            return math.sqrt(x) if x >= 0 else math.nan  # NaN for a negative number, as in C
+        case "floor", [float() as x]:
+            return whole(x, math.floor(x)) if math.isfinite(x) else x
+        case "ceil", [float() as x]:
+            return whole(x, math.ceil(x)) if math.isfinite(x) else x
+        case "round", [float() as x]:
+            if not math.isfinite(x):
+                return x
+            truncated = math.trunc(x)
+            if abs(x - truncated) >= 0.5:  # exact, since x - truncated is the fraction of x
+                truncated += 1 if x > 0 else -1
+            return whole(x, truncated)
+        case "exp", [float() as x]:
+            try:
+                return math.exp(x)
+            except OverflowError:
+                return math.inf
+        case "ln", [float() as x]:
+            if x == 0:
+                return -math.inf
+            return math.log(x) if x > 0 else math.nan  # NaN stays NaN, and inf inf
+        case "sin" | "cos", [float() as x]:
+            if math.isinf(x):
+                return math.nan
+            return math.sin(x) if name == "sin" else math.cos(x)
+        case "upper", [str() as text]:
+            return text.translate(UPPER)
+        case "lower", [str() as text]:
+            return text.translate(LOWER)
+        case "starts_with", [str() as text, str() as part]:
+            return text.startswith(part)
+        case "ends_with", [str() as text, str() as part]:
+            return text.endswith(part)
+        case "pad_left" | "pad_right", [str() as text, int() as width, str() as fill]:
+            if len(fill) != 1:
+                raise EllaError(f"{name}() needs one character to fill with, not {quoted(fill)}", span)
+            padding = fill * max(width - len(text), 0)
+            return padding + text if name == "pad_left" else text + padding
+        case "format_f64", [float() as x, int() as digits]:
+            if not 0 <= digits <= MAX_DIGITS:
+                raise EllaError(f"format_f64() can write from 0 to {MAX_DIGITS} decimals, not {digits}", span)
+            return f"{x:.{digits}f}"
+        case "env", [str() as variable]:
+            if not variable or "=" in variable or "\0" in variable:
+                return NONE
+            value = os.environb.get(variable.encode("utf-8"))
+            if value is None:
+                return NONE
+            return some(decode(value, f"env(): the value of {variable} isn't valid UTF-8", span))
+        case "write_file", [str() as path, str() as text]:
+            return write_file(path, text)
+        case "exit", [int() as status]:
+            if not 0 <= status <= 255:
+                raise EllaError(f"exit() needs a status from 0 to 255, not {status}", span)
+            raise Exit(status, span)
+        case "abs", [int() as n]:
+            if not fits_i64(abs(n)):
+                raise EllaError(f"i64 overflow: abs({n}) doesn't fit in 64 bits", span)
+            return abs(n)
+        case "abs", [float() as x]:
+            return abs(x)
+        case "min", [int() | float() as a, int() | float() as b]:
+            return min(a, b)
+        case "max", [int() | float() as a, int() | float() as b]:
+            return max(a, b)
     raise AssertionError(f"no library function {name} for {args}")
+
+
+# upper and lower change ASCII letters only, as the runtime does.
+UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def whole(x: float, n: int) -> float:
+    """A whole number that x was rounded to, as a float: -0.0 if it is zero and x is negative, as in C."""
+    return math.copysign(0.0, x) if n == 0 else float(n)
 
 
 def decode(data: bytes, message: str, span: Span) -> str:
@@ -122,3 +223,15 @@ def read_file(path: str) -> Value:
         return ok(data.decode("utf-8"))
     except UnicodeDecodeError:
         return err(f"can't read {quoted(path)}: it isn't valid UTF-8")
+
+
+def write_file(path: str, text: str) -> Value:
+    """Write text to a file in UTF-8, replacing what it held, or give an error saying why it can't."""
+    if "\0" in path:
+        return err(f"can't write {quoted(path)}: {os.strerror(errno.EINVAL)}")
+    try:
+        with open(path, "wb") as file:
+            file.write(text.encode("utf-8"))
+    except OSError as error:
+        return err(f"can't write {quoted(path)}: {error.strerror}")
+    return ok(())

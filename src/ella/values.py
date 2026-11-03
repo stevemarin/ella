@@ -37,8 +37,8 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ella.checker import Type, show_type
-from ella.lexer import Span
+from ella.checker import LIBRARY, Type, show_type
+from ella.lexer import EllaError, Span
 from ella.syntax import Expr, Lambda, show
 
 I64_MIN = -(2**63)
@@ -199,6 +199,16 @@ class Scope:
         self.vars[name] = Var(value, mutable)
 
 
+STATUS_ERROR = "main returned {}, but an exit status must be from 0 to 255"
+
+
+def check_status(status: int, span: Span) -> int:
+    """The exit status `main` returned, which must fit in a byte."""
+    if not 0 <= status <= 255:
+        raise EllaError(STATUS_ERROR.format(status), span)
+    return status
+
+
 def fits_i64(n: int) -> bool:
     """Python integers never overflow, so i64 results are checked with this."""
     return I64_MIN <= n <= I64_MAX
@@ -295,11 +305,11 @@ def to_text(value: Value, nested: bool = False) -> str:
             if not fields:
                 return variant
             return f"{variant}(" + ", ".join(to_text(item, True) for item in fields) + ")"
-        case Builtin(name=name):
+        case Builtin(name=name) if name not in LIBRARY:  # (a library function is a value, as in compiled code)
             return f"<built-in function {name}>"
         case Constructor(variant=variant):
             return f"<constructor {variant}>"
-        case Closure() | FunctionRef():
+        case Closure() | FunctionRef() | Builtin():
             return "<function>"
         case PoolValue():
             return f"<pool of {value.live()}>"

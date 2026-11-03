@@ -820,13 +820,17 @@ class Parser:
         or a name followed by `=` or `:`. Otherwise the value starts.
 
         `let (a, b) = value` and `let Point(x, y) = value` take a value apart
-        with a pattern instead.
+        with a pattern instead, perhaps `mut` and with a type:
+        `let mut (a, b): (i64, i64) = value`.
         """
         token = self.advance()
-        if self.at("(") or (self.at_kind(TokenKind.NAME) and self.at("(", 1)):
+        skip = 1 if self.at("mut") else 0
+        if self.at("(", skip) or (self.at_kind(TokenKind.NAME, skip) and self.at("(", skip + 1)):
+            mutable = self.accept("mut")
             pattern = self.parse_pattern()
+            type_ = self.parse_type() if self.accept(":") else None
             self.expect("=")
-            return LetPattern(pattern, self.parse_expr(), token.span)
+            return LetPattern(pattern, self.parse_expr(), token.span, mutable, type_)
         bindings = [self.parse_binding()]
         self.expect("=")
         while self.at("mut") or (
@@ -1135,6 +1139,12 @@ class Parser:
     def parse_pattern_atom(self) -> Pattern:
         """One pattern without `|`."""
         token = self.peek()
+        if self.accept("mut"):
+            name = self.peek()
+            if not self.at_kind(TokenKind.NAME) or name.text == "_" or self.at("(", 1):
+                raise EllaError("'mut' in a pattern must be followed by a name, like 'mut x'", token.span)
+            self.advance()
+            return NamePattern(name.text, name.span, mutable=True)
         if self.at_kind(TokenKind.NAME):
             self.advance()
             if token.text == "_":

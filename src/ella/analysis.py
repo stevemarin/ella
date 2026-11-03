@@ -44,11 +44,13 @@ from ella.checker import (
     VarInfo,
     check,
     resolve,
+    show_library,
     show_type,
     substitute,
 )
 from ella.lexer import KEYWORDS, EllaError, Span, Token, TokenKind, tokenize
 from ella.parser import parse_partial
+from ella.prelude import in_prelude, with_prelude
 from ella.staging import Expander, has_splices, parts, uses_staging
 from ella.syntax import (
     Binary,
@@ -97,9 +99,12 @@ BUILTIN_ENUMS = ("Result", "Optional", "Error")  # defined by the language, not 
 
 @dataclass(frozen=True, slots=True)
 class Problem:
+    """An error, or a warning about something that doesn't stop the program (a case that never matches)."""
+
     message: str
     line: int
     column: int
+    warning: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,8 +218,8 @@ def keywords() -> list[Completion]:
     ]
 
 
-def problem(error: EllaError) -> Problem:
-    return Problem(error.message, error.span.line, error.span.column)
+def problem(error: EllaError, warning: bool = False) -> Problem:
+    return Problem(error.message, error.span.line, error.span.column, warning)
 
 
 # Fixes for lexer errors, so the rest of the program can be read: by message,
@@ -272,8 +277,10 @@ class Checked:
         self.program, parse_errors = parse_partial(self.tokens, source)
         self.checker = Checker()
         self.checker.errors = []
-        expander = Expander(self.program, self.checker, io.StringIO()) if uses_staging(self.program) else None
-        self.checker.check_program(self.program)
+        # Every prelude definition is checked, so that completions offer them.
+        program = with_prelude(self.program, every=True)
+        expander = Expander(program, self.checker, io.StringIO()) if uses_staging(program) else None
+        self.checker.check_program(program)
 
         # Errors in a top-level line with a parse error likely follow from it.
         lines = self.top_level_lines()
@@ -285,7 +292,9 @@ class Checked:
                 check(expander.expand_program())
             except EllaError as error:
                 errors.append(error)
-        self.problems = sorted({problem(error): None for error in errors}, key=lambda p: (p.line, p.column))
+        problems = [problem(error) for error in errors]
+        problems += [problem(warning, True) for warning in self.checker.warnings]
+        self.problems = sorted(dict.fromkeys(problems), key=lambda p: (p.line, p.column))
 
     def top_level_lines(self) -> list[int]:
         """The lines where top-level lines of the program start."""
@@ -381,7 +390,7 @@ def describe(name: str, info: VarInfo) -> str:
     """A name's type, or what it is, for completions."""
     match info.kind:
         case "builtin":
-            return show_type(LIBRARY[name]) if name in LIBRARY else "built-in function"
+            return show_library(name) if name in LIBRARY else "built-in function"
         case "variant" | "constructor":
             return f"variant of {info.enum}"
     return ("mut " if info.mutable else "") + show_type(info.type)
@@ -443,7 +452,7 @@ class Symbols:
                 kind = "" if name == "return" else name_kind(info, self.checker)  # `return` in `where` is a keyword
                 hover = f"{name}: {self.show(node)}"
                 if info.kind == "builtin":
-                    hover = f"{name}: {show_type(LIBRARY[name])}" if name in LIBRARY else f"{name}: built-in function"
+                    hover = f"{name}: {show_library(name)}" if name in LIBRARY else f"{name}: built-in function"
                 elif info.kind in ("variant", "constructor"):
                     hover = self.variant_text(info.enum, name)
                 self.add(checked.token_at(span), hover, kind, self.modifiers(info), self.definition(info, name))
@@ -462,8 +471,10 @@ class Symbols:
                 enum = self.enum_of(node)
                 definition = self.variant_location(enum, name)
                 self.add(checked.token_at(span), self.variant_text(enum, name), "enumMember", (), definition)
-            case NamePattern(name, span):
-                self.add(checked.token_at(span), f"{name}: {self.show(node)}", "variable", ("declaration", "readonly"))
+            case NamePattern(name, span, mutable):
+                modifiers = ("declaration",) if mutable else ("declaration", "readonly")
+                hover = f"{'mut ' if mutable else ''}{name}: {self.show(node)}"
+                self.add(checked.token_at(span), hover, "variable", modifiers)
             case VariantPattern(name, _, span):
                 enum = self.enum_of(node)
                 kind = "struct" if enum in self.checker.enums and self.checker.enums[enum].struct else "enumMember"
@@ -494,13 +505,15 @@ class Symbols:
     def modifiers(self, info: VarInfo) -> tuple[str, ...]:
         if info.kind == "builtin" or (info.kind in ("variant", "constructor") and info.enum in BUILTIN_ENUMS):
             return ("defaultLibrary",)
+        if in_prelude(info.binder):
+            return ("defaultLibrary", "readonly")
         return () if info.mutable else ("readonly",)
 
     def definition(self, info: VarInfo, name: str) -> Location | None:
         """Where a name is defined: its `let`, parameter or pattern, or its variant."""
         if info.kind in ("variant", "constructor"):
             return self.variant_location(info.enum, name)
-        if isinstance(info.binder, Binding | Param | NamePattern):
+        if isinstance(info.binder, Binding | Param | NamePattern) and not in_prelude(info.binder):
             token = self.checked.token_at(info.binder.span)
             return None if token is None else location(token)
         return None

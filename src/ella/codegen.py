@@ -48,7 +48,21 @@ the same "stack overflow" error as in the interpreters.
 
 import struct
 
-from ella.checker import F64, I64, STR, BuiltinTy, EnumTy, FuncTy, ListTy, PrimTy, TupleTy, Type, substitute
+from ella.checker import (
+    F64,
+    GENERIC_LIBRARY,
+    I64,
+    STR,
+    BuiltinTy,
+    EnumTy,
+    FuncTy,
+    ListTy,
+    PrimTy,
+    TupleTy,
+    Type,
+    show_type,
+    substitute,
+)
 from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, Value, format_instr, region_level
 from ella.lexer import Span
 from ella.values import MAX_CALL_DEPTH
@@ -120,7 +134,7 @@ class CodeGen:
             "    .text",
             "",
             "# The program's entry point, called by main() in the runtime: run the top-level code",
-            "# on the stack whose top is given, ella_main(stack).",
+            "# on the stack whose top is given, ella_main(stack), which gives the exit status.",
             "    .globl ella_main",
             "ella_main:",
             "    push rbp",
@@ -461,8 +475,12 @@ class CodeGen:
                 self.store(dest)
             case "builtin":
                 # Library functions take their arguments, the call's place for errors, and where the result goes.
+                # abs, min and max have one for each number type: ella_lib_abs_i64, ...
                 result_region = Region(instr.region) if instr.region else 0
-                self.call_c(f"ella_lib_{instr.name}", *args, line, column, result_region)
+                symbol = f"ella_lib_{instr.name}"
+                if instr.name in GENERIC_LIBRARY:
+                    symbol += f"_{show_type(args[0].type)}"
+                self.call_c(symbol, *args, line, column, result_region)
                 self.store(dest)
             case "set_index":
                 self.slot_value(instr, args[0], args[2])
@@ -527,8 +545,8 @@ class CodeGen:
             case "to_text":
                 self.call_c("ella_to_text", args[0], self.type_descriptor(args[0].type), Region(instr.region))
                 self.store(dest)
-            case "print":
-                self.call_c("ella_print", args[0], self.type_descriptor(args[0].type))
+            case "print" | "eprint":
+                self.call_c(f"ella_{instr.op}", args[0], self.type_descriptor(args[0].type))
             case "variant":
                 assert dest is not None
                 self.call_c("ella_variant_alloc", self.tag(dest.type, instr.name), len(args), Region(instr.region))

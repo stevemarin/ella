@@ -59,14 +59,22 @@ def compile_native(source: str, executable: Path, optimized: bool = True, out: T
     build(module, executable)
 
 
-def run_native(source: str, out: TextIO, optimized: bool = True, stdin: bytes = b"", args: Sequence[str] = ()) -> None:
-    """Compile a program to a native executable and run it, like the interpreters' `run`.
+def run_native(
+    source: str,
+    out: TextIO,
+    optimized: bool = True,
+    stdin: bytes = b"",
+    args: Sequence[str] = (),
+    err: TextIO | None = None,
+) -> int:
+    """Compile a program to a native executable and run it, like the interpreters' `run`. Returns its exit status.
 
     The program reads `stdin` and gets the arguments `args`. What it prints
-    goes to `out`. If it stops with a run-time error, that is raised as an
-    EllaError, as an interpreter would. Freed arena memory is overwritten
-    (ELLA_POISON), so that a program that uses an object after its arena is
-    freed prints nonsense instead of passing by luck.
+    goes to `out`, and what it prints to standard error to `err` (if given).
+    If it stops with a run-time error, that is raised as an EllaError, as an
+    interpreter would. Freed arena memory is overwritten (ELLA_POISON), so
+    that a program that uses an object after its arena is freed prints
+    nonsense instead of passing by luck.
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
@@ -74,13 +82,30 @@ def run_native(source: str, out: TextIO, optimized: bool = True, stdin: bytes = 
         env = os.environ | {"ELLA_POISON": "1"}
         result = subprocess.run([str(executable), *args], check=False, capture_output=True, input=stdin, env=env)
     out.write(result.stdout.decode("utf-8"))
-    if result.returncode != 0:
-        raise parse_error(result.stderr.decode("utf-8"))
+    return finish_run(result.returncode, result.stderr.decode("utf-8"), err)
 
 
-def parse_error(stderr: str) -> EllaError:
-    """Turn a native program's "line:column: message" error back into an EllaError."""
-    match = re.fullmatch(r"(\d+):(\d+): (.*)", stderr.removesuffix("\n"), re.DOTALL)
+def finish_run(status: int, stderr: str, err: TextIO | None) -> int:
+    """After a native program ends: pass on what it printed to standard error, and raise its run-time error if any.
+
+    A run-time error is the last line of standard error, and makes the
+    status 1, which `main` can give too.
+    """
+    error = parse_error(stderr) if status == 1 else None
+    if error is not None:
+        stderr = stderr[: stderr.rstrip("\n").rfind("\n") + 1]
+    if err is not None:
+        err.write(stderr)
+    if error is not None:
+        raise error
+    if status not in range(256):  # killed by a signal
+        raise EllaError(f"the program failed: {stderr.strip()}", Span(0, 0))
+    return status
+
+
+def parse_error(stderr: str) -> EllaError | None:
+    """The "line:column: message" run-time error at the end of a native program's standard error, if there is one."""
+    match = re.search(r"(?:^|\n)(\d+):(\d+): ([^\n]*)\n?\Z", stderr)
     if match is None:
-        return EllaError(f"the program failed: {stderr.strip()}", Span(0, 0))
+        return None
     return EllaError(match[3], Span(int(match[1]), int(match[2])))

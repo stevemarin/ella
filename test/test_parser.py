@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 102
+    assert len(program.body) == 119
 
 
 # Precedence (docs/grammar.md §8)
@@ -134,7 +134,20 @@ def test_let_with_a_pattern() -> None:
     assert one("let (a, b) = pair") == "(let (tuple a b) pair)"
     assert one("let (a, (b, _)) = f(x)") == "(let (tuple a (tuple b _)) (call f x))"
     assert one("let Point(x, y) = p") == "(let (Point x y) p)"
-    assert error("let (a, b): (i64, i64) = p").message == "expected '=', found ':'"
+    assert one("let (a, b): (i64, i64) = p") == "(let (tuple a b): (i64, i64) p)"
+    assert one("let mut (a, b) = p") == "(let mut (tuple a b) p)"
+    assert one("let mut Point(x, y): Point = p") == "(let mut (Point x y): Point p)"
+    assert one("let mut x = 1") == "(let [mut x] 1)"
+
+
+def test_mut_names_in_patterns() -> None:
+    assert one("let (mut a, b) = p") == "(let (tuple mut a b) p)"
+    assert one("for (i, mut x) in xs\n    x") == "(for (tuple i mut x) xs (block x))"
+    assert one("match o\n    case Some(mut x) => x") == "(match o (case (Some mut x) x))"
+    message = "'mut' in a pattern must be followed by a name, like 'mut x'"
+    assert error("let (mut _, b) = p").message == message
+    assert error("let (mut Some(x), b) = p").message == message
+    assert error("let (mut 1, b) = p").message == message
 
 
 def test_tuple_items() -> None:

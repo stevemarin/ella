@@ -6,6 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ella.checker import Checker
 from ella.codegen import generate
 from ella.interpreter import Interpreter
 from ella.ir import Module, format_module, format_placement
@@ -13,7 +14,7 @@ from ella.ir_interpreter import IRInterpreter
 from ella.lexer import EllaError, tokenize
 from ella.library import Host
 from ella.lower import compile_program
-from ella.native import build, parse_error
+from ella.native import build, finish_run
 from ella.parser import parse
 from ella.passes import PASSES, optimize
 from ella.staging import prepare
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             args.error(f"unknown pass {unknown[0]!r}; the passes are {', '.join(PASSES)}")
 
     source = options.file.read_text(encoding="utf-8")
+    status = 0
     try:
         if options.tokens:
             for token in tokenize(source):
@@ -80,9 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         elif options.tree:
             program = parse(source)
             program, checker = prepare(program)
-            Interpreter(checker=checker, host=host, max_depth=options.max_depth).run(program)
+            warn(options.file, checker)
+            status = Interpreter(checker=checker, host=host, max_depth=options.max_depth).run(program)
         else:
             module = compile_program(source)
+            warn(options.file, module.checker)
             if options.optimize or passes is not None:
                 optimize(module, passes)
             if options.ir:
@@ -94,28 +98,34 @@ def main(argv: list[str] | None = None) -> int:
             elif options.output is not None:
                 build(module, options.output, options.max_depth)
             elif options.native:
-                run_executable(module, program_args, options.max_depth)
+                status = run_executable(module, program_args, options.max_depth)
             elif options.profile:
                 interpreter = IRInterpreter(module, host=host, max_depth=options.max_depth)
                 try:
-                    interpreter.run()
+                    status = interpreter.run()
                 finally:
                     sys.stdout.flush()
                     print(interpreter.format_profile(), end="", file=sys.stderr)
             else:
-                IRInterpreter(module, host=host, max_depth=options.max_depth).run()
+                status = IRInterpreter(module, host=host, max_depth=options.max_depth).run()
     except EllaError as error:
         # Flush what the program printed first, so the error comes after it.
         sys.stdout.flush()
         print(f"{options.file}:{error}", file=sys.stderr)
         return 1
-    return 0
+    return status
 
 
-def run_executable(module: Module, program_args: list[str], max_depth: int) -> None:
+def warn(file: Path, checker: Checker) -> None:
+    """Print the checker's warnings, which don't stop the program."""
+    for warning in checker.warnings:
+        print(f"{file}:{warning.span}: warning: {warning.message}", file=sys.stderr)
+
+
+def run_executable(module: Module, program_args: list[str], max_depth: int) -> int:
     """Build a native executable in a temporary directory, and run it with the program's arguments.
 
-    It reads this process's standard input, and its output is passed on.
+    It reads this process's standard input, and its output is passed on. Returns its exit status.
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
@@ -123,5 +133,5 @@ def run_executable(module: Module, program_args: list[str], max_depth: int) -> N
         sys.stdout.flush()
         result = subprocess.run([str(executable), *program_args], check=False, capture_output=True)
     sys.stdout.buffer.write(result.stdout)
-    if result.returncode != 0:
-        raise parse_error(result.stderr.decode("utf-8"))
+    sys.stdout.flush()
+    return finish_run(result.returncode, result.stderr.decode("utf-8"), sys.stderr)

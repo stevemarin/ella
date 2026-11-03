@@ -1,0 +1,18 @@
+# exit(status) stops the program at once: nothing more runs, not even finalizers.
+
+nocopy struct Res
+    name: str
+    finalize = (r: Res) -> () => print("finalize {{r.name}}")
+
+let check = (n: i64) -> i64 =>
+    if n > 2 then
+        print("too big: {{n}}")
+        exit(4)
+    n * 10
+
+let main = () -> () =>
+    let _r = Res("main")
+    for i in 0..5
+        let _each = Res("loop {{i}}")
+        print(check(i))
+    print("not reached")

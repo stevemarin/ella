@@ -149,6 +149,25 @@ def test_integer_errors(expr: str) -> None:
     assert_same_as_interpreter(f'print("before")\nlet n = {expr}\nprint(n)')
 
 
+@pytest.mark.parametrize(
+    "expr",
+    ['ord("ab")', 'ord("")', 'ord("\\n\\"x")', "chr(-1)", "chr(1114112)", "chr(55296)", "chr(57343)", "chr(57344)"],
+)
+def test_code_point_errors(expr: str) -> None:
+    assert_same_as_interpreter(f'print("before")\nlet n = {expr}\nprint([n])')
+
+
+def test_cli_native_exit_status_and_standard_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "program.ella"
+    path.write_text('eprint("to stderr", 1)\nprint("to stdout")\nlet main = () -> i64 => 7\n')
+    assert main(["--native", str(path)]) == 7
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("to stdout\n", "to stderr 1\n")
+    path.write_text('eprint("first")\nassert false\n')
+    assert main(["--native", str(path)]) == 1
+    assert capsys.readouterr().err == f"first\n{path}:2:8: assertion failed: false\n"
+
+
 # Strings, lists and other values
 
 

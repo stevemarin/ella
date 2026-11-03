@@ -19,6 +19,7 @@ from ella.checker import (
 )
 from ella.lexer import EllaError, Span
 from ella.parser import parse
+from ella.prelude import NAMES, with_prelude
 from ella.staging import prepare
 from ella.syntax import Binary, Block, Lambda, Let
 
@@ -214,8 +215,10 @@ def test_shadowing_locals_can_change_type() -> None:
     assert type_of(source) == "str"
 
 
-def test_main_must_be_unit_to_unit() -> None:
-    assert error("let main = () -> i64 => 1").message == "main must have type () -> (), not () -> i64"
+def test_main_gives_nothing_or_an_exit_status() -> None:
+    assert error('let main = () -> str => ""').message == "main must have type () -> () or () -> i64, not () -> str"
+    assert error("let main = (n: i64) -> i64 => n").message.startswith("main must have type () -> () or () -> i64")
+    check(parse("let main = () -> i64 => 3"))
 
 
 # Functions and control flow
@@ -860,6 +863,19 @@ def test_checker_records_the_scope_of_each_name() -> None:
         ('replace("ab", "b", "c")', "str"),
         ('trim(" a ")', "str"),
         ('chars("ab")', "[str]"),
+        ('ord("a")', "i64"),
+        ("chr(97)", "str"),
+        ("sqrt(2.0)", "f64"),
+        ("floor(2.5)", "f64"),
+        ("abs(-2)", "i64"),
+        ("abs(-2.5)", "f64"),
+        ("min(1, 2)", "i64"),
+        ("max(1.5, 2.5)", "f64"),
+        ("trim", "(str) -> str"),
+        ("let f: (f64) -> f64 = abs\nf", "(f64) -> f64"),
+        ('print("a", 1, true)', "()"),
+        ("print()", "()"),
+        ('eprint("a", 1)', "()"),
         ('"abc"[0..2]', "str"),
         ("[1, 2, 3][1..=2]", "[i64]"),
     ],
@@ -874,7 +890,6 @@ def test_library_types(source: str, t: str) -> None:
         ("to_f64(1.5)", "argument 1 of to_f64() should be i64, not f64"),
         ('split("a")', "split takes 2 arguments but was given 1"),
         ('let mut s = "a"\ntrim(mut s)', "trim() has no 'mut' parameter"),
-        ("let f = to_f64", "'to_f64' can only be called, not used as a value"),
         (
             "enum Optional[T]\n    Some(T)\n    Nothing\nread_line()",
             "read_line() needs the built-in Optional, which this program replaces",
@@ -885,6 +900,15 @@ def test_library_types(source: str, t: str) -> None:
         ),
         ("let mut xs = [1, 2]\nxs[0..1] = [3]", "can't assign to a slice; change the items one by one"),
         ("(1, 2)[0..1]", "an index must be an i64, not range"),
+        ('abs("a")', "abs needs T to be Num, and str isn't"),
+        ("min(1, 2.5)", "argument 2 of min() should be i64, not f64"),
+        ("let f = abs\nf(true)", "abs needs T to be Num, and bool isn't"),
+        ("let f = print", "'print' can only be called, not used as a value"),
+        ("let x = 1\nprint(mut x)", "print() has no 'mut' parameter"),
+        (
+            "enum Optional[T]\n    Some(T)\n    Nothing\nlet f = read_line",
+            "read_line() needs the built-in Optional, which this program replaces",
+        ),
     ],
 )
 def test_library_errors(source: str, message: str) -> None:
@@ -915,6 +939,18 @@ def test_let_with_a_pattern() -> None:
     assert type_of("struct P\n    x: i64\n    y: i64\nlet P(a, b) = P(1, 2)\na + b") == "i64"
     assert error("let (a, b) = 1").message == "this tuple pattern should be i64, not (?1, ?2)"
     assert error("let (a, b) = (1, 2)\na = 3").message.startswith("can't assign to 'a' because it isn't mutable")
+
+
+def test_let_mut_with_a_pattern() -> None:
+    assert type_of("let mut (a, b) = (1, 2)\na = 3\nb += a\nb") == "i64"
+    assert type_of("let f = () -> [i64] =>\n    let mut (xs, _) = ([1], 2)\n    xs[0] = 5\n    xs\nf()") == "[i64]"
+
+
+def test_let_pattern_with_a_type() -> None:
+    assert binding_type("let (a, b): (f64, [str]) = (1.0, [])\nlet c = b", "c") == "[str]"
+    assert error("let (a, b): (i64, i64) = (1, 'x')").message == (
+        "the value of the 'let' should be (i64, i64), not (i64, str)"
+    )
 
 
 def test_let_patterns_must_match_every_value() -> None:
@@ -967,7 +1003,43 @@ def test_matches_that_cover_every_value(cases: list[str], subject: str) -> None:
     *setup, last = subject.split("\n")
     lines = ["struct P\n    x: i64\n    y: i64", *setup, f"match {last}"]
     lines += [f"    case {case} => 1" for case in cases]
-    check(parse("\n".join(lines)))
+    assert [w for w in warnings("\n".join(lines)) if NEVER_MATCHES in w] == []
+
+
+def warnings(source: str) -> list[str]:
+    return [f"{warning.span}: {warning.message}" for warning in check(parse(source)).warnings]
+
+
+NEVER_MATCHES = "this case can never match: the cases before it match every value it does"
+
+
+@pytest.mark.parametrize(
+    ("cases", "subject", "redundant"),
+    [
+        (["Some(_)", "None", "_"], "Some(1)", [3]),
+        (["_", "Some(_)"], "Some(1)", [2]),
+        (["Some(x)", "Some(1)", "None"], "Some(1)", [2]),
+        (["1", "2", "1", "_"], "5", [3]),
+        (['"a"', '"a" | "b"', "_"], '"a"', []),  # "b" can still match
+        (['"a" | "a"', "_"], '"a"', []),
+        (["(true, _)", "(_, true)", "(true, true)", "_"], "(true, false)", [3]),
+        (["true", "false", "_"], "true", [3]),
+        (["n if n > 0", "n", "0"], "5", [3]),
+        (["n if n > 0", "n if n > 0", "_"], "5", []),  # guards may be false
+        (["0..5", "1", "_"], "5", []),  # ranges aren't compared
+        (["P(1, _)", "P(_, 2)", "P(1, 2)", "_"], "P(1, 2)", [3]),
+    ],
+)
+def test_cases_that_can_never_match(cases: list[str], subject: str, redundant: list[int]) -> None:
+    lines = ["struct P\n    x: i64\n    y: i64", f"match {subject}"]
+    lines += [f"    case {case} => 1" for case in cases]
+    expected = [f"{4 + i}:5: {NEVER_MATCHES}" for i in redundant]  # case i is on line 4 + i
+    assert [w for w in warnings("\n".join(lines)) if NEVER_MATCHES in w] == expected
+
+
+def test_cases_in_functions_that_can_never_match() -> None:
+    source = "let f = (b: bool) -> i64 =>\n    match b\n        case _ => 1\n        case true => 2\nf(true)"
+    assert warnings(source) == [f"4:9: {NEVER_MATCHES}"]
 
 
 def test_infinite_types_need_a_catch_all() -> None:
@@ -1002,3 +1074,122 @@ let make = () -> Code[i64] =>
     assert error(source).message == (
         "'y' belongs to a quote outside this function, which a quote inside it can't use yet"
     )
+
+
+# Warnings
+
+
+def test_unused_variables() -> None:
+    source = """\
+let f = (n: i64, unused_param: i64) -> i64 =>
+    let a = 1
+    let _b = 2
+    let (c, d) = (3, 4)
+    for i in 0..n
+        print(c)
+    match Some(n)
+        case Some(x) | Some(x) => 0
+        case None => 0
+f(1, 2)
+let top = 5
+"""
+    assert warnings(source) == [
+        "2:9: 'a' is never used; start its name with '_' if that is on purpose",
+        "4:13: 'd' is never used; start its name with '_' if that is on purpose",
+        "5:9: 'i' is never used; start its name with '_' if that is on purpose",
+        "8:19: 'x' is never used; start its name with '_' if that is on purpose",
+    ]
+
+
+def test_variables_used_in_lambdas_assignments_and_text_are_used() -> None:
+    source = """\
+let f = () -> i64 =>
+    let a = 1
+    let mut b = 0
+    b = 2
+    let c = "x"
+    let g = () -> i64 => a
+    print("{{c}}")
+    g()
+f()
+"""
+    assert warnings(source) == []
+
+
+def test_code_that_never_runs() -> None:
+    source = """\
+let f = (n: i64) -> i64 =>
+    if n > 0 then return 1 else return 2
+    print("never")
+    print("not reported twice")
+    3
+let g = () -> () =>
+    for i in 0..3
+        continue
+        print(i)
+    loop
+        print(1)
+    print("after an endless loop")
+f(1)
+g()
+"""
+    assert warnings(source) == [
+        "3:5: this code never runs: the line before it never finishes",
+        "9:9: this code never runs: the line before it never finishes",
+        "12:5: this code never runs: the line before it never finishes",
+    ]
+
+
+def test_no_unused_warnings_after_an_error() -> None:
+    checker = Checker()
+    checker.errors = []
+    checker.check_program(parse("let f = () -> i64 =>\n    let a = 1\n    a + true\nf()"))
+    assert checker.errors and checker.warnings == []
+
+
+# `mut` in patterns
+
+
+def test_mut_names_in_patterns() -> None:
+    assert type_of("let (mut a, b) = (1, true)\na += 1\na") == "i64"
+    assert error("let (a, b) = (1, true)\na += 1").message == (
+        "can't assign to 'a' because it isn't mutable; declare it with 'let mut'"
+    )
+    assert error("match None\n    case mut None => 1").message == "'mut' marks a variable, and 'None' is a variant"
+    assert error("match (1, 2)\n    case (mut x, 1) | (x, _) => x\n    case _ => 0").message == (
+        "'x' must be 'mut' in every alternative of '|', or in none"
+    )
+
+
+# The library and the prelude
+
+
+def test_exit_can_only_be_called() -> None:
+    assert type_of("let f = (n: i64) -> i64 => if n > 0 then exit(1) else n\nf(1)") == "i64"
+    assert error("let f = exit").message == "'exit' can only be called, not used as a value"
+
+
+def test_prelude_functions() -> None:
+    def prepared(source: str) -> str:
+        program, checker = prepare(parse(source))
+        return show_type(checker.type_of(program.body[-1]))
+
+    assert prepared("map([1], (n: i64) -> str => 'x')") == "[str]"
+    assert prepared("sort(['b', 'a'])") == "[str]"
+    assert prepared("pi") == "f64"
+    assert prepared("let map = (n: i64) -> i64 => n\nmap(1)") == "i64"  # a program's own definition wins
+    with pytest.raises(EllaError, match="sort needs T to be Ord, and bool isn't"):
+        prepare(parse("sort([true])"))
+
+
+def test_prelude_is_only_added_when_used() -> None:
+    program = parse("let x = 1")
+    assert with_prelude(program) is program
+    used = with_prelude(parse("sort([1])"))
+    assert [d for d in used.body if d in NAMES.values()] == [NAMES["sort"]]
+    assert with_prelude(used) is used
+
+
+def test_prelude_gives_no_warnings() -> None:
+    _, checker = prepare(with_prelude(parse("let x = 1"), every=True))
+    assert checker.warnings == []

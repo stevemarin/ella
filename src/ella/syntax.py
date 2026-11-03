@@ -88,10 +88,14 @@ class WildcardPattern:
 
 @dataclass(frozen=True, slots=True)
 class NamePattern:
-    """A bare name: binds the value, unless name resolution finds it is a variant like `None`."""
+    """A bare name: binds the value, unless name resolution finds it is a variant like `None`.
+
+    `mut x` binds a mutable variable.
+    """
 
     name: str
     span: Span
+    mutable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,11 +337,16 @@ class Let:
 
 @dataclass(frozen=True, slots=True)
 class LetPattern:
-    """`let (a, b) = pair`: binds the names in a pattern, which must match every value of its type."""
+    """`let (a, b) = pair`: binds the names in a pattern, which must match every value of its type.
+
+    `let mut (a, b): (i64, i64) = pair` makes them all mutable, and gives the value's type.
+    """
 
     pattern: Pattern
     value: Expr
     span: Span
+    mutable: bool = False
+    type: TypeExpr | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,8 +634,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
         # Patterns
         case WildcardPattern():
             return "_"
-        case NamePattern(name):
-            return name
+        case NamePattern(name, mutable=mutable):
+            return f"mut {name}" if mutable else name
         case LiteralPattern(value):
             return show_literal(value)
         case RangePattern(low, high, inclusive):
@@ -671,8 +680,9 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("?", show(operand))
         case Let(bindings, value):
             return sexpr("let", f"[{', '.join(map(show_binding, bindings))}]", show(value))
-        case LetPattern(pattern, value):
-            return sexpr("let", show(pattern), show(value))
+        case LetPattern(pattern, value, _, mutable, type_):
+            text = ("mut " if mutable else "") + show(pattern) + (f": {show(type_)}" if type_ else "")
+            return sexpr("let", text, show(value))
         case Assign(op, target, value):
             return sexpr(op, show(target), show(value))
         case Lambda(params, return_type, where, body):

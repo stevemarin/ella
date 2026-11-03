@@ -24,8 +24,8 @@ let hit = (mut c: Counter) -> () =>
     c.hits += 1
 
 let work = () -> () =>
-    let x = open("x")
-    let t = Two(Res("ta"), open("tb"))
+    let _x = open("x")
+    let _t = Two(Res("ta"), open("tb"))
     let mut c = Counter(0)
     hit(mut c)
     hit(mut c)
@@ -33,10 +33,10 @@ let work = () -> () =>
         let tmp = Res("tmp")
         break size(tmp)
     print(n)
-    let kept = loop
+    let _kept = loop
         break Res("kept")
     for i in 0..2
-        let r = open("r{{i}}")
+        let _r = open("r{{i}}")
         if i == 1 then return
     print("unreachable")
 
@@ -48,6 +48,6 @@ let h2 = alloc(mut pool, open("p2"))
 free(mut pool, h1)
 
 let main = () -> () =>
-    let m = Res("main")
+    let _m = Res("main")
     print("main")
 print("end of top level")

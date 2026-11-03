@@ -23,6 +23,14 @@ is one column, the subject. Looking at the first column:
 With no columns left, a value is missed if no rows are left either. Cases
 with a guard don't count, since the guard may be false; literals other
 than `true` and `false`, and ranges, never cover their whole type.
+
+`redundant` uses the same matrix the other way round, to find the cases
+that can never match: a case is *useful* if some value it matches isn't
+matched by the unguarded cases before it. A wildcard is tried against
+each constructor when the rows name them all, and otherwise against the
+values they don't name. A literal is only covered by a wildcard or the
+same literal, and a range only by a wildcard, so a case they cover in some
+other way (`case 1` after `case 0..5`) isn't reported.
 """
 
 from collections.abc import Callable, Sequence
@@ -70,8 +78,30 @@ def missing[T](patterns: Sequence[Pattern], t: T, constructors: Constructors[T],
     return None if found is None else found[0]
 
 
-def reduce(pattern: Pattern, variants: set[int]) -> list[Pat]:
+def redundant[T](
+    cases: Sequence[tuple[Pattern, bool]], t: T, constructors: Constructors[T], variants: set[int]
+) -> list[int]:
+    """The positions of the cases that can never match. Each case is its pattern and whether it has a guard."""
+    matrix = Matrix(constructors)
+    rows: list[list[Pat]] = []
+    found = []
+    for i, (pattern, guarded) in enumerate(cases):
+        pats = reduce(pattern, variants, literals=True)
+        if not any(matrix.useful(rows, [pat], [t]) for pat in pats):
+            found.append(i)
+        if not guarded:
+            rows += [[pat] for pat in pats]
+    return found
+
+
+def reduce(pattern: Pattern, variants: set[int], literals: bool = False) -> list[Pat]:
     """The reduced patterns a pattern stands for: one, or one for each alternative of an or-pattern."""
+    """The reduced patterns a pattern stands for: one, or one for each alternative of an or-pattern.
+
+    With `literals`, a literal is a constructor of its own (`literal 3`), which
+    only a wildcard or the same literal covers. A type with literals has no
+    fixed set of constructors, so `missing` treats them like PARTIAL.
+    """
     match pattern:
         case WildcardPattern():
             return [None]
@@ -79,21 +109,23 @@ def reduce(pattern: Pattern, variants: set[int]) -> list[Pat]:
             return [Shape(name, ())] if id(pattern) in variants else [None]
         case LiteralPattern(bool() as value):
             return [Shape("true" if value else "false", ())]
+        case LiteralPattern(value) if literals:
+            return [Shape(f"literal {value!r}", ())]
         case LiteralPattern() | RangePattern():
             return [PARTIAL]
         case OrPattern(alternatives):
-            return [pat for alternative in alternatives for pat in reduce(alternative, variants)]
+            return [pat for alternative in alternatives for pat in reduce(alternative, variants, literals)]
         case VariantPattern(name, args):
-            return [Shape(name, combined) for combined in combinations(args, variants)]
+            return [Shape(name, combined) for combined in combinations(args, variants, literals)]
         case TuplePattern(items):
-            return [Shape(TUPLE, combined) for combined in combinations(items, variants)]
+            return [Shape(TUPLE, combined) for combined in combinations(items, variants, literals)]
 
 
-def combinations(patterns: Sequence[Pattern], variants: set[int]) -> list[tuple[Pat, ...]]:
+def combinations(patterns: Sequence[Pattern], variants: set[int], literals: bool = False) -> list[tuple[Pat, ...]]:
     """Every combination of the patterns' alternatives: `(0 | 1, x)` is `(0, x)` and `(1, x)`."""
     result: list[tuple[Pat, ...]] = [()]
     for pattern in patterns:
-        result = [(*done, pat) for done in result for pat in reduce(pattern, variants)]
+        result = [(*done, pat) for done in result for pat in reduce(pattern, variants, literals)]
     return result
 
 
@@ -121,6 +153,34 @@ class Matrix[T]:
             return ["_", *found]
         name, fields = next(c for c in constructors if c[0] not in named)
         return [show(name, ["_"] * len(fields)), *found]
+
+    def useful(self, rows: list[list[Pat]], row: list[Pat], types: list[T]) -> bool:
+        """Does `row` match some values (one for each column) that none of `rows` match?"""
+        if not types:
+            return not rows
+        t, rest = types[0], types[1:]
+        first = row[0]
+        if isinstance(first, Shape):
+            fields = self.fields(t, first.name, len(first.args))
+            return self.useful(specialize(rows, first.name, len(fields)), [*first.args, *row[1:]], [*fields, *rest])
+        if first is None:
+            constructors = self.constructors(t)
+            named = {r[0].name for r in rows if isinstance(r[0], Shape)}
+            if constructors is not None and all(name in named for name, _ in constructors):
+                return any(
+                    self.useful(specialize(rows, name, len(fields)), [None] * len(fields) + row[1:], [*fields, *rest])
+                    for name, fields in constructors
+                )
+        # A wildcard over values the rows don't name, or a range: only wildcard rows cover them.
+        return self.useful([r[1:] for r in rows if r[0] is None], row[1:], rest)
+
+    def fields(self, t: T, name: str, arity: int) -> tuple[T, ...]:
+        """The types of a constructor's fields (a literal has none)."""
+        for constructor, fields in self.constructors(t) or []:
+            if constructor == name:
+                return fields
+        assert arity == 0, f"no constructor {name}"
+        return ()
 
 
 def specialize(rows: list[list[Pat]], name: str, arity: int) -> list[list[Pat]]:

@@ -114,9 +114,11 @@ Operations
     reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
     len c                        length of a list, string or range, or a pool's count
     builtin a, ... @r            a library function (in `name`), such as split(a, b),
-                                 whose result is all new objects (ella.library)
+                                 whose result is all new objects (ella.library); abs,
+                                 min and max take i64s or f64s
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
+    eprint v                     the same, to standard error
     variant Name(a, ...)         make an enum value or struct (registering its finalizer)
     is_variant v, Name           does v hold that variant?
     variant_field v, Name.n      field n of v, which holds that variant
@@ -143,6 +145,7 @@ from typing import Any, assert_never
 from ella.checker import (
     BOOL,
     F64,
+    GENERIC_LIBRARY,
     I64,
     LIBRARY,
     NEVER,
@@ -750,7 +753,9 @@ class Verifier:
         """Check that an instruction's operands and result have the types its operation needs."""
         args = [a.type for a in instr.args]
         dest = instr.dest.type if instr.dest is not None else None
-        effects = ("store", "global_set", "print", "assert", "set_index", "set_field", "reset", "free", "pool_set")
+        effects = (
+            "store", "global_set", "print", "eprint", "assert", "set_index", "set_field", "reset", "free", "pool_set"
+        )  # fmt: skip
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
         self.require(not instr.outs or instr.op == "call", f"{instr.op} can't have extra results", block)
         self.check_region(instr, block)
@@ -814,7 +819,9 @@ class Verifier:
                     and (dest == STR or isinstance(dest, ListTy))
                 )
             case "builtin":
-                library = LIBRARY.get(instr.name)
+                library: Type | None = LIBRARY.get(instr.name)
+                if library is not None and instr.name in GENERIC_LIBRARY and args and args[0] in (I64, F64):
+                    library = substitute(library, {"T": args[0]})
                 need(library is not None and dest is not None and FuncTy(tuple(args), dest) == library)
             case "set_index":
                 need(len(args) == 3 and isinstance(args[0], ListTy) and args[1:] == [I64, args[0].element])
@@ -858,7 +865,7 @@ class Verifier:
                 need(len(args) == 1 and (item_type(args[0]) is not None or pool) and dest == I64)
             case "to_text":
                 need(len(args) == 1 and dest == STR)
-            case "print":
+            case "print" | "eprint":
                 need(len(args) == 1)
             case "variant":
                 need(isinstance(dest, EnumTy) and args == list(self.field_types(dest, instr.name, block)))

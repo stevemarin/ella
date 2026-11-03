@@ -178,6 +178,7 @@ from ella.syntax import (
 from ella.syntax import (
     Return as ReturnExpr,
 )
+from ella.values import STATUS_ERROR
 
 # Ella operators and the IR operations that implement them.
 BINARY_OPS = {
@@ -666,7 +667,7 @@ class Lowerer:
     def lower_program(self, program: Program) -> Module:
         """Lower the top-level code into the `top` function, then every function it uses."""
         self.globals_changed = changed_in_place(program.body, self.checker, into_lambdas=True)
-        self.start_function("top", UNIT, program.span, program.body)
+        self.start_function("top", I64, program.span, program.body)
         # Generic functions are made for each set of type arguments they are
         # used with. So are methods (`Point.norm`, `Stack.push[i64]`), which
         # are generic in their type's parameters. Finalizers are always made.
@@ -706,12 +707,21 @@ class Lowerer:
             else:
                 self.lower(expr)
 
-        # Then run `main`, if there is one.
+        # Then run `main`, if there is one. The top-level code gives the exit status: main's, or 0.
         main = self.checker.globals.vars.get("main")
+        status = self.const(0, program.span)
         if main is not None and main.kind == "global":
-            function = self.emit("global_get", self.module.globals["main"], [], program.span, "main")
-            self.emit("call", UNIT, [function], program.span)
-        self.block.terminator = Return(self.const((), program.span))
+            main_type = self.module.globals["main"]
+            assert isinstance(main_type, FuncTy)
+            function = self.emit("global_get", main_type, [], program.span, "main")
+            result = self.emit("call", main_type.result, [function], program.span)
+            if main_type.result == I64:
+                status = result
+                fail = self.new_block("bad_status")
+                fail.terminator = Trap(STATUS_ERROR, status, program.span)
+                self.test(self.emit("ge", BOOL, [status, self.const(0, program.span)], program.span), fail)
+                self.test(self.emit("le", BOOL, [status, self.const(255, program.span)], program.span), fail)
+        self.block.terminator = Return(status)
         self.finish_function()
 
         while self.pending:
@@ -837,6 +847,10 @@ class Lowerer:
                     args = tuple(self.concrete(arg) for arg in self.checker.instances[id(expr)])
                     function = self.specialize(name, args, span)
                     return self.emit("closure", self.type_of(expr), [], span, function, region=dest)
+                if kind == "builtin":  # a library function as a value
+                    t = self.type_of(expr)
+                    assert isinstance(t, FuncTy)
+                    return self.emit("closure", t, [], span, self.library_function(name, t, span), region=dest)
                 return self.read_name(name, kind, span, dest)
             case Let(bindings, value_expr):
                 t = self.type_of(value_expr)
@@ -849,10 +863,10 @@ class Lowerer:
                     home = self.home(binding.name, t)
                     value = self.bind(binding.name, value, binding.span, binding.mutable, home)
                 return value
-            case LetPattern(pattern, value_expr):
+            case LetPattern(pattern, value_expr, _, mutable):
                 value = self.lower(value_expr, self.here() if self.scopes else "global")
                 no_match = self.new_block("nomatch")
-                self.lower_pattern(pattern, value, no_match)
+                self.lower_pattern(pattern, value, no_match, mutable)
                 matched = self.block
                 self.block = no_match
                 self.block.terminator = Trap("the 'let' pattern doesn't match {}", value, span)
@@ -1303,15 +1317,19 @@ class Lowerer:
         if name in LIBRARY:
             # Its result is all new objects, made where they are wanted.
             values = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
-            return self.emit("builtin", self.type_of(expr), values, span, name, region=dest or self.here())
+            result = self.emit("builtin", self.type_of(expr), values, span, name, region=dest or self.here())
+            if result.type == NEVER:  # exit() doesn't return
+                self.block.terminator = Trap(f"{name}() returned", None, span)
+                return self.leave(span)
+            return result
         operands = [self.lower(arg) for arg in args]
         match name:
             case "len" if self.has_method(operands[0].type, "len"):
                 return self.call_method("len", operands, I64, span, dest)
             case "len":
                 return self.emit("len", I64, operands, span)
-            case "print":
-                self.emit_effect("print", operands, span)
+            case "print" | "eprint":
+                self.emit_effect(name, [self.printed(operands, span)], span)
                 return self.const((), span)
             case "pool_new":
                 return self.emit("pool_new", self.type_of(expr), [], span, region=dest)
@@ -1319,6 +1337,31 @@ class Lowerer:
                 return self.emit("run", self.type_of(expr), operands, span, region=dest)
             case _:  # reflection, which only the interpreters can do
                 return self.emit("reflect", self.type_of(expr), operands, span, name, region=dest)
+
+    def printed(self, values: list[Value], span: Span) -> Value:
+        """What `print` writes for several values: their text forms with spaces between (one is printed as it is)."""
+        if len(values) == 1:
+            return values[0]
+        texts = [v if v.type == STR else self.emit("to_text", STR, [v], span, region=self.here()) for v in values]
+        result = texts[0] if texts else self.const("", span)
+        for text in texts[1:]:
+            spaced = self.emit("add", STR, [result, self.const(" ", span)], span, region=self.here())
+            result = self.emit("add", STR, [spaced, text], span, region=self.here())
+        return result
+
+    def library_function(self, name: str, t: FuncTy, span: Span) -> str:
+        """The IR function for a library function used as a value, such as `trim(str)` or `abs(f64)`.
+
+        It only calls the library function, with its result made where the caller wants it.
+        """
+        label = f"{name}({', '.join(show_type(param) for param in t.params)})"
+        if label not in self.module.functions:
+            params = [Value(i, param) for i, param in enumerate(t.params)]
+            result = Value(len(params), t.result)
+            call = Instr("builtin", result, list(params), span, name, region="result" if is_boxed(t.result) else "")
+            entry = Block("entry", params, [call], Return(result))
+            self.module.functions[label] = Function(label, t.result, span, [entry])
+        return label
 
     def lower_quote(self, quote: Quote, span: Span) -> Value:
         """`quote e`: code, built at run time by the interpreter from the quote's syntax tree.
@@ -1592,8 +1635,8 @@ class Lowerer:
 
     # Patterns
 
-    def lower_pattern(self, pattern: Pattern, value: Value, fail: Block) -> None:
-        """Test `value` against `pattern`, binding its variables; go to `fail` if it doesn't match.
+    def lower_pattern(self, pattern: Pattern, value: Value, fail: Block, mutable: bool = False) -> None:
+        """Test `value` against `pattern`, binding its variables (all mutable for `let mut`); go to `fail` if not.
 
         The tests are emitted one after another. Each failing test branches to
         `fail`, and lowering continues in the block where it succeeded.
@@ -1602,11 +1645,11 @@ class Lowerer:
         match pattern:
             case WildcardPattern():
                 pass
-            case NamePattern(name):
+            case NamePattern(name, mutable=mutable_name):
                 if self.checker.kinds[id(pattern)] == "variant":
                     self.test(self.emit("is_variant", BOOL, [value], span, name), fail)
                 else:
-                    self.bind(name, value, span)
+                    self.bind(name, value, span, mutable or mutable_name)
             case LiteralPattern(literal):
                 self.test(self.emit("eq", BOOL, [value, self.const(literal, span)], span), fail)
             case RangePattern(low, high, inclusive):
@@ -1617,22 +1660,22 @@ class Lowerer:
                 matched = self.new_block("matched")
                 for alternative in alternatives[:-1]:
                     next_alternative = self.new_block("or")
-                    self.lower_pattern(alternative, value, next_alternative)
+                    self.lower_pattern(alternative, value, next_alternative, mutable)
                     self.jump(matched)
                     self.block = next_alternative
-                self.lower_pattern(alternatives[-1], value, fail)
+                self.lower_pattern(alternatives[-1], value, fail, mutable)
                 self.jump(matched)
                 self.block = matched
             case VariantPattern(name, args):
                 self.test(self.emit("is_variant", BOOL, [value], span, name), fail)
                 for i, (arg, field_type) in enumerate(zip(args, self.fields(value.type, name))):
-                    self.lower_pattern(arg, self.variant_field(value, name, i, field_type, span), fail)
+                    self.lower_pattern(arg, self.variant_field(value, name, i, field_type, span), fail, mutable)
             case TuplePattern(items):
                 assert isinstance(value.type, TupleTy)
                 for i, (item, item_type) in enumerate(zip(items, value.type.items)):
                     item_value = self.emit("tuple_get", item_type, [value], span, index=i)
                     self.info[item_value.id] = self.info_of(value)
-                    self.lower_pattern(item, item_value, fail)
+                    self.lower_pattern(item, item_value, fail, mutable)
 
     def test(self, cond: Value, fail: Block) -> None:
         """Continue in a new block if `cond` is true, otherwise go to `fail`."""

@@ -28,32 +28,32 @@ from ella.staging import prepare
 PROGRAMS = Path(__file__).parent / "programs"
 
 
-def run_tree(source: str, out: TextIO, stdin: bytes, args: list[str]) -> None:
+def run_tree(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Type check, then run with the tree-walking interpreter."""
     program = parse(source)
     program, checker = prepare(program, out)
-    Interpreter(out, checker, host=Host(io.BytesIO(stdin), args)).run(program)
+    return Interpreter(out, checker, host=Host(io.BytesIO(stdin), args, err)).run(program)
 
 
-def run_ir(source: str, out: TextIO, stdin: bytes, args: list[str]) -> None:
+def run_ir(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Compile to IR and run it."""
-    IRInterpreter(compile_program(source, out), out, Host(io.BytesIO(stdin), args)).run()
+    return IRInterpreter(compile_program(source, out), out, Host(io.BytesIO(stdin), args, err)).run()
 
 
-def run_optimized(source: str, out: TextIO, stdin: bytes, args: list[str]) -> None:
+def run_optimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Compile to IR, optimize it, and run it."""
-    IRInterpreter(optimize(compile_program(source, out)), out, Host(io.BytesIO(stdin), args)).run()
+    return IRInterpreter(optimize(compile_program(source, out)), out, Host(io.BytesIO(stdin), args, err)).run()
 
 
-def run_native_unoptimized(source: str, out: TextIO, stdin: bytes, args: list[str]) -> None:
-    run_native(source, out, False, stdin, args)
+def run_native_unoptimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+    return run_native(source, out, False, stdin, args, err)
 
 
-def run_native_optimized(source: str, out: TextIO, stdin: bytes, args: list[str]) -> None:
-    run_native(source, out, True, stdin, args)
+def run_native_optimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+    return run_native(source, out, True, stdin, args, err)
 
 
-RUNNERS: dict[str, Callable[[str, TextIO, bytes, list[str]], None]] = {
+RUNNERS: dict[str, Callable[[str, TextIO, TextIO, bytes, list[str]], int]] = {
     "tree": run_tree,
     "ir": run_ir,
     "optimized": run_optimized,
@@ -67,14 +67,18 @@ RUNNERS: dict[str, Callable[[str, TextIO, bytes, list[str]], None]] = {
 def test_program(path: Path, runner: str) -> None:
     if runner.startswith("native") and shutil.which("gcc") is None:
         pytest.skip("native code needs gcc")
-    out = io.StringIO()
+    out, err = io.StringIO(), io.StringIO()
     stdin = path.with_suffix(".in").read_bytes() if path.with_suffix(".in").exists() else b""
     args = path.with_suffix(".args").read_text().splitlines() if path.with_suffix(".args").exists() else []
     expected_error = path.with_suffix(".err")
     if expected_error.exists():
         with pytest.raises(EllaError) as info:
-            RUNNERS[runner](path.read_text(), out, stdin, args)
+            RUNNERS[runner](path.read_text(), out, err, stdin, args)
         assert str(info.value) == expected_error.read_text().strip()
     else:
-        RUNNERS[runner](path.read_text(), out, stdin, args)
+        status = RUNNERS[runner](path.read_text(), out, err, stdin, args)
+        expected_status = path.with_suffix(".status")
+        assert status == (int(expected_status.read_text()) if expected_status.exists() else 0)
     assert out.getvalue() == path.with_suffix(".out").read_text()
+    expected_stderr = path.with_suffix(".stderr")
+    assert err.getvalue() == (expected_stderr.read_text() if expected_stderr.exists() else "")
