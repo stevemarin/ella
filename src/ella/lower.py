@@ -68,6 +68,40 @@ before the read value is used, as in `xs + [(xs[0] = 5)]`, would show the
 change. Ella's semantics are that a read gives the value at the time of
 reading, so `protect` copies a read value if a later part of the same
 expression changes its variable in place.
+
+And one case needs none: `x = y`, where y is a variable of the same block
+that nothing reads afterwards, moves y's value into x instead of copying
+it, since no one can see the sharing.
+
+Loops that carry values
+-----------------------
+
+A loop that gives a variable declared outside it a new value on every
+iteration would pile up one version per iteration in the variable's arena
+("region bloat", docs/memory-model.md §6). Instead, such a loop *carries*
+the variable (`carried_by` decides which): inside the loop it lives in a
+slot of its own, whose values are in the loop's arenas. New values are made
+in the iteration's level, @k. At the end of an iteration (the *latch*),
+a variable that still holds a value from the last iteration, in @carryk,
+is copied into @k (`carry`), and `swap k` frees @carryk and makes @k the
+carried arena. When the loop ends, each variable is copied back to its own
+region. So the loop holds at most two versions of each variable.
+
+`for i in 0..n: s = s + "x"` becomes, roughly:
+
+    store s.1, (load s)                 # the loop's slot for s
+  for:
+    swap 1
+    ...
+  body:
+    %1 = add (load s.1), "x" @1         # the new value, in the iteration's arena
+    store s.1, %1
+  next:
+    store s.1, (carry (load s.1) @1)    # copied only if it is still in @carry1
+    jump for
+  exit:
+    store s, (copy (load s.1) @0)
+    reset 1
 """
 
 from collections import Counter
@@ -100,6 +134,7 @@ from ella.checker import (
     is_nocopy,
     literal_type,
     names_used,
+    pattern_names,
     place_root,
     show_type,
     substitute,
@@ -116,6 +151,7 @@ from ella.ir import (
     Trap,
     Value,
     allocates,
+    carry_level,
     is_boxed,
     outlives,
     shortest,
@@ -133,6 +169,7 @@ from ella.syntax import (
     BoolLit,
     Break,
     Call,
+    Case,
     Compare,
     ConstraintDef,
     Continue,
@@ -265,6 +302,15 @@ class PendingFunction:
 
 
 @dataclass(slots=True)
+class Carried:
+    """A variable a loop carries between iterations: its name, its kind outside the loop, and its slot inside it."""
+
+    name: str
+    kind: str  # "local" or "global"
+    slot: str
+
+
+@dataclass(slots=True)
 class LoopTarget:
     """Where `break` and `continue` go for one loop being lowered, and the level outside it."""
 
@@ -333,6 +379,9 @@ class Lowerer:
         self.slots: dict[str, SlotInfo] = {}
         self.info: dict[int, Info] = {}  # value id -> what is known about it
         self.changed: set[str] = set()  # names of variables changed in place in this function
+        self.carrying: set[int] = set()  # the levels of the loops being lowered that carry variables
+        self.promoted: set[str] = set()  # globals that the loops being lowered carry, in local slots
+        self.last_uses: dict[int, str] = {}  # id of an `x = y` -> y, if nothing reads y afterwards
         self.returned: set[str] = set()  # names of variables this function may return
 
     # Building blocks
@@ -345,6 +394,7 @@ class Lowerer:
         self.block = self.new_block("entry")
         self.scopes, self.loops, self.self_info = [], [], None
         self.slots, self.info = {}, {}
+        self.carrying, self.promoted, self.last_uses = set(), set(), {}
         self.changed = changed_in_place(body, self.checker, into_lambdas=False)
         self.returned = returned_names(body) if name != "top" else set()
 
@@ -451,7 +501,13 @@ class Lowerer:
         return str(self.level)
 
     def info_of(self, value: Value) -> Info:
-        """What is known about a value. Values not recorded are new objects, unboxed values, or constants."""
+        """What is known about a value. Values not recorded are new objects, unboxed values, or constants.
+
+        An unboxed value (a number read from a variable, say) shares nothing
+        and lives anywhere, whatever is recorded for it.
+        """
+        if not is_boxed(value.type):
+            return Info()
         return self.info.get(value.id, Info())
 
     def needs_copy(self, t: Type, info: Info | None = None) -> bool:
@@ -644,7 +700,12 @@ class Lowerer:
         self.info[value.id] = Info(frozenset({slot}) | info.borrows, info.region)
         return value
 
+    def resolve(self, name: str, kind: str) -> str:
+        """How to reach a variable: a global that a loop carries is in a local slot while the loop runs."""
+        return "local" if kind == "global" and name in self.promoted else kind
+
     def read_name(self, name: str, kind: str, span: Span, dest: str = "") -> Value:
+        kind = self.resolve(name, kind)
         if kind == "local":
             return self.read_local(name, span, dest)
         value = self.emit("global_get", self.module.globals[name], [], span, name)
@@ -653,7 +714,7 @@ class Lowerer:
 
     def write_name(self, name: str, kind: str, value: Value, span: Span) -> None:
         """Store an already placed value in a variable."""
-        if kind == "local":
+        if self.resolve(name, kind) == "local":
             slot = self.find_slot(name)
             self.emit_effect("store", [value], span, slot)
             self.info[value.id] = Info(frozenset({slot}), self.slots[slot].region)
@@ -663,7 +724,16 @@ class Lowerer:
 
     def var_region(self, name: str, kind: str) -> str:
         """Where a variable's value lives."""
-        return self.slots[self.find_slot(name)].region if kind == "local" else "global"
+        return self.slots[self.find_slot(name)].region if self.resolve(name, kind) == "local" else "global"
+
+    def build_region(self, region: str) -> str:
+        """Where to make a new value for a variable whose value lives in `region`.
+
+        A variable a loop carries holds values from the last iteration, in
+        @carryk, but its new values are made in the iteration's arena, @k.
+        """
+        level = carry_level(region)
+        return str(level) if level is not None else region
 
     # Programs and functions
 
@@ -886,7 +956,7 @@ class Lowerer:
                 return value
             case Assign(op, target, value_expr):
                 if isinstance(target, Name):
-                    return self.lower_assign_name(op, target, value_expr, span)
+                    return self.lower_assign_name(op, target, value_expr, span, self.last_uses.get(id(expr), ""))
                 if isinstance(target, Index) and self.has_method(self.type_of(target.target), "set"):
                     return self.lower_assign_set(op, target, value_expr, span)
                 return self.lower_assign_place(op, target, value_expr, span)
@@ -949,6 +1019,16 @@ class Lowerer:
             # Control flow
             case BlockExpr(exprs):
                 self.scopes.append({})
+                declared: set[str] = set()
+                for i, line in enumerate(exprs):
+                    match line:
+                        case Assign("=", Name(), Name(name)) if name in declared:
+                            if name not in names_used(exprs[i + 1 :], inside_lambdas=True):
+                                self.last_uses[id(line)] = name
+                        case Let(bindings):
+                            declared |= {binding.name for binding in bindings}
+                        case LetPattern(pattern):
+                            declared |= {node.name for node in pattern_names(pattern)}
                 for line in exprs[:-1]:
                     self.lower(line)
                 result = self.lower(exprs[-1], dest)
@@ -963,29 +1043,35 @@ class Lowerer:
                 return self.lower_for(expr)
             case While(label, cond, body):
                 # header: evaluate cond, then go to body or exit. body: ..., back to header.
-                outer = self.enter_loop()
+                names = self.carried_by(expr)
+                outer = self.enter_loop(bool(names))
+                carried = self.begin_carrying(names, span)
                 header, body_block = self.new_block("while"), self.new_block("body")
+                latch = self.latch(carried, header, span)
                 exit = self.new_block("exit", outer)
                 self.jump(header)
                 self.block = header
-                self.emit_effect("reset", [], span, index=self.level)
+                self.end_iteration(carried, span)
                 self.branch(self.lower(cond), body_block, exit)
                 self.block = body_block
-                self.lower_loop_body(LoopTarget(label, exit, header, outer), body)
-                self.jump(header)
-                self.leave_loop(exit, outer, span)
+                self.lower_loop_body(LoopTarget(label, exit, latch, outer), body)
+                self.jump(latch)
+                self.leave_loop(exit, outer, span, carried)
                 return self.const((), span)
             case Loop(label, body):
-                outer = self.enter_loop()
+                names = self.carried_by(expr)
+                outer = self.enter_loop(bool(names))
+                carried = self.begin_carrying(names, span)
                 body_block = self.new_block("loop")
+                latch = self.latch(carried, body_block, span)
                 exit, param = self.join_block(self.type_of(expr), outer)
                 self.jump(body_block)
                 self.block = body_block
-                self.emit_effect("reset", [], span, index=self.level)
-                loop = LoopTarget(label, exit, body_block, outer)
+                self.end_iteration(carried, span)
+                loop = LoopTarget(label, exit, latch, outer)
                 self.lower_loop_body(loop, body)
-                self.jump(body_block)
-                self.leave_loop(exit, outer, span)
+                self.jump(latch)
+                self.leave_loop(exit, outer, span, carried)
                 return self.result_of(param, loop.breaks, span)
             case Break(label, value):
                 loop = self.find_loop(label)
@@ -1075,17 +1161,21 @@ class Lowerer:
             self.info[result.id] = self.info_of(container)
         return result
 
-    def lower_assign_name(self, op: str, target: Name, value_expr: Expr, span: Span) -> Value:
-        """`x = v` and `x op= v`."""
+    def lower_assign_name(self, op: str, target: Name, value_expr: Expr, span: Span, moved: str = "") -> Value:
+        """`x = v` and `x op= v`. `moved` is a variable v reads for the last time, whose value can move to x."""
         kind = self.checker.kinds[id(target)]
         if is_append(Assign(op, target, value_expr, span), self.checker):
             items = value_expr.right if isinstance(value_expr, Binary) and op == "=" else value_expr
             return self.lower_append(target, kind, items, span)
-        region = self.var_region(target.name, kind)
+        region = self.build_region(self.var_region(target.name, kind))
         value = self.lower(value_expr, region if op == "=" else "")
         if op != "=":
             old = self.read_name(target.name, kind, target.span)
             value = self.operate(op.removesuffix("="), old, value, old.type, span, region)
+        elif moved:
+            # Nothing reads the variable again, so sharing its value can't be seen.
+            info = self.info_of(value)
+            self.info[value.id] = Info(info.borrows - {self.find_slot(moved)}, info.lives)
         value = self.place(value, region, span, mutable=True)
         self.write_name(target.name, kind, value, span)
         return value
@@ -1574,18 +1664,129 @@ class Lowerer:
 
     # Loops
 
-    def enter_loop(self) -> int:
-        """Start lowering a loop's iterations, one level deeper. Returns the level outside it."""
+    def enter_loop(self, carries: bool = False) -> int:
+        """Start lowering a loop's iterations, one level deeper. Returns the level outside it.
+
+        Inside a loop that carries variables, the next level is its spare
+        arena, so loops inside it go two levels deeper.
+        """
         outer = self.level
-        self.level += 1
-        self.max_level = max(self.max_level, self.level)
+        self.level += 2 if outer in self.carrying else 1
+        self.max_level = max(self.max_level, self.level + (1 if carries else 0))
+        if carries:
+            self.carrying.add(self.level)
         return outer
 
-    def leave_loop(self, exit: Block, outer: int, span: Span) -> None:
-        """Continue after a loop, at its exit, which frees the loop's level."""
+    def leave_loop(self, exit: Block, outer: int, span: Span, carried: Sequence[Carried] = ()) -> None:
+        """Continue after a loop, at its exit, which copies out what it carried and frees the loop's levels."""
+        level = self.level
+        self.carrying.discard(level)
         self.level = outer
         self.block = exit
-        self.emit_effect("reset", [], span, index=outer + 1)
+        self.end_carrying(carried, level, span)
+        self.emit_effect("reset", [], span, index=level)
+
+    def carried_by(self, loop: For | While | Loop) -> list[tuple[str, str]]:
+        """The variables declared outside a loop that it carries, with their kinds: those it gives new values.
+
+        Leaving the loop copies them back to their own regions, so it must not
+        be left another way than its exit: a `break` or `continue` of a loop
+        outside it means none. Left out are:
+
+        * variables the loop changes in place (`xs += ys`, `xs[i] = v`, `mut
+          xs`), which grow or change where they are and need no new versions,
+        * names declared inside the loop, which may be other variables,
+        * values that are never copied or aren't objects, and
+        * globals, if the loop calls Ella functions or makes closures or
+          code, which could see them while the loop has them in a slot.
+        """
+        parts: list[object] = [loop.body, loop.cond] if isinstance(loop, While) else [loop.body]
+        inside = list(loop_nodes(tuple(parts)))
+        labels = {loop.label} | {node.label for node in inside if isinstance(node, For | While | Loop)}
+        if any(isinstance(node, Break | Continue) and node.label not in (None, *labels) for node in inside):
+            return []
+        declared = {node.name for node in pattern_names(loop.pattern)} if isinstance(loop, For) else set()
+        for node in inside:
+            match node:
+                case Let(bindings):
+                    declared |= {binding.name for binding in bindings}
+                case LetPattern(pattern) | For(pattern=pattern) | Case(pattern=pattern):
+                    declared |= {name.name for name in pattern_names(pattern)}
+        changed = changed_in_place(tuple(parts), self.checker, into_lambdas=False)
+        closed = CALLS not in changed and not any(isinstance(node, Lambda | Quote) for node in inside)
+        names: list[tuple[str, str]] = []
+        for node in inside:
+            if not isinstance(node, Assign) or not isinstance(node.target, Name) or is_append(node, self.checker):
+                continue
+            name = node.target.name
+            kind = self.resolve(name, self.checker.kinds.get(id(node.target), ""))
+            if name in declared or name in changed or (name, kind) in names:
+                continue
+            if kind == "local" and self.find_slot(name) != SELF:
+                t = self.function.locals[self.find_slot(name)]
+            elif kind == "global" and closed:
+                t = self.module.globals[name]
+            else:
+                continue
+            if is_boxed(t) and not self.nocopy(t) and not has_pool(t, self.module.enums):
+                names.append((name, kind))
+        return names
+
+    def begin_carrying(self, names: list[tuple[str, str]], span: Span) -> list[Carried]:
+        """Before a loop: give each variable it carries a slot of its own, in a new scope, holding its value."""
+        if not names:
+            return []
+        carried, scope = [], {}
+        for name, kind in names:
+            value = self.read_name(name, kind, span)
+            slot = self.new_slot(name, value.type)
+            region = f"carry{self.level}"
+            self.function.local_regions[slot] = region
+            self.slots[slot] = SlotInfo(name, True, "local", region)
+            self.emit_effect("store", [value], span, slot)
+            scope[name] = slot
+            carried.append(Carried(name, kind, slot))
+        self.scopes.append(scope)
+        self.promoted |= {c.name for c in carried if c.kind == "global"}
+        return carried
+
+    def latch(self, carried: list[Carried], header: Block, span: Span) -> Block:
+        """Where an iteration of a loop ends: its header, or a block that keeps the carried values, then goes there.
+
+        A variable whose value is still in @carryk (it got no new value this
+        time) is copied into the iteration's arena, which the loop keeps.
+        """
+        if not carried:
+            return header
+        block, self.block = self.block, self.new_block("latch")
+        latch = self.block
+        self.keep_carried(carried, span)
+        self.jump(header)
+        self.block = block
+        return latch
+
+    def keep_carried(self, carried: list[Carried], span: Span) -> None:
+        for c in carried:
+            t = self.function.locals[c.slot]
+            value = self.emit("load", t, [], span, c.slot)
+            kept = self.emit("carry", t, [value], span, index=self.level, region=self.here())
+            self.emit_effect("store", [kept], span, c.slot)
+
+    def end_iteration(self, carried: list[Carried], span: Span) -> None:
+        """At a loop's header: free the last iteration's arena, or swap the arenas of a loop that carries values."""
+        self.emit_effect("swap" if carried else "reset", [], span, index=self.level)
+
+    def end_carrying(self, carried: Sequence[Carried], level: int, span: Span) -> None:
+        """After a loop: copy each variable it carried back to where the variable lives."""
+        if not carried:
+            return
+        self.scopes.pop()
+        self.promoted -= {c.name for c in carried if c.kind == "global"}
+        for c in carried:
+            value = self.emit("load", self.function.locals[c.slot], [], span, c.slot)
+            self.info[value.id] = Info(frozenset({c.slot}), f"carry{level}")
+            region = self.build_region(self.var_region(c.name, c.kind))
+            self.write_name(c.name, c.kind, self.place(value, region, span, mutable=True), span)
 
     def lower_for(self, expr: For) -> Value:
         """`for pattern in xs body` counts through the items with a hidden counter:
@@ -1603,13 +1804,15 @@ class Lowerer:
         counter = self.new_slot("for.i", I64)
         self.function.local_regions[counter] = self.here()
         self.emit_effect("store", [self.const(0, span)], span, counter)
-        outer = self.enter_loop()
+        names = self.carried_by(expr)
+        outer = self.enter_loop(bool(names))
+        carried = self.begin_carrying(names, span)
         header, body, next_block = (self.new_block(h) for h in ("for", "body", "next"))
         exit = self.new_block("exit", outer)
         self.jump(header)
 
         self.block = header
-        self.emit_effect("reset", [], span, index=self.level)
+        self.end_iteration(carried, span)
         i = self.emit("load", I64, [], span, counter)
         self.branch(self.emit("lt", BOOL, [i, count], span), body, exit)
 
@@ -1627,11 +1830,12 @@ class Lowerer:
         self.block.terminator = Trap("the 'for' pattern doesn't match {}", item, span)
 
         self.block = next_block
+        self.keep_carried(carried, span)
         i = self.emit("load", I64, [], span, counter)
         self.emit_effect("store", [self.emit("add", I64, [i, self.const(1, span)], span)], span, counter)
         self.jump(header)
 
-        self.leave_loop(exit, outer, span)
+        self.leave_loop(exit, outer, span, carried)
         return self.const((), span)
 
     def lower_loop_body(self, target: LoopTarget, body: Expr) -> None:
@@ -1723,6 +1927,17 @@ def unused_functions(program: Program) -> set[int]:
             if name in functions:
                 wanted |= names_used(functions[name].value, inside_lambdas=True)
     return {id(expr) for expr in functions.values() if not any(b.name in used for b in expr.bindings)}
+
+
+def loop_nodes(node: object) -> list[object]:
+    """The syntax tree nodes in some code, itself included, but not those inside lambdas and quotes, which run elsewhere."""
+    if isinstance(node, tuple):
+        return [n for item in node for n in loop_nodes(item)]
+    if not is_dataclass(node) or isinstance(node, type | Span):
+        return []
+    if isinstance(node, Lambda | Quote):
+        return [node]
+    return [node, *(n for child in children(node) for n in loop_nodes(child))]
 
 
 def type_splices(node: object) -> list[TypeSplice]:

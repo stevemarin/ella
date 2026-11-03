@@ -1,0 +1,18 @@
+# Nested loops: an inner loop builds a row, the outer one keeps the last
+# row and a label, rebuilt every iteration, and stops early.
+let scan = (rows: i64, cols: i64) -> ([i64], str, i64) =>
+    let mut last: [i64] = []
+    let mut label = "none"
+    let mut best = 0
+    for r in 0..rows
+        let mut row: [i64] = []
+        for c in 0..cols
+            row += [(r * 31 + c * 17) % 1000]
+        last = row
+        label = "row {{r}} of {{rows}}"
+        best = max(best, sum(row, 0))
+        if r == rows - 1 then
+            break
+    (last[0..3], label, best)
+
+print(scan(5000, 200))

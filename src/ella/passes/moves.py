@@ -22,7 +22,9 @@ This pass does that in the simplest safe case:
 * the original is made entirely of new objects, so no part of it is shared
   with anything else. A list of numbers or strings, a call's result, or an
   earlier copy qualifies; a list of lists built from variables doesn't,
-  since its items may belong to those variables.
+  since its items may belong to those variables. Constants count as new:
+  they are static, so a tuple of a number and a string constant can be
+  made where its copy would be, and still share the constant.
 
 The original is then made where the copy would have been, in the copy's
 region. Finding last uses in general, with liveness analysis, is left for
@@ -38,13 +40,14 @@ NEW = frozenset({"copy", "call", "to_text", "range", "range_incl", "append", "in
 
 def move_copies(function: Function, module: Module) -> bool:
     uses = count_uses(function)
+    constants = {i.dest.id for b in function.blocks for i in b.instrs if i.op == "const" and i.dest is not None}
     replacements: dict[int, Value] = {}
     for block in function.blocks:
         made = {i.dest.id: i for i in block.instrs if i.dest is not None}  # made earlier in this block
         kept = []
         for instr in block.instrs:
             source = made.get(instr.args[0].id) if instr.op == "copy" else None
-            if source is not None and uses[instr.args[0].id] == 1 and movable(source, instr.region):
+            if source is not None and uses[instr.args[0].id] == 1 and movable(source, instr.region, constants):
                 source.region = instr.region
                 assert instr.dest is not None
                 replacements[instr.dest.id] = instr.args[0]
@@ -55,7 +58,7 @@ def move_copies(function: Function, module: Module) -> bool:
     return bool(replacements)
 
 
-def movable(source: Instr, region: str) -> bool:
+def movable(source: Instr, region: str, constants: set[int]) -> bool:
     """Whether a value made by `source` is all new objects, and can be made in `region` instead.
 
     An `append` can't move to another region: its list belongs to a variable,
@@ -70,5 +73,6 @@ def movable(source: Instr, region: str) -> bool:
     t = source.dest.type
     if source.op == "add":  # joining strings, or lists of numbers, makes all new objects
         return not isinstance(t, ListTy) or not is_boxed(t.element)
-    # A new list, tuple or variant of numbers.
-    return source.op in ("list", "tuple", "variant") and not any(is_boxed(arg.type) for arg in source.args)
+    # A new list, tuple or variant of numbers and constants.
+    parts = [arg for arg in source.args if is_boxed(arg.type) and arg.id not in constants]
+    return source.op in ("list", "tuple", "variant") and not parts

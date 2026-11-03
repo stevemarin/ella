@@ -12,8 +12,8 @@ error. Only instructions that can never fail are removed:
 
 * building and taking apart values: `const`, `tuple`, `list`, `variant`,
   `closure`, `tuple_get`, `is_variant`, `variant_field`, `range`, `len`,
-  `to_text`, `copy`, `quote` (but not making a struct with a finalizer,
-  which will run)
+  `to_text`, `copy`, `carry`, `quote` (but not making a struct with a
+  finalizer, which will run)
 * comparisons, `not`, and the bitwise operations that can't overflow
 * floating point arithmetic, which never fails (IEEE 754 gives infinities
   and NaNs instead), and joining strings and lists with `add`
@@ -60,6 +60,7 @@ SAFE = frozenset(
         "bitxor",
         "div",  # always f64, so it never fails
         "copy",
+        "carry",
         "quote",
         "quote_begin",
     }

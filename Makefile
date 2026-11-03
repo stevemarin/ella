@@ -7,7 +7,7 @@ FILE ?= example_syntax.ella
 VSCODE_EXTENSIONS ?= $(if $(wildcard $(HOME)/.vscode-server),$(HOME)/.vscode-server/extensions,$(HOME)/.vscode/extensions)
 
 .DEFAULT_GOAL := help
-.PHONY: help sync test lint format format-check typecheck check run tree native asm ir \
+.PHONY: help sync test lint format format-check typecheck check bench run tree native asm ir \
 	lsp extension install-extension uninstall-extension package clean
 
 help: ## List the recipes
@@ -34,6 +34,9 @@ typecheck: ## Strict type checking of src/ and test/
 	uv run mypy
 
 check: lint format-check typecheck test ## Everything CI would run
+
+bench: ## Time the benchmarks in test/benchmarks natively, with their arena peaks (needs gcc)
+	uv run python test/bench.py
 
 # Running programs (FILE=path/to/program.ella, default the syntax tour)
 

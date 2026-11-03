@@ -258,6 +258,26 @@ print(f([1]))
     assert run(module) == ["[[9]]"]
 
 
+def test_moves_counts_constants_as_new() -> None:
+    # The struct's string is a constant, which is static, so the struct can
+    # be made where its copy goes and keep sharing the constant.
+    source = """\
+struct P
+    n: i64
+    s: str
+let f = () -> P =>
+    let a = P(1, "x")
+    let mut b = a
+    b.n = 5
+    b
+print(f())
+"""
+    assert "copy" in ops(compiled(source, ["mem2reg"]).functions["f"])
+    module = compiled(source, ["mem2reg", "moves"])
+    assert "copy" not in ops(module.functions["f"])
+    assert run(module) == ['P(5, "x")']
+
+
 def test_dce_drops_levels_nothing_allocates_in() -> None:
     # The loop made a string until folding turned it into a constant.
     function = compiled('let f = () -> () =>\n    for i in 0..3\n        print("a" + "b")\nf()').functions["f"]

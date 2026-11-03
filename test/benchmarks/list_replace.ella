@@ -1,0 +1,5 @@
+# A small list replaced on every iteration.
+let mut xs = [1, 2, 3]
+for i in 0..100000
+    xs = [i, i + 1, i + 2]
+print(xs)

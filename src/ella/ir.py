@@ -59,6 +59,8 @@ one names the arena, its *region*, written after an `@`:
 
     @0, @1, ...    the function's scope levels: 0 is the function body, and
                    each loop nested in it adds a level for its iterations
+    @carry1, ...   (for variables only) the arena that holds the values a
+                   loop at level 1 carries from its last iteration
     @result        where the caller wants the function's result
     @mut0, ...     where the variable passed to `mut` parameter 0 lives
     @global        the program's global arena, freed when the program ends
@@ -66,7 +68,18 @@ one names the arena, its *region*, written after an `@`:
                    value, in its slot's own arena, which gets a copy
 
 `reset k` frees levels k and up when control leaves a loop iteration, and
-returning frees all of the function's levels. A value must never be used
+returning frees all of the function's levels.
+
+A loop that assigns new values to variables declared outside it *carries*
+them from one iteration to the next (docs/memory-model.md §6). Such a loop
+at level k has two arenas, level k and a spare (level k+1; loops inside it
+start at k+2), and they take turns: new objects go in @k, and the values
+carried from the last iteration are in @carryk. Where a plain loop frees
+level k after each iteration, `swap k` frees the carried arena and makes
+the iteration's arena the carried one. The loop's variables are copied
+into the iteration's arena first if they still hold values from the
+carried one (`carry`), and copied out when the loop ends. So a loop that
+rebuilds a value keeps at most two versions, not one per iteration. A value must never be used
 after its arena is freed, and an object must never be stored where it would
 outlive its arena; the IR interpreter checks both at run time. Freeing an
 arena first runs the finalizers of the values in it that have them (nocopy
@@ -97,6 +110,10 @@ Operations
     move v @r                    v, which can't be copied, moved to region r with
                                  its finalizers (a returned local variable)
     reset k                      free the function's scope levels k and up
+    swap k                       end an iteration of a loop at level k that carries values:
+                                 free levels k+2 and up, run the finalizers of @k's
+                                 values, free @carryk, and swap the two arenas
+    carry v @k                   v, or a copy of it in @k if it is in @carryk (index k)
     pool_new @r                  a new, empty pool
     alloc pool, v                put v in a new slot of the pool, in the slot's own
                                  arena; gives its handle
@@ -321,6 +338,7 @@ ALLOCATING = frozenset(
         "reflect",
         "slice",
         "builtin",
+        "carry",
     }
 )
 
@@ -348,8 +366,28 @@ def is_boxed(t: Type) -> bool:
 
 
 def region_level(region: str) -> int | None:
-    """The scope level a region names (`"2"` is level 2), or None for result, global and mut regions."""
+    """The scope level a region names (`"2"` is level 2), or None for carry, result, global and mut regions."""
     return int(region) if region.isdigit() else None
+
+
+def carry_level(region: str) -> int | None:
+    """The level of the loop whose carried values a region holds (`"carry2"` is 2), or None."""
+    rest = region.removeprefix("carry")
+    return int(rest) if rest != region and rest.isdigit() else None
+
+
+def rank(region: str) -> float | None:
+    """Where a region comes in the order arenas are freed in, the last freed first; None for the caller's regions.
+
+    The values a loop at level k carries are freed when the iteration ends,
+    after the loops inside it (k+2, ...) but before the iteration's own
+    arena, which then holds the carried values.
+    """
+    level = region_level(region)
+    if level is not None:
+        return level
+    carried = carry_level(region)
+    return carried + 0.5 if carried is not None else None
 
 
 def outlives(a: str, b: str) -> bool:
@@ -358,14 +396,15 @@ def outlives(a: str, b: str) -> bool:
     The global region outlives everything. The result and `mut` regions
     belong to the caller, so they outlive every level of the function, but
     nothing says which of them outlives the others. Level k outlives the
-    deeper levels k+1, k+2, ...
+    deeper levels k+1, k+2, ..., and the values carried by the loop at
+    level k (@carryk), which outlive the levels inside that loop.
     """
     if a == b or a == "global":
         return True
-    level_a, level_b = region_level(a), region_level(b)
-    if level_b is None:
+    rank_a, rank_b = rank(a), rank(b)
+    if rank_b is None:
         return False
-    return level_a is None or level_a <= level_b
+    return rank_a is None or rank_a <= rank_b
 
 
 def shortest(a: str, b: str) -> str:
@@ -389,6 +428,8 @@ def trim_levels(function: Function) -> bool:
             level = region_level(instr.region) if instr.op not in ("set_index", "set_field") else None
             if level is not None:
                 used = max(used, level + 1)
+            if instr.op == "swap":  # the loop's spare arena is the next level
+                used = max(used, instr.index + 2)
     used = max(used, 1)
     changed = used < function.levels
     for block in function.blocks:
@@ -565,7 +606,7 @@ def format_instr(instr: Instr) -> str:
             operands = f"{callee}(" + ", ".join(shown) + ")"
         case "assert":
             operands = f"{args}, {show_literal(instr.name)}"
-        case "reset":
+        case "reset" | "swap":
             operands = str(instr.index)
         case _:
             operands = args
@@ -754,7 +795,8 @@ class Verifier:
         args = [a.type for a in instr.args]
         dest = instr.dest.type if instr.dest is not None else None
         effects = (
-            "store", "global_set", "print", "eprint", "assert", "set_index", "set_field", "reset", "free", "pool_set"
+            "store", "global_set", "print", "eprint", "assert", "set_index", "set_field", "reset", "swap", "free",
+            "pool_set",
         )  # fmt: skip
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
         self.require(not instr.outs or instr.op == "call", f"{instr.op} can't have extra results", block)
@@ -860,6 +902,10 @@ class Verifier:
                 need(bool(args) and (args[0] == first or (isinstance(args[0], BuiltinTy) and args[0].name == "Type")))
             case "reset":
                 need(not args and 1 <= instr.index < self.function.levels)
+            case "swap":
+                need(not args and 1 <= instr.index and instr.index + 1 < self.function.levels)
+            case "carry":
+                need(len(args) == 1 and dest == args[0] and instr.region == str(instr.index))
             case "len":
                 pool = len(args) == 1 and isinstance(args[0], BuiltinTy) and args[0].name == "Pool"
                 need(len(args) == 1 and (item_type(args[0]) is not None or pool) and dest == I64)

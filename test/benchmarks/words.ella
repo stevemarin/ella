@@ -1,0 +1,12 @@
+# Text work: splitting, a map of counts, and the text rebuilt each round.
+let main = () -> () =>
+    let mut text = "the quick brown fox jumps over the lazy dog"
+    let mut counts: Map[str, i64] = new_map()
+    for _ in 0..2000
+        let words = split(text, " ")
+        for w in words
+            let seen = if w in counts then counts[w] else 0
+            counts[w] = seen + 1
+        text = join(sort(words), " ")
+    print(text)
+    print(counts["the"], len(counts))

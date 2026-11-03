@@ -1,0 +1,6 @@
+# A tuple with a string replaced on every iteration, at the top level.
+let mut best = (0, "")
+for i in 0..100000
+    if i % 7 == 3 then
+        best = (i, "item {{i}}")
+print(best)

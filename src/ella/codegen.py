@@ -18,7 +18,9 @@ The design favors being easy to follow over fast code:
   to make it in, worked out from the instruction's region: a function that
   allocates in its own scope levels asks the runtime for depths when it
   starts (`ella_enter`), keeps the first in a stack slot, and frees them
-  when it returns (`ella_leave`).
+  when it returns (`ella_leave`). A loop that carries values has two arenas
+  that take turns (`swap`), so the depths of its level and of its carried
+  values are kept in stack slots of their own.
 
 Ella's calling convention
 -------------------------
@@ -63,7 +65,20 @@ from ella.checker import (
     show_type,
     substitute,
 )
-from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, Value, format_instr, region_level
+from ella.ir import (
+    Block,
+    Branch,
+    Function,
+    Instr,
+    Jump,
+    Module,
+    Return,
+    Trap,
+    Value,
+    carry_level,
+    format_instr,
+    region_level,
+)
 from ella.lexer import Span
 from ella.syntax import bare_name
 from ella.values import MAX_CALL_DEPTH
@@ -118,6 +133,9 @@ class CodeGen:
         self.function = Function("", I64, Span(1, 1))
         self.slots: dict[int, str] = {}
         self.local_slots: dict[str, str] = {}
+        # For each loop that carries values, by level: the slots of the depths of its level and its carried values.
+        self.current_slots: dict[int, str] = {}
+        self.carried_slots: dict[int, str] = {}
         self.base_slot = ""
 
     def emit(self, line: str) -> None:
@@ -201,6 +219,7 @@ class CodeGen:
         """The prologue, then each block."""
         self.function = function
         self.slots, self.local_slots = {}, {}
+        self.current_slots, self.carried_slots = {}, {}
         frame = 0
 
         def new_slot() -> str:
@@ -223,11 +242,14 @@ class CodeGen:
         for name in function.locals:
             self.local_slots[name] = new_slot()
         uses_levels = any(
-            region_level(instr.region) is not None and instr.op not in ("set_index", "set_field")
+            (region_level(instr.region) is not None and instr.op not in ("set_index", "set_field"))
+            or instr.op == "swap"
             for block in function.blocks
             for instr in block.instrs
         )
         self.base_slot = new_slot() if uses_levels else ""
+        for level in sorted({i.index for block in function.blocks for i in block.instrs if i.op == "swap"}):
+            self.current_slots[level], self.carried_slots[level] = new_slot(), new_slot()
 
         self.emit("push rbp")
         self.emit("mov rbp, rsp")
@@ -242,6 +264,11 @@ class CodeGen:
             self.emit(f"mov rdi, {function.levels}")
             self.emit("call ella_enter            # take arenas for the scope levels")
             self.emit(f"mov {self.base_slot}, rax")
+            for level in self.current_slots:
+                self.emit(f"lea rcx, [rax + {level}]")
+                self.emit(f"mov {self.current_slots[level]}, rcx")
+                self.emit(f"lea rcx, [rax + {level + 1}]")
+                self.emit(f"mov {self.carried_slots[level]}, rcx")
         for block in function.blocks:
             self.text.append(f"{self.block_label(block)}:")
             for instr in block.instrs:
@@ -254,8 +281,12 @@ class CodeGen:
 
     def region_to(self, register: str, region: str) -> None:
         """Put the depth of a region's arena in a register."""
-        level = region_level(region)
-        if level is not None:
+        level, carried = region_level(region), carry_level(region)
+        if level in self.current_slots:
+            self.emit(f"mov {register}, {self.current_slots[level]}")
+        elif carried is not None:
+            self.emit(f"mov {register}, {self.carried_slots[carried]}")
+        elif level is not None:
             self.emit(f"mov {register}, {self.base_slot}")
             if level:
                 self.emit(f"add {register}, {level}")
@@ -539,6 +570,23 @@ class CodeGen:
                 self.call_c("ella_error", line, column, self.c_string(message))
             case "copy":
                 self.call_c("ella_copy", args[0], self.type_descriptor(args[0].type), Region(instr.region))
+                self.store(dest)
+            case "swap":
+                current, carried = self.current_slots[instr.index], self.carried_slots[instr.index]
+                self.emit(f"mov rdi, {self.base_slot}")
+                self.emit(f"add rdi, {instr.index + 2}")
+                self.emit(f"mov rsi, {self.base_slot}")
+                self.emit(f"add rsi, {self.function.levels}")
+                self.emit(f"mov rdx, {current}")
+                self.emit(f"mov rcx, {carried}")
+                self.emit("call ella_swap")
+                self.emit(f"mov rax, {current}")
+                self.emit(f"mov rcx, {carried}")
+                self.emit(f"mov {current}, rcx")
+                self.emit(f"mov {carried}, rax")
+            case "carry":
+                carried = Region(f"carry{instr.index}")
+                self.call_c("ella_carry", args[0], self.type_descriptor(args[0].type), carried, Region(instr.region))
                 self.store(dest)
             case "reset":
                 if self.base_slot:

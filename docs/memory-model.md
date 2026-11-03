@@ -9,7 +9,9 @@ IR interpreter checks, and real arenas in native code. Stage 7 built steps
 and finalizers, together with structs and multi-stage programming.
 Sub-arenas are not built yet. [What stage 6 built](#14-what-stage-6-built)
 and [what stage 7 built](#15-what-stage-7-built) describe the
-implementation, and where it settles or departs from this design.
+implementation, and where it settles or departs from this design, and
+[loops that carry values](#16-loops-that-carry-values) how region bloat
+is avoided.
 
 The rest of this document is the design, recorded so an implementation can
 start from it without repeating the discussion. Items marked
@@ -223,12 +225,16 @@ version in the outer arena each time, and the old versions are not freed
 until the outer scope exits. Mitigations, in order:
 
 1. **Prefer in-place mutation.** Value semantics makes this safe (§3), so
-   `acc = acc + [x]` on a `mut acc` should append in place.
+   `acc = acc + [x]` on a `mut acc` should append in place. *(Done in stage
+   6.)*
 2. **Reset when the old contents are dead** (MLKit's storage-mode analysis):
    if a value is entirely replaced and the old version is dead, reuse its
-   space.
+   space. *(Done for loops: a loop that gives an outer variable new values
+   carries it in two arenas that take turns, so at most two versions are
+   alive; see §16.)*
 3. **Report it.** The compiler warns when a loop allocates into an outer
    arena, for example "allocation in loop goes to outer arena (depth 1)".
+   *(`--placement` marks such allocations; there is no warning yet.)*
 4. Move long-lived, frequently changing state into a pool or sub-arena.
 
 ## 7. Cleanup
@@ -368,7 +374,11 @@ Out of scope for now. The intended direction:
 * Long-running programs (event loops, servers) keep much of their state in
   pools and sub-arenas that need **explicit** freeing. Generation checks catch
   stale handles, but nothing catches leaks.
-* Region bloat (§6).
+* Region bloat (§6), in the cases loops don't carry (§16): a variable
+  that a loop both replaces and changes in place, a global that a loop
+  replaces while calling Ella functions, a loop left by a labeled `break`
+  or `continue` of a loop outside it, and values rebuilt in calls rather
+  than loops.
 * Monomorphization increases code size and compile time.
 * Exclusivity rejects some valid code (§4).
 
@@ -501,9 +511,10 @@ program reports its peak arena use when it finishes.
 
 ### Known limitations
 
-* Strings and other values rebuilt in a loop and kept outside it pile up in
-  the outer arena until it is freed (§6, region bloat). Lists appended to
-  in place don't.
+* Strings and other values rebuilt in a loop and kept outside it piled up
+  in the outer arena until it was freed (§6, region bloat). Lists appended
+  to in place didn't. Loops now carry such values instead (§16), with the
+  exceptions listed in §12.
 * Copies are deep: copying a list of strings copies the strings too, even
   when they would live long enough.
 * The exclusivity check, and the analysis of which variables change in
@@ -640,3 +651,106 @@ order. Nothing is finalized when a program stops with an error.
 * In the IR, a quote inside a function that is defined inside a splice
   can't refer to the variables of the quote the splice is in (the AST
   interpreter could). The checker rejects such programs for now.
+
+## 16. Loops that carry values
+
+The lowering ([src/ella/lower.py](../src/ella/lower.py), "Loops that carry
+values") deals with region bloat in loops, the case §6 calls its known
+failure mode. Before, `for i in 0..n: s = s + "x"` with `s` declared
+outside the loop made each new string in `s`'s arena, which isn't freed
+until `s`'s scope ends: all n versions stayed, and a loop of 3,000 used
+18 MB.
+
+### Two arenas that take turns
+
+A loop that gives a variable declared outside it new values *carries* it.
+Such a loop at level k has two arenas, level k and a spare (level k+1;
+loops inside it start at k+2). One is the iteration's, `@k`, where new
+objects go, as in any loop. The other, `@carryk`, holds the values the
+loop carries from the iteration before. Inside the loop, each carried
+variable lives in a slot of its own, whose values are in one of the two:
+
+* Before the loop, the slot gets the variable's value, which lives outside
+  the loop.
+* An assignment makes the new value in `@k`. It must not share objects
+  with `@carryk`: `best = (i, best.1)` copies the tuple into `@k`, string
+  and all, since `best.1` is in the old version.
+* At the end of an iteration (the *latch*, where `continue` goes too),
+  `carry` copies a variable's value into `@k` if it is still in
+  `@carryk` (the variable got no new value this time); otherwise it is
+  left alone.
+* `swap k`, where a plain loop has `reset k`, frees the loops inside it,
+  runs the finalizers of `@k`'s values, frees `@carryk`, and swaps the
+  two: the iteration's arena becomes the carried one, and the freed one is
+  the next iteration's.
+* When the loop ends, each variable's value is copied back to where the
+  variable lives, and both arenas are freed.
+
+So a loop holds at most two versions of what it carries, plus one
+iteration's temporaries, which now live until the end of the next
+iteration. Finalizers still run when their iteration ends: the values a
+loop carries can be copied, so they never have finalizers, and `swap`
+runs the rest. `carry` decides at run time (natively, from the object's
+address), because whether a variable got a new value can depend on the
+path taken. Looking at the value's top object is enough: a carried
+value never holds parts of `@carryk` unless its top object is there too.
+
+The IR interpreter checks all of it, as it does other arenas. The two
+arenas' order changes with each swap (the carried one is freed first), so
+it keeps each arena's place in the order freed, and compares tags by that
+rather than by depth.
+
+### Which loops carry which variables
+
+`carried_by` picks the variables a loop assigns with `=` or `op=`, other
+than appending. It leaves out:
+
+* variables the loop also changes in place (`xs[i] = v`, `xs += ys`, `mut
+  xs`), which change where they are;
+* names declared inside the loop, which may be other variables;
+* nocopy values (which can't be assigned anyway) and unboxed ones;
+* globals, if the loop calls an Ella function (or a method, or an
+  operator that is one), or makes a closure or a quote: code elsewhere
+  could read the global while the loop holds it in a slot;
+* every variable, if the loop can be left by a labeled `break` or
+  `continue` of a loop outside it, which would skip the copy back.
+
+A loop with nothing to carry is lowered as before.
+
+### Moving at the last use
+
+A related change removes a copy in the common pattern of building a new
+version in a variable that dies, as the standard library's `sort` does:
+
+```ella
+while width < n
+    let mut merged: [T] = []
+    ...
+    items = merged
+```
+
+Storing `merged` into the `mut` variable `items` used to copy it, since the
+two would share a list that can change. But nothing reads `merged` after
+that line: `x = y`, where y is declared earlier in the same block and no
+later line of it uses y, moves the value instead. Together with carrying,
+`sort` no longer copies the list on each pass: it copies it once on the
+way in and once on the way out.
+
+### Results
+
+The benchmarks in [test/benchmarks](../test/benchmarks) (`make bench`)
+measure it; each has a bound on its arena peak that the tests check.
+
+| Benchmark | Arena peak before | After | Time before | After |
+|---|---|---|---|---|
+| `string_build` (3,000 strings) | 18,048,160 B | 24,128 B | 9.0 ms | 0.9 ms |
+| `tuple_replace` | 2,285,824 B | 256 B | 2.4 ms | 2.3 ms |
+| `list_replace` | 4,800,080 B | 176 B | 2.6 ms | 1.3 ms |
+| `sort` (200,000 numbers) | 36,194,720 B | 9,518,832 B | 67.8 ms | 56.2 ms |
+| `running_max` (nested loops) | 8,480,800 B | 9,808 B | 13.8 ms | 10.7 ms |
+| `words` | 388,304 B | 5,040 B | 5.4 ms | 5.1 ms |
+
+Two smaller fixes also removed copies: a number read from a variable no
+longer counts as sharing that variable's lifetime (so `(i, "x")` in a loop
+can be made where it goes), and the `moves` pass treats constants as new
+objects, since they are static.

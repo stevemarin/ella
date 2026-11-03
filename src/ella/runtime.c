@@ -276,9 +276,8 @@ static void unregister(word object) {
 extern void ella_call1(const Closure *closure, word argument);  // in the generated code
 static void free_pool(word pool);
 
-static void free_arena(word depth) {
-    Arena *a = arena(depth);
-    // Finalizers first, newest first, while the values are still there.
+// Run the finalizers of the values in an arena, newest first.
+static void finalize_all(Arena *a) {
     while (a->count > 0) {
         Final final = a->finals[--a->count];
         if (final.finalize == NULL) {
@@ -287,6 +286,11 @@ static void free_arena(word depth) {
             ella_call1(final.finalize, final.object);
         }
     }
+}
+
+static void free_arena(word depth) {
+    Arena *a = arena(depth);
+    finalize_all(a);  // first, while the values are still there
     char *start = arena_start(depth);
     size_t used = (size_t)(a->top - start);
     in_use -= used;
@@ -302,6 +306,19 @@ static void free_arena(word depth) {
 // iteration ends.
 void ella_reset(word first, word end) {
     for (word depth = end - 1; depth >= first; depth--) free_arena(depth);
+}
+
+// A loop that carries values (docs/memory-model.md §6) ends an iteration:
+// free the levels of the loops inside it (first .. end - 1), run the
+// finalizers of the iteration's values (in arena `current`; the values the
+// loop keeps can't have any), and free `carried`, the values it kept from
+// the iteration before. The generated code then swaps the two depths: the
+// iteration's arena holds what the loop carries, and the freed one is the
+// next iteration's.
+void ella_swap(word first, word end, word current, word carried) {
+    ella_reset(first, end);
+    finalize_all(arena(current));
+    free_arena(carried);
 }
 
 // A call starts: take `levels` depths, and return the first.
@@ -599,6 +616,14 @@ word ella_move(word v, const Type *t, word depth) {
     default:
         return is_boxed(t) ? ella_copy(v, t, depth) : v;
     }
+}
+
+// `carry v @current`: a value a loop keeps for its next iteration, copied
+// into the iteration's arena if it is still in the carried one, which is
+// about to be freed. (Then all of it is: the loop's values never hold parts
+// of the carried arena otherwise.)
+word ella_carry(word v, const Type *t, word carried, word current) {
+    return ella_region_of(v) == carried ? ella_copy(v, t, current) : v;
 }
 
 // Storing `value` into an object that may be a pool's value (`@slot`): a

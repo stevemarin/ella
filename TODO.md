@@ -15,8 +15,9 @@ and warnings, then a prelude written in Ella, more of the library, `mut`
 in patterns and more warnings, then inferred lambda types, built-ins and
 constructors as values, a larger prelude with a hash map, prelude error
 locations, and warnings for unused parameters and functions, then modules
-and imports, with the prelude as standard library modules). `make check`
-passes (1020 tests, ruff, strict mypy).
+and imports, with the prelude as standard library modules, then loops that
+carry values instead of piling them up, and benchmarks). `make check`
+passes (1044 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -25,12 +26,12 @@ passes (1020 tests, ruff, strict mypy).
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
-| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, pools with generation-checked handles, `nocopy` and finalizers |
+| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, `nocopy` and finalizers |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `contains`, `len`) |
 | Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]` |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
-| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile |
+| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
 Rough speed, from `fib(32)` (about 3.5 million calls): the native executable
 takes 0.05 s, about 4× slower than C at `gcc -O0`. A `fib(24)` run takes
@@ -61,9 +62,6 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   compares with `==`, by its inner fields.
 - `sum` takes a start value (`sum(xs, 0)`): a generic function has no way
   to make the zero of a `Num` type.
-- `sort` and `sort_by` pile up a copy of the list per merge pass in the
-  caller's arena (42 MB for 200,000 numbers): the region bloat described
-  under Memory model below.
 - A run-time error inside library code gives a location in the library
   (`<std>/maps.ella:14:13: precondition failed: key in m` for a missing
   key), not the program's line that called it; that needs stack traces.
@@ -125,8 +123,15 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - Sub-arenas for groups of long-lived values that die together.
 - Owning (non-copyable) handles, and handles that know their pool; a handle
   used with the wrong pool of the same type isn't caught.
-- Region bloat: values rebuilt in a loop and kept outside it pile up in
-  the outer arena.
+- Region bloat remains where loops don't carry values (memory-model.md
+  §12, §16): a variable a loop both replaces and changes in place, a global
+  replaced in a loop that calls Ella functions, loops left by a labeled
+  `break` or `continue` of an outer loop, and values rebuilt by recursion
+  rather than a loop.
+- A loop that carries values keeps one iteration's temporaries until the
+  end of the next, so its peak can be up to twice a plain loop's.
+- Moving at the last use (`x = y`) only sees `y`'s own block, not
+  liveness in general.
 - Copies are deep, even where a shallow copy would be safe.
 - Exclusivity and in-place analysis go by name, so shadowing makes them
   more conservative than needed.
@@ -159,8 +164,8 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - The language server has no rename, find references, formatting, signature
   help or code actions.
 - No formatter, REPL or debugger support (no DWARF line info in native code).
-- No benchmark suite to catch performance regressions; the timings above
-  were measured by hand.
+- The benchmarks (test/benchmarks) check output and memory, not speed;
+  `make bench` shows the times, which are for watching by hand.
 - Run-time errors show one location, with no stack trace.
 
 ## Quick wins
@@ -296,8 +301,23 @@ Small steps that build on the above:
 4. A way for generic code to make the zero of a `Num` type, so that
    `sum(xs)` needs no start value.
 5. Warnings for unused methods, enum variants and top-level variables.
-6. A small benchmark suite in `test/`, so the speed numbers above are
-   measured rather than by hand.
+6. Benchmarks for speed alone (calls, arithmetic, `Map`), like `fib(32)`
+   above, so its numbers are measured rather than by hand.
+
+### Done (2026-11-02, sixth round): region bloat
+
+1. A loop that gives variables declared outside it new values carries
+   them in two arenas that take turns (IR `swap` and `carry`), so it
+   keeps at most two versions instead of one per iteration, in every
+   backend (docs/memory-model.md §16).
+2. `x = y` moves y's value when nothing reads y afterwards in its block,
+   so `sort` and `sort_by` no longer copy the list on every pass.
+3. Numbers read from variables no longer shorten a value's lifetime, and
+   the `moves` pass counts constants as new, removing more copies.
+4. test/benchmarks: six programs with their output and a bound on their
+   arena peak, checked by the tests; `make bench` times them. Peaks fell
+   from 18 MB to 24 KB (a string built in a loop) and from 36 MB to
+   9.5 MB (sorting 200,000 numbers).
 
 ## Roadmap ideas
 

@@ -1,0 +1,10 @@
+# A string rebuilt on every iteration, kept outside the loop.
+let build = (n: i64) -> str =>
+    let mut s = ""
+    for i in 0..n
+        s = s + "{{i % 10}}"
+    s
+
+let s = build(3000)
+print(len(s))
+print(s[0..20])

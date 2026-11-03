@@ -679,6 +679,110 @@ def test_returning_an_object_from_a_freed_arena_is_caught() -> None:
         run_module(module)
 
 
+# Loops that carry values (docs/memory-model.md §6)
+
+
+def test_a_loop_carries_a_variable_it_rebuilds() -> None:
+    source = """\
+let f = (n: i64) -> str =>
+    let mut s = ""
+    for i in 0..n
+        s = s + "x"
+    s
+print(f(3))
+"""
+    module = compile_program(source)
+    text = format_module(module)
+    assert "local s.1: str @carry1" in text
+    assert "swap 1" in text and "reset 1" in text
+    assert "= add %20, %21 @1" in text  # the new string goes in the iteration's arena
+    assert "= carry %" in text  # kept at the end of each iteration
+    assert "= copy %" in text and "@result" in text  # and copied out when the loop ends
+    assert module.functions["f"].levels == 3  # level 1 and its spare
+    assert "<- in a loop" not in format_placement(module)
+    assert run_module(module) == ["xxx"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "xs += [i]",  # grows in place
+        "xs = [i]\n        xs[0] = 1",  # changed in place too
+        "let xs = [i]\n        print(xs)",  # another variable
+        "xs = [i]\n        g()",  # a global, and the loop calls a function
+        "xs = [i]\n        let h = () -> i64 => 1",  # a global, and a closure
+        "for j in 0..1\n            xs = [j]\n            break outer",  # (the inner loop) leaves by a labeled break
+    ],
+)
+def test_loops_that_dont_carry(body: str) -> None:
+    source = f"""\
+let g = () -> () => print("g")
+let mut xs = [0]
+outer: for i in 0..2
+    for _ in 0..1
+        {body}
+print(xs)
+"""
+    module = compile_program(source)
+    swaps = [i.index for b in module.functions["top"].blocks for i in b.instrs if i.op == "swap"]
+    # The outer loop may carry xs, but the inner one never does.
+    assert all(index == 1 for index in swaps)
+
+
+def test_a_value_left_in_the_carried_arena_is_caught() -> None:
+    # Without `carry`, a value from the iteration before stays in the arena
+    # that `swap` frees.
+    source = """\
+let f = (n: i64) -> str =>
+    let mut s = "a"
+    for i in 0..n
+        if i == 0 then
+            s = s + "x"
+    s
+print(f(3))
+"""
+    module = compile_program(source)
+    for block in module.functions["f"].blocks:
+        replacements = {i.dest.id: i.args[0] for i in block.instrs if i.op == "carry" and i.dest is not None}
+        block.instrs = [i for i in block.instrs if i.op != "carry"]
+        for instr in block.instrs:
+            instr.args = [replacements.get(arg.id, arg) for arg in instr.args]
+    verify(module)
+    with pytest.raises(EllaError, match="memory check failed: .* is used after its arena"):
+        run_module(module)
+
+
+def test_the_last_use_of_a_variable_moves_its_value() -> None:
+    source = """\
+let f = () -> () =>
+    let mut items = [1]
+    let mut other = [2, 3]
+    other[0] = 4
+    items = other
+    items[1] = 5
+    print(items)
+f()
+"""
+    module = compile_program(source)
+    assert "copy" not in [i.op for b in module.functions["f"].blocks for i in b.instrs]
+    assert run_module(module) == ["[4, 5]"]
+    # If it is read afterwards, it is copied, so that changing items doesn't change it.
+    module = compile_program(source.replace("    print(items)\n", "    print(items)\n    print(other)\n"))
+    assert "copy" in [i.op for b in module.functions["f"].blocks for i in b.instrs]
+    assert run_module(module) == ["[4, 5]", "[4, 3]"]
+
+
+def test_verifier_checks_swap_and_carry() -> None:
+    text = Value(1, ListTy(I64))
+    one = Instr("const", Value(3, I64), [], S, const=1)
+    swap = Instr("swap", None, [], S, index=1)  # the function has no level 1, nor a spare level 2
+    with pytest.raises(IRError, match="bad operand or result types for swap 1"):
+        verify(function_with(swap, one))
+    carry = Instr("carry", Value(2, ListTy(I64)), [text], S, index=1, region="0")
+    with pytest.raises(IRError, match="bad operand or result types for"):
+        verify(function_with(Instr("list", text, [], S, region="0"), carry))
+
+
 def test_storing_an_object_where_it_would_outlive_its_arena_is_caught() -> None:
     xs = Value(1, ListTy(I64))
     block = Block("entry", [], [Instr("list", xs, [], S, region="0"), Instr("global_set", None, [xs], S, "g")])
@@ -691,18 +795,26 @@ def test_storing_an_object_where_it_would_outlive_its_arena_is_caught() -> None:
 
 
 def test_profile_and_placement_report() -> None:
-    source = (
-        'let f = (n: i64) -> str =>\n    let mut s = ""\n    for i in 0..n\n        s = s + "x"\n    s\nprint(f(3))'
-    )
+    # The list is changed in place as well as replaced, so the loop doesn't
+    # carry it: each new list goes to the function's result.
+    source = """\
+let f = (n: i64) -> [i64] =>
+    let mut xs = [0]
+    for i in 0..n
+        xs = [i, i]
+        xs[0] = 1
+    xs
+print(f(3))
+"""
     module = compile_program(source)
     placement = format_placement(module)
     assert "function f\n" in placement
-    assert "4:15     add       @result  str  <- in a loop (level 1), but outlives the iteration" in placement
+    assert "4:14     list      @result  [i64]  <- in a loop (level 1), but outlives the iteration" in placement
     interpreter = IRInterpreter(module, io.StringIO())
     interpreter.run()
     profile = interpreter.format_profile()
     assert "High water by scope:" in profile and "f level 0" in profile
-    assert "3x  4:15 add in f" in profile
+    assert "3x  4:14 list in f" in profile
 
 
 @pytest.mark.parametrize(

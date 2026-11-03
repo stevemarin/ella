@@ -19,6 +19,7 @@ uv run ruff format     # format (line length 119)
 uv run mypy            # strict type checking of src/ and test/
 uv run ella FILE       # run a program (`-- ARGS` passes it arguments); --help lists --ir, --asm, --native, -O, ...
 uv run ella-lsp        # language server over stdio (editors/vscode starts it)
+make bench             # time the benchmarks (test/benchmarks) natively, with their arena peaks
 make                   # lists the Makefile's recipes: check, lsp, install-extension, package, ...
 ```
 
@@ -126,9 +127,12 @@ plain:
   local slots; lambdas are closure converted. It also decides memory: which
   region (arena) each object is made in, and where `copy` is needed, by
   tracking what each value borrows and how long it lives (see its docstring
-  and docs/memory-model.md §14). Generic functions are specialized per type
-  arguments, and so are methods (functions named `Type.method`); operators
-  on structs with methods like `add` become calls.
+  and docs/memory-model.md §14). A loop that gives outer variables new
+  values carries them in two arenas that take turns (`swap`, `carry`;
+  memory-model.md §16), and `x = y` moves y at its last use in its block.
+  Generic functions are specialized per type arguments, and so are methods
+  (functions named `Type.method`); operators on structs with methods like
+  `add` become calls.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
   ("memory check failed" means a compiler bug), and keeps the `--profile`
@@ -184,7 +188,9 @@ plain:
   `NAME.status` (expected exit status), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized). A
   program of several modules is a directory `NAME/` with `main.ella`
-  (and `main.out`, ...).
+  (and `main.out`, ...). `test/benchmarks/` holds `NAME.ella` with
+  `NAME.out` and `NAME.peak` (a bound on its arena peak, in bytes), checked
+  natively by `test/test_benchmarks.py`; `test/bench.py` times them.
 
 Stage 7 (staged programming, structs, generics, pools, nocopy and
 finalizers) is done, and so are modules; see README.md, TODO.md and

@@ -107,8 +107,9 @@ allocation is future work; currently every IR value has a stack slot.
 ### 6. Memory model
 
 Done: explicit copies, in-place mutation, `mut` parameters, scope arenas,
-compiler-chosen placement, pools, non-copyable types, and finalization are
-implemented. Sub-arenas are not implemented. See
+compiler-chosen placement, loops that carry values without piling them up,
+pools, non-copyable types, and finalization are implemented. Sub-arenas are
+not implemented. See
 [docs/memory-model.md](docs/memory-model.md) for the design and limitations.
 
 ### 7. Staged programming

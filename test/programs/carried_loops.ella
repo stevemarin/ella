@@ -1,0 +1,230 @@
+# Loops that give variables declared outside them new values carry them
+# from one iteration to the next in two arenas that take turns
+# (docs/memory-model.md §6). Every case here must behave as if each value
+# lived as long as its variable.
+
+# A string rebuilt every iteration, returned.
+let build = (n: i64) -> str =>
+    let mut s = ""
+    for i in 0..n
+        s = s + "{{i}}"
+    s
+
+print(build(12))
+
+# A new value that shares part of the old one: the shared part must survive
+# the old value's arena being freed.
+let keep_name = (n: i64) -> (i64, str) =>
+    let mut best = (0, "first")
+    for i in 0..n
+        best = (i, best.1)
+        if i % 3 == 0 then
+            best = (i, "{{best.1}}+")
+    best
+
+print(keep_name(10))
+
+# Another carried variable keeps a value of the first one, which then changes.
+let aliases = () -> (str, str) =>
+    let mut s = "a"
+    let mut kept = ""
+    for i in 0..5
+        if i == 1 then
+            kept = s
+        s = s + "x"
+    (kept, s)
+
+print(aliases())
+
+# Assigned on some iterations only: the value from an earlier iteration must
+# be kept when the arenas swap.
+let sometimes = (n: i64) -> [str] =>
+    let mut last = ["none"]
+    for i in 0..n
+        if i % 4 == 1 then
+            last = ["at {{i}}", "{{i * i}}"]
+    last
+
+print(sometimes(11))
+
+# Nested loops: the inner loop gives the outer loop's variable new values.
+let grid = (rows: i64, cols: i64) -> (str, [i64]) =>
+    let mut text = ""
+    let mut row: [i64] = []
+    for r in 0..rows
+        row = []
+        for c in 0..cols
+            text = "{{r}},{{c}}"
+            row = row[0..0] + [r * c]
+        text = text + ";"
+    (text, row)
+
+print(grid(3, 4))
+
+# `while` and `loop`, with `continue`, `break` and a break value that reads
+# a carried variable; the condition reads one too.
+let walk = (limit: i64) -> (str, str) =>
+    let mut path = "start"
+    let mut i = 0
+    while len(path) < limit
+        i += 1
+        if i % 2 == 0 then
+            continue
+        path = path + "-{{i}}"
+    let mut trail = "t"
+    let found = loop
+        trail = trail + "."
+        if len(trail) > 4 then
+            break "{{trail}}!"
+    (path, found)
+
+print(walk(14))
+
+# A labeled break out of an inner loop leaves through the outer loop's exit.
+let search = (target: i64) -> str =>
+    let mut seen = "none"
+    let mut outer_seen = ""
+    rows: for r in 0..5
+        outer_seen = "row {{r}}"
+        for c in 0..5
+            seen = "{{r}}/{{c}}"
+            if r * c == target then
+                break rows
+    "{{outer_seen}} {{seen}}"
+
+print(search(6))
+print(search(100))
+
+# Returning from inside the loop.
+let first_long = (words: [str]) -> str =>
+    let mut joined = ""
+    for w in words
+        joined = joined + w
+        if len(joined) > 6 then
+            return joined
+    joined
+
+print(first_long(["ab", "cd", "ef", "gh"]))
+print(first_long(["a"]))
+
+# A `mut` parameter rebuilt in a loop.
+let pad = (mut s: str, n: i64) -> () =>
+    for _ in 0..n
+        s = "<{{s}}>"
+
+let mut word = "w"
+pad(mut word, 3)
+print(word)
+
+# A closure made in the loop captures the carried value of that iteration.
+let closures = () -> [str] =>
+    let mut s = "c"
+    let mut out: [str] = []
+    for i in 0..3
+        s = s + "{{i}}"
+        let f = () -> str => s
+        out += [f()]
+    out
+
+print(closures())
+
+# Structs with a string field, rebuilt from the old value.
+struct Named
+    name: str
+    count: i64
+
+let rename = (n: i64) -> Named =>
+    let mut v = Named("v", 0)
+    for i in 0..n
+        v = Named(v.name + "{{i}}", v.count + 1)
+    v
+
+print(rename(5))
+
+# A list moved from a variable that dies, as the library's sort does.
+let passes = (n: i64) -> [i64] =>
+    let mut items = [3, 1, 2]
+    for p in 0..n
+        let mut merged: [i64] = []
+        for x in items
+            merged += [x + p]
+        items = merged
+    items
+
+print(passes(4))
+
+# Temporaries with finalizers are still finalized when their iteration ends.
+nocopy struct Noisy
+    id: i64
+    finalize = (x: Noisy) -> () => print("finalize {{x.id}}")
+
+let noisy = () -> str =>
+    let mut log = ""
+    for i in 0..3
+        let n = Noisy(i)
+        log = log + "{{n.id}}"
+        print("iteration {{i}}")
+    log
+
+print(noisy())
+
+# Globals at the top level: carried if the loop calls no Ella function.
+let mut total = "g"
+for i in 0..4
+    total = total + "{{i}}"
+print(total)
+
+let mut status = "s"
+let report = () -> str => "status is {{status}}"
+for i in 0..3
+    status = "{{i}}"
+    print(report())
+print(status)
+
+# A carried variable that is never read: the optimizer drops its `carry`,
+# but the loop still swaps its arenas.
+let unread = (n: i64) -> i64 =>
+    let mut s = "a"
+    for _ in 0..n
+        s = "x"
+    n
+
+print(unread(3))
+
+# Generic functions carry values of their type parameters.
+let rotate_all[T] = (xs: [T], n: i64) -> [T] =>
+    let mut out = xs
+    for _ in 0..n
+        out = out[1..len(out)] + out[0..1]
+    out
+
+print(rotate_all(["a", "b", "c"], 4))
+print(rotate_all([1, 2], 3))
+
+# Globals in nested loops, with `continue` of the outer loop, and a `loop`
+# whose inner loop carries a global too. The inner loop iterates over a
+# value it then replaces.
+let mut g = "g"
+let mut h = [0]
+outer: while len(g) < 6
+    for c in ["x", "y"]
+        g = g + c
+        h = h[0..0] + [len(g)]
+        if len(g) == 5 then
+            continue outer
+let v = loop
+    g = g + "!"
+    for ch in g
+        if ch == "!" then
+            h = [99]
+    break g
+print(g, h, v)
+
+let shuffle = (n: i64) -> str =>
+    let mut s = "abc"
+    for _ in 0..n
+        for ch in s
+            s = s[1..3] + ch
+    s
+
+print(shuffle(2))

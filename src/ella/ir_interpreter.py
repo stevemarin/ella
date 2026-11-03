@@ -36,6 +36,13 @@ strings from arena 3 is tagged with arena 3.) The interpreter checks that
 A failed check is a bug in the compiler, reported as a run-time error that
 starts with "memory check failed".
 
+A loop that carries values (docs/memory-model.md §6) has two arenas that
+take turns, so which depth a level is at changes as it runs: each frame
+keeps the current depth of each such loop's level and of its carried
+values. Their order changes too: the carried arena is freed first, so it
+counts as deeper. `key` gives each arena's place in the order arenas are
+freed in, which is its depth except for those two.
+
 A pool's values each live in an arena of their own, a *slot arena*, which
 is freed when the value is (`free`) or replaced. Slot arenas are numbered
 from SLOT_DEPTH up, and aren't freed in any particular order, so they are
@@ -65,6 +72,7 @@ from ella.ir import (
     Return,
     Trap,
     allocates,
+    carry_level,
     is_boxed,
     region_level,
     verify,
@@ -128,6 +136,9 @@ class Frame:
     base: int  # the depth of its scope level 0
     result_depth: int
     mut_depths: dict[int, int]  # mut parameter position -> depth of its region
+    # For each loop that carries values, by level: the depths of its iteration's arena and of the carried one.
+    current: dict[int, int] = field(default_factory=dict)
+    carried: dict[int, int] = field(default_factory=dict)
     values: dict[int, Value] = field(default_factory=dict)
     tags: dict[int, Tag] = field(default_factory=dict)
     locals: dict[str, Value] = field(default_factory=dict)
@@ -155,6 +166,8 @@ class IRInterpreter:
         self.depth = 0  # how many calls are in progress
         self.arenas = [Arena()]  # by depth; 0 is the global arena
         self.next_depth = 1
+        self.swaps: dict[str, set[int]] = {}  # function -> the levels of its loops that carry values
+        self.keys: dict[int, int] = {}  # depth -> its place in the order arenas are freed in, if not its depth
         self.slot_arenas: dict[int, Arena] = {}
         self.free_slot_arenas: list[int] = []
         self.pool_arenas: dict[int, list[int]] = {}  # id of a pool -> the arena of each of its slots
@@ -194,7 +207,10 @@ class IRInterpreter:
     def depth_of(self, region: str, frame: Frame) -> int:
         level = region_level(region)
         if level is not None:
-            return frame.base + level
+            return frame.current.get(level, frame.base + level)
+        carried = carry_level(region)
+        if carried is not None:
+            return frame.carried[carried]
         if region == "result":
             return frame.result_depth
         if region.startswith("mut"):
@@ -216,14 +232,42 @@ class IRInterpreter:
             self.free_arena(depth)
 
     def free_arena(self, depth: int) -> None:
-        arena = self.arena(depth)
-        while arena.finals:
-            value, finalizer = arena.finals.pop()
-            self.finalize(value, finalizer)
+        arena = self.finalize_all(depth)
         arena.generation += 1
         arena.used = 0
         if depth >= SLOT_DEPTH:
             self.free_slot_arenas.append(depth)
+
+    def finalize_all(self, depth: int) -> Arena:
+        """Run the finalizers of the values in an arena, newest first."""
+        arena = self.arena(depth)
+        while arena.finals:
+            value, finalizer = arena.finals.pop()
+            self.finalize(value, finalizer)
+        return arena
+
+    def swap(self, level: int, frame: Frame) -> None:
+        """`swap`: end an iteration of a loop that carries values, which keeps its arena for the next one.
+
+        The loops inside it are freed, the iteration's values are finalized
+        (only the values it carries are kept, and those can't have
+        finalizers), and the carried arena is freed and becomes the next
+        iteration's.
+        """
+        self.free(frame.base + level + 2, frame.base + frame.function.levels)
+        current, carried = frame.current[level], frame.carried[level]
+        self.finalize_all(current)
+        self.free_arena(carried)
+        frame.current[level], frame.carried[level] = carried, current
+        self.keys[current], self.keys[carried] = self.key(carried), self.key(current)
+
+    def key(self, depth: int) -> int:
+        return self.keys.get(depth, depth)
+
+    def shortest(self, *tags: Tag) -> Tag:
+        """The tag of something holding values with all these tags: the one freed first."""
+        present = [tag for tag in tags if tag is not None]
+        return max(present, key=lambda tag: self.key(tag[0])) if present else None
 
     def finalize(self, value: Value, finalizer: str) -> None:
         if finalizer == POOL:
@@ -254,7 +298,7 @@ class IRInterpreter:
 
         Slot arenas don't come in order, so they are only checked when used.
         """
-        if tag is not None and tag[0] > depth and tag[0] < SLOT_DEPTH and depth < SLOT_DEPTH:
+        if tag is not None and self.key(tag[0]) > self.key(depth) and tag[0] < SLOT_DEPTH and depth < SLOT_DEPTH:
             raise EllaError(
                 f"memory check failed: {what} would outlive its arena (depth {tag[0]} stored at depth {depth})", span
             )
@@ -282,6 +326,11 @@ class IRInterpreter:
         for level in range(function.levels):
             self.arena(base + level).owner = (function.name, level)
         frame = Frame(function, base, result_depth, mut_depths)
+        if function.name not in self.swaps:
+            self.swaps[function.name] = function_swaps(function)
+        for level in self.swaps[function.name]:
+            frame.current[level], frame.carried[level] = base + level, base + level + 1
+            self.arena(base + level + 1).owner = (function.name, level)
         block = function.blocks[0]
         self.enter(block, args, arg_tags, frame)
         try:
@@ -310,6 +359,8 @@ class IRInterpreter:
             # After an error, the program stops: nothing is freed or finalized.
             self.next_depth = base
             self.depth -= 1
+            for depth in range(base, base + function.levels):
+                self.keys.pop(depth, None)
 
     def leave(
         self, value: IRValue, outs: list[IRValue], frame: Frame, span: Span
@@ -374,17 +425,17 @@ class IRInterpreter:
                 result = binary(OPERATORS[op], args[0], args[1], span)
                 t = instr.dest.type if instr.dest is not None else None
                 if isinstance(t, ListTy) and is_boxed(t.element):
-                    tag = shortest(tags[0], tags[1])  # a joined list holds the operands' items
+                    tag = self.shortest(tags[0], tags[1])  # a joined list holds the operands' items
             case "tuple":
                 result = tuple(args)
-                tag = shortest(*tags)
+                tag = self.shortest(*tags)
             case "tuple_get":
                 container = args[0]
                 assert isinstance(container, tuple)
                 result, tag = container[instr.index], tags[0]
             case "list":
                 result = args
-                tag = shortest(*tags)
+                tag = self.shortest(*tags)
             case "index":
                 container, i = args
                 if isinstance(container, range):
@@ -419,7 +470,7 @@ class IRInterpreter:
                 copies = [copy_value(item) for item in new_items]
                 size = 8 * len(copies) + sum(deep_size(item) for item in copies)
                 items.extend(copies)  # the items may be the same list as new_items: copy them first
-                result, tag = items, shortest(tags[0], self.allocate(depth, size, instr, frame))
+                result, tag = items, self.shortest(tags[0], self.allocate(depth, size, instr, frame))
             case "copy":
                 result = copy_value(args[0])
                 tag = self.allocate(depth, deep_size(result), instr, frame)
@@ -451,6 +502,15 @@ class IRInterpreter:
                 result = reflect(instr.name, args, self.module.enums, span)
             case "reset":
                 self.free(frame.base + instr.index, frame.base + frame.function.levels)
+            case "swap":
+                self.swap(instr.index, frame)
+            case "carry":
+                # Kept for the next iteration: copied out of the carried arena, which is about to be freed.
+                if tags[0] is not None and tags[0][0] == frame.carried[instr.index]:
+                    result = copy_value(args[0])
+                    tag = self.allocate(depth, deep_size(result), instr, frame)
+                else:
+                    result, tag = args[0], tags[0]
             case "len":
                 container = args[0]
                 if isinstance(container, PoolValue):
@@ -471,7 +531,7 @@ class IRInterpreter:
                 assert instr.dest is not None and isinstance(instr.dest.type, EnumTy)
                 enum = self.module.enums[instr.dest.type.name]
                 result = VariantValue(enum.name, instr.name, list(args), nocopy=enum.nocopy)
-                tag = shortest(*tags)
+                tag = self.shortest(*tags)
                 if enum.finalize:
                     self.arena(depth).finals.append((result, enum.finalize))
             case "is_variant":
@@ -483,7 +543,7 @@ class IRInterpreter:
                 result, tag = value.fields[instr.index], tags[0]
             case "closure":
                 result = FunctionRef(instr.name, tuple(args))
-                tag = shortest(*tags)
+                tag = self.shortest(*tags)
             case "call":
                 result, tag = self.execute_call(instr, args, tags, depth, frame)
             case "assert":
@@ -494,8 +554,10 @@ class IRInterpreter:
         if instr.dest is not None:
             if instr.op == "pool_new":
                 self.arena(depth).finals.append((result, POOL))
-            if allocates(instr) and instr.op not in ("append", "copy", "move", "call", "run", "slice", "builtin"):
-                tag = shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
+            if allocates(instr) and instr.op not in (
+                "append", "copy", "move", "call", "run", "slice", "builtin", "carry"
+            ):  # fmt: skip
+                tag = self.shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
             frame.values[instr.dest.id] = result
             frame.tags[instr.dest.id] = tag if is_boxed(instr.dest.type) else None
 
@@ -616,10 +678,9 @@ class IRInterpreter:
         return "\n".join(lines) + "\n"
 
 
-def shortest(*tags: Tag) -> Tag:
-    """The tag of something holding values with all these tags: the deepest, which is freed first."""
-    present = [tag for tag in tags if tag is not None]
-    return max(present) if present else None
+def function_swaps(function: Function) -> set[int]:
+    """The levels of a function's loops that carry values (that have a `swap`)."""
+    return {instr.index for block in function.blocks for instr in block.instrs if instr.op == "swap"}
 
 
 def round16(size: int) -> int:
