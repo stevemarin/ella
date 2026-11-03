@@ -40,16 +40,24 @@ def runtime_object() -> Path:
     return obj
 
 
-def build(module: Module, executable: Path, max_depth: int = MAX_CALL_DEPTH) -> None:
-    """Generate assembly for a module and link it with the runtime into an executable."""
+def build(module: Module, executable: Path, max_depth: int = MAX_CALL_DEPTH, registers: int | None = None) -> None:
+    """Generate assembly for a module and link it with the runtime into an executable.
+
+    `registers` limits the registers of each kind values may have (see ella.codegen.generate), for tests.
+    """
     with tempfile.TemporaryDirectory() as directory:
         assembly = Path(directory) / "program.s"
-        assembly.write_text(generate(module, max_depth))
+        assembly.write_text(generate(module, max_depth, registers))
         subprocess.run(["gcc", str(assembly), str(runtime_object()), "-lm", "-o", str(executable)], check=True)
 
 
 def compile_native(
-    source: str, executable: Path, optimized: bool = True, out: TextIO | None = None, path: Path | None = None
+    source: str,
+    executable: Path,
+    optimized: bool = True,
+    out: TextIO | None = None,
+    path: Path | None = None,
+    registers: int | None = None,
 ) -> None:
     """Compile Ella source into a native executable. Raises EllaError for errors in the program.
 
@@ -58,7 +66,7 @@ def compile_native(
     module = compile_program(source, out, path)
     if optimized:
         optimize(module)
-    build(module, executable)
+    build(module, executable, registers=registers)
 
 
 def run_native(
@@ -69,6 +77,7 @@ def run_native(
     args: Sequence[str] = (),
     err: TextIO | None = None,
     path: Path | None = None,
+    registers: int | None = None,
 ) -> int:
     """Compile a program to a native executable and run it, like the interpreters' `run`. Returns its exit status.
 
@@ -81,7 +90,7 @@ def run_native(
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
-        compile_native(source, executable, optimized, out, path)
+        compile_native(source, executable, optimized, out, path, registers)
         env = os.environ | {"ELLA_POISON": "1"}
         result = subprocess.run([str(executable), *args], check=False, capture_output=True, input=stdin, env=env)
     out.write(result.stdout.decode("utf-8"))

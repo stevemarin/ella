@@ -146,14 +146,26 @@ plain:
   ("memory check failed" means a compiler bug), and keeps the `--profile`
   numbers. It builds run-time code and lowers it into the module for `run`.
 * `src/ella/passes/`: optimization passes, one module each (`mem2reg`,
-  `moves`, `fold`, `simplify`, `dce`), each `pass(function, module) -> bool`
-  (changed?).
-  `optimize()` in `__init__.py` runs them, verifying the IR after every pass.
+  `direct`, `moves`, `fold`, `simplify`, `dce`, `inline`), each
+  `pass(function, module) -> bool` (changed?).
+  `optimize()` in `__init__.py` runs them, verifying the IR after every pass,
+  then drops functions inlining left unused (unless the program has quotes).
   Passes must keep behavior identical, including run-time errors: never fold
-  or remove an operation that can fail.
-* `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). A stack slot
-  per value, Ella's own calling convention (arguments pushed; see the module
-  docstring), C calling convention for runtime calls. A generator
+  or remove an operation that can fail. `direct` turns calls of known
+  functions into `call_direct`; `inline` copies small non-recursive
+  functions into their callers (bottom up), their levels going above the
+  caller's, with `enter`/`leave` so the call still counts toward the depth
+  limit.
+* `src/ella/regalloc.py`: register allocation for codegen: liveness, then
+  greedy coloring in dominator-tree order (the IR is SSA); a value with no
+  free register spills to a stack slot. Values live across a call (`calls`,
+  `calls_partway`, which must match codegen) get callee-saved registers
+  (rbx, r12-r15), others caller-saved ones (rsi, rdi, r8-r10); rax, rcx,
+  rdx, r11 are codegen's scratch. Generator functions get none.
+* `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). Each value
+  in its register or a stack slot, Ella's own calling convention (arguments
+  pushed; see the module docstring), C calling convention for runtime calls
+  (arguments moved all at once, `parallel_move`). A generator
   function's frame is in its Gen, addressed from `r12`. A source line passed
   to the runtime has its file's number (in the table `ella_files`) above
   its low 32 bits, for errors in modules.
@@ -186,7 +198,7 @@ plain:
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
   of both interpreters, the optimized IR and native code), `test/test_passes.py`,
-  `test/test_native.py`, `test/test_cli.py`, `test/test_analysis.py`,
+  `test/test_native.py`, `test/test_regalloc.py`, `test/test_cli.py`, `test/test_analysis.py`,
   `test/test_lsp.py` (starts `ella-lsp` as a client would),
   `test/test_vscode.py`, `test/test_modules.py` (programs of several
   files). Native tests need
@@ -195,7 +207,8 @@ plain:
   `NAME.err` (expected error), `NAME.in` (standard input), `NAME.args`
   (arguments, one per line), `NAME.stderr` (expected standard error) and
   `NAME.status` (expected exit status), run by `test/test_programs.py` through both
-  interpreters, the optimized IR, and native code (plain and optimized). A
+  interpreters, the optimized IR, and native code (plain, optimized, and
+  optimized with one register of each kind, so values spill). A
   program of several modules is a directory `NAME/` with `main.ella`
   (and `main.out`, ...). `test/benchmarks/` holds `NAME.ella` with
   `NAME.out` and `NAME.peak` (a bound on its arena peak, in bytes), checked

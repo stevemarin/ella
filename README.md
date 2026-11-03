@@ -95,14 +95,15 @@ and printer and is run by the IR interpreter.
 
 ### 4. Optimization
 
-Done: separate passes promote local slots to SSA values, fold constants,
-simplify control flow, and remove dead code; the IR is verified after each
-pass. Further optimizations remain future work.
+Done: separate passes promote local slots to SSA values, call known
+functions directly, inline small functions, fold constants, simplify
+control flow, and remove dead code; the IR is verified after each pass.
+Further optimizations remain future work.
 
 ### 5. Native code generation
 
-Done: the x64 backend and C runtime build native executables. Register
-allocation is future work; currently every IR value has a stack slot.
+Done: the x64 backend and C runtime build native executables, with
+register allocation (SSA-based: greedy coloring in dominator-tree order).
 
 ### 6. Memory model
 

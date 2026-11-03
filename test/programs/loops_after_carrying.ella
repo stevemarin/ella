@@ -1,0 +1,15 @@
+# A loop that carries values swaps its two arenas each iteration; nested
+# loops after it must still get arenas of their own (2 iterations: swapped).
+let f = (n: i64) -> str =>
+    let mut s = ""
+    for _ in 0..n
+        s = s + "x"
+    for i in 0..2
+        let t = "a{{i}}"
+        for j in 0..3
+            let u = "b{{j}}"
+            print(t + u)
+        print(t)
+    s
+print(f(2))
+print(f(3))

@@ -1,0 +1,16 @@
+# Small methods and operators on a struct, called in a loop.
+struct Vec2
+    x: f64
+    y: f64
+    add = (a: Vec2, b: Vec2) -> Vec2 => Vec2(a.x + b.x, a.y + b.y)
+    scale = (v: Vec2, k: f64) -> Vec2 => Vec2(v.x * k, v.y * k)
+    dot = (a: Vec2, b: Vec2) -> f64 => a.x * b.x + a.y * b.y
+
+let main = () -> () =>
+    let mut p = Vec2(0.0, 0.0)
+    let v = Vec2(0.5, 0.25)
+    let mut energy = 0.0
+    for _ in 0..10000000
+        p = p + v.scale(0.001)
+        energy += p.dot(v)
+    print(p.x, p.y, energy)

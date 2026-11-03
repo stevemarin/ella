@@ -17,16 +17,16 @@ constructors as values, a larger prelude with a hash map, prelude error
 locations, and warnings for unused parameters and functions, then modules
 and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
-and iterators). `make check`
-passes (1104 tests, ruff, strict mypy).
+and iterators, then direct calls, inlining and register allocation).
+`make check` passes (1182 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
 | Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
-| IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
-| Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
+| IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, direct calls, inlining, constant folding, CFG simplification, DCE, copy-to-move |
+| Native code | x64 assembly plus a C runtime with real arenas, and SSA register allocation; byte-for-byte the same output and errors as the interpreters |
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers, generators that keep their frame and levels in the `Gen` |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
@@ -34,8 +34,9 @@ passes (1104 tests, ruff, strict mypy).
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
-Rough speed, from `fib(32)` (about 3.5 million calls): the native executable
-takes 0.05 s, about 4× slower than C at `gcc -O0`. A `fib(24)` run takes
+Rough speed, from `fib(35)` (about 30 million calls, test/benchmarks):
+the native executable takes 0.09 s, about 2× slower than C at `gcc -O0`
+(it was 0.2 s before direct calls and register allocation). A `fib(24)` run takes
 1 s in the AST interpreter and 2 s in the IR interpreter; the IR one is
 slower because it checks every memory access.
 
@@ -163,9 +164,20 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
 ### Back end and performance
 
-- No register allocation: every IR value has a stack slot.
-- No inlining, loop optimizations, common subexpression elimination or
-  escape analysis; the optimizer is mostly cleanup.
+- Register allocation is simple: a value that finds no free register
+  spills to a stack slot for its whole life (no splitting of live ranges,
+  no choice of which value to spill), values live across a call can only
+  use the five callee-saved registers, `f64` values use general registers
+  (moved to xmm to compute), generator functions get none, and arguments
+  are still pushed on the stack.
+- Inlining goes by size alone (INLINE_LIMIT instructions), never inlines a
+  recursive function, and gives each inlined call's scope levels to the
+  caller, which takes them on every call, so a recursive function that
+  inlines calls with levels uses more native scope arenas per call. An
+  inlined call still counts toward the depth limit (`enter`/`leave`).
+- No loop optimizations, common subexpression elimination, strength
+  reduction (`n % 2` divides; test/benchmarks/arith.ella is mostly
+  `idiv`), or escape analysis.
 - `iter` and copies allocate where a smarter lowering wouldn't.
 - Only x64 Linux, through gcc.
 
@@ -316,8 +328,34 @@ Small steps that build on the above:
 4. A way for generic code to make the zero of a `Num` type, so that
    `sum(xs)` needs no start value.
 5. Warnings for unused methods, enum variants and top-level variables.
-6. Benchmarks for speed alone (calls, arithmetic, `Map`), like `fib(32)`
-   above, so its numbers are measured rather than by hand.
+
+### Done (2026-11-02, eighth round): a faster back end
+
+1. Benchmarks for speed (test/benchmarks: `fib`, `arith`, `methods`,
+   `map_ops`), shown by `make bench`.
+2. Calls of known functions are direct (`call_direct`, ella.passes.direct),
+   and a closure that captures nothing is static data, so calling a
+   top-level function no longer makes a closure.
+3. Inlining (ella.passes.inline): small, non-recursive functions are
+   copied into their callers, bottom up. The copy's scope levels go above
+   the caller's, a `reset` frees them where it returns, and `enter` and
+   `leave` keep counting the call toward the depth limit, so errors stay
+   exactly the same. Functions left unused are dropped.
+4. Register allocation (ella.regalloc): liveness, then greedy coloring in
+   dominator-tree order, which SSA makes safe; values live across calls
+   get callee-saved registers. Jumps and runtime calls move values all at
+   once. Test programs also run with one register of each kind, so that
+   values spill.
+5. `//` and `%` on i64s, and indexing a range, are inline instructions
+   rather than runtime calls.
+6. A bug fix: after a loop that carried values ran an odd number of
+   iterations, its two arenas stayed swapped, so a later loop nested one
+   level deeper shared its arena with its outer loop and could free
+   values still in use (native code printed garbage). `reset` now puts
+   them back in order.
+
+Times went from 204 to 90 ms (`fib`), 189 to 110 ms (`methods`) and 190
+to 120 ms (`map_ops`); `arith` stays at 250 ms, bound by `idiv`.
 
 ### Done (2026-11-02, seventh round): generators and iterators
 
@@ -380,13 +418,13 @@ functions. What's left is code from outside the program: a library path
 or packages, importing several names at once, re-exports, and perhaps
 separate compilation of modules that don't change.
 
-### 3. A real back end: register allocation and inlining
+### 3. A real back end: beyond register allocation and inlining
 
-The IR is already SSA with a verifier, which is the right starting point.
-Linear-scan register allocation would be a good learning project and should
-give a several-fold speedup. Inlining small functions and methods (including
-the protocol calls, which are tiny) would follow, then simple loop
-optimizations. A benchmark suite in `test/` would keep this honest.
+Direct calls, inlining and SSA register allocation are done (above), with
+speed benchmarks in test/benchmarks. Next would be passing arguments in
+registers, spilling smarter (splitting live ranges, choosing what to
+spill), strength reduction, and simple loop optimizations (hoisting
+invariant code, keeping a range loop's counter without `index`).
 
 ### 4. Error handling and diagnostics
 

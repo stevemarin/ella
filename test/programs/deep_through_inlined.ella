@@ -1,0 +1,6 @@
+# Recursion that runs out of call depth at a call that the optimizer
+# inlines: the inlined call still counts, so every backend stops there.
+let less = (n: i64) -> i64 => n - 1
+let down = (n: i64) -> i64 => if n == 0 then 0 else down(less(n)) + 1
+print(down(5))
+print(down(20000))

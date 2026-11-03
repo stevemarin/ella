@@ -1,8 +1,9 @@
 """Run every program in test/programs and compare with its expected output (see test/programs/README.md).
 
-Each program is run five ways: by the tree-walking interpreter, through the
+Each program is run six ways: by the tree-walking interpreter, through the
 IR, through the optimized IR, and as native code made from the plain and the
-optimized IR. All must give the expected output and error. This is what
+optimized IR, and from the optimized IR with only one register of each kind
+(so that most values spill, and moves between registers form cycles). All must give the expected output and error. This is what
 checks that lowering, optimization and code generation keep the program's
 meaning. A program of several modules is a directory with a `main.ella`.
 """
@@ -54,12 +55,17 @@ def run_native_optimized(path: Path, out: TextIO, err: TextIO, stdin: bytes, arg
     return run_native(path.read_text(), out, True, stdin, args, err, path)
 
 
+def run_native_spilling(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+    return run_native(path.read_text(), out, True, stdin, args, err, path, registers=1)
+
+
 RUNNERS: dict[str, Callable[[Path, TextIO, TextIO, bytes, list[str]], int]] = {
     "tree": run_tree,
     "ir": run_ir,
     "optimized": run_optimized,
     "native": run_native_unoptimized,
     "native-optimized": run_native_optimized,
+    "native-spilling": run_native_spilling,
 }
 
 

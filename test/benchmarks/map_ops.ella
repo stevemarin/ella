@@ -1,0 +1,11 @@
+# The standard library's Map: inserting, updating and looking up keys.
+let main = () -> () =>
+    let mut counts: Map[str, i64] = new_map()
+    for i in 0..1500000
+        let key = "k{{i % 1000}}"
+        let seen = if key in counts then counts[key] else 0
+        counts[key] = seen + i
+    let mut total = 0
+    for k in counts
+        total += counts[k]
+    print(len(counts), total)

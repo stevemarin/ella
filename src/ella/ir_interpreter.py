@@ -269,9 +269,26 @@ class IRInterpreter:
         """
         if not frame.levels:
             self.free(frame.base + first, frame.base + frame.function.levels)
-            return
-        for depth in reversed(frame.levels[first:]):
-            self.clear_arena(depth)
+        else:
+            for depth in reversed(frame.levels[first:]):
+                self.clear_arena(depth)
+        self.restore_swaps(frame, first)
+
+    def restore_swaps(self, frame: Frame, first: int) -> None:
+        """Put the two arenas of each loop at levels `first` and up that carries values back in order.
+
+        `swap` exchanges them, so after an odd number of iterations the loop's
+        level is at the next level's depth. Code after the loop may use that
+        next level as a level of its own; once both are freed, they are
+        interchangeable again.
+        """
+        depths = frame.levels or [frame.base + level for level in range(frame.function.levels)]
+        for level in frame.current:
+            if level >= first:
+                frame.current[level], frame.carried[level] = depths[level], depths[level + 1]
+                if not frame.levels:
+                    self.keys.pop(depths[level], None)
+                    self.keys.pop(depths[level + 1], None)
 
     def clear_arena(self, depth: int) -> None:
         """Free an arena's values, keeping the arena (a slot arena that something still owns)."""
@@ -673,7 +690,21 @@ class IRInterpreter:
                 result = FunctionRef(instr.name, tuple(args))
                 tag = self.shortest(*tags)
             case "call":
-                result, tag = self.execute_call(instr, args, tags, depth, frame)
+                function = args[0]
+                assert isinstance(function, FunctionRef)
+                # Captured values are in the closure, so they live as long as it does.
+                captures = [tags[0]] * len(function.captured)
+                result, tag = self.execute_call(
+                    instr, function.name, [*function.captured, *args[1:]], captures + tags[1:], depth, frame
+                )
+            case "call_direct":
+                result, tag = self.execute_call(instr, instr.name, args, tags, depth, frame)
+            case "enter":
+                if self.depth >= self.max_depth:
+                    raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
+                self.depth += 1
+            case "leave":
+                self.depth -= 1
             case "assert":
                 if not args[0]:
                     raise EllaError(instr.name, span)
@@ -683,7 +714,7 @@ class IRInterpreter:
             if instr.op in ("pool_new", "arena_new", "gen_new"):
                 self.arena(depth).finals.append((result, {"pool_new": POOL, "arena_new": ARENA}.get(instr.op, GEN)))
             if allocates(instr) and instr.op not in (
-                "append", "copy", "move", "call", "run", "slice", "builtin", "carry", "resume"
+                "append", "copy", "move", "call", "call_direct", "run", "slice", "builtin", "carry", "resume"
             ):  # fmt: skip
                 tag = self.shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
             frame.values[instr.dest.id] = result
@@ -805,20 +836,15 @@ class IRInterpreter:
         return result, tag
 
     def execute_call(
-        self, instr: Instr, args: list[Value], tags: list[Tag], depth: int, frame: Frame
+        self, instr: Instr, name: str, args: list[Value], tags: list[Tag], depth: int, frame: Frame
     ) -> tuple[Value, Tag]:
-        function, *call_args = args
-        assert isinstance(function, FunctionRef)
-        callee = self.module.functions[function.name]
-        # Captured values are in the closure, so they live as long as it does.
-        captures = callee.params[: len(function.captured)]
-        arg_tags = [tags[0] if is_boxed(capture.type) else None for capture in captures] + tags[1:]
+        """Call IR function `name` with all its parameters' values (captured ones first), and their tags."""
+        callee = self.module.functions[name]
+        arg_tags = [tag if is_boxed(param.type) else None for param, tag in zip(callee.params, tags)]
         mut_depths = {
             position: self.depth_of(region, frame) for position, region in zip(callee.mut_params, instr.out_regions)
         }
-        result, tag, outs = self.call(
-            callee, [*function.captured, *call_args], arg_tags, depth, mut_depths, instr.span
-        )
+        result, tag, outs = self.call(callee, args, arg_tags, depth, mut_depths, instr.span)
         for out, (value, out_tag) in zip(instr.outs, outs):
             frame.values[out.id] = value
             frame.tags[out.id] = out_tag if is_boxed(out.type) else None

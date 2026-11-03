@@ -35,7 +35,7 @@ from ella.checker import ListTy
 from ella.ir import Function, Instr, Module, Value, count_uses, is_boxed, replace_values
 
 # Operations whose results are entirely new objects.
-NEW = frozenset({"copy", "call", "to_text", "range", "range_incl", "append", "index"})
+NEW = frozenset({"copy", "call", "call_direct", "to_text", "range", "range_incl", "append", "index"})
 
 
 def move_copies(function: Function, module: Module) -> bool:

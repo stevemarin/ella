@@ -298,3 +298,123 @@ f()
     module = compiled(source)
     assert "variant" in ops(module.functions["f"])
     assert run(module) == ["free unused"]
+
+
+# Direct calls
+
+FIB = """\
+let fib = (n: i64) -> i64 => if n < 2 then n else fib(n - 1) + fib(n - 2)
+print(fib(10))
+"""
+
+
+def test_direct_calls_name_known_functions() -> None:
+    module = compiled(FIB, ["mem2reg", "direct", "dce"])
+    function = module.functions["fib"]
+    assert ops(function).count("call_direct") == 2
+    assert "call" not in ops(function) and "closure" not in ops(function)
+    assert "call_direct fib(" in format_function(module.functions["top"])
+    assert run(module) == ["55"]
+
+
+def test_direct_calls_leave_globals_that_can_change() -> None:
+    source = """\
+let mut f = (n: i64) -> i64 => n + 1
+let g = () -> i64 => f(1)
+f = (n: i64) -> i64 => n + 2
+print(g())
+"""
+    module = compiled(source, ["mem2reg", "direct"])
+    assert "global_get" in ops(module.functions["g"]) and "call" in ops(module.functions["g"])
+    assert run(module) == ["3"]
+
+
+def test_closures_that_capture_nothing_are_static() -> None:
+    module = compiled(FIB, [])
+    [closure] = [i for i in module.functions["top"].blocks[0].instrs if i.op == "closure" and i.name == "fib"]
+    assert closure.region == ""
+
+
+# Inlining
+
+VEC = """\
+struct V
+    x: i64
+    y: i64
+    add = (a: V, b: V) -> V => V(a.x + b.x, a.y + b.y)
+let main = () -> () =>
+    let mut p = V(0, 0)
+    for i in 0..3
+        p = p + V(i, 1)
+    print(p)
+"""
+
+
+def test_inlining_puts_small_functions_where_they_are_called() -> None:
+    module = compiled(VEC)
+    function = module.functions["main"]
+    assert "call_direct" not in ops(function)
+    assert ops(function).count("enter") == ops(function).count("leave") == 1
+    assert "V.add" not in module.functions  # unused now, so dropped
+    assert run(module) == ["V(3, 3)"]
+
+
+def test_inlining_leaves_recursive_functions() -> None:
+    module = compiled(FIB)
+    assert ops(module.functions["fib"]).count("call_direct") == 2
+    assert run(module) == ["55"]
+
+
+def test_inlining_passes_captured_values_and_mut_arguments() -> None:
+    source = """\
+let bump = (mut xs: [i64], k: i64) -> i64 =>
+    xs += [k]
+    len(xs)
+let main = () -> () =>
+    let base = 10
+    let add = (n: i64) -> i64 => n + base
+    let mut xs = [1]
+    let n = bump(mut xs, add(5))
+    print(xs, n)
+"""
+    module = compiled(source)
+    assert not {"call", "call_direct"} & set(ops(module.functions["main"]))
+    assert run(module) == ["[1, 15] 2"]
+
+
+def test_inlined_levels_go_above_the_callers() -> None:
+    # `words` makes a list in its own level 0, which becomes main's level 1:
+    # freed where the inlined call returns, after the list's length is taken.
+    source = """\
+let words = (s: str) -> i64 => len(split(s, " "))
+let main = () -> () =>
+    print(words("a b c"))
+"""
+    module = compiled(source)
+    function = module.functions["main"]
+    assert function.levels == 2
+    assert "@1" in format_function(function) and "reset 1" in format_function(function)
+    assert run(module) == ["3"]
+
+
+def test_inlined_calls_count_toward_the_depth_limit() -> None:
+    source = """\
+let less = (n: i64) -> i64 => n - 1
+let down = (n: i64) -> i64 => if n == 0 then 0 else down(less(n)) + 1
+print(down(100))
+"""
+    for module in (compile_program(source), compiled(source)):
+        with pytest.raises(EllaError, match=r"^2:62: stack overflow: more than 50 nested calls"):
+            IRInterpreter(module, io.StringIO(), max_depth=50).run()
+
+
+def test_inlining_keeps_functions_code_built_at_run_time_may_call() -> None:
+    source = """\
+let twice = (n: i64) -> i64 => n * 2
+let main = () -> () =>
+    print(twice(2))
+    print(run(quote twice(4)))
+"""
+    module = compiled(source)
+    assert "twice" in module.functions
+    assert run(module) == ["4", "8"]

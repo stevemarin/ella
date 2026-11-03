@@ -433,11 +433,14 @@ operations.
   passed to a `mut` parameter, also passed by the caller), or `@global`.
   String constants are static, and i64, f64, bool and () aren't objects.
 * There is **no stack allocation** of objects yet: every list, string, tuple,
-  range, enum value and closure lives in an arena. Numbers and bools are
+  range, enum value and closure lives in an arena (a closure that captures
+  nothing is static data, like a string constant). Numbers and bools are
   never boxed.
 * Arenas are numbered by **depth**, not by call: each call takes the next
   `levels` depths for its scope levels, so a function with a loop uses two.
-  Depth 0 is the global arena.
+  Depth 0 is the global arena. An inlined call's levels become the
+  caller's, above all of its own (ella.passes.inline), so they are still
+  deeper than the caller's and freed first.
 
 ### Placement
 
@@ -722,7 +725,12 @@ variable lives in a slot of its own, whose values are in one of the two:
   two: the iteration's arena becomes the carried one, and the freed one is
   the next iteration's.
 * When the loop ends, each variable's value is copied back to where the
-  variable lives, and both arenas are freed.
+  variable lives, and both arenas are freed. `reset k` also puts them back
+  in order (level k at its own depth, the spare at the next), since after
+  an odd number of swaps the loop's level is at the spare's depth, and
+  code after the loop may use level k+1 as a level of its own: a later
+  loop's inner loop, or an inlined call's level. Once freed, the two
+  arenas are interchangeable.
 
 So a loop holds at most two versions of what it carries, plus one
 iteration's temporaries, which now live until the end of the next

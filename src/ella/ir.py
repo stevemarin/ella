@@ -126,7 +126,9 @@ Operations
     copy v @r                    a deep copy of v in region r
     move v @r                    v, which can't be copied, moved to region r with
                                  its finalizers (a returned local variable)
-    reset k                      free the function's scope levels k and up
+    reset k                      free the function's scope levels k and up, putting the
+                                 two arenas of each loop there that carries values back
+                                 in order (`swap` exchanges them)
     swap k                       end an iteration of a loop at level k that carries values:
                                  free levels k+2 and up, run the finalizers of @k's
                                  values, free @carryk, and swap the two arenas
@@ -169,15 +171,27 @@ Operations
     is_variant v, Name           does v hold that variant?
     variant_field v, Name.n      field n of v, which holds that variant
     set_field v, x @r            change field n (in `index`) of struct v in place
-    closure f(a, ...)            a function value: IR function f with captured values
+    closure f(a, ...)            a function value: IR function f with captured values;
+                                 one that captures nothing is static, with no region
     call f(a, mut b @r, ...)     call a function value; the result goes in the call's
                                  region. A `mut` argument b, which lives in region r,
                                  is passed in and its new value comes back as an extra
                                  result: `%5: (), %6: [i64] = call %1(mut %2 @0) @0`.
+    call_direct f(a, ...)        the same for IR function f (in `name`), which captures
+                                 nothing: `call_direct fib(%3) @0`
+    enter                        an inlined call starts: it counts toward the call depth,
+                                 and stops the program if that is too deep, as `call` does
+    leave                        an inlined call ends
     assert c, "message"          stop with the message if c is false
 
 A function with `mut` parameters returns their final values along with its
 result: `return %9, mut %7`.
+
+Inlining (ella.passes.inline) puts a copy of a function's body where it is
+called. Its scope levels become levels of the caller above all of the
+caller's own, so they are freed first, as a callee's arenas are; a `reset`
+frees them where the copy returns, and `enter` and `leave` keep counting
+the call toward the call depth limit.
 
 Operations that fail at run time (overflow, an index out of range, a failed
 assert, ...) carry the source span to report.
@@ -238,6 +252,8 @@ class Instr:
     * `region`: where an allocating instruction puts its result (see "Memory").
     * `outs`, `out_regions`: a call's `mut` arguments: their new values, and
       the regions they live in.
+    * `mutable`: the positions of a `call_direct`'s `mut` arguments (a
+      `call` has them in its function value's type).
     """
 
     op: str
@@ -250,6 +266,7 @@ class Instr:
     region: str = ""
     outs: list[Value] = field(default_factory=list)
     out_regions: list[str] = field(default_factory=list)
+    mutable: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -372,6 +389,7 @@ ALLOCATING = frozenset(
         "copy",
         "move",
         "call",
+        "call_direct",
         "append",
         "pool_new",
         "arena_new",
@@ -393,10 +411,13 @@ def allocates(instr: Instr) -> bool:
     """Whether an instruction makes a new object, and so names the region to put it in.
 
     Indexing a list gives an item that is already in the list; indexing a
-    string makes a new one-character string.
+    string makes a new one-character string. A closure that captures nothing
+    is static data, like a string constant.
     """
     if instr.op not in ALLOCATING or instr.dest is None or not is_boxed(instr.dest.type):
         return False
+    if instr.op == "closure" and not instr.args:
+        return False  # static: it holds nothing
     return instr.op != "index" or instr.args[0].type == STR
 
 
@@ -657,6 +678,13 @@ def format_instr(instr: Instr) -> str:
             regions = iter(instr.out_regions)
             shown = [f"mut {arg} @{next(regions, '?')}" if i in mutable else str(arg) for i, arg in enumerate(rest)]
             operands = f"{callee}(" + ", ".join(shown) + ")"
+        case "call_direct":
+            regions = iter(instr.out_regions)
+            shown = [
+                f"mut {arg} @{next(regions, '?')}" if i in instr.mutable else str(arg)
+                for i, arg in enumerate(instr.args)
+            ]
+            operands = f"{instr.name}(" + ", ".join(shown) + ")"
         case "assert":
             operands = f"{args}, {show_literal(instr.name)}"
         case "reset" | "swap":
@@ -857,10 +885,11 @@ class Verifier:
         dest = instr.dest.type if instr.dest is not None else None
         effects = (
             "store", "global_set", "print", "eprint", "assert", "set_index", "set_field", "reset", "swap", "free",
-            "pool_set",
+            "pool_set", "enter", "leave",
         )  # fmt: skip
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
-        self.require(not instr.outs or instr.op == "call", f"{instr.op} can't have extra results", block)
+        calls = ("call", "call_direct")
+        self.require(not instr.outs or instr.op in calls, f"{instr.op} can't have extra results", block)
         self.check_region(instr, block)
 
         def need(condition: bool) -> None:
@@ -1016,6 +1045,19 @@ class Verifier:
                     need(len(instr.out_regions) == len(mut_types))
                     for region in instr.out_regions:
                         self.require(self.valid_region(region, "call"), f"unknown region @{region}", block)
+            case "call_direct":
+                function = self.module.functions.get(instr.name)
+                self.require(function is not None, f"call_direct of unknown function {instr.name}", block)
+                assert function is not None
+                self.require(not function.generator and not function.captures, f"can't call {instr.name}", block)
+                need(args == [p.type for p in function.params] and dest == function.result)
+                need(instr.mutable == function.mut_params)
+                need([out.type for out in instr.outs] == [args[i] for i in function.mut_params])
+                need(len(instr.out_regions) == len(function.mut_params))
+                for region in instr.out_regions:
+                    self.require(self.valid_region(region, "call"), f"unknown region @{region}", block)
+            case "enter" | "leave":
+                need(not args)
             case "gen_new":
                 function = self.module.functions.get(instr.name)
                 self.require(function is not None, f"gen_new of unknown function {instr.name}", block)
@@ -1033,7 +1075,7 @@ class Verifier:
 
     def valid_region(self, region: str, op: str = "") -> bool:
         if region == "slot":  # the arena of the object being changed (or passed as mut), a pool's or arena's value
-            return op in CHANGING or op == "call"
+            return op in CHANGING or op in ("call", "call_direct")
         level = region_level(region)
         if level is not None:
             return level < self.function.levels

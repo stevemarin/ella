@@ -5,10 +5,15 @@ native executable; see ella.native.
 
 The design favors being easy to follow over fast code:
 
-* **Every IR value gets its own 8-byte stack slot.** An instruction loads
-  its operands from their slots into registers, computes, and stores the
-  result in its own slot. There is no register allocation, so no value ever
-  needs to be saved across a call.
+* **An IR value lives in a register or in its own 8-byte stack slot.**
+  ella.regalloc chooses which values get registers; the rest spill to
+  slots. An instruction reads its operands where they are (a register or
+  a slot work alike as most operands), computes in the scratch registers
+  rax, rcx, rdx, r11 and xmm0/xmm1, and puts the result where it goes.
+  Values live across a call are in callee-saved registers, which each
+  function saves in its frame first and restores before it returns.
+  Values passed to a runtime function or a jump's target move all at once
+  (`parallel_move`), since they may be in each other's registers.
 * **Every value is one 64-bit word.** An `i64` is itself, a bool is 0 or 1,
   `()` is 0, and an `f64` is its raw bits (moved into an `xmm` register to
   do arithmetic). Strings, lists, tuples, ranges, enum values and closures
@@ -29,23 +34,27 @@ Ella functions don't use the C calling convention. The caller pushes the
 depths of the arenas its `mut` arguments live in (last first), then the
 arguments from last to first, then the depth of the arena for the result,
 then the closure being called, and calls the closure's code. The result
-comes back in `rax`. So inside a function with n declared parameters:
+comes back in `rax`. A direct call (`call_direct`) pushes 0 for the
+closure. So inside a function with n declared parameters:
 
     [rbp + 16]              the closure (its captured values start 24 bytes in)
     [rbp + 24]              where to put the result: an arena depth
     [rbp + 32 + 8*i]        declared parameter i
     [rbp + 32 + 8*(n + j)]  the depth of the arena of `mut` parameter j
-    [rbp - 8*k]             the slot of each other value
+    [rbp - 8*k]             the slot of each other value that has no register, and of
+                            each callee-saved register the function uses
 
-A function returns the final values of its `mut` parameters by writing them
-over the parameters' own words, where the caller reads them after the call.
+The prologue loads the parameters that have registers. A function returns
+the final values of its `mut` parameters by writing them over the
+parameters' own words, where the caller reads them after the call.
 Pushing everything keeps calls uniform: any number of arguments, and floats
 travel like everything else. Calls into the runtime do use the C convention
 (arguments in rdi, rsi, rdx, rcx, r8, r9), with the stack aligned to 16
 bytes as it requires; each function's prologue aligns it.
 
 Each call increments a call depth, so that runaway recursion stops with
-the same "stack overflow" error as in the interpreters.
+the same "stack overflow" error as in the interpreters; so does each
+inlined call (`enter` and `leave`).
 
 Generators
 ----------
@@ -56,9 +65,10 @@ keeps its frame in its Gen (runtime.c), so that its values survive a
 frame, instead of from `rbp`. `resume g` calls it like a closure, with the
 Gen as the closure, and its prologue sets `r12` and jumps to where it
 last stopped. A `yield` records the block to carry on at, and returns.
-Ella functions other than generator functions never change `r12`, which
-the C convention preserves, and a generator function restores it before
-it returns. Its scope levels are slot arenas the Gen keeps (`depths`), so
+Other Ella functions save `r12` before using it, as they do the other
+callee-saved registers, and a generator function restores it before it
+returns. A generator function keeps all its values in its frame, none in
+registers. Its scope levels are slot arenas the Gen keeps (`depths`), so
 regions name those rather than depths taken by `ella_enter`. `gen_new`
 fills in the frame's parameters, and the depths of the loops that carry
 values, at offsets known from the body's layout.
@@ -95,11 +105,13 @@ from ella.ir import (
     Value,
     Yield,
     carry_level,
+    defined_by,
     format_instr,
     is_boxed,
     region_level,
 )
 from ella.lexer import Span
+from ella.regalloc import allocate, uses_levels
 from ella.syntax import bare_name
 from ella.values import MAX_CALL_DEPTH
 
@@ -135,13 +147,15 @@ class Register(str):
 
 @dataclass(slots=True)
 class Layout:
-    """Where a function keeps its values: each one's distance below the frame's base (rbp, or r12 in a
-    generator function), or for declared parameters of other functions, the caller's slot above rbp.
+    """Where a function keeps its values: a register, or each one's distance below the frame's base (rbp, or r12
+    in a generator function), or for declared parameters of other functions, the caller's slot above rbp.
 
     `levels_at` is the slot of the depth of its scope level 0 (0 if it has none of its own), and `current`
     and `carried` those of the depths of each loop that carries values, by level. `size` is in bytes.
     """
 
+    registers: dict[int, Register] = field(default_factory=dict)  # value id -> its register, if it has one
+    saved: dict[str, int] = field(default_factory=dict)  # callee-saved register -> the offset of its slot
     below: dict[int, int] = field(default_factory=dict)  # value id -> offset below the base
     above: dict[int, int] = field(default_factory=dict)  # value id -> offset above rbp
     locals: dict[str, int] = field(default_factory=dict)
@@ -151,22 +165,27 @@ class Layout:
     size: int = 0
 
 
-def generate(module: Module, max_depth: int = MAX_CALL_DEPTH) -> str:
-    """The assembly text for a whole module, whose functions may call each other `max_depth` deep."""
-    return CodeGen(module, max_depth).generate()
+def generate(module: Module, max_depth: int = MAX_CALL_DEPTH, registers: int | None = None) -> str:
+    """The assembly text for a whole module, whose functions may call each other `max_depth` deep.
+
+    `registers` limits how many registers of each kind (callee-saved and caller-saved) values may have, so that
+    tests can make values spill.
+    """
+    return CodeGen(module, max_depth, registers).generate()
 
 
 class CodeGen:
-    def __init__(self, module: Module, max_depth: int = MAX_CALL_DEPTH) -> None:
+    def __init__(self, module: Module, max_depth: int = MAX_CALL_DEPTH, registers: int | None = None) -> None:
         self.module = module
         self.max_depth = max_depth
+        self.registers = registers  # at most this many registers of each kind (ella.regalloc), for tests
         self.text: list[str] = []  # code
         self.rodata: list[str] = []  # constants: strings, type descriptors
         self.labels = 0  # a counter for new labels
         self.strings: dict[str, Label] = {}  # Ella string constants
         self.c_strings: dict[str, Label] = {}  # C strings: messages and names
         self.type_labels: dict[Type, Label] = {}
-        self.finalizers: set[str] = set()
+        self.static_closures: set[str] = set()
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
         self.layouts: dict[str, Layout] = {}
         self.files = [""]  # the files of spans, numbered for the runtime's errors (0: the entry file)
@@ -174,7 +193,8 @@ class CodeGen:
         # The function being generated: the stack slot of each value and local,
         # and of the depth of its scope level 0 if it allocates in its levels.
         self.function = Function("", I64, Span(1, 1))
-        self.slots: dict[int, str] = {}
+        self.slots: dict[int, str] = {}  # value id -> its register or stack slot
+        self.saved: dict[str, str] = {}  # callee-saved register -> where the prologue saved it
         self.local_slots: dict[str, str] = {}
         # For each loop that carries values, by level: the slots of the depths of its level and its carried values.
         self.current_slots: dict[int, str] = {}
@@ -269,21 +289,22 @@ class CodeGen:
         self.base_slot = f"qword ptr [rbp - {layout.levels_at}]" if layout.levels_at else ""
         self.current_slots = {level: f"qword ptr [{base} - {k}]" for level, k in layout.current.items()}
         self.carried_slots = {level: f"qword ptr [{base} - {k}]" for level, k in layout.carried.items()}
+        self.slots |= layout.registers
+        self.saved = {register: f"qword ptr [rbp - {k}]" for register, k in layout.saved.items()}
         params = function.params
         if function.generator:
             self.generator_prologue(function, layout)
             return
         frame = layout.size
 
+        if layout.registers:
+            self.text.append("    # registers: " + ", ".join(f"%{v} {r}" for v, r in sorted(layout.registers.items())))
         self.emit("push rbp")
         self.emit("mov rbp, rsp")
         self.emit(f"sub rsp, {(frame + 15) // 16 * 16}")
+        for register, slot in self.saved.items():
+            self.emit(f"mov {slot}, {register}   # callee-saved: restored before returning")
         self.emit("and rsp, -16              # align the stack for calls into the runtime")
-        if function.captures:
-            self.emit("mov rax, qword ptr [rbp + 16]   # the closure")
-            for i in range(function.captures):
-                self.emit(f"mov rcx, qword ptr [rax + {24 + 8 * i}]")
-                self.emit(f"mov {self.slots[params[i].id]}, rcx")
         if self.base_slot:
             self.emit(f"mov rdi, {function.levels}")
             self.emit("call ella_enter            # take arenas for the scope levels")
@@ -293,6 +314,14 @@ class CodeGen:
                 self.emit(f"mov {self.current_slots[level]}, rcx")
                 self.emit(f"lea rcx, [rax + {level + 1}]")
                 self.emit(f"mov {self.carried_slots[level]}, rcx")
+        if function.captures:
+            self.emit("mov rax, qword ptr [rbp + 16]   # the closure")
+            for i in range(function.captures):
+                self.emit(f"mov rcx, qword ptr [rax + {24 + 8 * i}]")
+                self.emit(f"mov {self.slots[params[i].id]}, rcx")
+        for i, param in enumerate(params[function.captures :]):
+            if param.id in layout.registers:
+                self.emit(f"mov {layout.registers[param.id]}, {self.param_slot(i)}")
         for block in function.blocks:
             self.text.append(f"{self.block_label(block)}:")
             for instr in block.instrs:
@@ -300,39 +329,41 @@ class CodeGen:
             self.terminator(block)
 
     def layout(self, function: Function) -> Layout:
-        """A stack slot (8 bytes) for each of a function's values and locals, and the depths of its levels.
+        """Where a function's values are: a register (ella.regalloc), or else a stack slot (8 bytes); also a slot
+        for each local, each callee-saved register it uses, and the depths of its levels.
 
         A generator function's are all in its frame, in the Gen, its
         parameters too; its levels' depths are in the Gen itself.
         """
         if function.name in self.layouts:
             return self.layouts[function.name]
-        layout = Layout()
+        allocation = allocate(function, self.registers)
+        layout = Layout(registers={v: Register(r) for v, r in allocation.registers.items()})
 
         def new_slot() -> int:
             layout.size += 8
             return layout.size
 
+        for register in allocation.saved:
+            layout.saved[register] = new_slot()
         for i, param in enumerate(function.params):
+            if param.id in layout.registers:
+                continue
             if i < function.captures or function.generator:
                 layout.below[param.id] = new_slot()  # copied in from the closure, or by gen_new
             else:
                 layout.above[param.id] = 32 + 8 * (i - function.captures)
         for block in function.blocks:
             for value in block.params if block is not function.blocks[0] else []:
-                layout.below[value.id] = new_slot()
-            for instr in block.instrs:
-                for value in [instr.dest, *instr.outs] if instr.dest is not None else []:
+                if value.id not in layout.registers:
                     layout.below[value.id] = new_slot()
+            for instr in block.instrs:
+                for value in defined_by(instr):
+                    if value.id not in layout.registers:
+                        layout.below[value.id] = new_slot()
         for name in function.locals:
             layout.locals[name] = new_slot()
-        uses_levels = any(
-            (region_level(instr.region) is not None and instr.op not in ("set_index", "set_field"))
-            or instr.op == "swap"
-            for block in function.blocks
-            for instr in block.instrs
-        )
-        if uses_levels and not function.generator:
+        if uses_levels(function) and not function.generator:
             layout.levels_at = new_slot()
         for level in sorted({i.index for block in function.blocks for i in block.instrs if i.op == "swap"}):
             layout.current[level], layout.carried[level] = new_slot(), new_slot()
@@ -379,12 +410,7 @@ class CodeGen:
 
     def resume(self, instr: Instr) -> None:
         """`resume g`: call the generator's body, as a closure with no arguments; the Gen is the closure."""
-        line, column = self.span_args(instr.span)
-        ok = self.label("depth")
-        self.emit(f"cmp qword ptr [rip + ella_depth], {self.max_depth}")
-        self.emit(f"jl {ok}")
-        self.call_c("ella_stack_overflow", self.max_depth, line, column)
-        self.text.append(f"{ok}:")
+        self.check_depth(instr.span)
         self.emit("inc qword ptr [rip + ella_depth]")
         self.region_to("rax", instr.region)
         self.emit("push rax                  # where the result goes")
@@ -428,29 +454,79 @@ class CodeGen:
     # Moving values
 
     def load(self, register: str, value: Value) -> None:
-        self.emit(f"mov {register}, {self.slots[value.id]}")
+        if self.slots[value.id] != register:
+            self.emit(f"mov {register}, {self.slots[value.id]}")
 
     def store(self, value: Value | None, register: str = "rax") -> None:
-        """Store a register in a value's slot. (`movsd` for an `xmm` register.)"""
+        """Put a register's value in a value's register or slot. (`movsd` or `movq` for an `xmm` register.)"""
         assert value is not None
-        move = "movsd" if register.startswith("xmm") else "mov"
-        self.emit(f"{move} {self.slots[value.id]}, {register}")
+        place = self.slots[value.id]
+        if register.startswith("xmm"):
+            self.emit(f"{'movq' if self.in_register(value) else 'movsd'} {place}, {register}")
+        elif place != register:
+            self.emit(f"mov {place}, {register}")
+
+    def in_register(self, value: Value) -> bool:
+        return isinstance(self.slots[value.id], Register)
+
+    def load_xmm(self, register: str, value: Value) -> None:
+        """Put an f64 value in an xmm register."""
+        self.emit(f"{'movq' if self.in_register(value) else 'movsd'} {register}, {self.slots[value.id]}")
+
+    def xmm_operand(self, value: Value, spare: str = "xmm1") -> str:
+        """An f64 value as the second operand of an SSE instruction: its slot, or `spare` holding it."""
+        if not self.in_register(value):
+            return self.slots[value.id]
+        self.load_xmm(spare, value)
+        return spare
 
     def call_c(self, function: str, *args: Value | int | Label | Region | Register) -> None:
-        """Call a runtime function with the C calling convention. The result is in rax."""
+        """Call a runtime function with the C calling convention. The result is in rax.
+
+        Values may be in the very registers that arguments go in, so they are
+        moved all at once (`parallel_move`), before the arguments that
+        aren't values.
+        """
+        moves = []
         for register, arg in zip(C_ARGS, args):
             match arg:
                 case Value():
-                    self.load(register, arg)
+                    moves.append((register, self.slots[arg.id]))
+                case Register():
+                    moves.append((register, str(arg)))
+        self.parallel_move(moves)
+        for register, arg in zip(C_ARGS, args):
+            match arg:
                 case Label():
                     self.emit(f"lea {register}, [rip + {arg}]")
                 case Region():
                     self.region_to(register, arg)
-                case Register():
-                    self.emit(f"mov {register}, {arg}")
                 case int():
                     self.emit(f"mov {register}, {arg}")
         self.emit(f"call {function}")
+
+    def parallel_move(self, moves: list[tuple[str, str]]) -> None:
+        """Do moves (destination, source) between registers and stack slots as if all at once.
+
+        Each move is done once nothing else still needs to read its
+        destination. When the rest form cycles (`a <- b, b <- a`), one
+        destination is saved in r11 first. A move from a slot to a slot goes
+        through rax. Destinations are all different.
+        """
+        pending = {dest: source for dest, source in moves if dest != source}
+        while pending:
+            ready = [dest for dest in pending if dest not in pending.values()]
+            if ready:
+                dest = ready[0]
+                source = pending.pop(dest)
+                if "[" in dest and "[" in source:
+                    self.emit(f"mov rax, {source}")
+                    source = "rax"
+                self.emit(f"mov {dest}, {source}")
+            else:  # a cycle: free one destination by keeping its value in r11
+                dest = next(iter(pending))
+                self.emit(f"mov r11, {dest}")
+                pending = {d: "r11" if source == dest else source for d, source in pending.items()}
 
     def span_args(self, span: Span) -> tuple[int, int]:
         """A place in the source for the runtime's errors: the line, with the number of its file above its low 32 bits."""
@@ -536,10 +612,14 @@ class CodeGen:
 
     def finalizer(self, struct: str) -> Label:
         """A static closure of a struct's finalizer (which captures nothing)."""
-        label = Label(f"ella_finalize.{struct}")
-        if label not in self.finalizers:
-            self.finalizers.add(label)
-            code = self.function_labels[self.module.enums[struct].finalize]
+        return self.static_closure(self.module.enums[struct].finalize)
+
+    def static_closure(self, function: str) -> Label:
+        """A closure of an IR function that captures nothing, as static data: its code, no captures."""
+        code = self.function_labels[function]
+        label = Label(f"ella_closure.{code}")
+        if label not in self.static_closures:
+            self.static_closures.add(label)
             empty = self.type_descriptor(TupleTy(()))
             self.rodata += ["    .balign 8", f"{label}:", f"    .quad {code}, 0, {empty}"]
         return label
@@ -578,7 +658,9 @@ class CodeGen:
                 self.emit(f"mov qword ptr [rip + ella_global_set.{instr.name}], 1")
             case "add" | "sub" | "mul" | "div" | "pow":
                 self.arithmetic(instr)
-            case "floordiv" | "mod" | "shl" | "shr":
+            case "floordiv" | "mod":
+                self.divide(instr)
+            case "shl" | "shr":
                 self.call_c(f"ella_{op}", args[0], args[1], line, column)
                 self.store(dest)
             case "bitand" | "bitor" | "bitxor":
@@ -638,7 +720,9 @@ class CodeGen:
                     case PrimTy("str"):
                         self.call_c("ella_str_index", container, index, line, column, Region(instr.region))
                     case _:
-                        self.call_c("ella_range_index", container, index)
+                        self.load("rax", container)
+                        self.emit("mov rax, qword ptr [rax]   # the range's start")
+                        self.emit(f"add rax, {self.slots[index.id]}")
                 self.store(dest)
             case "slice" if args[0].type == STR:
                 self.call_c("ella_str_slice", args[0], args[1], line, column, Region(instr.region))
@@ -743,6 +827,7 @@ class CodeGen:
                 self.emit("mov rdi, qword ptr [rbp + 16]")
                 self.emit(f"mov rsi, {instr.index}")
                 self.emit("call ella_gen_reset")
+                self.restore_swaps(instr.index)
             case "reset":
                 if self.base_slot:
                     self.emit(f"mov rdi, {self.base_slot}")
@@ -750,6 +835,7 @@ class CodeGen:
                     self.emit(f"mov rsi, {self.base_slot}")
                     self.emit(f"add rsi, {self.function.levels}")
                     self.emit("call ella_reset")
+                    self.restore_swaps(instr.index)
             case "len" if isinstance(args[0].type, PrimTy) and args[0].type.name == "range":
                 self.call_c("ella_range_len", args[0])
                 self.store(dest)
@@ -786,6 +872,9 @@ class CodeGen:
                 self.load("rax", args[0])
                 self.emit(f"mov rax, qword ptr [rax + {16 + 8 * instr.index}]")
                 self.store(dest)
+            case "closure" if not args:
+                self.emit(f"lea rax, [rip + {self.static_closure(instr.name)}]")
+                self.store(dest)
             case "closure":
                 types = self.type_descriptor(TupleTy(tuple(a.type for a in args)))
                 code = Label(self.function_labels[instr.name])
@@ -794,8 +883,13 @@ class CodeGen:
                     self.load("rdx", captured)
                     self.emit(f"mov qword ptr [rax + {24 + 8 * i}], rdx")
                 self.store(dest)
-            case "call":
+            case "call" | "call_direct":
                 self.call(instr)
+            case "enter":
+                self.check_depth(instr.span)
+                self.emit("inc qword ptr [rip + ella_depth]")
+            case "leave":
+                self.emit("dec qword ptr [rip + ella_depth]")
             case "gen_new":
                 self.gen_new(instr)
             case "resume":
@@ -810,6 +904,23 @@ class CodeGen:
             case _:
                 raise AssertionError(f"no code for IR operation {op}")
 
+    def restore_swaps(self, first: int) -> None:
+        """After `reset first`: put the two arenas of each loop at levels `first` and up that carries values back in
+        order (see restore_swaps in ella.ir_interpreter). They are freed, so they are interchangeable."""
+        for level in sorted(level for level in self.current_slots if level >= first):
+            if self.function.generator:
+                self.emit("mov rax, qword ptr [rbp + 16]   # the Gen")
+                self.emit(f"mov rcx, qword ptr [rax + {GEN_DEPTHS + 8 * level}]")
+                self.emit(f"mov {self.current_slots[level]}, rcx")
+                self.emit(f"mov rcx, qword ptr [rax + {GEN_DEPTHS + 8 * (level + 1)}]")
+                self.emit(f"mov {self.carried_slots[level]}, rcx")
+            else:
+                self.emit(f"mov rax, {self.base_slot}")
+                self.emit(f"lea rcx, [rax + {level}]")
+                self.emit(f"mov {self.current_slots[level]}, rcx")
+                self.emit(f"lea rcx, [rax + {level + 1}]")
+                self.emit(f"mov {self.carried_slots[level]}, rcx")
+
     def slot_value(self, instr: Instr, container: Value, value: Value) -> None:
         """Put the value to store into `container` in rax: copied into its slot arena if it is a pool's or arena's value."""
         if instr.region != "slot":
@@ -819,19 +930,21 @@ class CodeGen:
 
     def const(self, instr: Instr) -> None:
         value = instr.const
+        assert instr.dest is not None
+        register = self.slots[instr.dest.id] if self.in_register(instr.dest) else "rax"
         match value:
             case bool():
-                self.emit(f"mov rax, {int(value)}")
+                self.emit(f"mov {register}, {int(value)}")
             case int():
-                self.emit(f"mov rax, {value}")
+                self.emit(f"mov {register}, {value}")
             case float():
                 [bits] = struct.unpack("<q", struct.pack("<d", value))
-                self.emit(f"mov rax, {bits}              # {value!r}")
+                self.emit(f"mov {register}, {bits}              # {value!r}")
             case str():
-                self.emit(f"lea rax, [rip + {self.string(value)}]")
+                self.emit(f"lea {register}, [rip + {self.string(value)}]")
             case _:
-                self.emit("mov rax, 0                 # ()")
-        self.store(instr.dest)
+                self.emit(f"mov {register}, 0                 # ()")
+        self.store(instr.dest, register)
 
     def arithmetic(self, instr: Instr) -> None:
         """`add`, `sub`, `mul`, `div` and `pow`, whose code depends on the operands' type."""
@@ -843,8 +956,8 @@ class CodeGen:
                     self.call_c("ella_pow_f64", a, b)
                     self.store(dest)
                     return
-                self.emit(f"movsd xmm0, {self.slots[a.id]}")
-                self.emit(f"{op}sd xmm0, {self.slots[b.id]}")
+                self.load_xmm("xmm0", a)
+                self.emit(f"{op}sd xmm0, {self.xmm_operand(b)}")
                 self.store(dest, "xmm0")
             case PrimTy("str"):
                 self.call_c("ella_str_concat", a, b, Region(instr.region))
@@ -872,6 +985,43 @@ class CodeGen:
                 self.text.append(f"{ok}:")
                 self.store(dest)
 
+    def divide(self, instr: Instr) -> None:
+        """`//` and `%` on i64s, rounding toward negative infinity (so a remainder has the sign of the divisor).
+
+        Division by zero, and `//` overflowing (the smallest i64 by -1), go to
+        the runtime's own function, which reports the error.
+        """
+        op, (a, b), dest = instr.op, instr.args, instr.dest
+        line, column = self.span_args(instr.span)
+        slow, minus_one, done = self.label("slow"), self.label("minus_one"), self.label("done")
+        self.load("rax", a)
+        self.load("rcx", b)
+        self.emit("test rcx, rcx")
+        self.emit(f"jz {slow}")
+        self.emit("cmp rcx, -1")
+        self.emit(f"je {minus_one}             # the hardware can't divide the smallest i64 by -1")
+        self.emit("cqo")
+        self.emit("idiv rcx                  # rax: the quotient, rdx: the remainder, rounded toward zero")
+        if op == "mod":
+            self.emit("mov rax, rdx")
+        self.emit("test rdx, rdx")
+        self.emit(f"jz {done}")
+        self.emit("xor rdx, rcx")
+        self.emit(f"jns {done}                # the remainder and the divisor have the same sign")
+        self.emit("add rax, rcx" if op == "mod" else "dec rax")
+        self.emit(f"jmp {done}")
+        self.text.append(f"{minus_one}:")
+        if op == "mod":
+            self.emit("xor eax, eax")
+        else:
+            self.emit("neg rax")
+            self.emit(f"jo {slow}")
+        self.emit(f"jmp {done}")
+        self.text.append(f"{slow}:")
+        self.call_c(f"ella_{op}", a, b, line, column)
+        self.text.append(f"{done}:")
+        self.store(dest)
+
     def comparison(self, instr: Instr) -> None:
         op, (a, b), dest = instr.op, instr.args, instr.dest
         match a.type:
@@ -885,8 +1035,8 @@ class CodeGen:
                 # and `<=`, compare the other way round.
                 if op in ("lt", "le"):
                     a, b = b, a
-                self.emit(f"movsd xmm0, {self.slots[a.id]}")
-                self.emit(f"ucomisd xmm0, {self.slots[b.id]}")
+                self.load_xmm("xmm0", a)
+                self.emit(f"ucomisd xmm0, {self.xmm_operand(b)}")
                 match op:
                     case "eq":
                         self.emit("sete al")
@@ -911,19 +1061,31 @@ class CodeGen:
         self.emit("movzx eax, al")
         self.store(dest)
 
-    def call(self, instr: Instr) -> None:
-        """Call an Ella function value, with Ella's calling convention (see the module docstring)."""
-        closure, *args = instr.args
-        line, column = self.span_args(instr.span)
+    def check_depth(self, span: Span) -> None:
+        """Stop with "stack overflow" if calls are nested as deeply as they may be."""
+        line, column = self.span_args(span)
         ok = self.label("depth")
         self.emit(f"cmp qword ptr [rip + ella_depth], {self.max_depth}")
         self.emit(f"jl {ok}")
         self.call_c("ella_stack_overflow", self.max_depth, line, column)
         self.text.append(f"{ok}:")
+
+    def call(self, instr: Instr) -> None:
+        """Call an Ella function value, or a function directly (`call_direct`), with Ella's calling convention.
+
+        A direct call passes no closure (0): the function captures nothing (see the module docstring).
+        """
+        if instr.op == "call_direct":
+            closure, args, mutable = None, instr.args, instr.mutable
+        else:
+            closure, *args = instr.args
+            assert isinstance(closure.type, FuncTy)
+            mutable = closure.type.mutable
+        self.check_depth(instr.span)
         self.emit("inc qword ptr [rip + ella_depth]")
         # A mut argument that is a pool's value lives in its slot's arena, found
         # from its address. Its new value's slot holds that until the call returns.
-        mut_args = [args[i] for i in closure.type.mutable] if isinstance(closure.type, FuncTy) else []
+        mut_args = [args[i] for i in mutable]
         for region, mut_arg, out in zip(instr.out_regions, mut_args, instr.outs):
             if region == "slot":
                 self.call_c("ella_region_of", mut_arg)
@@ -938,11 +1100,14 @@ class CodeGen:
             self.emit(f"push {self.slots[arg.id]}")
         self.region_to("rax", instr.region or "global")
         self.emit("push rax                  # where the result goes")
-        self.emit(f"push {self.slots[closure.id]}")
-        self.load("rax", closure)
-        self.emit("call qword ptr [rax]       # the closure's code")
-        assert isinstance(closure.type, FuncTy)
-        for out, position in zip(instr.outs, closure.type.mutable):
+        if closure is None:
+            self.emit("push 0                    # no closure")
+            self.emit(f"call {self.function_labels[instr.name]}")
+        else:
+            self.emit(f"push {self.slots[closure.id]}")
+            self.load("rax", closure)
+            self.emit("call qword ptr [rax]       # the closure's code")
+        for out, position in zip(instr.outs, mutable):
             self.emit(f"mov rcx, qword ptr [rsp + {16 + 8 * position}]   # a mut argument's new value")
             self.emit(f"mov {self.slots[out.id]}, rcx")
         self.emit(f"add rsp, {8 * (len(args) + 2 + len(instr.out_regions))}")
@@ -954,17 +1119,14 @@ class CodeGen:
     def terminator(self, block: Block) -> None:
         match block.terminator:
             case Jump(target, args):
-                # Pass values to the target's parameters. They are pushed
-                # first and then popped into place, so that it works even
-                # when parameters swap values, as loop variables can.
-                for arg in args:
-                    self.emit(f"push {self.slots[arg.id]}")
-                for param in reversed(target.params):
-                    self.emit(f"pop {self.slots[param.id]}")
+                # Pass values to the target's parameters, all at once, since
+                # parameters can swap values, as loop variables can.
+                self.parallel_move([(self.slots[p.id], self.slots[a.id]) for p, a in zip(target.params, args)])
                 self.emit(f"jmp {self.block_label(target)}")
             case Branch(cond, then, else_):
-                self.load("rax", cond)
-                self.emit("test rax, rax")
+                register = self.slots[cond.id] if self.in_register(cond) else "rax"
+                self.load(register, cond)
+                self.emit(f"test {register}, {register}")
                 self.emit(f"jnz {self.block_label(then)}")
                 self.emit(f"jmp {self.block_label(else_)}")
             case Return(value, outs):
@@ -975,6 +1137,8 @@ class CodeGen:
                     self.load("rax", out)
                     self.emit(f"mov {self.param_slot(position)}, rax   # a mut parameter's final value")
                 self.load("rax", value)
+                for register, slot in self.saved.items():
+                    self.emit(f"mov {register}, {slot}")
                 self.emit("leave")
                 self.emit("ret")
             case Yield(value, target):

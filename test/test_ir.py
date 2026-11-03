@@ -669,7 +669,7 @@ def test_returning_an_object_from_a_freed_arena_is_caught() -> None:
     f_block = Block("entry", [], [Instr("list", xs, [], S, region="0")], Return(xs))
     f = Function("f", ListTy(I64), S, [f_block])
     function_value, result = Value(1, FuncTy((), ListTy(I64))), Value(2, ListTy(I64))
-    top_block = Block("entry", [], [Instr("closure", function_value, [], S, "f", region="global")])
+    top_block = Block("entry", [], [Instr("closure", function_value, [], S, "f")])
     top_block.instrs.append(Instr("call", result, [function_value], S, region="0"))
     top_block.instrs.append(Instr("const", unit := Value(3, UNIT), [], S, const=()))
     top_block.terminator = Return(unit)
