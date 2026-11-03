@@ -47,7 +47,9 @@ plain:
 
 * `src/ella/lexer.py`: `Span` (line, column, and a file: empty for the
   entry file, else the module's path from it, or `<std>/NAME.ella`),
-  `EllaError`, `TokenKind`, `Token`, `tokenize(source, file)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
+  `EllaError` (a run-time one also has its stack trace of `CallSite`s, set
+  by `traced`, and `format` prints it), `TokenKind`, `Token`,
+  `tokenize(source, file)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
   depth (newlines ignored inside `()`/`[]`), number formats, escapes, and
   string interpolation (`STRING_START`, `STRING_TEXT`, `INTERP_START` …
   tokens … `INTERP_END`, `STRING_END`).
@@ -87,8 +89,11 @@ plain:
   than `check` to run a program).
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters, as
-  are `MAX_CALL_DEPTH` (every backend's default call depth limit) and
-  `run_deep` (runs an interpreter on a thread with a big stack).
+  are `MAX_CALL_DEPTH` (every backend's default call depth limit),
+  `run_deep` (runs an interpreter on a thread with a big stack),
+  `make_error` (a built-in `Error`, whose `error` flag makes `==` and the
+  text form leave out its `at`) and `main_error` (the error of an `Err`
+  that `main` returns).
 * `src/ella/library.py`: the library functions (`split`, `read_line`,
   `parse_i64`, ...) on run-time values, shared by both interpreters; the
   runtime's `ella_lib_NAME` functions must match them exactly (`abs`,
@@ -130,7 +135,8 @@ plain:
   The module docstring specifies every operation. A generator is a
   function that makes its `Gen` (`gen_new`) and a generator function, its
   body, which `resume` runs until a `yield` terminator; its frame and
-  levels live in the Gen (docs/memory-model.md §17).
+  levels live in the Gen (docs/memory-model.md §17). A call's `within` is
+  the function it is in, for stack traces, kept when inlining moves it.
 * `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
   local slots; lambdas are closure converted. It also decides memory: which
   region (arena) each object is made in, and where `copy` is needed, by
@@ -177,7 +183,8 @@ plain:
   at its items (right after it, or another's in a view); a tuple's are in
   it. Objects live in arenas, all in one reserved address range (so an
   object's arena follows from its address), bump allocated, freed by scope
-  or pool slot, with finalization lists.
+  or pool slot, with finalization lists. Each call puts its site in
+  `ella_trace` at its call depth, which `fail` prints as the stack trace.
 * `src/ella/native.py`: builds executables with gcc (the compiled runtime is
   cached in the temp directory) and runs them (`run_native`, which sets
   `ELLA_POISON` so freed arena memory is overwritten).
@@ -208,7 +215,7 @@ plain:
   files). Native tests need
   gcc and are skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), `NAME.in` (standard input), `NAME.args`
+  `NAME.err` (expected error, with its stack trace), `NAME.in` (standard input), `NAME.args`
   (arguments, one per line), `NAME.stderr` (expected standard error) and
   `NAME.status` (expected exit status), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain, optimized, and

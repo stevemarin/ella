@@ -1,0 +1,14 @@
+# An error in a finalizer reports the call that ran it as a finalizer's.
+nocopy struct File
+    name: str
+    finalize = (self: File) -> () =>
+        print("closing {{self.name}}")
+        assert self.name != "b"
+
+let open = (name: str) -> () =>
+    let f = File(name)
+    print("using {{f.name}}")
+
+let main = () -> () =>
+    open("a")
+    open("b")

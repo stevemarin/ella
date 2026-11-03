@@ -1,0 +1,19 @@
+# A run-time error reports the calls in progress, innermost first: where
+# each is, and the function it is in (none for the top-level code).
+struct Grid
+    cells: [i64]
+    cell = (self: Grid, i: i64) -> i64 => self.cells[i]
+
+let first[T] = (xs: [T]) -> T => xs[0]
+
+let total = (grid: Grid, picks: [i64]) -> i64 =>
+    let pick = (i: i64) -> i64 => grid.cell(i)
+    sum(map(picks, pick), 0) + first(picks)
+
+let letters = (codes: [i64]) -> [str] => map(codes, chr)
+
+let main = () -> () =>
+    let grid = Grid([10, 20, 30])
+    print(total(grid, [0, 2]))
+    print(letters([72, 105]))
+    print(total(grid, [1, 5]))

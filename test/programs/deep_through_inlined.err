@@ -1,1 +1,22 @@
 4:62: stack overflow: more than 10000 nested calls
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  ... 9979 more calls
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 4:57 in down
+  called at 6:11

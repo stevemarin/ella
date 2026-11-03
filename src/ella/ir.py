@@ -18,6 +18,7 @@ where control goes next:
     yield value, target       (in a generator function) give value to `resume`'s
                               caller; the next `resume` carries on at target
     trap "message", value     stop the program with a run-time error
+    trap error e              stop the program with the Error e that `main` returned
 
 Instructions are *three-address code*: each does one small thing to
 operands that are already computed, like `%3: i64 = add %1, %2`.
@@ -195,7 +196,10 @@ frees them where the copy returns, and `enter` and `leave` keep counting
 the call toward the call depth limit.
 
 Operations that fail at run time (overflow, an index out of range, a failed
-assert, ...) carry the source span to report.
+assert, ...) carry the source span to report. A run-time error also reports
+the calls in progress, each from its instruction's span and `within`. One
+at Span(0, 0) (in the function made for a library function used as a
+value) is reported at the innermost call instead (`EllaError.traced`).
 """
 
 from collections import Counter
@@ -255,6 +259,10 @@ class Instr:
       the regions they live in.
     * `mutable`: the positions of a `call_direct`'s `mut` arguments (a
       `call` has them in its function value's type).
+    * `within`: for a call (`call`, `call_direct`, `resume`, or `enter` for
+      an inlined one), the name of the function it is in, as stack traces
+      show it ("" for the top-level code), even after inlining moves it to
+      another; None for the call of `main`, which traces leave out.
     """
 
     op: str
@@ -268,6 +276,7 @@ class Instr:
     outs: list[Value] = field(default_factory=list)
     out_regions: list[str] = field(default_factory=list)
     mutable: tuple[int, ...] = ()
+    within: str | None = None
 
 
 @dataclass(slots=True)
@@ -301,11 +310,17 @@ class Yield:
 
 @dataclass(slots=True)
 class Trap:
-    """Stop with a run-time error. A `{}` in the message is replaced by the value's text."""
+    """Stop with a run-time error. A `{}` in the message is replaced by the value's text.
+
+    With `error`, the value is a built-in Error that `main` returned in an
+    Err, and is the error, reported where it was made, with its causes
+    (ella.values.main_error); there is no message.
+    """
 
     message: str
     value: Value | None
     span: Span
+    error: bool = False
 
 
 type Terminator = Jump | Branch | Return | Yield | Trap
@@ -715,6 +730,8 @@ def format_terminator(terminator: Terminator | None) -> str:
             return f"return {value}" + "".join(f", mut {out}" for out in outs)
         case Yield(value, target):
             return f"yield {value}, {target.name}"
+        case Trap(value=value, error=True):
+            return f"trap error {value}"
         case Trap(message, value):
             return f"trap {show_literal(message)}" + (f", {value}" if value is not None else "")
         case None:
@@ -876,9 +893,12 @@ class Verifier:
                 self.require(self.function.generator, "only a generator function can yield", block)
                 self.require(value.type == self.function.result, "yields a value of the wrong type", block)
                 self.require(not target.params, "a yield's target can't take parameters", block)
-            case Trap(_, value):
+            case Trap(_, value, error=error):
                 if value is not None:
                     check_use(value)
+                self.require(
+                    not error or value is not None and value.type == EnumTy("Error"), "traps a non-Error", block
+                )
 
     def require(self, condition: bool, message: str, block: Block) -> None:
         if not condition:

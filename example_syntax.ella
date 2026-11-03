@@ -92,7 +92,8 @@ assert to_f64(3) / 2.0 == 1.5
 assert parse_i64(trim(" 42 ")) == Ok(42)
 
 # Result (Ok / Err) and Optional (Some / None) are built-in enums, and
-# Error is a built-in struct holding a message
+# Error is a built-in struct holding a message, the error that caused it
+# (if any), and where it was made
 let invert = (n: f64) -> Result[f64, Error] =>
     if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
 
@@ -110,6 +111,13 @@ let double_inverse = (n: f64) -> Result[f64, Error] =>
     let v = invert(n)?
     Ok(v * 2.0)
 assert double_inverse(0.0) == Err(Error("divide by zero"))
+
+# An Error can wrap the one that caused it; == leaves out where each was made
+let checked_inverse = (n: f64) -> Result[f64, Error] =>
+    match invert(n)
+        case Ok(v) => Ok(v)
+        case Err(e) => Err(Error("can't invert {{n}}", e))
+assert checked_inverse(0.0) == Err(Error("can't invert 0.0", Error("divide by zero")))
 
 # / always returns f64; // floors to an integer and % matches it
 assert 7 / 2 == 3.5

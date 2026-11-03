@@ -162,7 +162,8 @@ class Matrix[T]:
         first = row[0]
         if isinstance(first, Shape):
             fields = self.fields(t, first.name, len(first.args))
-            return self.useful(specialize(rows, first.name, len(fields)), [*first.args, *row[1:]], [*fields, *rest])
+            args = padded(first, len(fields))
+            return self.useful(specialize(rows, first.name, len(fields)), [*args, *row[1:]], [*fields, *rest])
         if first is None:
             constructors = self.constructors(t)
             named = {r[0].name for r in rows if isinstance(r[0], Shape)}
@@ -190,8 +191,14 @@ def specialize(rows: list[list[Pat]], name: str, arity: int) -> list[list[Pat]]:
         if first is None:
             result.append([None] * arity + rest)
         elif isinstance(first, Shape) and first.name == name:
-            result.append([*first.args, *rest])
+            result.append([*padded(first, arity), *rest])
     return result
+
+
+def padded(shape: Shape, arity: int) -> list[Pat]:
+    """A shape's patterns for each of its constructor's fields: one that leaves out the last ones (as an Error's
+    may, `Error(message)`) matches anything there."""
+    return [*shape.args, *[None] * (arity - len(shape.args))]
 
 
 def show(name: str, args: Sequence[str]) -> str:

@@ -54,7 +54,10 @@ bytes as it requires; each function's prologue aligns it.
 
 Each call increments a call depth, so that runaway recursion stops with
 the same "stack overflow" error as in the interpreters; so does each
-inlined call (`enter` and `leave`).
+inlined call (`enter` and `leave`). Before it does, it puts its *site* in
+`ella_trace` at the depth: where it is and the function it is in, for the
+runtime's stack traces (`Site` in runtime.c; 0 for the call of `main`,
+which they leave out).
 
 Generators
 ----------
@@ -90,6 +93,7 @@ from ella.checker import (
     PrimTy,
     TupleTy,
     Type,
+    is_builtin_error,
     show_type,
     substitute,
 )
@@ -186,6 +190,7 @@ class CodeGen:
         self.c_strings: dict[str, Label] = {}  # C strings: messages and names
         self.type_labels: dict[Type, Label] = {}
         self.static_closures: set[str] = set()
+        self.sites: dict[tuple[Span, str], Label] = {}  # call sites, for stack traces
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
         self.layouts: dict[str, Layout] = {}
         self.files = [""]  # the files of spans, numbered for the runtime's errors (0: the entry file)
@@ -231,14 +236,21 @@ class CodeGen:
             "",
             "# Call an Ella closure with one argument, from the runtime: ella_call1(closure, argument).",
             "# It runs finalizers, whose results are () and need no arena.",
+            "# It counts as a call, at the runtime's finalizer site, as in the interpreters.",
             "    .globl ella_call1",
             "ella_call1:",
             "    push rbp",
             "    mov rbp, rsp",
+            "    mov rax, qword ptr [rip + ella_depth]",
+            "    lea rcx, [rip + ella_trace]",
+            "    lea rdx, [rip + ella_finalizer_site]",
+            "    mov qword ptr [rcx + 8*rax], rdx",
+            "    inc qword ptr [rip + ella_depth]",
             "    push rsi                    # the argument",
             "    push 0                      # where the result goes",
             "    push rdi                    # the closure",
             "    call qword ptr [rdi]",
+            "    dec qword ptr [rip + ella_depth]",
             "    leave",
             "    ret",
         ]
@@ -273,6 +285,13 @@ class CodeGen:
         lines += ["", "# Global variables, and whether each has been set yet.", "    .bss", "    .balign 8"]
         for name in self.module.globals:
             lines += [f"ella_global.{name}:", "    .zero 8", f"ella_global_set.{name}:", "    .zero 8"]
+        lines += [
+            "",
+            "# The site of each call in progress, by depth, for stack traces.",
+            "    .globl ella_trace",
+            "ella_trace:",
+            f"    .zero {8 * (self.max_depth + 2)}",
+        ]
         lines += ["", '    .section .note.GNU-stack, "", @progbits', ""]
         return "\n".join(lines)
 
@@ -410,8 +429,7 @@ class CodeGen:
 
     def resume(self, instr: Instr) -> None:
         """`resume g`: call the generator's body, as a closure with no arguments; the Gen is the closure."""
-        self.check_depth(instr.span)
-        self.emit("inc qword ptr [rip + ella_depth]")
+        self.start_call(instr)
         self.region_to("rax", instr.region)
         self.emit("push rax                  # where the result goes")
         self.emit(f"push {self.slots[instr.args[0].id]}")
@@ -546,6 +564,15 @@ class CodeGen:
                 self.rodata.append("    .long " + ", ".join(str(ord(c)) for c in text))
         return self.strings[text]
 
+    def site(self, span: Span, function: str) -> Label:
+        """A call's site, for stack traces: where it is (as `span_args`), and the C string of the function it is in."""
+        if (span, function) not in self.sites:
+            label = Label(f".Lsite{len(self.sites)}")
+            self.sites[span, function] = label
+            line, column = self.span_args(span)
+            self.rodata += ["    .balign 8", f"{label}:", f"    .quad {line}, {column}, {self.c_string(function)}"]
+        return self.sites[span, function]
+
     def c_string(self, text: str) -> Label:
         """A static C string (UTF-8, ending with a zero byte), for messages and names."""
         if text not in self.c_strings:
@@ -591,13 +618,14 @@ class CodeGen:
                 mapping = dict(zip(enum.params, args))
                 kind, count = ENUM_KIND, len(enum.variants)
                 finalize = self.finalizer(name) if enum.finalize else "0"
+                error = int(is_builtin_error(self.module.enums, name))
                 for variant, fields in enum.variants.items():
                     field_labels = [self.type_descriptor(substitute(f, mapping)) for f in fields]
                     variant_label = self.label("variant")
                     self.rodata += [
                         "    .balign 8",
                         f"{variant_label}:",
-                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}"
+                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}, {error}"
                         + "".join(f", {f}" for f in field_labels),
                     ]
                     parts.append(variant_label)
@@ -886,8 +914,7 @@ class CodeGen:
             case "call" | "call_direct":
                 self.call(instr)
             case "enter":
-                self.check_depth(instr.span)
-                self.emit("inc qword ptr [rip + ella_depth]")
+                self.start_call(instr)
             case "leave":
                 self.emit("dec qword ptr [rip + ella_depth]")
             case "gen_new":
@@ -1061,14 +1088,24 @@ class CodeGen:
         self.emit("movzx eax, al")
         self.store(dest)
 
-    def check_depth(self, span: Span) -> None:
-        """Stop with "stack overflow" if calls are nested as deeply as they may be."""
-        line, column = self.span_args(span)
+    def start_call(self, instr: Instr) -> None:
+        """A call starts: stop with "stack overflow" if calls are nested as deeply as they may be, put the call's
+        site in `ella_trace` at the call depth, and count the call."""
+        line, column = self.span_args(instr.span)
         ok = self.label("depth")
-        self.emit(f"cmp qword ptr [rip + ella_depth], {self.max_depth}")
+        self.emit("mov rax, qword ptr [rip + ella_depth]")
+        self.emit(f"cmp rax, {self.max_depth}")
         self.emit(f"jl {ok}")
         self.call_c("ella_stack_overflow", self.max_depth, line, column)
         self.text.append(f"{ok}:")
+        self.emit("lea rcx, [rip + ella_trace]")
+        if instr.within is None:
+            self.emit("mov qword ptr [rcx + 8*rax], 0     # the call of main")
+        else:
+            self.emit(f"lea rdx, [rip + {self.site(instr.span, instr.within)}]")
+            self.emit("mov qword ptr [rcx + 8*rax], rdx   # the call's site")
+        self.emit("inc rax")
+        self.emit("mov qword ptr [rip + ella_depth], rax")
 
     def call(self, instr: Instr) -> None:
         """Call an Ella function value, or a function directly (`call_direct`), with Ella's calling convention.
@@ -1081,8 +1118,7 @@ class CodeGen:
             closure, *args = instr.args
             assert isinstance(closure.type, FuncTy)
             mutable = closure.type.mutable
-        self.check_depth(instr.span)
-        self.emit("inc qword ptr [rip + ella_depth]")
+        self.start_call(instr)
         # A mut argument that is a pool's value lives in its slot's arena, found
         # from its address. Its new value's slot holds that until the call returns.
         mut_args = [args[i] for i in mutable]
@@ -1149,6 +1185,9 @@ class CodeGen:
                 self.emit("mov r12, qword ptr [rbp - 8]")
                 self.emit("leave")
                 self.emit("ret")
+            case Trap(value=value, error=True):
+                assert value is not None
+                self.call_c("ella_main_error", value)
             case Trap(message, value, span):
                 line, column = self.span_args(span)
                 if value is None:

@@ -390,7 +390,9 @@ def test_cli_errors_name_the_modules_file(tmp_path: Path, capsys: pytest.Capture
         {"geo/poly.ella": "let f = () -> i64 => 1 // 0\n", "main.ella": "import geo.poly\nprint(geo.poly.f())\n"},
     )
     assert main([str(path)]) == 1
-    assert capsys.readouterr().err == f"{(tmp_path / 'geo/poly.ella').as_posix()}:1:24: integer division by zero\n"
+    assert capsys.readouterr().err == (
+        f"{(tmp_path / 'geo/poly.ella').as_posix()}:1:24: integer division by zero\n  called at {path}:2:17\n"
+    )
 
 
 def test_cli_shows_each_module_with_splices(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

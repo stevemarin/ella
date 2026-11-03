@@ -117,6 +117,7 @@ from typing import TextIO
 
 from ella.checker import (
     BOOL,
+    ERROR,
     I64,
     LIBRARY,
     NEVER,
@@ -135,6 +136,7 @@ from ella.checker import (
     finish,
     has_mutable,
     has_pool,
+    is_builtin_error,
     is_nocopy,
     literal_type,
     names_used,
@@ -378,6 +380,7 @@ class Lowerer:
 
         # The function being lowered. `start_function` resets all of these.
         self.function = Function("", UNIT, Span(1, 1))
+        self.within = ""  # the current function's name in stack traces
         self.block = Block("")
         self.next_id = 0  # numbers for new values and blocks
         self.scopes: list[dict[str, str]] = []  # Ella name -> slot, innermost last
@@ -396,8 +399,12 @@ class Lowerer:
 
     # Building blocks
 
-    def start_function(self, name: str, result: Type, span: Span, body: Expr | tuple[Expr, ...]) -> None:
+    def start_function(
+        self, name: str, result: Type, span: Span, body: Expr | tuple[Expr, ...], within: str = ""
+    ) -> None:
+        """Start IR function `name`. `within` is its name in stack traces (see `Instr.within`)."""
         self.function = Function(name, result, span)
+        self.within = within
         self.module.functions[name] = self.function
         self.next_id = 0
         self.level = self.max_level = 0
@@ -446,6 +453,8 @@ class Lowerer:
         """
         dest = self.new_value(t)
         instr = Instr(op, dest, args, span, name, index, region=region)
+        if op in ("call", "call_direct", "resume"):
+            instr.within = self.within
         if not allocates(instr):
             instr.region = ""
         self.block.instrs.append(instr)
@@ -640,6 +649,16 @@ class Lowerer:
         self.info[result.id] = self.merge(items, region)
         return result
 
+    def error_fields(self, items: list[Value], span: Span, dest: str) -> list[Value]:
+        """The fields of a built-in Error made by `Error(message)` or `Error(message, cause)`: the message, the
+        cause as an Optional, and where it is made."""
+        cause_type = EnumTy("Optional", (ERROR,))
+        if len(items) == 2:
+            cause = self.build("variant", cause_type, [items[1]], span, dest, "Some")
+        else:
+            cause = self.emit("variant", cause_type, [], span, "None", region=dest)
+        return [items[0], cause, self.const(str(span), span)]
+
     def lower_items(self, items: Sequence[Expr], dest: str) -> list[Value]:
         """Lower the items of a list, tuple or variant, protecting each from changes made by later ones."""
         values = []
@@ -807,8 +826,11 @@ class Lowerer:
             main_type = self.module.globals["main"]
             assert isinstance(main_type, FuncTy)
             function = self.emit("global_get", main_type, [], program.span, "main")
-            result = self.emit("call", main_type.result, [function], program.span)
-            if main_type.result == I64:
+            result = self.emit("call", main_type.result, [function], program.span, region=self.here())
+            self.block.instrs[-1].within = None  # the program calls main: not in stack traces
+            if isinstance(main_type.result, EnumTy) and main_type.result.name == "Result":
+                result = self.main_result(result, program.span)
+            if result.type == I64:
                 status = result
                 fail = self.new_block("bad_status")
                 fail.terminator = Trap(STATUS_ERROR, status, program.span)
@@ -820,6 +842,21 @@ class Lowerer:
         while self.pending:
             self.lower_function(self.pending.pop(0))
         return self.module
+
+    def main_result(self, result: Value, span: Span) -> Value:
+        """What `main` gave in an Ok. An Err stops the program with its error (ella.values.main_error)."""
+        assert isinstance(result.type, EnumTy)
+        value_type, error_type = result.type.args
+        failed = self.new_block("main_failed")
+        self.test(self.emit("is_variant", BOOL, [result], span, "Ok"), failed)
+        passed, self.block = self.block, failed
+        error = self.variant_field(result, "Err", 0, error_type, span)
+        if error_type == ERROR and is_builtin_error(self.checker.enums, "Error"):
+            failed.terminator = Trap("", error, span, error=True)
+        else:
+            failed.terminator = Trap("main returned Err({})", error, span)
+        self.block = passed
+        return self.variant_field(result, "Ok", 0, value_type, span)
 
     def lower_lambda(self, function: Lambda, self_names: list[str], span: Span, dest: str = "") -> Value:
         """A lambda expression: a `closure` of a new IR function, capturing every local variable."""
@@ -853,7 +890,7 @@ class Lowerer:
             self.lower_generator(pending)
             return
         self.subst = pending.subst
-        self.start_function(pending.name, t.result, function.span, function.body)
+        self.start_function(pending.name, t.result, function.span, function.body, source_name(pending.name))
         self.function.captures = len(pending.captures)
         self.function.mut_params = t.mutable
         entry = self.block
@@ -922,7 +959,7 @@ class Lowerer:
         while body_name in self.module.functions or any(p.name == body_name for p in self.pending):
             n += 1
             body_name = f"{pending.name}.body.{n}"
-        self.start_function(pending.name, t.result, function.span, function.body)
+        self.start_function(pending.name, t.result, function.span, function.body, source_name(pending.name))
         self.function.captures = len(pending.captures)
         self.scopes = [{}]
         values = self.generator_params(pending, function.span, "param")
@@ -934,7 +971,7 @@ class Lowerer:
 
         assert isinstance(t.result, BuiltinTy)
         result = EnumTy("Optional", t.result.args)
-        self.start_function(body_name, result, function.span, function.body)
+        self.start_function(body_name, result, function.span, function.body, source_name(pending.name))
         self.function.generator = True
         self.returned = set()  # its variables live on: nothing is built in the caller's region
         self.scopes = [{}]
@@ -1488,7 +1525,10 @@ class Lowerer:
         if isinstance(callee, Name) and kind == "builtin":
             return self.lower_builtin(expr, callee.name, args, span, dest)
         if isinstance(callee, Name) and kind == "constructor":
-            return self.build("variant", self.type_of(expr), self.lower_items(args, dest), span, dest, callee.name)
+            items = self.lower_items(args, dest)
+            if is_builtin_error(self.checker.enums, self.checker.resolved[id(callee)].enum):
+                items = self.error_fields(items, span, dest)
+            return self.build("variant", self.type_of(expr), items, span, dest, callee.name)
         if isinstance(callee, Member) and id(callee) in self.checker.methods:
             # `v.name(args)` calls v's method with v first. A `mut v` is passed like any `mut` argument.
             receiver = callee.target
@@ -1592,7 +1632,8 @@ class Lowerer:
             params = [Value(i, param) for i, param in enumerate(t.params)]
             result = Value(len(params), t.result)
             region = "" if not is_boxed(t.result) else "0" if name in VIEWS else "result"
-            instrs = [Instr("builtin", result, list(params), span, name, region=region)]
+            # Its errors are reported where it is called (EllaError.traced), as the interpreter does.
+            instrs = [Instr("builtin", result, list(params), Span(0, 0), name, region=region)]
             if name in VIEWS:
                 copied = Value(len(params) + 1, t.result)
                 instrs.append(Instr("copy", copied, [result], span, region="result"))
@@ -2116,6 +2157,14 @@ class Lowerer:
 
 
 # Finding what code does, for the decisions above
+
+
+def source_name(name: str) -> str:
+    """An IR function's name as the program writes it, for stack traces: `id` for `id[i64]`, `g` for `g.1`,
+    `Stack.push` for `Stack.push[i64]`."""
+    name = name.split("[")[0]
+    base, _, number = name.rpartition(".")
+    return base if number.isdigit() else name
 
 
 def unused_functions(program: Program) -> set[int]:

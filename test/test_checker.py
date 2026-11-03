@@ -133,6 +133,26 @@ def test_error_type() -> None:
     assert error('Error("bad").msg').message == "Error has no field 'msg'"
 
 
+def test_errors_have_a_cause_and_where_they_were_made() -> None:
+    assert type_of('Error("bad", Error("worse")).cause') == "Optional[Error]"
+    assert type_of('Error("bad").at') == "str"
+    assert type_of("let f = Error\nf") == "(str) -> Error"
+    assert error('Error("bad", "worse")').message == "the argument of Error should be Error, not str"
+    assert error("Error()").message == "Error takes 1 or 2 arguments but was given 0"
+    assert error('Error("a", Error("b"), "1:1")').message == "Error takes 1 or 2 arguments but was given 3"
+    # A pattern may leave out the cause and where it was made, but not the message.
+    check(parse('match Error("a")\n    case Error(m) => m'))
+    check(parse('match Error("a")\n    case Error(m, Some(Error(n))) => n\n    case Error(_, None, at) => at'))
+    assert error('match Error("a")\n    case Error() => 0').message == "Error has 3 fields, but the pattern has 0"
+    # Where it was made can't change, though the rest of it can.
+    check(parse('let mut e = Error("a")\ne.message = "b"\ne.cause = Some(Error("c"))'))
+    assert error('let mut e = Error("a")\ne.at = "1:1"').message == (
+        "an Error's 'at' is where it was made, so you can't assign to it"
+    )
+    # A program's own Error is an ordinary struct.
+    check(parse('struct Error\n    text: str\n    at: i64\nlet mut e = Error("a", 1)\ne.at = 2'))
+
+
 # Type errors
 
 
@@ -227,9 +247,14 @@ def test_shadowing_locals_can_change_type() -> None:
 
 
 def test_main_gives_nothing_or_an_exit_status() -> None:
-    assert error('let main = () -> str => ""').message == "main must have type () -> () or () -> i64, not () -> str"
-    assert error("let main = (n: i64) -> i64 => n").message.startswith("main must have type () -> () or () -> i64")
+    assert error('let main = () -> str => ""').message == (
+        "main must have type () -> (), () -> i64, () -> Result[(), E] or () -> Result[i64, E], not () -> str"
+    )
+    assert error("let main = (n: i64) -> i64 => n").message.startswith("main must have type () -> (), () -> i64")
+    assert error('let main = () -> Result[str, Error] => Ok("")').message.endswith("not () -> Result[str, Error]")
     check(parse("let main = () -> i64 => 3"))
+    check(parse("let main = () -> Result[(), Error] => Ok(())"))
+    check(parse('let main = () -> Result[i64, str] => Err("no")'))
 
 
 # Functions and control flow

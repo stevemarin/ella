@@ -11,3 +11,14 @@ Error("bad")
 not a digit: 7
 1
 not a digit: x
+Ok([1, 0])
+Err(Error("can't read [\"1\", \"y\"]", Error("not a digit: y")))
+can't read ["1", "y"] at 37:28 because not a digit: y
+its cause is at 37:28
+61:22 true None
+true
+false
+[Error("a"), Error("b")] 68:31
+5
+Error("\"five\" isn't an i64") <std>/lists.ella:14:21
+74:16

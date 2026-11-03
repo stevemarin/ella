@@ -30,6 +30,7 @@ Two parts of Ella need more than grouping characters:
 See docs/grammar.md §1 (lexical structure) and §2 (layout).
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from string import ascii_letters
@@ -57,13 +58,80 @@ class Span:
 STD = "<std>"  # the directory of the standard library's modules, in spans
 
 
+@dataclass(frozen=True, slots=True)
+class CallSite:
+    """A call in progress when a run-time error stopped the program: where it is, and the function it is in
+    ("" for the top-level code). A finalizer's call, which the program doesn't write, is at Span(0, 0)."""
+
+    span: Span
+    function: str
+
+
+def parse_place(text: str) -> Span | None:
+    """The span that `str(span)` writes, `12:5` or `geo/poly.ella:12:5`, as an Error's `at` holds it."""
+    file, _, place = text.rpartition(":")
+    file, _, line = file.rpartition(":")
+    if not line.isdigit() or not place.isdigit():
+        return None
+    return Span(int(line), int(place), file)
+
+
+# A stack trace of more calls than twice this shows only this many at each end.
+TRACE_ENDS = 10
+
+
 class EllaError(Exception):
-    """The one error type for problems in Ella source, with where they were found."""
+    """The one error type for problems in Ella source, with where they were found.
+
+    A run-time error also has its stack trace: the calls in progress,
+    innermost first (`trace`), of which the middle `omitted` ones are left
+    out when there are many (between the first TRACE_ENDS and the rest).
+    The error `main` returns in an Err may have causes: where each was
+    made, and its message.
+    """
 
     def __init__(self, message: str, span: Span) -> None:
         super().__init__(f"{span}: {message}")
         self.message = message
         self.span = span
+        self.trace: list[CallSite] | None = None  # None until a backend gives it one
+        self.omitted = 0
+        self.causes: list[tuple[Span, str]] = []
+
+    def traced(self, calls: list[CallSite]) -> None:
+        """Give the error its stack trace, from the calls in progress (outermost first), unless it has one.
+
+        An error at Span(0, 0) is one in a function the compiler made for a
+        library function used as a value (`map(xs, chr)`): it is reported
+        where that was called, as if the library function were called there.
+        """
+        if self.trace is not None:
+            return
+        trace = calls[::-1]
+        if self.span == Span(0, 0) and trace:
+            self.span, trace = trace[0].span, trace[1:]
+            self.args = (f"{self.span}: {self.message}",)
+        if len(trace) > 2 * TRACE_ENDS:
+            self.omitted = len(trace) - 2 * TRACE_ENDS
+            trace = trace[:TRACE_ENDS] + trace[-TRACE_ENDS:]
+        self.trace = trace
+
+    def format(self, where: Callable[[Span], str] = str) -> str:
+        """The error with its stack trace, a line each, giving places with `where`:
+
+        4:19: integer division by zero
+          called at 7:9 in main
+        """
+        lines = [f"{where(self.span)}: {self.message}"]
+        lines += [f"  caused by {where(span)}: {message}" for span, message in self.causes]
+        for i, call in enumerate(self.trace or []):
+            if i == TRACE_ENDS and self.omitted:
+                lines.append(f"  ... {self.omitted} more calls")
+            if call.span == Span(0, 0):
+                lines.append("  called to finalize a value")
+            else:
+                lines.append(f"  called at {where(call.span)}{f' in {call.function}' if call.function else ''}")
+        return "\n".join(lines)
 
 
 class TokenKind(Enum):

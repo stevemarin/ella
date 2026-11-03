@@ -11,7 +11,7 @@ from ella.codegen import generate
 from ella.interpreter import Interpreter
 from ella.ir import Module, format_module, format_placement
 from ella.ir_interpreter import IRInterpreter
-from ella.lexer import STD, EllaError, tokenize
+from ella.lexer import STD, EllaError, Span, tokenize
 from ella.library import Host
 from ella.lower import compile_program
 from ella.modules import link
@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     except EllaError as error:
         # Flush what the program printed first, so the error comes after it.
         sys.stdout.flush()
-        print(f"{where(options.file, error)}: {error.message}", file=sys.stderr)
+        print(error.format(lambda span: where(options.file, span)), file=sys.stderr)
         return 1
     return status
 
@@ -123,13 +123,12 @@ def main(argv: list[str] | None = None) -> int:
 def warn(file: Path, checker: Checker) -> None:
     """Print the checker's warnings, which don't stop the program."""
     for warning in checker.warnings:
-        print(f"{where(file, warning)}: warning: {warning.message}", file=sys.stderr)
+        print(f"{where(file, warning.span)}: warning: {warning.message}", file=sys.stderr)
 
 
-def where(file: Path, error: EllaError) -> str:
+def where(file: Path, span: Span) -> str:
     """Where an error is: `prog.ella:3:5`, `geo/poly.ella:3:5` in a module (from the entry file's
     directory, as the entry file was given), or `<std>/maps.ella:12:5` in the standard library."""
-    span = error.span
     if not span.file:
         return f"{file}:{span}"
     if span.file.startswith(STD):

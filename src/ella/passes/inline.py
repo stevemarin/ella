@@ -126,7 +126,7 @@ def inline(function: Function, block: Block, k: int, callee: Function, captured:
             value, outs = b.terminator.value, b.terminator.outs
             b.instrs += [Instr("reset", None, [], call.span, index=base), Instr("leave", None, [], call.span)]
             b.terminator = Jump(after, [value, *outs])
-    block.instrs = [*block.instrs[:k], Instr("enter", None, [], call.span)]
+    block.instrs = [*block.instrs[:k], Instr("enter", None, [], call.span, within=call.within)]
     block.terminator = Jump(copies[0], args)
     at = function.blocks.index(block) + 1
     function.blocks[at:at] = [*copies, after]
@@ -197,8 +197,8 @@ class Copier:
                 return Branch(self.value(cond), self.blocks[then.name], self.blocks[else_.name])
             case Return(value, outs):
                 return Return(self.value(value), [self.value(out) for out in outs])
-            case Trap(message, value, span):
-                return Trap(message, self.value(value) if value is not None else None, span)
+            case Trap(value=value) as trap:
+                return replace(trap, value=self.value(value) if value is not None else None)
             case Yield() | None:
                 raise AssertionError(f"can't inline {self.callee.name}: {terminator}")
 

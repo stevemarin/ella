@@ -1,4 +1,4 @@
-# The built-in Error type: a struct holding a message.
+# The built-in Error type: a struct holding a message, its cause, and where it was made.
 let invert = (n: f64) -> Result[f64, Error] =>
     if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
 
@@ -39,3 +39,38 @@ for s in ["0", "7", "1", "x"]
     match parse_digit(s)
         case Ok(d) => print(d)
         case Err(e) => print(e.message)
+
+# An Error knows where it was made (`at`), and may have a cause: the error it
+# was made from. `==` and the text form leave out where it was made.
+let read_digits = (xs: [str]) -> Result[[i64], Error] =>
+    let mut digits = []
+    for x in xs
+        match parse_digit(x)
+            case Ok(d) => digits += [d]
+            case Err(cause) => return Err(Error("can't read {{xs}}", cause))
+    Ok(digits)
+print(read_digits(["1", "0"]))
+print(read_digits(["1", "y"]))
+match read_digits(["1", "y"])
+    case Err(Error(message, Some(cause))) => print(message, "at", cause.at, "because", cause.message)
+    case _ => print("no cause")
+match read_digits(["z"])
+    case Err(Error(_, None, at)) => print("no cause, at", at)
+    case Err(Error(_, Some(Error(_, _, at)), _)) => print("its cause is at", at)
+    case Ok(_) => print("read")
+let made_here = Error("here")
+print(made_here.at, made_here == Error("here"), made_here.cause)
+print(Error("outer", Error("inner")) == Error("outer", Error("inner")))
+print(Error("outer", Error("inner")) == Error("outer", Error("other")))
+
+# Used as a value, Error makes its errors where it is used; a library function
+# where it is called.
+let wrapped = map(["a", "b"], Error)
+print(wrapped, wrapped[1].at)
+for r in map(["5", "five"], parse_i64)
+    match r
+        case Err(e) => print(e, e.at)
+        case Ok(n) => print(n)
+match parse_f64("half")
+    case Err(e) => print(e.at)
+    case Ok(x) => print(x)

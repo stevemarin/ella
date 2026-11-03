@@ -28,12 +28,21 @@ place while it runs.
 import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TextIO
 
-from ella.checker import LIBRARY, OPERATOR_METHODS, REFLECTION, Checker, check_code, finish, pattern_names
-from ella.lexer import EllaError, Span
+from ella.checker import (
+    BUILTIN_ENUMS,
+    LIBRARY,
+    OPERATOR_METHODS,
+    REFLECTION,
+    Checker,
+    check_code,
+    finish,
+    pattern_names,
+)
+from ella.lexer import CallSite, EllaError, Span
 from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.modules import link
@@ -123,6 +132,8 @@ from ella.values import (
     check_status,
     copy_value,
     equal,
+    main_error,
+    make_error,
     run_deep,
     to_text,
     type_name,
@@ -191,6 +202,7 @@ class Generator:
 
     function: Lambda
     scope: Scope
+    name: str  # the generator's, for stack traces
     owners: list[list[Value]] = field(default_factory=lambda: [[]])
     thread: threading.Thread | None = None
     go: threading.Semaphore = field(default_factory=lambda: threading.Semaphore(0))
@@ -234,11 +246,17 @@ class Interpreter:
         self.host = host if host is not None else Host()
         self.depth = 0  # how many Ella function calls are in progress
         self.max_depth = max_depth
+        # The calls in progress, outermost first, for stack traces (None for the call of `main`, which
+        # the program doesn't write), and the name of the function running (see `CallSite`): None while
+        # the program calls `main`.
+        self.calls: list[CallSite | None] = []
+        self.running: str | None = ""
+        self.names: dict[int, str] = {}  # id of a lambda -> the function's name, from its `let`
         self.checker = checker
         self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
         # While compiling, a top-level function's splices are expanded before it runs.
         self.prepare_function: Callable[[Lambda], Lambda] | None = None
-        self.structs: dict[str, tuple[str, ...]] = {"Error": ("message",)}  # struct -> its field names
+        self.structs: dict[str, tuple[str, ...]] = {"Error": BUILTIN_ENUMS["Error"].field_names}  # struct -> fields
         self.nocopy: set[str] = set()  # the nocopy structs
         self.finalizers: dict[str, Value] = {}  # struct -> its finalize function
         self.methods: dict[str, dict[str, Value]] = {}  # struct or enum -> its methods
@@ -269,7 +287,7 @@ class Interpreter:
         # Result, Optional and Error are ordinary enums and structs that happen to be predefined.
         self.globals.define("Ok", Constructor("Result", "Ok", 1))
         self.globals.define("Err", Constructor("Result", "Err", 1))
-        self.globals.define("Error", Constructor("Error", "Error", 1))
+        self.globals.define("Error", Constructor("Error", "Error", 1, error=True))
         self.globals.define("Some", Constructor("Optional", "Some", 1))
         self.globals.define("None", VariantValue("Optional", "None"))
         # Code in a module other than the entry file always sees these by their names (see `visible`).
@@ -283,6 +301,7 @@ class Interpreter:
 
     def run_program(self, program: Program) -> int:
         status = 0
+        self.depth = 1  # the top-level code counts as a call, as in the IR and native code
         try:
             self.declare_top_level(program)
             self.owners.append([])  # the top-level code's own values
@@ -290,7 +309,14 @@ class Interpreter:
                 self.eval(expr, self.globals)
             main = self.globals.vars.get("main")
             if main is not None:
+                self.running = None  # the program calls main
                 result = self.call(main.value, [], Span(1, 1))
+                self.running = ""
+                match result:
+                    case VariantValue("Result", "Ok", [value]):
+                        result = value
+                    case VariantValue("Result", "Err", [error]):
+                        raise main_error(error, program.span)
                 if isinstance(result, int) and not isinstance(result, bool):  # main gave an exit status
                     status = check_status(result, program.span)
             self.close_owner()
@@ -299,6 +325,9 @@ class Interpreter:
         except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
             self.out.flush()
             return stop.status
+        except EllaError as error:
+            error.traced([])  # one in the top-level code
+            raise
         # Signals that escape to the top level weren't inside anything that
         # could catch them.
         except ReturnSignal as signal:
@@ -318,6 +347,7 @@ class Interpreter:
         for expr in program.body:
             match expr:
                 case Let(bindings, Lambda() as function):
+                    self.names[id(function)] = bindings[0].name
                     closure = Closure(function, Scope(self.globals))
                     for binding in bindings:
                         self.globals.define(binding.name, closure, binding.mutable)
@@ -353,8 +383,18 @@ class Interpreter:
             # Variables
             case Name(name, span):
                 # Reading a variable copies its value: Ella has value semantics.
-                return copy_value(self.lookup(name, scope, span).value)
+                value = copy_value(self.lookup(name, scope, span).value)
+                if (
+                    isinstance(value, Constructor)
+                    and value.error
+                    and self.checker
+                    and id(expr) in self.checker.wrappers
+                ):
+                    return replace(value, at=span)  # Error used as a value makes its Errors here
+                return value
             case Let(bindings, value_expr):
+                if isinstance(value_expr, Lambda):
+                    self.names[id(value_expr)] = bindings[0].name
                 value = self.eval(value_expr, scope)
                 if scope is self.globals:
                     self.adopt(value, -1, 0)  # a global's values live as long as the program
@@ -812,6 +852,11 @@ class Interpreter:
                 if arity >= 0:  # print and eprint take any number
                     self.check_arity(name, arity, args, span)
                 return run(args, span)
+            case Constructor(error=True, at=at):
+                if len(args) not in (1, 2):
+                    raise EllaError(f"Error takes 1 or 2 arguments but was given {len(args)}", span)
+                assert isinstance(args[0], str)
+                return make_error(args[0], at or span, args[1] if len(args) == 2 else None)
             case Constructor(enum, variant, arity):
                 self.check_arity(variant, arity, args, span)
                 value = VariantValue(enum, variant, list(args), nocopy=enum in self.nocopy)
@@ -820,9 +865,10 @@ class Interpreter:
                 return value
             case Closure(lambda_, captured):
                 self.check_arity("function", len(lambda_.params), args, span)
+                name = self.names.get(id(lambda_), "lambda")  # the name of the function as written
                 if self.prepare_function is not None:
                     lambda_ = self.prepare_function(lambda_)
-                return self.call_closure(lambda_, captured, args, span, finals)
+                return self.call_closure(lambda_, captured, args, span, name, finals)
         raise EllaError(f"can't call a value of type {type_name(function)}", span)
 
     def check_arity(self, name: str, arity: int, args: list[Value], span: Span) -> None:
@@ -831,16 +877,40 @@ class Interpreter:
             raise EllaError(f"{name} takes {arity} argument{plural} but was given {len(args)}", span)
 
     def call_closure(
-        self, lambda_: Lambda, captured: Scope, args: list[Value], span: Span, finals: list[Value] | None = None
+        self,
+        lambda_: Lambda,
+        captured: Scope,
+        args: list[Value],
+        span: Span,
+        name: str,
+        finals: list[Value] | None = None,
     ) -> Value:
         """Run a function's body with its parameters bound, checking its `where` conditions.
+
+        `name` is the function's, for stack traces.
 
         Calling a generator only makes its GenValue (`make_generator`).
         """
         if self.depth >= self.max_depth:
             raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
-        if is_generator(lambda_):
-            return self.make_generator(lambda_, captured, args)
+        self.calls.append(CallSite(span, self.running) if self.running is not None else None)
+        caller, self.running = self.running, name
+        try:
+            if is_generator(lambda_):
+                return self.make_generator(lambda_, captured, args)
+            return self.run_closure(lambda_, captured, args, finals)
+        except EllaError as error:
+            error.traced(self.trace())
+            raise
+        finally:
+            self.calls.pop()
+            self.running = caller
+
+    def trace(self) -> list[CallSite]:
+        """The calls in progress that a stack trace shows, outermost first."""
+        return [call for call in self.calls if call is not None]
+
+    def run_closure(self, lambda_: Lambda, captured: Scope, args: list[Value], finals: list[Value] | None) -> Value:
         # Parameters live in a new scope inside the captured one. Only `mut` ones can change.
         local = Scope(captured)
         for param, arg in zip(lambda_.params, args):
@@ -951,7 +1021,7 @@ class Interpreter:
             local.define(param.name, arg, True)
         for cond in function.where:
             self.check_condition(cond, local, "precondition")
-        generator = Generator(function, local)
+        generator = Generator(function, local, self.running or "lambda")
         for arg in args:
             moving = {id(v) for v in self.finalizable(arg)}
             for owner in range(len(self.owners)):
@@ -967,11 +1037,19 @@ class Interpreter:
             return VariantValue("Optional", "None")
         if self.depth >= self.max_depth:
             raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
-        self.switch(generator, "resume")
-        kind, value = generator.outcome
-        if kind == "error":
-            assert isinstance(value, BaseException)
-            raise value
+        self.calls.append(CallSite(span, self.running) if self.running is not None else None)
+        caller, self.running = self.running, generator.name
+        try:
+            self.switch(generator, "resume")
+            kind, value = generator.outcome
+            if kind == "error":
+                assert isinstance(value, BaseException)
+                if isinstance(value, EllaError):
+                    value.traced(self.trace())
+                raise value
+        finally:
+            self.calls.pop()
+            self.running = caller
         if kind == "end":
             generator.done = True
             return VariantValue("Optional", "None")
@@ -1248,7 +1326,8 @@ class Interpreter:
                         return bindings
                 return None
             case VariantPattern(name, args):
-                if not isinstance(value, VariantValue) or value.variant != name or len(value.fields) != len(args):
+                # An Error's pattern may leave out its last fields (the checker allows that only for it).
+                if not isinstance(value, VariantValue) or value.variant != name or len(value.fields) < len(args):
                     return None
                 return self.match_all(args, value.fields, scope)
             case TuplePattern(items):
@@ -1391,6 +1470,8 @@ class Interpreter:
             if enum.nocopy:
                 self.nocopy.add(enum.name)
         if enum.methods:
+            for method in enum.methods:
+                self.names[id(method.function)] = f"{enum.name}.{method.name}"
             self.methods[enum.name] = {method.name: self.eval(method.function, scope) for method in enum.methods}
             if "finalize" in self.methods[enum.name]:
                 self.finalizers[enum.name] = self.methods[enum.name]["finalize"]

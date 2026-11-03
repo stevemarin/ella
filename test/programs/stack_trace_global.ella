@@ -1,0 +1,12 @@
+# A finalizer of a global runs after main, when the program ends; an error in
+# it reports the finalizer's call, and no other.
+nocopy struct File
+    name: str
+    finalize = (self: File) -> () =>
+        print("closing {{self.name}}")
+        assert self.name != "log"
+
+let log = File("log")
+
+let main = () -> () =>
+    print("writing to {{log.name}}")

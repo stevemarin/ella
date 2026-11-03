@@ -371,12 +371,29 @@ class EnumInfo:
 SELF = ParamTy("Self")
 
 # The built-in enums, and the built-in struct `Error`. Variants' fields refer
-# to the type parameters.
+# to the type parameters. An Error's `at` is where it was made (docs/grammar.md
+# §9, "Errors"): its constructor takes only the message and the cause (see
+# `error_constructor`), and its patterns may leave out the last fields.
 BUILTIN_ENUMS = {
     "Result": EnumInfo("Result", ("T", "E"), {"Ok": (ParamTy("T"),), "Err": (ParamTy("E"),)}),
     "Optional": EnumInfo("Optional", ("T",), {"Some": (ParamTy("T"),), "None": ()}),
-    "Error": EnumInfo("Error", (), {"Error": (STR,)}, ("message",), struct=True),
+    "Error": EnumInfo(
+        "Error",
+        (),
+        {"Error": (STR, EnumTy("Optional", (EnumTy("Error"),)), STR)},
+        ("message", "cause", "at"),
+        struct=True,
+    ),
 }
+
+
+MAIN_TYPES = "main must have type () -> (), () -> i64, () -> Result[(), E] or () -> Result[i64, E]"
+
+
+def is_builtin_error(enums: dict[str, EnumInfo], name: str) -> bool:
+    """Is `name` the built-in struct Error (which a program may replace with its own)?"""
+    return name == "Error" and enums.get(name) == BUILTIN_ENUMS["Error"]
+
 
 PRIMITIVE_NAMES = {"i64": I64, "f64": F64, "bool": BOOL, "str": STR}
 
@@ -1103,15 +1120,24 @@ class Checker:
             )
 
     def check_main(self, program: Program) -> None:
-        """`main` is `() -> ()`, or `() -> i64` to give the program's exit status."""
+        """`main` is `() -> ()`, or `() -> i64` to give the program's exit status, or gives a Result of either,
+        whose Err stops the program with an error (docs/grammar.md §3)."""
         main = self.globals.vars.get("main")
         if main is None or main.kind != "global":
             return
         t = resolve(main.type)
-        if isinstance(t, FuncTy) and not t.params and resolve(t.result) == I64:
-            return
+        if isinstance(t, FuncTy) and not t.params:
+            result = finish(t.result)
+            if (
+                isinstance(result, EnumTy)
+                and result.name == "Result"
+                and self.enums["Result"] == BUILTIN_ENUMS["Result"]
+            ):
+                result = result.args[0]
+            if result in (I64, UNIT):
+                return
         if not self.unify(main.type, FuncTy((), UNIT)):
-            raise EllaError(f"main must have type () -> () or () -> i64, not {show_type(main.type)}", program.span)
+            raise EllaError(f"{MAIN_TYPES}, not {show_type(main.type)}", program.span)
 
     def attempt(self, node: object, defines: Iterable[str], step: Callable[[], object]) -> bool:
         """Take one step of checking a program, about `node`, which defines the names `defines`. Did it work?
@@ -1302,6 +1328,8 @@ class Checker:
                         return self.library_type(name, span)
                     case "builtin" if name in WRAPPED:
                         return self.wrap(expr, 1, env)
+                    case "constructor" if is_builtin_error(self.enums, info.enum):
+                        return self.wrap(expr, 1, env)  # the message
                     case "constructor":
                         return self.wrap(expr, len(self.enums[info.enum].variants[name]), env)
                     case "builtin":
@@ -1800,10 +1828,12 @@ class Checker:
                             t = element
                         case _:
                             raise EllaError(f"can't {verb} an element of a {show_type(container)}", span)
-            case Member(container_expr, _, span):
+            case Member(container_expr, member, span):
                 container = self.check_place(container_expr, env, verb, False)
                 if isinstance(resolve(container), TupleTy):
                     raise EllaError(f"a tuple can't be changed in place, so you can't {verb} its items", span)
+                if member == "at" and resolve(container) == ERROR and is_builtin_error(self.enums, "Error"):
+                    raise EllaError(f"an Error's 'at' is where it was made, so you can't {verb} it", span)
                 t = self.member_type(target, container)
             case _:
                 raise EllaError(f"can only {verb} a variable or a part of one", target.span)
@@ -1993,7 +2023,13 @@ class Checker:
             if info.kind == "constructor":
                 self.kinds[id(callee)] = "constructor"
                 enum_type, fields = self.instantiate(info.enum, callee.name)
-                self.check_arity(callee.name, len(fields), args, span)
+                if is_builtin_error(self.enums, info.enum):
+                    # Error(message) or Error(message, cause); where it is made is its `at`.
+                    if len(args) not in (1, 2):
+                        raise EllaError(f"Error takes 1 or 2 arguments but was given {len(args)}", span)
+                    fields = (STR, ERROR)
+                else:
+                    self.check_arity(callee.name, len(fields), args, span)
                 for arg, field_type in zip(args, fields):
                     self.expect(self.check(arg, env), field_type, arg.span, f"the argument of {callee.name}")
                 return enum_type
@@ -2469,7 +2505,9 @@ class Checker:
                     raise EllaError(f"'{name}' isn't an enum variant", span)
                 enum_type, fields = self.instantiate(info.enum, name)
                 self.expect(enum_type, t, span, f"the pattern '{name}(...)'")
-                if len(args) != len(fields):
+                # An Error's pattern may leave out its cause and where it was made: Error(message).
+                short = is_builtin_error(self.enums, info.enum) and 0 < len(args) < len(fields)
+                if len(args) != len(fields) and not short:
                     raise EllaError(f"{name} has {len(fields)} fields, but the pattern has {len(args)}", span)
                 for arg, field_type in zip(args, fields):
                     self.check_pattern(arg, field_type, env)

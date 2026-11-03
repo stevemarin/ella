@@ -1,0 +1,8 @@
+# main may return a Result of an exit status: Ok(status) exits with it.
+let check = (xs: [i64]) -> Result[i64, Error] =>
+    if len(xs) == 0 then Err(Error("nothing to check")) else Ok(len(xs))
+
+let main = () -> Result[i64, Error] =>
+    let n = check([1, 2, 3])?
+    print("checked {{n}}")
+    Ok(n)

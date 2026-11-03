@@ -77,7 +77,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from ella.checker import EnumTy, ListTy, check_code
+from ella.checker import EnumTy, ListTy, check_code, is_builtin_error
 from ella.ir import (
     VIEWS,
     Block,
@@ -96,7 +96,7 @@ from ella.ir import (
     verify,
 )
 from ella.ir import Value as IRValue
-from ella.lexer import EllaError, Span
+from ella.lexer import CallSite, EllaError, Span
 from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
@@ -117,6 +117,7 @@ from ella.values import (
     Value,
     VariantValue,
     copy_value,
+    main_error,
     run_deep,
     to_text,
 )
@@ -221,6 +222,9 @@ class IRInterpreter:
         self.globals: dict[str, Value] = {}  # a global is missing until it is first set
         self.global_tags: dict[str, Tag] = {}
         self.depth = 0  # how many calls are in progress
+        # The calls in progress, outermost first, for stack traces: None for one they leave out (of `main`).
+        # Nothing takes them off after an error, which stops the program, so they are its trace then.
+        self.calls: list[CallSite | None] = []
         self.arenas = [Arena()]  # by depth; 0 is the global arena
         self.next_depth = 1
         self.swaps: dict[str, set[int]] = {}  # function -> the levels of its loops that carry values
@@ -239,10 +243,13 @@ class IRInterpreter:
     def run_program(self) -> int:
         try:
             status, _, _ = self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
+            self.free(0, 1)  # the globals, at the end of the program
+        except EllaError as error:
+            error.traced([call for call in self.calls if call is not None])
+            raise
         except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
             self.out.flush()
             return stop.status
-        self.free(0, 1)  # the globals, at the end of the program
         assert isinstance(status, int)
         return status
 
@@ -391,7 +398,7 @@ class IRInterpreter:
                     self.free_arena(self.pool_arenas[id(value)][slot])
                     value.slots[slot] = None
             return
-        self.call(self.module.functions[finalizer], [value], [None], 0, {}, Span(0, 0))
+        self.call(self.module.functions[finalizer], [value], [None], 0, {}, Span(0, 0), CallSite(Span(0, 0), ""))
 
     def move_finals(self, value: Value, depth: int) -> None:
         """Move the finalizers of the values `value` holds to the arena at `depth`, keeping their order."""
@@ -427,14 +434,17 @@ class IRInterpreter:
         result_depth: int,
         mut_depths: dict[int, int],
         span: Span,
+        site: CallSite | None = None,
     ) -> tuple[Value, Tag, list[tuple[Value, Tag]]]:
         """Run a function from its entry block until it returns.
 
-        Returns its result and the final values of its `mut` parameters, each with its tag.
+        Returns its result and the final values of its `mut` parameters, each
+        with its tag. `site` is the call's, for stack traces (None if they leave it out).
         """
         if self.depth >= self.max_depth:
             raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
         self.depth += 1
+        self.calls.append(site)
         base = self.next_depth
         self.next_depth += function.levels
         for level in range(function.levels):
@@ -446,6 +456,7 @@ class IRInterpreter:
         try:
             returned, _ = self.run_frame(frame, block, span)
             self.free(base, base + function.levels)
+            self.calls.pop()
             return returned
         finally:
             # After an error, the program stops: nothing is freed or finalized.
@@ -482,6 +493,9 @@ class IRInterpreter:
                     return self.leave(value, outs, frame, span), None
                 case Yield(value, target):
                     return self.leave(value, [], frame, span), target
+                case Trap(value=value, span=trap_span, error=True):
+                    assert value is not None
+                    raise main_error(frame.values[value.id], trap_span)
                 case Trap(message, value, trap_span):
                     if value is not None:
                         self.check_alive(frame.tags.get(value.id), str(value), trap_span)
@@ -511,18 +525,20 @@ class IRInterpreter:
         self.enter(block, values, tags, frame)
         return GenValue(Generator(frame, block))
 
-    def resume(self, generator: Value, depth: int, span: Span) -> tuple[Value, Tag]:
+    def resume(self, generator: Value, depth: int, instr: Instr) -> tuple[Value, Tag]:
         """`resume g`: run a generator's body from where it stopped until it yields, giving its result there."""
         assert isinstance(generator, GenValue) and isinstance(generator.state, Generator)
         state = generator.state
         if self.depth >= self.max_depth:
-            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
+            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", instr.span)
         self.depth += 1
+        self.calls.append(site(instr))
         try:
             state.frame.result_depth = depth
-            (value, tag, _), target = self.run_frame(state.frame, state.block, span)
+            (value, tag, _), target = self.run_frame(state.frame, state.block, instr.span)
         finally:
             self.depth -= 1
+        self.calls.pop()
         assert target is not None
         state.block = target
         return value, tag
@@ -622,7 +638,11 @@ class IRInterpreter:
                 size = LIST_VIEW if isinstance(result, View) else STR_VIEW
                 tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
             case "builtin":
-                result = call_library(instr.name, args, span, self.host)
+                try:
+                    result = call_library(instr.name, args, self.place(span), self.host)
+                except EllaError as error:
+                    error.span = span  # Span(0, 0) is reported at the call, without this function's (`traced`)
+                    raise
                 if instr.name in VIEWS:  # views of the first argument's characters
                     size = shallow_size(result) + STR_VIEW * len(result) if isinstance(result, list) else STR_VIEW
                     tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
@@ -666,7 +686,7 @@ class IRInterpreter:
             case "gen_new":
                 result = self.new_generator(instr, args)
             case "resume":
-                result, tag = self.resume(args[0], depth, span)
+                result, tag = self.resume(args[0], depth, instr)
             case "alloc" | "pool_get" | "pool_set" | "free" if isinstance(args[0], ArenaValue):
                 result, tag = self.execute_arena(instr, args, frame)
             case "alloc" | "pool_get" | "pool_set" | "free":
@@ -719,7 +739,8 @@ class IRInterpreter:
             case "variant":
                 assert instr.dest is not None and isinstance(instr.dest.type, EnumTy)
                 enum = self.module.enums[instr.dest.type.name]
-                result = VariantValue(enum.name, instr.name, list(args), nocopy=enum.nocopy)
+                builtin = is_builtin_error(self.module.enums, enum.name)
+                result = VariantValue(enum.name, instr.name, list(args), nocopy=enum.nocopy, error=builtin)
                 tag = self.shortest(*tags)
                 if enum.finalize:
                     self.arena(depth).finals.append((result, enum.finalize))
@@ -747,8 +768,10 @@ class IRInterpreter:
                 if self.depth >= self.max_depth:
                     raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
                 self.depth += 1
+                self.calls.append(site(instr))
             case "leave":
                 self.depth -= 1
+                self.calls.pop()
             case "assert":
                 if not args[0]:
                     raise EllaError(instr.name, span)
@@ -879,6 +902,13 @@ class IRInterpreter:
         result, tag, _ = self.call(self.module.functions[name], [], [], depth, {}, span)
         return result, tag
 
+    def place(self, span: Span) -> Span:
+        """Where an instruction is, for an Error a library function makes there: Span(0, 0) is in a function made
+        for a library function used as a value, which is where it is called (as in EllaError.traced)."""
+        if span == Span(0, 0):
+            return next((call.span for call in reversed(self.calls) if call is not None), span)
+        return span
+
     def execute_call(
         self, instr: Instr, name: str, args: list[Value], tags: list[Tag], depth: int, frame: Frame
     ) -> tuple[Value, Tag]:
@@ -888,7 +918,7 @@ class IRInterpreter:
         mut_depths = {
             position: self.depth_of(region, frame) for position, region in zip(callee.mut_params, instr.out_regions)
         }
-        result, tag, outs = self.call(callee, args, arg_tags, depth, mut_depths, instr.span)
+        result, tag, outs = self.call(callee, args, arg_tags, depth, mut_depths, instr.span, site(instr))
         for out, (value, out_tag) in zip(instr.outs, outs):
             frame.values[out.id] = value
             frame.tags[out.id] = out_tag if is_boxed(out.type) else None
@@ -906,6 +936,11 @@ class IRInterpreter:
         for (function, span, op), site in sorted(self.sites.items(), key=lambda item: -item[1].bytes):
             lines.append(f"  {site.bytes:>12,}  {site.count:>8,}x  {span} {op} in {function}")
         return "\n".join(lines) + "\n"
+
+
+def site(instr: Instr) -> CallSite | None:
+    """Where a call is, for stack traces (None for the call of `main`)."""
+    return CallSite(instr.span, instr.within) if instr.within is not None else None
 
 
 def function_swaps(function: Function) -> set[int]:

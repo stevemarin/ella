@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO, TextIO
 
 from ella.lexer import EllaError, Span
-from ella.values import Value, VariantValue, fits_i64, to_text
+from ella.values import Value, VariantValue, fits_i64, make_error, to_text
 
 MAX_CODE_POINT = 0x10FFFF
 SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and can't be written in UTF-8
@@ -62,8 +62,9 @@ def ok(value: Value) -> Value:
     return VariantValue("Result", "Ok", [value])
 
 
-def err(message: str) -> Value:
-    return VariantValue("Result", "Err", [VariantValue("Error", "Error", [message])])
+def err(message: str, span: Span) -> Value:
+    """`Err(Error(message))`, made at `span`: where the library function was called."""
+    return VariantValue("Result", "Err", [make_error(message, span)])
 
 
 def quoted(text: str) -> str:
@@ -82,11 +83,11 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             return math.trunc(x)
         case "parse_i64", [str() as text]:
             if not I64_TEXT.fullmatch(text):
-                return err(f"{quoted(text)} isn't an i64")
+                return err(f"{quoted(text)} isn't an i64", span)
             n = int(text)
-            return ok(n) if fits_i64(n) else err(f"{quoted(text)} doesn't fit in an i64")
+            return ok(n) if fits_i64(n) else err(f"{quoted(text)} doesn't fit in an i64", span)
         case "parse_f64", [str() as text]:
-            return ok(float(text)) if F64_TEXT.fullmatch(text) else err(f"{quoted(text)} isn't an f64")
+            return ok(float(text)) if F64_TEXT.fullmatch(text) else err(f"{quoted(text)} isn't an f64", span)
         case "read_line", []:
             line = (host.stdin or sys.stdin.buffer).readline()
             if not line:
@@ -94,7 +95,7 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             text = decode(line, "read_line(): the input isn't valid UTF-8", span)
             return some(text.removesuffix("\n").removesuffix("\r"))
         case "read_file", [str() as path]:
-            return read_file(path)
+            return read_file(path, span)
         case "args", []:
             for arg in host.args:
                 decode(arg.encode("utf-8", "surrogateescape"), "args(): an argument isn't valid UTF-8", span)
@@ -175,7 +176,7 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
                 return NONE
             return some(decode(value, f"env(): the value of {variable} isn't valid UTF-8", span))
         case "write_file", [str() as path, str() as text]:
-            return write_file(path, text)
+            return write_file(path, text, span)
         case "exit", [int() as status]:
             if not 0 <= status <= 255:
                 raise EllaError(f"exit() needs a status from 0 to 255, not {status}", span)
@@ -224,28 +225,28 @@ def decode(data: bytes, message: str, span: Span) -> str:
         raise EllaError(message, span) from None
 
 
-def read_file(path: str) -> Value:
+def read_file(path: str, span: Span) -> Value:
     """The whole file, or an error saying why it can't be read (the C library's words, as in C)."""
     if "\0" in path:
-        return err(f"can't read {quoted(path)}: {os.strerror(errno.EINVAL)}")  # as open() gives in C
+        return err(f"can't read {quoted(path)}: {os.strerror(errno.EINVAL)}", span)  # as open() gives in C
     try:
         with open(path, "rb") as file:
             data = file.read()
     except OSError as error:
-        return err(f"can't read {quoted(path)}: {error.strerror}")
+        return err(f"can't read {quoted(path)}: {error.strerror}", span)
     try:
         return ok(data.decode("utf-8"))
     except UnicodeDecodeError:
-        return err(f"can't read {quoted(path)}: it isn't valid UTF-8")
+        return err(f"can't read {quoted(path)}: it isn't valid UTF-8", span)
 
 
-def write_file(path: str, text: str) -> Value:
+def write_file(path: str, text: str, span: Span) -> Value:
     """Write text to a file in UTF-8, replacing what it held, or give an error saying why it can't."""
     if "\0" in path:
-        return err(f"can't write {quoted(path)}: {os.strerror(errno.EINVAL)}")
+        return err(f"can't write {quoted(path)}: {os.strerror(errno.EINVAL)}", span)
     try:
         with open(path, "wb") as file:
             file.write(text.encode("utf-8"))
     except OSError as error:
-        return err(f"can't write {quoted(path)}: {error.strerror}")
+        return err(f"can't write {quoted(path)}: {error.strerror}", span)
     return ok(())

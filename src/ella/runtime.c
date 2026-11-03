@@ -102,11 +102,14 @@ struct Type {
 };
 
 // A variant (or struct). A nocopy struct may have a finalizer, a closure run
-// on each value when it dies.
+// on each value when it dies. `error` marks the built-in Error, whose fields
+// are its message, its cause (an Optional) and where it was made: equality and
+// the text form leave that out, and show the cause without its Some.
 typedef struct {
     const char *name;
     word count;
     const Closure *finalize;
+    word error;
     const Type *fields[];
 } VariantType;
 
@@ -121,24 +124,92 @@ word ella_depth = 1;
 // file 0 is the entry file, whose errors don't name it.
 extern const char *const ella_files[];
 
-// Start a run-time error, after everything the program printed so far:
-// "line:column: ", or "file:line:column: " in a module other than the entry file.
-static void start_error(word line, word column) {
-    fflush(stdout);
+// Stack traces. Each call puts its site, made by the code generator, in
+// ella_trace at the call depth before it counts the call: where it is (a
+// line and column as passed to the runtime), and the function it is in ("" for
+// the top-level code). The call of main has no site (NULL), and a finalizer's
+// call is at 0:0. The calls in progress are those at depths 1 to ella_depth - 1.
+typedef struct {
+    word line, column;
+    const char *function;
+} Site;
+
+extern const Site *ella_trace[];  // in the generated code, by depth
+const Site ella_finalizer_site = {0, 0, ""};
+
+// A stack trace of more calls than twice this shows only this many at each
+// end (TRACE_ENDS in ella.lexer).
+enum { TRACE_ENDS = 10 };
+
+// A place in the source: "line:column", or "file:line:column" in a module
+// other than the entry file.
+static void print_place(word line, word column) {
     word file = line >> 32;
     if (file) fprintf(stderr, "%s:", ella_files[file]);
-    fprintf(stderr, "%" PRId64 ":%" PRId64 ": ", line & 0xffffffff, column);
+    fprintf(stderr, "%" PRId64 ":%" PRId64, line & 0xffffffff, column);
 }
 
-// Stop the program with a run-time error: "line:column: message".
+// The innermost call in progress below `depth` that has a site, or 0.
+static word site_below(word depth) {
+    while (--depth >= 1 && ella_trace[depth] == NULL) {
+    }
+    return depth;
+}
+
+// The stack trace of the calls in progress below `depth`, innermost first: a
+// line each, "  called at line:column in function", as EllaError.format.
+static void print_trace(word depth) {
+    word count = 0;
+    for (word d = site_below(depth); d >= 1; d = site_below(d)) count++;
+    word shown = 0;
+    for (word d = site_below(depth); d >= 1; d = site_below(d), shown++) {
+        if (count > 2 * TRACE_ENDS && shown >= TRACE_ENDS && shown < count - TRACE_ENDS) {
+            if (shown == TRACE_ENDS) fprintf(stderr, "  ... %" PRId64 " more calls\n", count - 2 * TRACE_ENDS);
+            continue;
+        }
+        const Site *site = ella_trace[d];
+        if (site->line == 0 && site->column == 0) {
+            fputs("  called to finalize a value\n", stderr);
+            continue;
+        }
+        fputs("  called at ", stderr);
+        print_place(site->line, site->column);
+        if (site->function[0]) fprintf(stderr, " in %s", site->function);
+        fputc('\n', stderr);
+    }
+}
+
+// Start a run-time error, after everything the program printed so far:
+// "line:column: ". Returns the depth whose calls in progress its stack trace
+// shows. An error at 0:0 is in a function made for a library function used as
+// a value, and is reported at its call, as in EllaError.traced.
+static word start_error(word line, word column) {
+    fflush(stdout);
+    word depth = ella_depth;
+    if (line == 0 && column == 0 && site_below(depth) >= 1) {
+        depth = site_below(depth);
+        line = ella_trace[depth]->line, column = ella_trace[depth]->column;
+    }
+    print_place(line, column);
+    fputs(": ", stderr);
+    return depth;
+}
+
+// End a run-time error after its message: the stack trace, then stop.
+_Noreturn static void end_error(word depth) {
+    fputc('\n', stderr);
+    print_trace(depth);
+    exit(1);
+}
+
+// Stop the program with a run-time error: "line:column: message", then the stack trace.
 _Noreturn static void fail(word line, word column, const char *format, ...) {
-    start_error(line, column);
+    word depth = start_error(line, column);
     va_list args;
     va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
-    fputc('\n', stderr);
-    exit(1);
+    end_error(depth);
 }
 
 _Noreturn void ella_error(word line, word column, const char *message) { fail(line, column, "%s", message); }
@@ -1004,7 +1075,7 @@ word ella_equal(word a, word b, const Type *t) {
         const Variant *x = (const Variant *)a, *y = (const Variant *)b;
         if (x->tag != y->tag) return 0;
         const VariantType *variant = t->parts[x->tag];
-        for (word i = 0; i < variant->count; i++) {
+        for (word i = 0; i < (variant->error ? 2 : variant->count); i++) {
             if (!ella_equal(x->fields[i], y->fields[i], variant->fields[i])) return 0;
         }
         return 1;
@@ -1212,7 +1283,16 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
         const Variant *x = (const Variant *)v;
         const VariantType *variant = t->parts[x->tag];
         put_ascii(b, variant->name);
-        if (variant->count) {
+        if (variant->error) {  // Error("message"), or Error("message", cause)
+            put(b, '(');
+            put_value(b, x->fields[0], variant->fields[0], 1);
+            const Variant *cause = (const Variant *)x->fields[1];
+            if (cause->count) {
+                put_ascii(b, ", ");
+                put_value(b, cause->fields[0], t, 1);
+            }
+            put(b, ')');
+        } else if (variant->count) {
             put(b, '(');
             for (word i = 0; i < variant->count; i++) {
                 if (i) put_ascii(b, ", ");
@@ -1283,10 +1363,9 @@ void ella_eprint(word v, const Type *t) {
 
 // Stop with a run-time error whose message is in a buffer.
 _Noreturn static void fail_with(word line, word column, Buffer *message) {
-    start_error(line, column);
+    word depth = start_error(line, column);
     write_utf8(stderr, message->chars, message->len);
-    fputc('\n', stderr);
-    exit(1);
+    end_error(depth);
 }
 
 // A trap whose message shows a value: "no case matches {}".
@@ -1294,11 +1373,11 @@ _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word 
     Buffer b = {0};
     put_value(&b, v, t, 1);
     const char *hole = strstr(message, "{}");
-    start_error(line, column);
+    word depth = start_error(line, column);
     fprintf(stderr, "%.*s", (int)(hole - message), message);
     write_utf8(stderr, b.chars, b.len);
-    fprintf(stderr, "%s\n", hole + 2);
-    exit(1);
+    fputs(hole + 2, stderr);
+    end_error(depth);
 }
 
 // Slices: `xs[a..b]` and `s[a..b]`, views of the list's items or the
@@ -1359,9 +1438,34 @@ static word some(word value, word depth) { return variant1(TAG_SOME, value, dept
 static word none(word depth) { return (word)ella_variant_alloc(TAG_NONE, 0, depth); }
 static word ok(word value, word depth) { return variant1(TAG_OK, value, depth); }
 
-// Err(Error(message)), with the message in a buffer, which is freed.
-static word err(Buffer *message, word depth) {
-    return variant1(TAG_ERR, variant1(TAG_ERROR, (word)buffer_str(message, depth), depth), depth);
+static Str *place_str(word line, word column, word depth);
+
+// `main` returned Err(error), a built-in Error: stop with it, where it was made,
+// then each of its causes on a line of its own (as ella.values.main_error).
+_Noreturn void ella_main_error(const Variant *error) {
+    fflush(stdout);
+    for (const char *before = "";; before = "  caused by ") {
+        const Str *message = (const Str *)error->fields[0], *at = (const Str *)error->fields[2];
+        fputs(before, stderr);
+        write_utf8(stderr, at->chars, at->len);
+        fputs(": ", stderr);
+        write_utf8(stderr, message->chars, message->len);
+        fputc('\n', stderr);
+        const Variant *cause = (const Variant *)error->fields[1];
+        if (cause->tag != TAG_SOME) break;
+        error = (const Variant *)cause->fields[0];
+    }
+    exit(1);
+}
+
+// Err(Error(message)), with the message in a buffer, which is freed, made at
+// the call at line and column (where an error there would be reported).
+static word err(Buffer *message, word line, word column, word depth) {
+    Variant *error = ella_variant_alloc(TAG_ERROR, 3, depth);
+    error->fields[0] = (word)buffer_str(message, depth);
+    error->fields[1] = none(depth);
+    error->fields[2] = (word)place_str(line, column, depth);
+    return variant1(TAG_ERR, (word)error, depth);
 }
 
 // One UTF-8 sequence at the start of p (n bytes): its length, and its code
@@ -1405,6 +1509,23 @@ static Str *decode(const unsigned char *bytes, size_t n, word depth) {
         i += utf8_sequence(bytes + i, n - i, &c);
         s->chars[k] = c;
     }
+    return s;
+}
+
+// Where a call is, as text for an Error's `at` (as print_place writes it).
+// 0:0 is in a function made for a library function used as a value: the place
+// is its call's, as for an error there (start_error).
+static Str *place_str(word line, word column, word depth) {
+    if (line == 0 && column == 0 && site_below(ella_depth) >= 1) {
+        const Site *site = ella_trace[site_below(ella_depth)];
+        line = site->line, column = site->column;
+    }
+    word file = line >> 32;
+    char text[4096];
+    int n = snprintf(text, sizeof text, "%s%s%" PRId64 ":%" PRId64, file ? ella_files[file] : "", file ? ":" : "",
+                     line & 0xffffffff, column);
+    Str *s = decode((const unsigned char *)text, (size_t)n < sizeof text ? (size_t)n : sizeof text - 1, depth);
+    if (s == NULL) out_of_memory("a file name isn't valid UTF-8");
     return s;
 }
 
@@ -1481,7 +1602,7 @@ word ella_lib_parse_i64(const Str *s, word line, word column, word depth) {
     Buffer message = {0};
     put_quoted(&message, s);
     put_ascii(&message, valid ? " doesn't fit in an i64" : " isn't an i64");
-    return err(&message, depth);
+    return err(&message, line, column, depth);
 }
 
 word ella_lib_parse_f64(const Str *s, word line, word column, word depth) {
@@ -1513,7 +1634,7 @@ word ella_lib_parse_f64(const Str *s, word line, word column, word depth) {
         Buffer message = {0};
         put_quoted(&message, s);
         put_ascii(&message, " isn't an f64");
-        return err(&message, depth);
+        return err(&message, line, column, depth);
     }
     char *text = encode(s);  // only ASCII, so one byte per character
     double x = strtod(text, NULL);
@@ -1570,13 +1691,13 @@ word ella_lib_read_file(const Str *path, word line, word column, word depth) {
     if (error) {
         put_ascii(&message, strerror(error));
         free(data);
-        return err(&message, depth);
+        return err(&message, line, column, depth);
     }
     Str *s = decode(data, len, depth);
     free(data);
     if (s == NULL) {
         put_ascii(&message, "it isn't valid UTF-8");
-        return err(&message, depth);
+        return err(&message, line, column, depth);
     }
     free(message.chars);
     return ok((word)s, depth);
@@ -1883,7 +2004,7 @@ word ella_lib_write_file(const Str *path, const Str *s, word line, word column, 
         put_quoted(&message, path);
         put_ascii(&message, ": ");
         put_ascii(&message, strerror(error));
-        return err(&message, depth);
+        return err(&message, line, column, depth);
     }
     return ok(0, depth);  // Ok(())
 }

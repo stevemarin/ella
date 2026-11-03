@@ -1,0 +1,22 @@
+# When main returns Err(e), the program stops with e as its error: where it
+# was made and its message, then each of its causes.
+let parse_row = (row: str) -> Result[[i64], Error] =>
+    let mut numbers = []
+    for field in split(row, ",")
+        match parse_i64(trim(field))
+            case Ok(n) => numbers += [n]
+            case Err(e) => return Err(Error("bad field '{{field}}'", e))
+    Ok(numbers)
+
+let total = (rows: [str]) -> Result[i64, Error] =>
+    let mut result = 0
+    for i in 0..len(rows)
+        match parse_row(rows[i])
+            case Ok(numbers) => result += sum(numbers, 0)
+            case Err(e) => return Err(Error("bad row {{i + 1}}", e))
+    Ok(result)
+
+let main = () -> Result[(), Error] =>
+    print(total(["1, 2", "3"])?)
+    print(total(["4", "5, x"])?)
+    Ok(())

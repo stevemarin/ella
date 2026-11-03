@@ -1,0 +1,3 @@
+6:16: assertion failed: self.name != "b"
+  called to finalize a value
+  called at 14:9 in main

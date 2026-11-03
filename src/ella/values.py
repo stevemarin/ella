@@ -41,7 +41,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ella.checker import Type, show_type
-from ella.lexer import EllaError, Span
+from ella.lexer import EllaError, Span, parse_place
 from ella.syntax import Expr, Lambda, bare_name, show
 
 I64_MIN = -(2**63)
@@ -57,13 +57,46 @@ class VariantValue:
     """An enum or struct value: `Some(1)` is `VariantValue("Optional", "Some", [1])`.
 
     A struct's fields can change in place. `nocopy` marks a value of a nocopy
-    struct, which `copy_value` leaves as it is: it is never copied.
+    struct, which `copy_value` leaves as it is: it is never copied. `error`
+    marks a built-in Error (its fields are message, cause and at), whose
+    equality and text form leave out where it was made (`at`), and show its
+    cause without the `Some`: `Error("bad row", Error("not a number"))`.
     """
 
     enum: str
     variant: str
     fields: list[Value] = field(default_factory=list)
     nocopy: bool = False
+    error: bool = False
+
+
+def main_error(error: Value, span: Span) -> EllaError:
+    """The error that stops the program when `main` (at `span`) returns `Err(error)`.
+
+    A built-in Error is reported where it was made, with its causes after
+    it; any other error as what main returned.
+    """
+    if not (isinstance(error, VariantValue) and error.error):
+        return EllaError(f"main returned Err({to_text(error, nested=True)})", span)
+    causes: list[tuple[Span, str]] = []
+    while True:
+        message, cause, at = error.fields
+        assert isinstance(message, str) and isinstance(cause, VariantValue) and isinstance(at, str)
+        causes.append((parse_place(at) or span, message))
+        if not cause.fields:
+            break
+        error = cause.fields[0]
+        assert isinstance(error, VariantValue)
+    (place, message), *rest = causes
+    result = EllaError(message, place)
+    result.causes = rest
+    return result
+
+
+def make_error(message: str, span: Span, cause: Value | None = None) -> VariantValue:
+    """A built-in Error, made at `span`."""
+    optional = VariantValue("Optional", "Some", [cause]) if cause is not None else VariantValue("Optional", "None")
+    return VariantValue("Error", "Error", [message, optional, str(span)], error=True)
 
 
 @dataclass(eq=False, slots=True)
@@ -144,11 +177,18 @@ class CodeValue:
 
 @dataclass(frozen=True, slots=True)
 class Constructor:
-    """A variant that has fields, such as `Some`. Calling it makes a VariantValue."""
+    """A variant that has fields, such as `Some`. Calling it makes a VariantValue.
+
+    The built-in Error's (`error`) takes a message and maybe a cause. Used as
+    a value, its Errors are made where it is used (`at`), as the lowering's
+    function for it makes them.
+    """
 
     enum: str
     variant: str
     arity: int
+    error: bool = False
+    at: Span | None = None
 
 
 @dataclass(eq=False, slots=True)
@@ -308,8 +348,8 @@ def copy_value(value: Value) -> Value:
             return [copy_value(item) for item in value]
         case tuple():
             return tuple(copy_value(item) for item in value)
-        case VariantValue(enum, variant, fields, nocopy) if fields and not nocopy:
-            return VariantValue(enum, variant, [copy_value(item) for item in fields])
+        case VariantValue(enum, variant, fields, nocopy, error) if fields and not nocopy:
+            return VariantValue(enum, variant, [copy_value(item) for item in fields], error=error)
         case _:
             return value
 
@@ -324,6 +364,8 @@ def equal(a: Value, b: Value) -> bool:
     if isinstance(a, list | tuple) and isinstance(b, list | tuple):
         return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
+        if a.error:  # where an Error was made doesn't count
+            return equal(a.fields[:2], b.fields[:2])
         return a.variant == b.variant and equal(a.fields, b.fields)
     if isinstance(a, PoolValue | ArenaValue | GenValue | CodeValue):
         return a is b
@@ -351,6 +393,8 @@ def to_text(value: Value, nested: bool = False) -> str:
             return "[" + ", ".join(to_text(item, True) for item in value) + "]"
         case range():
             return f"{value.start}..{value.stop}"
+        case VariantValue(fields=[message, VariantValue(fields=cause), _], error=True):
+            return f"Error({to_text(message, True)}" + "".join(f", {to_text(c, True)}" for c in cause) + ")"
         case VariantValue(variant=variant, fields=fields):
             if not fields:
                 return bare_name(variant)

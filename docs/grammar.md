@@ -220,7 +220,20 @@ file*) and the modules it imports, directly or not.
    (In other modules, `main` is an ordinary function.)
    `main` has type `() -> ()`, or `() -> i64` to give the program's exit
    status, which must be from 0 to 255 (anything else is a run-time error).
-   Without it the status is 0, and a run-time error makes it 1.
+   Without it the status is 0, and a run-time error makes it 1. `main` may
+   also give a `Result` of either, `() -> Result[(), E]` or
+   `() -> Result[i64, E]`, so that it can use `?`: `Ok(v)` is as if it gave
+   `v`, and `Err(e)` stops the program as a run-time error does. An `e`
+   that is the built-in `Error` ([§9](#errors)) is reported where it was
+   made, with its causes after it; any other is reported as what main
+   returned:
+
+   ```
+   prog.ella:16:44: bad row 2
+     caused by prog.ella:8:44: bad field ' x'
+     caused by prog.ella:6:24: "x" isn't an i64
+   prog.ella:1:1: main returned Err("no input")
+   ```
    `exit(status)` stops the program anywhere, with that status. The
    program's command-line arguments are `args()` ([§10](#10-built-ins)).
 5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
@@ -995,11 +1008,13 @@ for n in Countdown(3)
 ### Errors
 
 `Error` is a built-in struct for the error side of a `Result`, holding a
-message:
+message, the error that caused it if any, and where it was made:
 
 ```ella
 struct Error
     message: str
+    cause: Optional[Error]
+    at: str
 ```
 
 ```ella
@@ -1010,11 +1025,30 @@ match invert(0.0)
     case Ok(v) => print(v)
     case Err(e) => print(e.message)    # divide by zero
 print(invert(0.0))                     # Err(Error("divide by zero"))
+
+let read = (text: str) -> Result[i64, Error] =>
+    match parse_i64(text)
+        case Ok(n) => Ok(n)
+        case Err(e) => Err(Error("bad count", e))
+print(read("x"))                       # Err(Error("bad count", Error("\"x\" isn't an i64")))
 ```
 
-* It is an ordinary struct that happens to be predefined, so it is built,
-  read, compared, printed and matched (`case Err(Error(message))`) like any
-  other. A program can define its own `Error`, which replaces it.
+* It is made by `Error(message)`, or `Error(message, cause)` with the
+  `Error` it comes from, which its `cause` holds as `Some(cause)`. Its `at`
+  is where it is made, as an error message writes it: `12:9`, or
+  `geo/poly.ella:12:9` in another module. The library functions that give
+  an `Err` make its `Error` where they are called. Used as a value
+  (`map(messages, Error)`), `Error` makes its errors where it is written.
+* Its fields are read like any struct's, and the message and cause can be
+  changed, but not `at`.
+* Its patterns may leave out the last fields: `Error(message)`,
+  `Error(message, Some(cause))`, `Error(message, cause, at)`.
+* `==` leaves out where errors were made, and so does the text form, which
+  shows the cause without its `Some`: `Error("bad count", Error("..."))`.
+* An `Err` that `main` returns stops the program with its `Error`,
+  reported at its `at`, with a line for each cause ([§3](#3-program-structure)).
+* A program can define its own `Error`, which replaces it, and is an
+  ordinary struct.
 * `Result[T, E]` can still hold any error type: `Result[i64, str]` is fine.
 
 ### Values that can't be copied **(provisional syntax)**
@@ -1267,8 +1301,8 @@ print(next(mut g), next(mut g))  # Some(1) None
   finalized as if the body had stopped where it is: the innermost loop
   iteration's values first, newest first.
 * A run-time error in a generator's body stops the program at its
-  location, from the `next` that ran it. Each `next` counts as a call for
-  the call depth limit.
+  location, from the `next` that ran it, which its stack trace shows as a
+  call. Each `next` counts as a call for the call depth limit.
 * A `Gen` prints as `<gen>`, and isn't `Eq`.
 
 ## 10. Built-ins
@@ -1377,13 +1411,35 @@ failure can report the asserted expression's source text. It has type `()`.
 
 Run-time errors (failed `assert`, failed `where`, out-of-range index or
 slice, division by zero, `i64` overflow, and a few library errors) stop the
-program with a message and the source location.
+program with a message and the source location, then a *stack trace*: the
+calls in progress, innermost first, each where it is and in which function
+(nothing for the top-level code). It goes to standard error:
+
+```
+lists.ella:5:53: index 5 is out of range for a list of length 3
+  called at lists.ella:10:44 in pick
+  called at <std>/lists.ella:14:21 in lists.map
+  called at lists.ella:11:12 in total
+  called at lists.ella:19:16 in main
+```
+
+* A function is named by its `let` (a method as `Grid.cell`, a module's
+  functions with the module's name, `lists.map`), and is `lambda` if it
+  has none. `main`'s own call isn't shown, since the program doesn't
+  write it.
+* A call that ran a finalizer is `called to finalize a value`, and each
+  `next` that ran a generator's body is a call where the `next` is.
+* A library function used as a value (`map(codes, chr)`) reports its
+  errors where it is called, as if it were called there by name.
+* A trace of more than 20 calls shows the innermost and outermost 10, with
+  `... N more calls` between them.
 
 Functions can call each other 10,000 deep: one more nested call stops the
-program with "stack overflow: more than 10000 nested calls". `ella
---max-depth N` changes the limit. Every backend has the same limit, so a
-program behaves the same however it is run. (Native code has room for about
-two scope levels, a function body and one loop, per nested call.)
+program with "stack overflow: more than 10000 nested calls". The top-level
+code counts as one of them. `ella --max-depth N` changes the limit. Every
+backend has the same limit, so a program behaves the same however it is
+run. (Native code has room for about two scope levels, a function body and
+one loop, per nested call.)
 
 Type errors such as `1 + true` are found before the program runs. The AST
 interpreter also checks types as it goes, so it can still run programs that
@@ -1743,8 +1799,6 @@ Parsing notes:
 
 ## Open questions
 
-* What else an `Error` should hold: where it was made, or the error that
-  caused it.
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
 * Whether `==` and the text form (`print`) should use methods too, and

@@ -85,7 +85,7 @@ def test_program(path: Path, runner: str) -> None:
     if expected_error.exists():
         with pytest.raises(EllaError) as info:
             RUNNERS[runner](path, out, err, stdin, args)
-        assert str(info.value) == expected_error.read_text().strip()
+        assert info.value.format() == expected_error.read_text().strip()
     else:
         status = RUNNERS[runner](path, out, err, stdin, args)
         expected_status = path.with_suffix(".status")

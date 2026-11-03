@@ -304,6 +304,9 @@ def reify(value: Value, span: Span) -> Expr:
             return ListLit(tuple(reify(item, span) for item in value), span)
         case range():
             return Binary("..", IntLit(value.start, span), IntLit(value.stop, span), span)
+        case VariantValue(fields=[message, VariantValue(fields=cause), _], error=True):
+            # A built-in Error: Error(message) or Error(message, cause), made (`at`) where the code carries it.
+            return Call(Name("Error", span), tuple(reify(item, span) for item in [message, *cause]), span)
         case VariantValue(variant=variant, fields=values):
             if not values:
                 return Name(variant, span)

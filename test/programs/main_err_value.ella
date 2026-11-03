@@ -1,0 +1,5 @@
+# main may return a Result with any error type; an Err that isn't the
+# built-in Error stops the program with what main returned.
+let main = () -> Result[(), str] =>
+    print("starting")
+    Err("no input")

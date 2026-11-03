@@ -1,0 +1,2 @@
+7:16: assertion failed: self.name != "log"
+  called to finalize a value

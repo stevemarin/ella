@@ -19,7 +19,7 @@ from typing import TextIO
 
 from ella.codegen import generate
 from ella.ir import Module
-from ella.lexer import EllaError, Span
+from ella.lexer import CallSite, EllaError, Span
 from ella.lower import compile_program
 from ella.passes import optimize
 from ella.values import MAX_CALL_DEPTH
@@ -100,12 +100,14 @@ def run_native(
 def finish_run(status: int, stderr: str, err: TextIO | None) -> int:
     """After a native program ends: pass on what it printed to standard error, and raise its run-time error if any.
 
-    A run-time error is the last line of standard error, and makes the
-    status 1, which `main` can give too.
+    A run-time error is the last lines of standard error (its message, then
+    its stack trace), and makes the status 1, which `main` can give too.
     """
-    error = parse_error(stderr) if status == 1 else None
-    if error is not None:
-        stderr = stderr[: stderr.rstrip("\n").rfind("\n") + 1]
+    found = parse_error(stderr) if status == 1 else None
+    error = None
+    if found is not None:
+        error, start = found
+        stderr = stderr[:start]
     if err is not None:
         err.write(stderr)
     if error is not None:
@@ -115,12 +117,36 @@ def finish_run(status: int, stderr: str, err: TextIO | None) -> int:
     return status
 
 
-def parse_error(stderr: str) -> EllaError | None:
-    """The "line:column: message" run-time error at the end of a native program's standard error, if there is one.
+PLACE = r"(?:([^\n:]+):)?(\d+):(\d+)"  # line:column, or file:line:column in a module other than the entry file
+CALL = re.compile(rf"  called at {PLACE}(?: in (.*))?")
+CAUSE = re.compile(rf"  caused by {PLACE}: (.*)")
 
-    An error in a module other than the entry file starts with its file: `geo/poly.ella:3:5: ...`.
+
+def parse_error(stderr: str) -> tuple[EllaError, int] | None:
+    """The run-time error at the end of a native program's standard error, if there is one, and where it starts.
+
+    It is "line:column: message", then its causes and stack trace (EllaError.format).
+    An error in a module other than the entry file starts with its file:
+    `geo/poly.ella:3:5: ...`.
     """
-    match = re.search(r"(?:^|\n)(?:([^\n:]+):)?(\d+):(\d+): ([^\n]*)\n?\Z", stderr)
+    match = re.search(rf"(?:^|\n)({PLACE}: ([^\n]*)((?:\n  [^\n]*)*))\n?\Z", stderr)
     if match is None:
         return None
-    return EllaError(match[4], Span(int(match[2]), int(match[3]), match[1] or ""))
+    error = EllaError(match[5], place(match[2], match[3], match[4]))
+    error.trace = []
+    for line in match[6].splitlines()[1:]:
+        if line == "  called to finalize a value":
+            error.trace.append(CallSite(Span(0, 0), ""))
+        elif omitted := re.fullmatch(r"  \.\.\. (\d+) more calls", line):
+            error.omitted = int(omitted[1])
+        elif call := CALL.fullmatch(line):
+            error.trace.append(CallSite(place(call[1], call[2], call[3]), call[4] or ""))
+        elif cause := CAUSE.fullmatch(line):
+            error.causes.append((place(cause[1], cause[2], cause[3]), cause[4]))
+        else:
+            return None
+    return error, match.start(1)
+
+
+def place(file: str | None, line: str, column: str) -> Span:
+    return Span(int(line), int(column), file or "")

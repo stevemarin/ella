@@ -17,8 +17,9 @@ constructors as values, a larger prelude with a hash map, prelude error
 locations, and warnings for unused parameters and functions, then modules
 and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
-and iterators, then direct calls, inlining and register allocation).
-`make check` passes (1182 tests, ruff, strict mypy).
+and iterators, then direct calls, inlining and register allocation, then
+stack traces, errors with causes and locations, and `main` giving a
+`Result`). `make check` passes (1234 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -32,7 +33,7 @@ and iterators, then direct calls, inlining and register allocation).
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
 | Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]`; lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
-| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
+| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
 Rough speed, from `fib(35)` (about 30 million calls, test/benchmarks):
 the native executable takes 0.09 s, about 2× slower than C at `gcc -O0`
@@ -64,9 +65,6 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   compares with `==`, by its inner fields.
 - `sum` takes a start value (`sum(xs, 0)`): a generic function has no way
   to make the zero of a `Num` type.
-- A run-time error inside library code gives a location in the library
-  (`<std>/maps.ella:14:13: precondition failed: key in m` for a missing
-  key), not the program's line that called it; that needs stack traces.
 - `upper` and `lower` only change ASCII letters; the rest of Unicode would
   need case tables in the runtime.
 - Missing math: `tan`, `atan2`, `log10`, `f64` powers other than `**`,
@@ -128,7 +126,6 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   their meaning, so they can't be ordinary methods.
 - No generic computed types (`new_struct` makes non-generic structs only),
   and types can't be spliced into struct definitions.
-- `Error` holds only a message; no location or cause.
 
 ### Memory model
 
@@ -193,7 +190,6 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - No formatter, REPL or debugger support (no DWARF line info in native code).
 - The benchmarks (test/benchmarks) check output and memory, not speed;
   `make bench` shows the times, which are for watching by hand.
-- Run-time errors show one location, with no stack trace.
 
 ## Quick wins
 
@@ -323,11 +319,30 @@ Small steps that build on the above:
    that a key type can hash itself without building its text.
 2. Take a top-level function's missing types from its `let`'s declared
    type: `let inc: (i64) -> i64 = (x) => x + 1`.
-3. Report the program's call site for errors inside library code: a
-   one-entry stack trace, a first step to roadmap idea 4.
-4. A way for generic code to make the zero of a `Num` type, so that
+3. A way for generic code to make the zero of a `Num` type, so that
    `sum(xs)` needs no start value.
-5. Warnings for unused methods, enum variants and top-level variables.
+4. Warnings for unused methods, enum variants and top-level variables.
+
+### Done (2026-11-02, ninth round): errors and diagnostics
+
+1. Run-time errors print a stack trace in every backend, byte for byte
+   the same: each call in progress, innermost first, where it is and in
+   which function (`called at 10:44 in pick`), with the middle of a long
+   one left out. Every call records its site at its call depth (natively,
+   in `ella_trace`, which costs a store per call); an IR call's `within`
+   names its function even after inlining. Inside library code, the trace
+   shows the program's line that called it.
+2. `Error` has a `cause` and where it was made (`at`): `Error(message)`
+   or `Error(message, cause)`, and library functions make theirs where
+   they are called. `==` and the text form leave out `at`, and patterns
+   may leave out the last fields.
+3. `main` may give `Result[(), E]` or `Result[i64, E]`, so it can use
+   `?`; an `Err` stops the program with its error, an `Error` reported at
+   its `at` with a line for each cause.
+4. Fixes found on the way: a library function used as a value reported
+   its errors at its first use in the IR (now at its call, as the AST
+   interpreter does), and the AST interpreter allowed one more nested call
+   from the top-level code than the other backends.
 
 ### Done (2026-11-02, eighth round): a faster back end
 
@@ -428,10 +443,9 @@ invariant code, keeping a range loop's counter without `index`).
 
 ### 4. Error handling and diagnostics
 
-Give `Error` a location and an optional cause, add stack traces for run-time
-errors in all backends (the IR knows each call's span), and let `main`
-return a `Result` or an exit code. Together with the exhaustiveness
-checking that exists now, this makes failures much easier to understand.
+Done: stack traces, `Error` with a cause and location, and `main` giving a
+`Result` (ninth round, above). What's left is for tools: source lines in
+traces, and DWARF line info so that native programs can be debugged.
 
 ### 5. Views without copying
 
