@@ -52,7 +52,8 @@ Values are references to objects, and reading a variable doesn't copy. So
 for each boxed value, the lowering tracks two things (`Info`):
 
 * what it *borrows*: the variables whose objects it may share. A value read
-  from `xs`, or an item of it, borrows `xs`. A new object borrows nothing.
+  from `xs`, an item of it, or a slice of it (a *view* that shares its
+  items, docs/memory-model.md §18) borrows `xs`. A new object borrows nothing.
 * how long it *lives*: a region that every object in it outlives.
 
 A value is copied when it is stored (in a variable, a list, a returned
@@ -143,6 +144,7 @@ from ella.checker import (
     substitute,
 )
 from ella.ir import (
+    VIEWS,
     Block,
     Branch,
     Constant,
@@ -613,6 +615,14 @@ class Lowerer:
             elif self.slots[borrowed].name in changed:
                 return self.copy(value, self.here(), span)
         return value
+
+    def view_of(self, value: Value, region: str) -> Info:
+        """What is known about a view of a list's items or a string's characters, made in `region`.
+
+        It shares what the list or string shares, and lives no longer than its items (docs/memory-model.md §18).
+        """
+        info = self.info_of(value)
+        return Info(info.borrows, shortest(region, info.lives))
 
     def merge(self, values: list[Value], region: str) -> Info:
         """What is known about a new object in `region` that holds `values`."""
@@ -1257,9 +1267,12 @@ class Lowerer:
         return self.emit(BINARY_OPS[op], t, [a, b], span, region=region)
 
     def lower_index(self, container: Value, index: Value, t: Type, span: Span, dest: str) -> Value:
-        """`xs[i]` is an item already in the list; `s[i]` makes a new string, and a slice a new list or string."""
+        """`xs[i]` is an item already in the list; `s[i]` makes a new string, and a slice a view of the items."""
         if index.type == RANGE:
-            return self.emit("slice", t, [container, index], span, region=dest or self.here())
+            region = dest or self.here()
+            result = self.emit("slice", t, [container, index], span, region=region)
+            self.info[result.id] = self.view_of(container, region)
+            return result
         result = self.emit("index", t, [container, index], span, region=dest or self.here())
         if isinstance(container.type, ListTy):
             self.info[result.id] = self.info_of(container)
@@ -1531,9 +1544,12 @@ class Lowerer:
             # finalizers).
             return self.emit("alloc", self.type_of(expr), [pool, *values], span)
         if name in LIBRARY:
-            # Its result is all new objects, made where they are wanted.
+            # Its result is new objects, made where they are wanted, or views of its first argument.
             values = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
-            result = self.emit("builtin", self.type_of(expr), values, span, name, region=dest or self.here())
+            region = dest or self.here()
+            result = self.emit("builtin", self.type_of(expr), values, span, name, region=region)
+            if name in VIEWS:
+                self.info[result.id] = self.view_of(values[0], region)
             if result.type == NEVER:  # exit() doesn't return
                 self.block.terminator = Trap(f"{name}() returned", None, span)
                 return self.leave(span)
@@ -1568,14 +1584,20 @@ class Lowerer:
     def library_function(self, name: str, t: FuncTy, span: Span) -> str:
         """The IR function for a library function used as a value, such as `trim(str)` or `abs(f64)`.
 
-        It only calls the library function, with its result made where the caller wants it.
+        It only calls the library function, with its result made where the caller wants it. A
+        function's result shares nothing with its arguments, so a view (`trim`) is copied there.
         """
         label = f"{name}({', '.join(show_type(param) for param in t.params)})"
         if label not in self.module.functions:
             params = [Value(i, param) for i, param in enumerate(t.params)]
             result = Value(len(params), t.result)
-            call = Instr("builtin", result, list(params), span, name, region="result" if is_boxed(t.result) else "")
-            entry = Block("entry", params, [call], Return(result))
+            region = "" if not is_boxed(t.result) else "0" if name in VIEWS else "result"
+            instrs = [Instr("builtin", result, list(params), span, name, region=region)]
+            if name in VIEWS:
+                copied = Value(len(params) + 1, t.result)
+                instrs.append(Instr("copy", copied, [result], span, region="result"))
+                result = copied
+            entry = Block("entry", params, instrs, Return(result))
             self.module.functions[label] = Function(label, t.result, span, [entry])
         return label
 

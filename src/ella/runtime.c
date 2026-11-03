@@ -26,19 +26,29 @@
 
 typedef int64_t word;
 
-// A string, as Unicode code points, so indexing and len() are simple.
+// A string, as Unicode code points, so indexing and len() are simple. Its
+// characters follow the header, unless it is a *view* (docs/memory-model.md
+// §18): a slice whose characters are part of another string's.
 typedef struct {
     word len;
-    uint32_t chars[];
+    uint32_t *chars;
 } Str;
 
-// A list or a tuple: a length and that many words. A list may have room
-// for more items after them: `cap` is how many fit. (A tuple's is its length.)
+// A list: a length, and a pointer to that many words. Its items follow the
+// header, with room for `cap` of them, unless it is a view of another list's
+// items, with `cap` 0.
+typedef struct {
+    word len;
+    word cap;
+    word *items;
+} List;
+
+// A tuple: a length and that many words, in the object. (`cap` is its length.)
 typedef struct {
     word len;
     word cap;
     word items[];
-} List;
+} Tuple;
 
 // `start..stop`, with `stop` excluded. `stop` is 128 bits wide because
 // `0..=9223372036854775807` stops one past the largest i64.
@@ -453,7 +463,16 @@ word ella_pow_f64(word a_bits, word b_bits) {
 static Str *str_alloc(word len, word depth) {
     Str *s = alloc(sizeof(Str) + (size_t)len * sizeof(uint32_t), depth);
     s->len = len;
+    s->chars = (uint32_t *)(s + 1);
     return s;
+}
+
+// Characters start..stop of s, shared: a view (made in the arena at `depth`).
+static Str *str_view(const Str *s, word start, word stop, word depth) {
+    Str *view = alloc(sizeof(Str), depth);
+    view->len = stop - start;
+    view->chars = s->chars + start;
+    return view;
 }
 
 Str *ella_str_concat(const Str *a, const Str *b, word depth) {
@@ -487,12 +506,19 @@ word ella_str_contains(const Str *haystack, const Str *needle) {
     return 0;
 }
 
-// Lists (and tuples, which have the same layout)
+// Lists and tuples
 
 List *ella_list_alloc(word len, word depth) {
     List *xs = alloc(sizeof(List) + (size_t)len * sizeof(word), depth);
     xs->len = xs->cap = len;
+    xs->items = (word *)(xs + 1);
     return xs;
+}
+
+Tuple *ella_tuple_alloc(word len, word depth) {
+    Tuple *t = alloc(sizeof(Tuple) + (size_t)len * sizeof(word), depth);
+    t->len = t->cap = len;
+    return t;
 }
 
 List *ella_list_concat(const List *a, const List *b, word depth) {
@@ -579,12 +605,20 @@ word ella_copy(word v, const Type *t, word depth) {
         *copy = *r;
         return (word)copy;
     }
-    case K_LIST:
-    case K_TUPLE: {
+    case K_LIST: {
         const List *xs = (const List *)v;
         List *copy = ella_list_alloc(xs->len, depth);
+        const Type *item = t->parts[0];
         for (word i = 0; i < xs->len; i++) {
-            const Type *item = t->kind == K_LIST ? t->parts[0] : t->parts[i];
+            copy->items[i] = is_boxed(item) ? ella_copy(xs->items[i], item, depth) : xs->items[i];
+        }
+        return (word)copy;
+    }
+    case K_TUPLE: {
+        const Tuple *xs = (const Tuple *)v;
+        Tuple *copy = ella_tuple_alloc(xs->len, depth);
+        for (word i = 0; i < xs->len; i++) {
+            const Type *item = t->parts[i];
             copy->items[i] = is_boxed(item) ? ella_copy(xs->items[i], item, depth) : xs->items[i];
         }
         return (word)copy;
@@ -619,8 +653,8 @@ word ella_copy(word v, const Type *t, word depth) {
 word ella_move(word v, const Type *t, word depth) {
     switch (t->kind) {
     case K_TUPLE: {
-        const List *xs = (const List *)v;
-        List *moved = ella_list_alloc(xs->len, depth);
+        const Tuple *xs = (const Tuple *)v;
+        Tuple *moved = ella_tuple_alloc(xs->len, depth);
         for (word i = 0; i < xs->len; i++) moved->items[i] = ella_move(xs->items[i], t->parts[i], depth);
         return (word)moved;
     }
@@ -899,8 +933,9 @@ static void free_gen(word object) {
 
 // `xs += ys`: add copies of ys's items to xs, which lives in the arena at
 // `depth`, and return xs, which may have moved. If xs is the last object in
-// its arena, it grows in place; otherwise it moves to a new home with room
-// for twice as many items. Either way, adding an item costs O(1) on average.
+// its arena (and not a view), it grows in place; otherwise it moves to a new
+// home with room for twice as many items. Either way, adding an item costs
+// O(1) on average.
 List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
     if (depth < 0) depth = ella_region_of((word)xs);  // @slot: the arena xs is in
     word n = ys->len, len = xs->len;  // ys may be xs, so read its length first
@@ -909,7 +944,7 @@ List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
         if (cap < 4) cap = 4;
         Arena *a = arena(depth);
         char *end = (char *)xs + round16(sizeof(List) + (size_t)xs->cap * sizeof(word));
-        if (end == a->top) {
+        if (end == a->top && xs->items == (word *)(xs + 1)) {
             char *new_end = (char *)xs + round16(sizeof(List) + (size_t)cap * sizeof(word));
             size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : scope_size;
             if ((size_t)(new_end - arena_start(depth)) > limit) out_of_memory("an arena is full");
@@ -919,6 +954,7 @@ List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
             xs->cap = cap;
         } else {
             List *moved = alloc(sizeof(List) + (size_t)cap * sizeof(word), depth);
+            moved->items = (word *)(moved + 1);
             memcpy(moved->items, xs->items, (size_t)len * sizeof(word));
             moved->len = len;
             moved->cap = cap;
@@ -958,7 +994,7 @@ word ella_equal(word a, word b, const Type *t) {
         return 1;
     }
     case K_TUPLE: {
-        const List *x = (const List *)a, *y = (const List *)b;
+        const Tuple *x = (const Tuple *)a, *y = (const Tuple *)b;
         for (word i = 0; i < t->count; i++) {
             if (!ella_equal(x->items[i], y->items[i], t->parts[i])) return 0;
         }
@@ -1162,7 +1198,7 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
         break;
     }
     case K_TUPLE: {
-        const List *xs = (const List *)v;
+        const Tuple *xs = (const Tuple *)v;
         put(b, '(');
         for (word i = 0; i < t->count; i++) {
             if (i) put_ascii(b, ", ");
@@ -1265,7 +1301,9 @@ _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word 
     exit(1);
 }
 
-// Slices: `xs[a..b]` and `s[a..b]`, new lists (of copies of the items) and strings.
+// Slices: `xs[a..b]` and `s[a..b]`, views of the list's items or the
+// string's characters (docs/memory-model.md §18). The compiler copies them
+// where sharing could be seen.
 
 static void check_slice(const Range *r, word len, const char *what, word line, word column) {
     if (0 <= r->start && r->start <= r->stop && r->stop <= len) return;
@@ -1288,17 +1326,16 @@ static Str *substring(const Str *s, word start, word stop, word depth) {
 
 Str *ella_str_slice(const Str *s, const Range *r, word line, word column, word depth) {
     check_slice(r, s->len, "str", line, column);
-    return substring(s, r->start, (word)r->stop, depth);
+    return str_view(s, r->start, (word)r->stop, depth);
 }
 
-List *ella_list_slice(const List *xs, const Range *r, const Type *item, word line, word column, word depth) {
+List *ella_list_slice(const List *xs, const Range *r, word line, word column, word depth) {
     check_slice(r, xs->len, "list", line, column);
-    List *part = ella_list_alloc((word)r->stop - r->start, depth);
-    for (word i = 0; i < part->len; i++) {
-        word x = xs->items[r->start + i];
-        part->items[i] = is_boxed(item) ? ella_copy(x, item, depth) : x;
-    }
-    return part;
+    List *view = alloc(sizeof(List), depth);
+    view->len = (word)r->stop - r->start;
+    view->cap = 0;
+    view->items = xs->items + r->start;
+    return view;
 }
 
 // The library: built-in functions with fixed types, which must behave
@@ -1558,6 +1595,7 @@ word ella_lib_args(word line, word column, word depth) {
     return (word)args;
 }
 
+// split and trim give views of s's characters (the compiler knows).
 word ella_lib_split(const Str *s, const Str *separator, word line, word column, word depth) {
     if (separator->len == 0) fail(line, column, "split() needs a separator that isn't empty");
     word count = 1;
@@ -1573,14 +1611,14 @@ word ella_lib_split(const Str *s, const Str *separator, word line, word column, 
     word start = 0, k = 0;
     for (word i = 0; i < s->len;) {
         if (matches_at(s, i, separator)) {
-            parts->items[k++] = (word)substring(s, start, i, depth);
+            parts->items[k++] = (word)str_view(s, start, i, depth);
             i += separator->len;
             start = i;
         } else {
             i++;
         }
     }
-    parts->items[k] = (word)substring(s, start, s->len, depth);
+    parts->items[k] = (word)str_view(s, start, s->len, depth);
     return (word)parts;
 }
 
@@ -1642,7 +1680,7 @@ Str *ella_lib_trim(const Str *s, word line, word column, word depth) {
     word start = 0, stop = s->len;
     while (start < stop && is_space(s->chars[start])) start++;
     while (stop > start && is_space(s->chars[stop - 1])) stop--;
-    return substring(s, start, stop, depth);
+    return str_view(s, start, stop, depth);
 }
 
 List *ella_lib_chars(const Str *s, word line, word column, word depth) {

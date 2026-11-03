@@ -537,11 +537,11 @@ class CodeGen:
     # Constants
 
     def string(self, text: str) -> Label:
-        """A static Ella string: its length, then its code points."""
+        """A static Ella string: its length and where its code points are, which is right after them."""
         if text not in self.strings:
             label = Label(f".Lstr{len(self.strings)}")
             self.strings[text] = label
-            self.rodata += ["    .balign 8", f"{label}:", f"    .quad {len(text)}"]
+            self.rodata += ["    .balign 8", f"{label}:", f"    .quad {len(text)}, {label} + 16"]
             if text:
                 self.rodata.append("    .long " + ", ".join(str(ord(c)) for c in text))
         return self.strings[text]
@@ -703,10 +703,12 @@ class CodeGen:
                 self.call_c(f"ella_{op}", args[0], args[1], Region(instr.region))
                 self.store(dest)
             case "tuple" | "list":
-                self.call_c("ella_list_alloc", len(args), Region(instr.region))
+                # A list's items follow its length, capacity and pointer to them; a tuple's its length and capacity.
+                self.call_c(f"ella_{op}_alloc", len(args), Region(instr.region))
+                start = 24 if op == "list" else 16
                 for i, item in enumerate(args):
                     self.load("rdx", item)
-                    self.emit(f"mov qword ptr [rax + {16 + 8 * i}], rdx")
+                    self.emit(f"mov qword ptr [rax + {start + 8 * i}], rdx")
                 self.store(dest)
             case "tuple_get":
                 self.load("rax", args[0])
@@ -728,9 +730,7 @@ class CodeGen:
                 self.call_c("ella_str_slice", args[0], args[1], line, column, Region(instr.region))
                 self.store(dest)
             case "slice":
-                assert isinstance(args[0].type, ListTy)
-                item_type = self.type_descriptor(args[0].type.element)
-                self.call_c("ella_list_slice", args[0], args[1], item_type, line, column, Region(instr.region))
+                self.call_c("ella_list_slice", args[0], args[1], line, column, Region(instr.region))
                 self.store(dest)
             case "builtin":
                 # Library functions take their arguments, the call's place for errors, and where the result goes.

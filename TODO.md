@@ -435,11 +435,14 @@ checking that exists now, this makes failures much easier to understand.
 
 ### 5. Views without copying
 
-memory-model §12 calls zero-copy views awkward. Generators and the `next`
-protocol are done (above); slices that borrow their list for a single
-expression or loop, and second-class references in loops, would remove
-many copies, and the copy of a list that an iterator over it holds. This
-touches the memory model's core, so it is a design project first.
+Partly done: slices, `trim` and `split` are views in compiled code
+wherever the lowering's borrow analysis shows no one could tell
+(memory-model §18). Still open: views that are kept (a struct, iterator
+or generator holding a slice, which gets a copy; memory-model §4), the
+copy of a list that an iterator over it holds, and a loop that carries a
+slice of its own variable (`rest = rest[1..n]`), which copies each time.
+Views made list and string headers bigger (memory-model §18, Results);
+inlining `ella_list_index` in codegen would win back the extra load.
 
 ### 6. SIMD and narrower number types
 

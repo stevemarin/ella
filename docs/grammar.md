@@ -721,7 +721,9 @@ returns `None`. The enclosing function's return type must be compatible.
   string of those items: `"hello"[1..3]` is `"el"`, `xs[0..=1]` the first
   two items (copies of them). The range must be in order and within the
   value: `0 <= a <= b <= len(xs)`, or it is a run-time error. A slice
-  can't be assigned to.
+  can't be assigned to. (Compiled code shares the items instead of copying
+  them wherever no program could tell; see
+  [memory-model.md §18](memory-model.md#18-views).)
 
 ## 9. Types
 

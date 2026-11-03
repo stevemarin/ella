@@ -36,6 +36,12 @@ strings from arena 3 is tagged with arena 3.) The interpreter checks that
 A failed check is a bug in the compiler, reported as a run-time error that
 starts with "memory check failed".
 
+A slice is a view (docs/memory-model.md §18): natively, it shares its
+list's items or its string's characters, so it is tagged like them. Here
+it is a copy, but a list's view (`View`) remembers its list, and every use
+of it checks that the items it shares haven't changed since it was made,
+which natively would show.
+
 A loop that carries values (docs/memory-model.md §6) has two arenas that
 take turns, so which depth a level is at changes as it runs: each frame
 keeps the current depth of each such loop's level and of its carried
@@ -73,6 +79,7 @@ from typing import TextIO
 
 from ella.checker import EnumTy, ListTy, check_code
 from ella.ir import (
+    VIEWS,
     Block,
     Branch,
     Function,
@@ -125,9 +132,33 @@ PYTHON_FRAMES_PER_CALL = 10
 type Tag = tuple[int, int] | None
 
 SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
+STR_VIEW = 16  # bytes of a string's view: its length and where its characters are
+LIST_VIEW = 32  # a list's: its length, capacity (0) and where its items are, rounded up
 POOL = "<pool>"  # the finalizer of a pool: free its values
 ARENA = "<arena>"  # the finalizer of an arena: free its slot arena
 GEN = "<gen>"  # the finalizer of a generator: free its levels
+
+
+class View(list[Value]):
+    """A slice of a list: a copy of items start, start + 1, ... of `base`, which natively it shares.
+
+    Its base is None once it changes in place (natively it moves to a home of its own).
+    """
+
+    __slots__ = ("base", "start")
+
+    def __init__(self, base: list[Value], start: int, stop: int) -> None:
+        super().__init__(base[start:stop])
+        self.base: list[Value] | None = base
+        self.start = start
+
+    def check(self, span: Span) -> None:
+        """Check that the items this view shares are still the same."""
+        if self.base is None:
+            return
+        stop = self.start + len(self)
+        if len(self.base) < stop or any(a is not b for a, b in zip(self, self.base[self.start : stop])):
+            raise EllaError("memory check failed: a view's list changed while the view was in use", span)
 
 
 def run_ir(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
@@ -522,8 +553,10 @@ class IRInterpreter:
         args = [frame.values[a.id] for a in instr.args]
         tags = [frame.tags.get(a.id) for a in instr.args]
         span = instr.span
-        for arg, arg_tag in zip(instr.args, tags):
+        for arg, arg_tag, value in zip(instr.args, tags, args):
             self.check_alive(arg_tag, str(arg), span)
+            if isinstance(value, View):
+                value.check(span)
         result: Value = UNIT
         tag: Tag = None
         if instr.region == "slot":
@@ -580,19 +613,28 @@ class IRInterpreter:
                     if isinstance(container, list):
                         tag = tags[0]  # an item of a list is in the list; a string's is a new string
             case "slice":
+                # A view: a new header, sharing the items.
                 container, part = args
                 assert isinstance(container, list | str) and isinstance(part, range)
-                result = copy_value(slice_of(container, part, span))
-                tag = self.allocate(depth, deep_size(result), instr, frame)
+                result = slice_of(container, part, span)
+                if isinstance(container, list):
+                    result = View(container, part.start, part.stop)
+                size = LIST_VIEW if isinstance(result, View) else STR_VIEW
+                tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
             case "builtin":
                 result = call_library(instr.name, args, span, self.host)
-                if allocates(instr):
+                if instr.name in VIEWS:  # views of the first argument's characters
+                    size = shallow_size(result) + STR_VIEW * len(result) if isinstance(result, list) else STR_VIEW
+                    tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
+                elif allocates(instr):
                     tag = self.allocate(depth, deep_size(result), instr, frame)
             case "set_index":
                 container, i, item = args
                 index_into(container, i, span)  # check that the index is in range
                 assert isinstance(container, list) and isinstance(i, int)
                 container[i] = self.store_in(item, tags[0], tags[2], depth, instr, frame)
+                if isinstance(container, View):
+                    container.base = None
             case "set_field":
                 struct, item = args
                 assert isinstance(struct, VariantValue)
@@ -604,6 +646,8 @@ class IRInterpreter:
                 copies = [copy_value(item) for item in new_items]
                 size = 8 * len(copies) + sum(deep_size(item) for item in copies)
                 items.extend(copies)  # the items may be the same list as new_items: copy them first
+                if isinstance(items, View):
+                    items.base = None
                 result, tag = items, self.shortest(tags[0], self.allocate(depth, size, instr, frame))
             case "copy":
                 result = copy_value(args[0])
@@ -875,11 +919,18 @@ def round16(size: int) -> int:
 
 
 def shallow_size(value: Value) -> int:
-    """About how many bytes native code uses for one object (not counting the objects it refers to)."""
+    """About how many bytes native code uses for one object (not counting the objects it refers to).
+
+    A list's view is only its header. (A string doesn't say if it is a view: see STR_VIEW.)
+    """
     match value:
         case str():
-            return round16(8 + 4 * len(value))
-        case list() | tuple():
+            return round16(16 + 4 * len(value))
+        case View():
+            return LIST_VIEW
+        case list():
+            return round16(24 + 8 * len(value))
+        case tuple():
             return round16(16 + 8 * len(value))
         case range():
             return 32

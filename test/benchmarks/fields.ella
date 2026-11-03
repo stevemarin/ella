@@ -1,0 +1,15 @@
+# Text cut into fields: `split`, `trim` and string slices, read but never
+# kept, so none of them needs its own copy of the characters.
+let mut parts: [str] = []
+for i in 0..20000
+    parts += ["  field{{i % 97}} "]
+let text = join(parts, ",")
+let mut total = 0
+let mut prefixed = 0
+for _ in 0..20
+    for part in split(text, ",")
+        let field = trim(part)
+        if field[0..5] == "field" then
+            prefixed += 1
+            total += len(field[5..len(field)])
+print(prefixed, total)

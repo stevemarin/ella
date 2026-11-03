@@ -118,8 +118,8 @@ Operations
     tuple a, b, ...              build a tuple; `tuple_get t, n` reads item n
     list a, b, ...               build a list
     index c, i                   item i of a list,string (a 1-char string) or range
-    slice c, r @r                items r.start up to r.stop of a list (copies of them) or
-                                 string, as a new one
+    slice c, r @r                a view of items r.start up to r.stop of a list or string:
+                                 a new header in @r that shares c's items (or characters)
     set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
     append xs, ys @r             xs with copies of ys's items added, growing xs in place
                                  if it can; xs lives in region r and isn't used again
@@ -162,8 +162,9 @@ Operations
     reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
     len c                        length of a list, string or range, or a pool's or arena's count
     builtin a, ... @r            a library function (in `name`), such as split(a, b),
-                                 whose result is all new objects (ella.library); abs,
-                                 min and max take i64s or f64s
+                                 whose result is new objects in @r (ella.library), or
+                                 for those in VIEWS views of a's characters; abs, min
+                                 and max take i64s or f64s
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
     eprint v                     the same, to standard error
@@ -373,6 +374,10 @@ class Module:
 
 
 # Memory
+
+# Library functions whose results are views (docs/memory-model.md §18): `trim`
+# gives a view of its argument's characters, and `split` a new list of views.
+VIEWS = frozenset({"trim", "split"})
 
 # Operations that make a new object, and so name a region (when their result is boxed).
 ALLOCATING = frozenset(

@@ -138,13 +138,15 @@ plain:
   and docs/memory-model.md §14). A loop that gives outer variables new
   values carries them in two arenas that take turns (`swap`, `carry`;
   memory-model.md §16), and `x = y` moves y at its last use in its block.
+  A slice (and `trim`, `split`: `VIEWS` in ella.ir) is a view sharing its
+  list's items, borrowing what the list borrows (memory-model.md §18).
   Generic functions are specialized per type arguments, and so are methods
   (functions named `Type.method`); operators on structs with methods like
   `add` become calls.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
-  ("memory check failed" means a compiler bug), and keeps the `--profile`
-  numbers. It builds run-time code and lowers it into the module for `run`.
+  ("memory check failed" means a compiler bug; a list's view, `View`, checks
+  its list's items haven't changed), and keeps the `--profile` numbers. It builds run-time code and lowers it into the module for `run`.
 * `src/ella/passes/`: optimization passes, one module each (`mem2reg`,
   `direct`, `moves`, `fold`, `simplify`, `dce`, `inline`), each
   `pass(function, module) -> bool` (changed?).
@@ -171,9 +173,11 @@ plain:
   its low 32 bits, for errors in modules.
 * `src/ella/runtime.c`: the C runtime linked into native programs. It must
   match `operators.py` and `values.py` exactly, including error messages and
-  float formatting (Python's `repr`). Objects live in arenas, all in one
-  reserved address range (so an object's arena follows from its address),
-  bump allocated, freed by scope or pool slot, with finalization lists.
+  float formatting (Python's `repr`). A list's or string's header points
+  at its items (right after it, or another's in a view); a tuple's are in
+  it. Objects live in arenas, all in one reserved address range (so an
+  object's arena follows from its address), bump allocated, freed by scope
+  or pool slot, with finalization lists.
 * `src/ella/native.py`: builds executables with gcc (the compiled runtime is
   cached in the temp directory) and runs them (`run_native`, which sets
   `ELLA_POISON` so freed arena memory is overwritten).

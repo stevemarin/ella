@@ -13,7 +13,8 @@ and [what stage 7 built](#15-what-stage-7-built) describe the
 implementation, and where it settles or departs from this design, and
 [loops that carry values](#16-loops-that-carry-values) how region bloat
 is avoided. [Generators](#17-generators) describes how a suspended
-function keeps its variables and arenas.
+function keeps its variables and arenas, and [views](#18-views) how
+slices share their list's items instead of copying them.
 
 The rest of this document is the design, recorded so an implementation can
 start from it without repeating the discussion. Items marked
@@ -130,11 +131,14 @@ returned.
 
 ### Known limitation
 
-Zero-copy views (a parser holding a slice of its input, an iterator holding
-its collection) cannot be expressed with second-class references. For now,
-copy, or use index pairs such as `(start, len)`. Swift's experience suggests
-a limited storable reference ("this value depends on parameter X") may be
-needed later. Leave room in the syntax for it, but don't design it yet.
+Views that a program keeps (a parser holding a slice of its input, an
+iterator holding its collection) cannot be expressed with second-class
+references. Slices are views where the compiler can tell no one could see
+the difference (§18), but a struct or generator holding one gets a copy.
+For now, copy, or use index pairs such as `(start, len)`. Swift's
+experience suggests a limited storable reference ("this value depends on
+parameter X") may be needed later. Leave room in the syntax for it, but
+don't design it yet.
 
 ## 5. Storage classes
 
@@ -375,9 +379,10 @@ Out of scope for now. The intended direction:
 
 ## 12. Known drawbacks (accepted for now)
 
-* Zero-copy views are awkward (§4), and so is an iterator over a list,
-  which holds a copy of it (or the list itself, when nothing changes it).
-  A generator over a list copies it in once (§17).
+* Views that are kept are awkward (§4): a slice is only a view while it
+  is used where its list lives (§18), and an iterator over a list holds a
+  copy of it (or the list itself, when nothing changes it). A generator
+  over a list copies it in once (§17).
 * Copy costs are not visible in the source. Mitigated by the move
   optimization, and later by placement and copy reports.
 * Long-running programs (event loops, servers) keep much of their state in
@@ -788,7 +793,7 @@ The benchmarks in [test/benchmarks](../test/benchmarks) (`make bench`)
 measure it; each has a bound on its arena peak that the tests check.
 
 | Benchmark | Arena peak before | After | Time before | After |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `string_build` (3,000 strings) | 18,048,160 B | 24,128 B | 9.0 ms | 0.9 ms |
 | `tuple_replace` | 2,285,824 B | 256 B | 2.4 ms | 2.3 ms |
 | `list_replace` | 4,800,080 B | 176 B | 2.6 ms | 1.3 ms |
@@ -820,8 +825,10 @@ region like any result. The other is the body, a *generator function*
 (`Function.generator`), which `resume g` runs until the next `yield`
 terminator:
 
+```ella
     yield %value, target(args)    give %value to resume's caller; the next
                                   resume continues at target(args)
+```
 
 The body's result is `Optional[T]`: each `yield value` gives
 `Some(value)`, made in the caller's `@result`. After the end of the body,
@@ -859,3 +866,89 @@ body on a thread of its own, handing control back and forth at `next` and
 `yield`, with an owner stack (§15) of its own; finalizing a `Gen` that is
 suspended finalizes its owners, innermost first, and then ends its thread
 without running anything more.
+
+## 18. Views
+
+A slice, `xs[a..b]` or `s[a..b]`, means a new list or string
+([grammar.md §8](grammar.md#indexing-and-ranges)), and the interpreters
+make one. Compiled code makes a *view* instead: a small header that points
+into the items of the list or string it was taken from. Copying stays the
+semantics (§3); a view is an optimization the program can't see, like a
+move. `trim` and the items of `split` are views of their argument too.
+
+### Representation
+
+A list's or string's header points at its items, which usually follow it
+in the same object:
+
+    List   len, cap, items*    then cap items, if it isn't a view
+    Str    len, chars*         then len characters, if it isn't a view
+
+A view is just such a header whose pointer goes into another object's
+items, with `cap = 0`. Every operation reads through the pointer, so it
+works the same on a view (one more load than items right after the
+length). A list that grows can only grow in place if its items follow it,
+so appending to a view always moves it to a new home, as appending to a
+full list does. Tuples keep their items in the object (`len, cap, items`),
+since nothing slices a tuple. String constants are static headers
+pointing at their static characters.
+
+### When a view is safe
+
+The lowering already knows, for each value, what it *borrows* and how long
+it *lives* (§14), and copies a value when storing it would let a change
+show or let it outlive its objects. A view borrows what its list or
+string borrows, and lives as long as the shorter-lived of its header (made
+where the slice is wanted, like any new object) and its items. The usual
+rules then copy it (into a real list or string) exactly when needed:
+
+* when it is stored into a `mut` variable, or its list's variable is
+  changed in place (`xs[i] = v`, `xs += ys`, `mut xs`) while it is alive,
+  which could show a change; strings never change in place, so a string
+  view is never copied for this;
+* when it is stored somewhere it would outlive the items, such as a slice
+  made in a loop of a list made in that loop, stored in a variable outside
+  it;
+* when it is returned, unless its items live in the caller's arena
+  already: a function's result is all new objects (the `moves` pass counts
+  on it), and a parameter's items are the caller's;
+* when a loop carries it: a carried variable only holds values whose
+  objects are all in the iteration's arena or outside the loop (§16), so
+  `rest = rest[1..n]` still copies, and `carry` can still look at the top
+  object only.
+
+A slice of a new list (a call's result, say) points into that list, made
+in the current level. When the view is kept somewhere longer-lived, it is
+copied there, rather than the whole list being made there, so a small
+slice of a big temporary list never keeps the big list alive.
+
+Values put in pools and arenas, and generators' arguments, are copied as
+before, and copying a view gives a list or string of its own.
+
+### Checks
+
+The IR interpreter, whose lists are Python lists, still copies a slice, but
+gives it the tag of the list's arena (§14), so a view that would outlive
+its items fails the memory check. It also remembers which list a view came
+from, and checks on every use of the view that those items haven't changed
+since: a change there would show natively, where they are shared. Native
+tests set `ELLA_POISON`, so a view of freed memory reads nonsense.
+
+### Results
+
+Measured with `make bench` (the fastest of 15 runs). `halves` and `fields`
+were added for views; the others show what the bigger headers cost: a
+string's header grew from 8 to 16 bytes and a list's from 16 to 24, and
+reading an item loads the pointer to the items first.
+
+| Benchmark | Arena peak before | After | Time before | After |
+|---|---|---|---|---|
+| `halves` (slices of 100,000 numbers) | 4,250,480 B | 2,650,912 B | 43.1 ms | 25.0 ms |
+| `fields` (`split`, `trim`, slices) | 3,476,448 B | 3,156,656 B | 34.2 ms | 31.9 ms |
+| `sort` | 9,518,800 B | 9,491,776 B | 47.1 ms | 50.2 ms |
+| `map_ops` | 284,384 B | 348,928 B | 112.1 ms | 116.5 ms |
+| `words` | 4,912 B | 6,320 B | 4.2 ms | 4.0 ms |
+
+`fields` spends most of its time in `split` looking for separators, so
+views save it little time; its peak drops by the 20,000 strings each
+round no longer copies.

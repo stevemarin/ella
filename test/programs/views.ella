@@ -1,0 +1,163 @@
+# Slices share their list's items or string's characters in compiled code
+# (docs/memory-model.md §18), and are copied wherever the sharing could be
+# seen. Every case here must behave as if each slice were a new value.
+
+# A slice read while its list doesn't change, then after it changes in place.
+let mut xs = [1, 2, 3, 4, 5]
+let early = xs[1..3]
+print(early, xs[0..0], xs[0..5], xs[5..5])
+xs[1] = 20
+print(early, xs)
+xs += [6, 7, 8, 9, 10, 11, 12]
+print(early, xs[4..8])
+
+# A slice kept in a `mut` variable and changed: the list doesn't change.
+let mut part = xs[0..3]
+part[0] = 100
+part += [101]
+print(part, xs[0..3])
+
+# A slice of a new list, changed and grown.
+let numbers = (n: i64) -> [i64] =>
+    let mut out: [i64] = []
+    for i in 0..n
+        out += [i * i]
+    out
+
+let mut tail = numbers(6)[2..5]
+tail[0] = -1
+tail += [-2, -3]
+print(tail)
+
+# A slice of a slice, and appending a slice of a list to itself.
+let ys = [10, 20, 30, 40, 50, 60]
+print(ys[1..5][1..3], ys[2..6][0..0])
+let mut zs = [1, 2, 3]
+zs += zs[1..3]
+zs += zs[0..2]
+print(zs)
+
+# Read, then changed later in the same expression.
+let mut ws = [1, 2, 3]
+print((ws[0..2], (ws[0] = 5), ws[0..2]))
+
+# Returned slices: of a parameter, of a local variable, of a new list.
+let rest = (items: [i64]) -> [i64] => items[1..len(items)]
+let middle = () -> [str] =>
+    let names = ["a", "b", "c", "d"]
+    names[1..3]
+let firsts = (n: i64) -> [i64] => numbers(n)[0..2]
+
+let mut original = [7, 8, 9]
+let r = rest(original)
+original[1] = 0
+print(r, original, middle(), firsts(5), rest(rest([1, 2, 3, 4])))
+
+# Slices made in a loop, of values made in the loop, kept after it.
+let last_pair = (n: i64) -> ([i64], str) =>
+    let mut pair: [i64] = []
+    let mut word = ""
+    for i in 0..n
+        let row = [i, i + 1, i + 2]
+        pair = row[1..3]
+        let text = "word{{i}}!"
+        word = text[0..len(text) - 1]
+    (pair, word)
+
+print(last_pair(4))
+
+# Slices stored into a list, a struct and a tuple outside the loop.
+struct Holder
+    items: [i64]
+    name: str
+
+let gather = (n: i64) -> ([[i64]], Holder) =>
+    let mut found: [[i64]] = [[], []]
+    let mut holder = Holder([], "")
+    for i in 0..n
+        let row = numbers(i + 3)
+        found[i % 2] = row[1..3]
+        holder.items = row[0..2]
+        holder.name = "row {{i}}"[0..5]
+    (found, holder)
+
+print(gather(5))
+
+# A loop that carries a slice of its own variable, as a parser would.
+let words = (text: str) -> [str] =>
+    let mut rest = text
+    let mut out: [str] = []
+    while len(rest) > 0
+        let i = match find(rest, " ")
+            case Some(i) => i
+            case None => len(rest)
+        out += [rest[0..i]]
+        rest = if i < len(rest) then rest[i + 1..len(rest)] else ""
+    out
+
+print(words("the quick brown fox"))
+
+# A list of lists: changing an inner list changes the outer one in place.
+let mut grid = [[1, 2], [3, 4], [5, 6]]
+let top = grid[0..2]
+grid[0][0] = 9
+print(top, grid)
+
+# A global changed in place by a function called while a slice is alive.
+let mut counts = [0, 0, 0]
+let bump = () -> () =>
+    counts[0] += 1
+let before = counts[0..2]
+bump()
+print(before, counts)
+
+# A closure that captures a slice, and a generator given one.
+let mut base = [1, 2, 3, 4]
+let window = base[1..3]
+let show = () -> [i64] => window
+base[1] = 50
+print(show(), base)
+
+let each = (items: [i64]) -> Gen[i64] =>
+    for x in items
+        yield x * 10
+
+let mut source = [1, 2, 3]
+let mut g = each(source[0..2])
+source[0] = 99
+print(next(mut g), next(mut g), next(mut g))
+
+# A slice put in a pool, and a pool's value sliced.
+let mut pool: Pool[[i64]] = pool_new()
+let mut kept = [4, 5, 6]
+let h = alloc(mut pool, kept[0..2])
+kept[0] = 0
+print(pool[h], pool[h][1..2])
+
+# A slice of a `mut` parameter, changed afterwards.
+let shift = (mut items: [i64]) -> [i64] =>
+    let first = items[0..1]
+    items[0] = items[0] + 1
+    first
+
+let mut counter = [1, 2]
+print(shift(mut counter), counter)
+
+# Strings: slices, trim and split, kept, returned and compared.
+let s = "  hello, world  "
+let trimmed = trim(s)
+let parts = split(trimmed, ", ")
+print(trimmed, parts, trimmed[0..5] == parts[0], len(parts[1][1..5]))
+let clean = (line: str) -> str => trim(line)[1..3]
+print(clean("  abcd "), map(["  a ", " b"], trim), map(["x,y", "z"], (t: str) => split(t, ",")))
+let mut kept_words: [str] = []
+for line in ["one two", " three  "]
+    kept_words += split(trim(line), " ")
+print(kept_words)
+let mut label = "label"
+let shown = label[0..3]
+label = label + "!"
+print(shown, label, shown + label[3..len(label)])
+
+# Errors still come from the slice.
+print(xs[3..100])
