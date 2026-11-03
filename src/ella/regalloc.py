@@ -81,7 +81,7 @@ def calls(instr: Instr) -> bool:
     if op == "len":
         return args[0].type != STR and not isinstance(args[0].type, ListTy)
     if op == "index":
-        return args[0].type != RANGE
+        return args[0].type != RANGE and not isinstance(args[0].type, ListTy)
     if op == "closure":
         return bool(args)
     if op == "set_field":

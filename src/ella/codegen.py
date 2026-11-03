@@ -746,7 +746,16 @@ class CodeGen:
                 container, index = args
                 match container.type:
                     case ListTy():
+                        # Compared unsigned, a negative index is too big too. Out of range, the runtime reports it.
+                        ok = self.label("ok")
+                        self.load("rax", container)
+                        self.load("rcx", index)
+                        self.emit("cmp rcx, qword ptr [rax]   # the list's length")
+                        self.emit(f"jb {ok}")
                         self.call_c("ella_list_index", container, index, line, column)
+                        self.text.append(f"{ok}:")
+                        self.emit("mov rax, qword ptr [rax + 16]   # where its items are")
+                        self.emit("mov rax, qword ptr [rax + 8 * rcx]")
                     case PrimTy("str"):
                         self.call_c("ella_str_index", container, index, line, column, Region(instr.region))
                     case _:

@@ -456,7 +456,8 @@ or generator holding a slice, which gets a copy; memory-model §4), the
 copy of a list that an iterator over it holds, and a loop that carries a
 slice of its own variable (`rest = rest[1..n]`), which copies each time.
 Views made list and string headers bigger (memory-model §18, Results);
-inlining `ella_list_index` in codegen would win back the extra load.
+codegen indexes lists inline, calling the runtime only to report an index
+out of range, which wins back the extra load.
 
 ### 6. SIMD and narrower number types
 
