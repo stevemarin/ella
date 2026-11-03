@@ -30,11 +30,18 @@ node itself, since two separate nodes can be equal as values.
 Function bodies are checked last. A function may use top-level names defined
 after it, as long as it is called after they are defined, so its body is only
 checked once every top-level name's type is known. See `check_program`.
+
+The first error normally stops the check. Editors want every error, and the
+types of everything that could be checked, so they set `errors` to a list:
+each step of `check_program` (defining an enum, checking a top-level line or
+a function body, ...) then records its error and the check goes on. See
+`attempt`.
 """
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import count
 
 from ella.lexer import EllaError, Span
@@ -523,6 +530,14 @@ class Checker:
         self.loops: list[LoopInfo] = []  # the loops we are inside, innermost last
         self.pending_bodies: list[PendingBody] = []
 
+        # For editors. With `errors` a list, errors are collected there rather
+        # than raised (see `attempt`), and `failed` has the names whose
+        # definitions had errors. `scopes` has the scope each name was looked
+        # up in, for completing names.
+        self.errors: list[EllaError] | None = None
+        self.failed: set[str] = set()
+        self.scopes: dict[int, Env] = {}
+
     def type_of(self, node: object) -> Type:
         """The final type of a checked node (with type variables filled in)."""
         return finish(self.types[id(node)])
@@ -845,10 +860,10 @@ class Checker:
                 self.declare_enum(expr)
         for expr in program.body:
             if isinstance(expr, ConstraintDef):
-                self.define_constraint(expr)
+                self.attempt(expr, [expr.name], partial(self.define_constraint, expr))
         for expr in program.body:
             if isinstance(expr, EnumDef):
-                self.define_enum(expr, self.globals)
+                self.attempt(expr, defined_names(expr), partial(self.define_enum, expr, self.globals))
         # Top-level functions exist from the start (docs/grammar.md §3), and
         # their types are known from their annotations.
         functions = [expr for expr in program.body if isinstance(expr, Let) and isinstance(expr.value, Lambda)]
@@ -858,35 +873,92 @@ class Checker:
         later = [expr for expr in program.body if expr in functions and has_type_splice(expr.value)]
         for expr in [e for e in program.body if not any(e is f for f in later)] + later:
             match expr:
-                case Let(bindings, Lambda() as function):
-                    type_params, constraints = bindings[0].type_params, bindings[0].constraints
-                    t = self.lambda_type(function, type_params, constraints)
-                    for binding in bindings:
-                        self.bind_name(
-                            self.globals,
-                            binding.name,
-                            t,
-                            binding.mutable,
-                            binding.span,
-                            binding,
-                            function=True,
-                            type_params=type_params,
-                            constraints=constraints,
-                        )
+                case Let(bindings, Lambda()):
+                    self.attempt(expr, defined_names(expr), partial(self.declare_function, expr))
                 case Let(bindings):
                     self.pending_globals.update(b.name for b in bindings if b.name not in self.globals.vars)
 
         for expr in program.body:
-            self.check(expr, self.globals)
+            if not self.attempt(expr, defined_names(expr), partial(self.check, expr, self.globals)):
+                # Give the names it defines unknown types, so that later lines can still be checked.
+                for binding in expr.bindings if isinstance(expr, Let) else ():
+                    if binding.name not in self.globals.vars:
+                        self.bind_name(
+                            self.globals, binding.name, self.fresh(), binding.mutable, binding.span, binding
+                        )
         # Now every top-level name has its type, so function bodies can be checked.
         while self.pending_bodies:
-            self.check_body(self.pending_bodies.pop(0))
+            pending = self.pending_bodies.pop(0)
+            self.attempt(pending.function, [], partial(self.check_body, pending))
 
+        self.attempt(None, [], partial(self.check_main, program))
+        self.attempt(None, [], self.finish_checks)
+        if not self.errors:  # the copy rules need everything checked
+            self.attempt(None, [], partial(check_copies, program.body, self))
+
+    def declare_function(self, let: Let) -> None:
+        """Give a top-level function's names its type, from its annotations, before anything is checked."""
+        assert isinstance(let.value, Lambda)
+        type_params, constraints = let.bindings[0].type_params, let.bindings[0].constraints
+        t = self.lambda_type(let.value, type_params, constraints)
+        for binding in let.bindings:
+            self.bind_name(
+                self.globals,
+                binding.name,
+                t,
+                binding.mutable,
+                binding.span,
+                binding,
+                function=True,
+                type_params=type_params,
+                constraints=constraints,
+            )
+
+    def check_main(self, program: Program) -> None:
         main = self.globals.vars.get("main")
         if main is not None and main.kind == "global" and not self.unify(main.type, FuncTy((), UNIT)):
             raise EllaError(f"main must have type () -> (), not {show_type(main.type)}", program.span)
-        self.finish_checks()
-        check_copies(program.body, self)
+
+    def attempt(self, node: object, defines: Iterable[str], step: Callable[[], object]) -> bool:
+        """Take one step of checking a program, about `node`, which defines the names `defines`. Did it work?
+
+        Without `errors`, an error stops the check, as usual. With it, the
+        error is recorded and the check goes on from the top level. An error
+        in a step that uses a name whose definition failed isn't recorded,
+        since it may only follow from that one.
+        """
+        if self.errors is None:
+            step()
+            return True
+        try:
+            step()
+            return True
+        except EllaError as error:
+            self.record(error, node, defines)
+            self.env, self.level, self.quotes, self.type_params = self.globals, 0, 0, {}
+            self.return_type, self.loops = None, []
+            return False
+
+    def record(self, error: EllaError, node: object, defines: Iterable[str]) -> None:
+        """Keep an error found while collecting them, unless `node` uses a name whose definition failed."""
+        assert self.errors is not None
+        if not names_used(node, inside_lambdas=True) & self.failed:
+            self.errors.append(error)
+        self.failed.update(defines)
+
+    def check_line(self, line: Expr, env: Env) -> Type:
+        """Check a line of a block. When collecting errors, a line with one has an unknown type, as do its names."""
+        if self.errors is None:
+            return self.check(line, env)
+        outer = self.level, self.quotes, self.return_type, list(self.loops), self.type_params
+        try:
+            return self.check(line, env)
+        except EllaError as error:
+            self.level, self.quotes, self.return_type, self.loops, self.type_params = outer
+            self.record(error, line, defined_names(line))
+            for binding in line.bindings if isinstance(line, Let) else ():
+                self.bind_name(env, binding.name, self.fresh(), binding.mutable, binding.span, binding)
+            return self.fresh()
 
     def finish_checks(self) -> None:
         """The checks that need every type decided."""
@@ -971,6 +1043,7 @@ class Checker:
 
             # Names
             case Name(name, span):
+                self.scopes[id(expr)] = env
                 info = self.lookup(name, env, span)
                 self.kinds[id(expr)] = info.kind
                 self.resolved[id(expr)] = info
@@ -1139,7 +1212,7 @@ class Checker:
                 local = Env(env)
                 t = UNIT
                 for line in exprs:
-                    t = self.check(line, local)
+                    t = self.check_line(line, local)
                 # A block that ends with an assignment has the value ().
                 return UNIT if isinstance(exprs[-1], Assign) else t
             case If(cond, then, else_, span):
@@ -1406,6 +1479,7 @@ class Checker:
         """
         match target:
             case Name(name, span):
+                self.scopes[id(target)] = env
                 info = self.lookup(name, env, span)
                 self.kinds[id(target)] = info.kind
                 self.resolved[id(target)] = info
@@ -1565,7 +1639,10 @@ class Checker:
         if isinstance(callee, Member):
             return self.check_member_call(callee, args, env, span)
         if isinstance(callee, Name):
+            self.scopes[id(callee)] = env
             info = self.lookup(callee.name, env, callee.span)
+            if info.kind in ("builtin", "constructor"):
+                self.resolved[id(callee)] = info
             if info.kind == "builtin":
                 self.kinds[id(callee)] = "builtin"
                 return self.check_builtin(callee.name, args, env, span)
@@ -1913,18 +1990,28 @@ def place_root(place: Expr) -> str:
     return place.name
 
 
-def names_used(node: object) -> set[str]:
-    """Every name an expression reads, not looking inside nested lambdas."""
+def names_used(node: object, inside_lambdas: bool = False) -> set[str]:
+    """Every name an expression reads, not looking inside nested lambdas unless asked to."""
     match node:
         case Name(name):
             return {name}
-        case Lambda():
+        case Lambda() if not inside_lambdas:
             return set()
         case tuple():
-            return set().union(*(names_used(item) for item in node))
+            return set().union(*(names_used(item, inside_lambdas) for item in node))
         case _ if dataclasses.is_dataclass(node) and not isinstance(node, type):
-            return set().union(*(names_used(getattr(node, f.name)) for f in dataclasses.fields(node)))
+            return set().union(*(names_used(getattr(node, f.name), inside_lambdas) for f in dataclasses.fields(node)))
     return set()
+
+
+def defined_names(expr: object) -> list[str]:
+    """The names a top-level line defines: a `let`'s, or an enum's and its variants'."""
+    match expr:
+        case Let(bindings):
+            return [binding.name for binding in bindings]
+        case EnumDef(name, variants=variants):
+            return [name, *(variant.name for variant in variants)]
+    return []
 
 
 def any_part(

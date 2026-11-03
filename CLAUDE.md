@@ -18,6 +18,8 @@ uv run ruff check      # lint
 uv run ruff format     # format (line length 119)
 uv run mypy            # strict type checking of src/ and test/
 uv run ella FILE       # run a program; --help lists --ir, --asm, --native, -O, ...
+uv run ella-lsp        # language server over stdio (editors/vscode starts it)
+make                   # lists the Makefile's recipes: check, lsp, install-extension, package, ...
 ```
 
 ## Code style
@@ -103,11 +105,28 @@ plain:
 * `src/ella/native.py`: builds executables with gcc (the compiled runtime is
   cached in the temp directory) and runs them (`run_native`, which sets
   `ELLA_POISON` so freed arena memory is overwritten).
+* `src/ella/analysis.py`: what editors need, as plain data: every error,
+  symbols (hover text, definition, semantic token kind per name), and
+  completions. It keeps going after errors: it patches lexer errors in the
+  text (`tokenize_leniently`), and uses `parse_partial` (a line with an error
+  becomes `()`) and `Checker.errors` (each top-level step and block line
+  records its error and goes on; `scopes` gives each name's scope). Both are
+  opt-in: `parse` and `check` still stop at the first error.
+* `src/ella/lsp.py`: the language server (`ella-lsp`, needs the `lsp` extra:
+  pygls): diagnostics, hover, definition, semantic tokens, completion. The
+  analysis runs in a worker process that's killed after a timeout, since
+  compile-time code may not finish; between analyses, symbols follow edits
+  (`follow_edits`).
+* `editors/vscode/`: VS Code extension: TextMate grammar (keywords must match
+  `KEYWORDS`, see `test/test_vscode.py`), language configuration, and a
+  client that starts `ella-lsp`.
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
   of both interpreters, the optimized IR and native code), `test/test_passes.py`,
-  `test/test_native.py`, `test/test_cli.py`. Native tests need gcc and are
-  skipped without it. `test/programs/` holds
+  `test/test_native.py`, `test/test_cli.py`, `test/test_analysis.py`,
+  `test/test_lsp.py` (starts `ella-lsp` as a client would),
+  `test/test_vscode.py`. Native tests need
+  gcc and are skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
   `NAME.err` (expected error), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized).

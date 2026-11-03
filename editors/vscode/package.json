@@ -1,0 +1,77 @@
+{
+  "name": "ella",
+  "displayName": "Ella",
+  "description": "Highlighting, errors, hover, go to definition and completion for the Ella language",
+  "version": "0.1.0",
+  "publisher": "ella",
+  "private": true,
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "ella",
+        "aliases": [
+          "Ella"
+        ],
+        "extensions": [
+          ".ella"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ella",
+        "scopeName": "source.ella",
+        "path": "./syntaxes/ella.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.ella.codeblock",
+        "path": "./syntaxes/ella.markdown.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.ella": "ella"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "ella.restartServer",
+        "title": "Ella: Restart Language Server"
+      }
+    ],
+    "configurationDefaults": {
+      "[ella]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "Ella",
+      "properties": {
+        "ella.server.command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "uv",
+            "run",
+            "ella-lsp"
+          ],
+          "markdownDescription": "The command that starts the Ella language server, and its arguments. It runs in the first workspace folder. An empty list turns the server off."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  }
+}

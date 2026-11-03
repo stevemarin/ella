@@ -24,6 +24,10 @@ It then sees `-` (13, below 14) and stops, giving `2 * 3`. Back at the top,
 `-` (13) is allowed, so the result is `(1 + (2 * 3)) - 4`.
 
 Precedence lives in the `self.infix` and `self.prefix` tables.
+
+The first error normally stops the parser. For editors, `parse_partial`
+keeps going: a line of the program or of a block with an error becomes `()`,
+and parsing goes on with the next line of the same block (`parse_line`).
 """
 
 from collections.abc import Callable
@@ -123,6 +127,28 @@ def parse(source: str) -> Program:
     return Parser(tokenize(source), source).parse_program()
 
 
+def parse_partial(tokens: list[Token], source: str) -> tuple[Program, list[EllaError]]:
+    """Parse as much of a program as possible, for editors: the program, with `()` for each line
+    that has an error, and the errors."""
+    parser = Parser(tokens, source, recover=True)
+    program = parser.parse_program()
+    assert parser.errors is not None
+    return program, parser.errors
+
+
+def block_depths(tokens: list[Token]) -> list[int]:
+    """How many indented blocks each token is inside (a block's INDENT isn't, its DEDENT is)."""
+    depths = []
+    depth = 0
+    for token in tokens:
+        depths.append(depth)
+        if token.kind is TokenKind.INDENT:
+            depth += 1
+        elif token.kind is TokenKind.DEDENT:
+            depth -= 1
+    return depths
+
+
 def describe(token: Token) -> str:
     """How a token is named in error messages, as in "expected X, found <this>"."""
     match token.kind:
@@ -146,9 +172,12 @@ class Parser:
     The parser only ever looks a few tokens ahead (`peek`) and never backs up.
     """
 
-    def __init__(self, tokens: list[Token], source: str) -> None:
+    def __init__(self, tokens: list[Token], source: str, recover: bool = False) -> None:
         self.tokens = tokens
         self.pos = 0  # index of the current (next unconsumed) token
+        # With `recover`, errors in lines are collected here rather than raised (see `parse_line`).
+        self.errors: list[EllaError] | None = [] if recover else None
+        self.depths = block_depths(tokens) if recover else []
         # The source text, used to keep the text of `assert` and `where`
         # conditions for error messages. Line endings are normalized the same
         # way as in the tokenizer, so that spans line up.
@@ -283,9 +312,44 @@ class Parser:
         """A file is a sequence of expressions, one per line."""
         body = []
         while not self.at_kind(TokenKind.EOF):
-            body.append(self.parse_expr())
-            self.end_of_line()
+            body.append(self.parse_line())
         return Program(tuple(body), Span(1, 1))
+
+    def parse_line(self) -> Expr:
+        """A line of the program or of a block, through its end.
+
+        When recovering from errors, a line with an error is recorded and
+        becomes `()`, and parsing goes on at the next line of the same block,
+        or at the block's end.
+        """
+        if self.errors is None:
+            expr = self.parse_expr()
+            self.end_of_line()
+            return expr
+        start, labels, in_where = self.pos, list(self.labels), self.in_where
+        try:
+            expr = self.parse_expr()
+            self.end_of_line()
+            return expr
+        except EllaError as error:
+            self.errors.append(error)
+            self.labels, self.in_where = labels, in_where
+            self.skip_line(start)
+            return UnitLit(self.tokens[start].span)
+
+    def skip_line(self, start: int) -> None:
+        """Skip the rest of the line that starts at token `start`, and the blocks inside it."""
+        depth = self.depths[start]
+        self.pos = max(self.pos, start + 1)
+        while not self.at_kind(TokenKind.EOF) and self.depths[self.pos] >= depth:
+            token = self.peek()
+            if self.depths[self.pos] == depth:
+                if token.kind is TokenKind.DEDENT:
+                    return  # the end of the block
+                after_line = self.previous().kind in (TokenKind.NEWLINE, TokenKind.DEDENT)
+                if after_line and token.kind is not TokenKind.INDENT:
+                    return  # the next line
+            self.advance()
 
     def end_of_line(self) -> None:
         """Consume the NEWLINE that ends a line.
@@ -307,10 +371,11 @@ class Parser:
         """The lines of a block, after its INDENT, through its DEDENT."""
         exprs = []
         while True:
-            exprs.append(self.parse_expr())
-            self.end_of_line()
+            exprs.append(self.parse_line())
             if self.at_kind(TokenKind.DEDENT):
                 self.advance()
+                return tuple(exprs)
+            if self.at_kind(TokenKind.EOF):  # only after an error, when recovering
                 return tuple(exprs)
 
     def parse_body(self) -> Expr:

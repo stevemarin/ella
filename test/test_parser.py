@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from ella.lexer import EllaError, Span
-from ella.parser import parse
+from ella.lexer import EllaError, Span, tokenize
+from ella.parser import parse, parse_partial
 from ella.syntax import Assign, Binary, Call, IntLit, Lambda, Let, Name, show
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
@@ -488,4 +488,54 @@ def test_types_as_values_and_splices() -> None:
 def test_constrained_type_parameters() -> None:
     assert one("let max[T: Ord, U: Add + Eq] = (a: T) -> T => a") == (
         "(let [max[T: Ord, U: Add + Eq]] (lambda (a: T) -> T a))"
+    )
+
+
+def partial(source: str) -> tuple[list[str], list[str]]:
+    """What `parse_partial` makes of `source`: each top-level expression, and the errors."""
+    program, errors = parse_partial(tokenize(source), source)
+    return [show(expr) for expr in program.body], [str(error) for error in errors]
+
+
+def test_partial_parse_skips_lines_with_errors() -> None:
+    source = "let x = 1 +\nlet y = [1 2]\nprint(3)\n"
+    assert partial(source) == (
+        ["()", "()", "(call print 3)"],
+        ["1:11: a line can't end with '+'; wrap the expression in parentheses", "2:12: expected ']', found '2'"],
+    )
+
+
+def test_partial_parse_recovers_in_blocks() -> None:
+    source = """let f = (n: i64) -> i64 =>
+    let y = n *
+    if n > 0 then
+        print(n, , 2)
+        n
+    else
+        0
+print(f(2))
+"""
+    body, errors = partial(source)
+    assert body == [
+        "(let [f] (lambda (n: i64) -> i64 (block () (if (compare n > 0) (block () n) (block 0)))))",
+        "(call print (call f 2))",
+    ]
+    assert errors == [
+        "2:15: a line can't end with '*'; wrap the expression in parentheses",
+        "4:18: expected an expression, found ','",
+    ]
+
+
+def test_partial_parse_skips_a_line_with_its_blocks() -> None:
+    source = "match 1\n    cose 2 => 3\nloop\n    break\nprint(4)\n"
+    assert partial(source) == (
+        ["()", "(loop (block (break)))", "(call print 4)"],
+        ["2:5: expected 'case', found 'cose'"],
+    )
+
+
+def test_parse_still_stops_at_the_first_error() -> None:
+    assert (
+        str(error("let x = 1 +\nlet y = [1 2]\n"))
+        == "1:11: a line can't end with '+'; wrap the expression in parentheses"
     )

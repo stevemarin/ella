@@ -192,3 +192,8 @@ uv run ella --tokens example_syntax.ella  # print the tokens
 ```
 
 Native programs need gcc, and can't run code built at run time.
+
+[editors/vscode/](editors/vscode/) is a VS Code extension with syntax
+highlighting, and from the language server ([src/ella/lsp.py](src/ella/lsp.py),
+`uv run ella-lsp`): errors as you type, hover, go to definition, semantic
+highlighting and completion.

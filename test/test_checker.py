@@ -6,7 +6,9 @@ from ella.checker import (
     I64,
     STR,
     UNIT,
+    Checker,
     EnumTy,
+    Env,
     FuncTy,
     ListTy,
     TupleTy,
@@ -18,7 +20,7 @@ from ella.checker import (
 from ella.lexer import EllaError, Span
 from ella.parser import parse
 from ella.staging import prepare
-from ella.syntax import Let
+from ella.syntax import Binary, Block, Lambda, Let
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
 
@@ -788,3 +790,52 @@ def test_protocols() -> None:
 )
 def test_protocol_errors(source: str, message: str) -> None:
     assert error(source).message == message
+
+
+def all_errors(source: str) -> list[str]:
+    """Every error the checker finds, when it collects them as editors want."""
+    checker = Checker()
+    checker.errors = []
+    checker.check_program(parse(source))
+    return [str(error) for error in checker.errors]
+
+
+def test_collecting_errors_goes_on_after_each_one() -> None:
+    source = """let f = (n: i64) -> i64 =>
+    let a = nope + 1
+    print(n + "x")
+    if true then 1 else "no"
+let g = (s: str) -> i64 => s
+let x: str = 1
+"""
+    assert all_errors(source) == [
+        "6:14: the value of 'x' should be str, not i64",
+        "2:13: undefined name 'nope'",
+        "3:13: '+' needs two values of the same type, not i64 and str",
+        "4:5: both branches of 'if' must have the same type, not i64 and str",
+        "5:28: the function's result should be i64, not str",
+    ]
+
+
+def test_collecting_errors_skips_those_from_names_that_failed() -> None:
+    # `total` failed, so the errors of lines that use it may only follow from that.
+    source = "let total = 1 + true\nprint(total + 1)\nlet f = () -> i64 => total * 2\nprint(nope)\n"
+    assert all_errors(source) == [
+        "1:15: '+' needs two values of the same type, not i64 and bool",
+        "4:7: undefined name 'nope'",
+    ]
+
+
+def test_checker_records_the_scope_of_each_name() -> None:
+    program = parse("let f = (n: i64) -> i64 =>\n    let a = 1\n    n + a\n")
+    checker = check(program)
+    let = program.body[0]
+    assert isinstance(let, Let) and isinstance(let.value, Lambda) and isinstance(let.value.body, Block)
+    sum_ = let.value.body.exprs[-1]
+    assert isinstance(sum_, Binary)
+    env: Env | None = checker.scopes[id(sum_.left)]
+    names = set()
+    while env is not None:
+        names |= set(env.vars)
+        env = env.parent
+    assert {"a", "n", "f", "print"} <= names

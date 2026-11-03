@@ -11,3 +11,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Node packages for editors/vscode
+node_modules/

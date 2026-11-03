@@ -11,6 +11,12 @@ dependencies = []
 
 [project.scripts]
 ella = "ella:main"
+ella-lsp = "ella.lsp:main"
+
+[project.optional-dependencies]
+lsp = [
+    "pygls>=2.1.1",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.4,<0.13.0"]
@@ -20,6 +26,7 @@ build-backend = "uv_build"
 dev = [
     "ipython>=9.18.0",
     "mypy>=2.4.0",
+    "pygls>=2.1.1",
     "pytest>=9.1.1",
     "ruff>=0.17.2",
 ]
@@ -29,6 +36,8 @@ line-length = 119
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+# pygls 2.1 still uses asyncio.iscoroutinefunction.
+filterwarnings = ["ignore:.asyncio.iscoroutinefunction. is deprecated:DeprecationWarning:pygls"]
 
 [tool.mypy]
 strict = true
