@@ -839,3 +839,166 @@ def test_checker_records_the_scope_of_each_name() -> None:
         names |= set(env.vars)
         env = env.parent
     assert {"a", "n", "f", "print"} <= names
+
+
+# The library (docs/grammar.md §10)
+
+
+@pytest.mark.parametrize(
+    ("source", "t"),
+    [
+        ("to_f64(1)", "f64"),
+        ("to_i64(1.5)", "i64"),
+        ('parse_i64("1")', "Result[i64, Error]"),
+        ('parse_f64("1")', "Result[f64, Error]"),
+        ("read_line()", "Optional[str]"),
+        ('read_file("x")', "Result[str, Error]"),
+        ("args()", "[str]"),
+        ('split("a b", " ")', "[str]"),
+        ('join(["a"], ",")', "str"),
+        ('find("ab", "b")', "Optional[i64]"),
+        ('replace("ab", "b", "c")', "str"),
+        ('trim(" a ")', "str"),
+        ('chars("ab")', "[str]"),
+        ('"abc"[0..2]', "str"),
+        ("[1, 2, 3][1..=2]", "[i64]"),
+    ],
+)
+def test_library_types(source: str, t: str) -> None:
+    assert type_of(source) == t
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("to_f64(1.5)", "argument 1 of to_f64() should be i64, not f64"),
+        ('split("a")', "split takes 2 arguments but was given 1"),
+        ('let mut s = "a"\ntrim(mut s)', "trim() has no 'mut' parameter"),
+        ("let f = to_f64", "'to_f64' can only be called, not used as a value"),
+        (
+            "enum Optional[T]\n    Some(T)\n    Nothing\nread_line()",
+            "read_line() needs the built-in Optional, which this program replaces",
+        ),
+        (
+            'struct Error\n    code: i64\nparse_i64("1")',
+            "parse_i64() needs the built-in Error, which this program replaces",
+        ),
+        ("let mut xs = [1, 2]\nxs[0..1] = [3]", "can't assign to a slice; change the items one by one"),
+        ("(1, 2)[0..1]", "an index must be an i64, not range"),
+    ],
+)
+def test_library_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+def test_library_names_can_be_shadowed() -> None:
+    assert type_of("let split = (n: i64) -> i64 => n\nsplit(1)") == "i64"
+    assert type_of("let f = (args: [i64]) -> i64 => len(args)\nf([])") == "i64"
+
+
+# Tuple items and destructuring `let` (docs/grammar.md §4, §9)
+
+
+def test_tuple_items() -> None:
+    assert type_of('(1, "a").1') == "str"
+    assert type_of("let t = (1, (true, 2.5))\nt.1.0") == "bool"
+    assert error("(1, 2).2").message == "a tuple of 2 items has no item 2"
+    assert error("[1].0").message == "a [i64] has no fields"
+    assert error("let mut t = (1, 2)\nt.0 = 3").message == (
+        "a tuple can't be changed in place, so you can't assign to its items"
+    )
+
+
+def test_let_with_a_pattern() -> None:
+    assert binding_type("let (a, b) = (1, 'x')\nlet c = b", "c") == "str"
+    assert type_of("let f = () -> f64 =>\n    let (x, (y, _)) = (1.0, (2.0, true))\n    x + y\nf()") == "f64"
+    assert type_of("struct P\n    x: i64\n    y: i64\nlet P(a, b) = P(1, 2)\na + b") == "i64"
+    assert error("let (a, b) = 1").message == "this tuple pattern should be i64, not (?1, ?2)"
+    assert error("let (a, b) = (1, 2)\na = 3").message.startswith("can't assign to 'a' because it isn't mutable")
+
+
+def test_let_patterns_must_match_every_value() -> None:
+    assert error("let (a, 1) = (1, 2)").message == (
+        "'let' needs a pattern that matches every value, and this one doesn't match (_, _)"
+    )
+    assert error("let Some(x) = Some(1)").message == (
+        "'let' needs a pattern that matches every value, and this one doesn't match None"
+    )
+    assert error("for (a, true) in [(1, true)]\n    print(a)").message == (
+        "'for' needs a pattern that matches every value, and this one doesn't match (_, false)"
+    )
+
+
+# Exhaustiveness (docs/grammar.md §6)
+
+
+@pytest.mark.parametrize(
+    ("cases", "subject", "missing"),
+    [
+        (["Some(_)"], "Some(1)", "None"),
+        (["None", "Some(0)"], "Some(1)", "Some(_)"),
+        (["Ok(Some(_))", "Err(_)"], "let r: Result[Optional[i64], str] = Ok(None)\nr", "Ok(None)"),
+        (["true"], "true", "false"),
+        (["(true, _)", "(_, true)"], "(true, false)", "(false, false)"),
+        (["Circle(_)"], "Rect(1.0)", "Rect(_)"),
+        (["Some(true) | None"], "Some(false)", "Some(false)"),
+    ],
+)
+def test_matches_must_cover_every_value(cases: list[str], subject: str, missing: str) -> None:
+    *setup, last = subject.split("\n")
+    lines = ["enum Shape\n    Circle(f64)\n    Rect(f64)", *setup, f"match {last}"]
+    lines += [f"    case {case} => 1" for case in cases]
+    assert error("\n".join(lines)).message == f"'match' doesn't cover every value: add a case for {missing}"
+
+
+@pytest.mark.parametrize(
+    ("cases", "subject"),
+    [
+        (["Some(_)", "None"], "Some(1)"),
+        (["Ok(Some(_))", "Ok(None)", "Err(_)"], "let r: Result[Optional[i64], str] = Ok(None)\nr"),
+        (["(true, _)", "(false, true)", "(_, false)"], "(true, false)"),
+        (["0", "1", "n"], "5"),
+        (["Some(0 | 1)", "Some(_) | None"], "Some(1)"),
+        (["P(_, _)"], "P(1, 2)"),
+        (["_"], "()"),
+    ],
+)
+def test_matches_that_cover_every_value(cases: list[str], subject: str) -> None:
+    *setup, last = subject.split("\n")
+    lines = ["struct P\n    x: i64\n    y: i64", *setup, f"match {last}"]
+    lines += [f"    case {case} => 1" for case in cases]
+    check(parse("\n".join(lines)))
+
+
+def test_infinite_types_need_a_catch_all() -> None:
+    assert error('match "a"\n    case "a" => 1').message == "'match' on str needs a 'case _' to cover every value"
+    assert error("match 1\n    case 0..10 => 1").message == "'match' on i64 needs a 'case _' to cover every value"
+
+
+def test_guarded_cases_dont_count() -> None:
+    source = (
+        "let f = (n: Optional[i64]) -> i64 =>\n    match n\n        case Some(x) if x > 0 => x\n        case None => 0"
+    )
+    assert error(source).message == "'match' doesn't cover every value: add a case for Some(_)"
+
+
+def test_generic_values_need_a_catch_all() -> None:
+    source = "let f[T] = (x: T) -> i64 =>\n    match x\n        case y => 1\nf(1)"
+    assert type_of(source) == "i64"
+
+
+# Staging limits
+
+
+def test_quote_in_a_function_in_a_splice_cant_use_the_outer_quotes_variables() -> None:
+    source = """\
+let make = () -> Code[i64] =>
+    quote
+        let y = 5
+        $
+            let f = () -> Code[i64] => quote y + 1
+            f()
+"""
+    assert error(source).message == (
+        "'y' belongs to a quote outside this function, which a quote inside it can't use yet"
+    )

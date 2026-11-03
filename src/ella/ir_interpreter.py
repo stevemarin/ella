@@ -70,11 +70,14 @@ from ella.ir import (
 )
 from ella.ir import Value as IRValue
 from ella.lexer import EllaError, Span
+from ella.library import Host
+from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
-from ella.operators import binary, compare, contains, index_into, unary
+from ella.operators import binary, compare, contains, index_into, slice_of, unary
 from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
 from ella.syntax import Expr, Name
 from ella.values import (
+    MAX_CALL_DEPTH,
     UNIT,
     CodeValue,
     FunctionRef,
@@ -84,6 +87,7 @@ from ella.values import (
     Value,
     VariantValue,
     copy_value,
+    run_deep,
     to_text,
 )
 
@@ -91,7 +95,6 @@ from ella.values import (
 OPERATORS = {op: symbol for symbol, op in (BINARY_OPS | COMPARE_OPS).items()}
 UNARY = {"neg": "-", "not": "not", "bitnot": "~"}
 
-MAX_CALL_DEPTH = 1000  # the same limit as the AST interpreter
 PYTHON_FRAMES_PER_CALL = 10
 
 # Where a value's objects may be: (arena depth, generation), or None for
@@ -102,9 +105,9 @@ SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
 POOL = "<pool>"  # the finalizer of a pool: free its values
 
 
-def run_ir(source: str, out: TextIO | None = None) -> None:
+def run_ir(source: str, out: TextIO | None = None, host: Host | None = None) -> None:
     """Compile a program to IR and run it. Raises EllaError."""
-    IRInterpreter(compile_program(source, out), out).run()
+    IRInterpreter(compile_program(source, out), out, host).run()
 
 
 @dataclass(slots=True)
@@ -139,9 +142,13 @@ class Site:
 
 
 class IRInterpreter:
-    def __init__(self, module: Module, out: TextIO | None = None) -> None:
+    def __init__(
+        self, module: Module, out: TextIO | None = None, host: Host | None = None, max_depth: int = MAX_CALL_DEPTH
+    ) -> None:
         self.module = module
         self.out = out if out is not None else sys.stdout
+        self.host = host if host is not None else Host()
+        self.max_depth = max_depth
         self.globals: dict[str, Value] = {}  # a global is missing until it is first set
         self.global_tags: dict[str, Tag] = {}
         self.depth = 0  # how many calls are in progress
@@ -154,13 +161,11 @@ class IRInterpreter:
         self.sites: dict[tuple[str, Span, str], Site] = defaultdict(Site)
 
     def run(self) -> None:
-        limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(max(limit, MAX_CALL_DEPTH * PYTHON_FRAMES_PER_CALL))
-        try:
-            self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
-            self.free(0, 1)  # the globals, at the end of the program
-        finally:
-            sys.setrecursionlimit(limit)
+        run_deep(self.run_program, self.max_depth, PYTHON_FRAMES_PER_CALL)
+
+    def run_program(self) -> None:
+        self.call(self.module.functions[self.module.entry], [], [], 0, {}, Span(1, 1))
+        self.free(0, 1)  # the globals, at the end of the program
 
     # Arenas
 
@@ -261,8 +266,8 @@ class IRInterpreter:
 
         Returns its result and the final values of its `mut` parameters, each with its tag.
         """
-        if self.depth >= MAX_CALL_DEPTH:
-            raise EllaError(f"stack overflow: more than {MAX_CALL_DEPTH} nested calls", span)
+        if self.depth >= self.max_depth:
+            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
         self.depth += 1
         base = self.next_depth
         self.next_depth += function.levels
@@ -381,6 +386,15 @@ class IRInterpreter:
                     result = index_into(container, i, span)
                     if isinstance(container, list):
                         tag = tags[0]  # an item of a list is in the list; a string's is a new string
+            case "slice":
+                container, part = args
+                assert isinstance(container, list | str) and isinstance(part, range)
+                result = copy_value(slice_of(container, part, span))
+                tag = self.allocate(depth, deep_size(result), instr, frame)
+            case "builtin":
+                result = call_library(instr.name, args, span, self.host)
+                if allocates(instr):
+                    tag = self.allocate(depth, deep_size(result), instr, frame)
             case "set_index":
                 container, i, item = args
                 index_into(container, i, span)  # check that the index is in range
@@ -467,7 +481,7 @@ class IRInterpreter:
         if instr.dest is not None:
             if instr.op == "pool_new":
                 self.arena(depth).finals.append((result, POOL))
-            if allocates(instr) and instr.op not in ("append", "copy", "move", "call", "run"):
+            if allocates(instr) and instr.op not in ("append", "copy", "move", "call", "run", "slice", "builtin"):
                 tag = shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
             frame.values[instr.dest.id] = result
             frame.tags[instr.dest.id] = tag if is_boxed(instr.dest.type) else None

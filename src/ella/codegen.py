@@ -48,10 +48,10 @@ the same "stack overflow" error as in the interpreters.
 
 import struct
 
-from ella.checker import F64, I64, BuiltinTy, EnumTy, FuncTy, ListTy, PrimTy, TupleTy, Type, substitute
+from ella.checker import F64, I64, STR, BuiltinTy, EnumTy, FuncTy, ListTy, PrimTy, TupleTy, Type, substitute
 from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, Value, format_instr, region_level
-from ella.ir_interpreter import MAX_CALL_DEPTH
 from ella.lexer import Span
+from ella.values import MAX_CALL_DEPTH
 
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
 KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0}
@@ -79,14 +79,15 @@ class Register(str):
     """A register whose value is passed to the runtime."""
 
 
-def generate(module: Module) -> str:
-    """The assembly text for a whole module."""
-    return CodeGen(module).generate()
+def generate(module: Module, max_depth: int = MAX_CALL_DEPTH) -> str:
+    """The assembly text for a whole module, whose functions may call each other `max_depth` deep."""
+    return CodeGen(module, max_depth).generate()
 
 
 class CodeGen:
-    def __init__(self, module: Module) -> None:
+    def __init__(self, module: Module, max_depth: int = MAX_CALL_DEPTH) -> None:
         self.module = module
+        self.max_depth = max_depth
         self.text: list[str] = []  # code
         self.rodata: list[str] = []  # constants: strings, type descriptors
         self.labels = 0  # a counter for new labels
@@ -118,13 +119,17 @@ class CodeGen:
             "    .intel_syntax noprefix",
             "    .text",
             "",
-            "# The program's entry point, called by main() in the runtime: run the top-level code.",
+            "# The program's entry point, called by main() in the runtime: run the top-level code",
+            "# on the stack whose top is given, ella_main(stack).",
             "    .globl ella_main",
             "ella_main:",
+            "    push rbp",
+            "    mov rbp, rsp",
+            "    mov rsp, rdi                # switch to the program's own stack",
             "    push 0                      # its result (none) goes in the global arena",
             "    push 0                      # the top-level code isn't a closure",
             f"    call {self.function_labels[self.module.entry]}",
-            "    add rsp, 16",
+            "    leave                       # back to the runtime's stack",
             "    ret",
             "",
             "# Call an Ella closure with one argument, from the runtime: ella_call1(closure, argument).",
@@ -150,6 +155,14 @@ class CodeGen:
         # read-only after that.
         lines += ["", "    .section .data.rel.ro", *self.rodata]
         # Ella names can't contain dots, so these symbols can't clash with each other.
+        lines += [
+            "",
+            "# How deeply Ella functions may call each other, for the runtime's stack.",
+            "    .globl ella_max_depth",
+            "    .balign 8",
+            "ella_max_depth:",
+            f"    .quad {self.max_depth}",
+        ]
         lines += ["", "# Global variables, and whether each has been set yet.", "    .bss", "    .balign 8"]
         for name in self.module.globals:
             lines += [f"ella_global.{name}:", "    .zero 8", f"ella_global_set.{name}:", "    .zero 8"]
@@ -438,6 +451,19 @@ class CodeGen:
                     case _:
                         self.call_c("ella_range_index", container, index)
                 self.store(dest)
+            case "slice" if args[0].type == STR:
+                self.call_c("ella_str_slice", args[0], args[1], line, column, Region(instr.region))
+                self.store(dest)
+            case "slice":
+                assert isinstance(args[0].type, ListTy)
+                item_type = self.type_descriptor(args[0].type.element)
+                self.call_c("ella_list_slice", args[0], args[1], item_type, line, column, Region(instr.region))
+                self.store(dest)
+            case "builtin":
+                # Library functions take their arguments, the call's place for errors, and where the result goes.
+                result_region = Region(instr.region) if instr.region else 0
+                self.call_c(f"ella_lib_{instr.name}", *args, line, column, result_region)
+                self.store(dest)
             case "set_index":
                 self.slot_value(instr, args[0], args[2])
                 self.call_c("ella_list_set", args[0], args[1], Register("rax"), line, column)
@@ -650,9 +676,9 @@ class CodeGen:
         closure, *args = instr.args
         line, column = self.span_args(instr.span)
         ok = self.label("depth")
-        self.emit(f"cmp qword ptr [rip + ella_depth], {MAX_CALL_DEPTH}")
+        self.emit(f"cmp qword ptr [rip + ella_depth], {self.max_depth}")
         self.emit(f"jl {ok}")
-        self.call_c("ella_stack_overflow", MAX_CALL_DEPTH, line, column)
+        self.call_c("ella_stack_overflow", self.max_depth, line, column)
         self.text.append(f"{ok}:")
         self.emit("inc qword ptr [rip + ella_depth]")
         # A mut argument that is a pool's value lives in its slot's arena, found

@@ -88,6 +88,8 @@ Operations
     tuple a, b, ...              build a tuple; `tuple_get t, n` reads item n
     list a, b, ...               build a list
     index c, i                   item i of a list,string (a 1-char string) or range
+    slice c, r @r                items r.start up to r.stop of a list (copies of them) or
+                                 string, as a new one
     set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
     append xs, ys @r             xs with copies of ys's items added, growing xs in place
                                  if it can; xs lives in region r and isn't used again
@@ -111,6 +113,8 @@ Operations
                                  with the types t... spliced into it (`type [$t]`)
     reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
     len c                        length of a list, string or range, or a pool's count
+    builtin a, ... @r            a library function (in `name`), such as split(a, b),
+                                 whose result is all new objects (ella.library)
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
     variant Name(a, ...)         make an enum value or struct (registering its finalizer)
@@ -140,6 +144,7 @@ from ella.checker import (
     BOOL,
     F64,
     I64,
+    LIBRARY,
     NEVER,
     RANGE,
     STR,
@@ -311,6 +316,8 @@ ALLOCATING = frozenset(
         "pool_new",
         "run",
         "reflect",
+        "slice",
+        "builtin",
     }
 )
 
@@ -799,6 +806,16 @@ class Verifier:
                 need(isinstance(dest, ListTy) and all(a == dest.element for a in args))
             case "index":
                 need(len(args) == 2 and args[1] == I64 and dest == item_type(args[0]))
+            case "slice":
+                need(
+                    len(args) == 2
+                    and args[1] == RANGE
+                    and dest == args[0]
+                    and (dest == STR or isinstance(dest, ListTy))
+                )
+            case "builtin":
+                library = LIBRARY.get(instr.name)
+                need(library is not None and dest is not None and FuncTy(tuple(args), dest) == library)
             case "set_index":
                 need(len(args) == 3 and isinstance(args[0], ListTy) and args[1:] == [I64, args[0].element])
             case "append" | "copy" | "move":

@@ -1,3 +1,5 @@
+import io
+import shutil
 from pathlib import Path
 
 import pytest
@@ -115,3 +117,31 @@ let square = (x: i64) -> i64 => $(power(2, quote x))
 """
     assert main(["--expanded", write(tmp_path, source)]) == 0
     assert "(let [square] (lambda (x: i64) -> i64 (* x (* x 1))))" in capsys.readouterr().out
+
+
+def test_program_arguments_follow_two_dashes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "print(args())\n")
+    for mode in (["--tree"], [], ["--native"] if shutil.which("gcc") else []):
+        assert main([*mode, path, "--", "a b", "--tree"]) == 0
+        assert capsys.readouterr().out == '["a b", "--tree"]\n'
+    assert main([path]) == 0
+    assert capsys.readouterr().out == "[]\n"
+
+
+def test_reads_standard_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write(tmp_path, "print(read_line())\nprint(read_line())\n")
+    for mode in (["--tree"], []):
+        monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO("héllo\r\n".encode())))
+        assert main([*mode, path]) == 0
+        assert capsys.readouterr().out == 'Some("héllo")\nNone\n'
+
+
+def test_max_depth(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write(tmp_path, "let down = (n: i64) -> i64 => if n == 0 then 0 else 1 + down(n - 1)\nprint(down(50))\n")
+    for mode in (["--tree"], [], ["--native"] if shutil.which("gcc") else []):
+        assert main([*mode, path]) == 0
+        assert capsys.readouterr().out == "50\n"
+        assert main([*mode, "--max-depth", "20", path]) == 1
+        assert capsys.readouterr().err == f"{path}:1:61: stack overflow: more than 20 nested calls\n"

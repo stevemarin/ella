@@ -171,3 +171,19 @@ def test_follow_edits_moves_symbols_with_their_lines() -> None:
     ]
     # A changed line loses its symbols.
     assert follow_edits([symbol, other], old, "let a = 1\nlet b = a + 1\n") == [other]
+
+
+def test_hover_on_library_functions_and_let_patterns() -> None:
+    found = symbols('let (a, b) = (1, "x")\nprint(split(b, ","))\nlet c = a\n')
+    assert found[(1, 6)].hover == "a: i64"
+    assert found[(1, 9)].hover == "b: str"
+    assert found[(2, 7)].hover == "split: (str, str) -> [str]"
+    assert found[(3, 9)].hover == "a: i64"
+    assert found[(3, 9)].definition == Location(1, 6, 1)
+
+
+def test_errors_in_a_let_pattern_leave_its_names_defined() -> None:
+    assert problems("let (a, b) = nope\nprint(a)\nprint(c)\n") == [
+        "1:14: undefined name 'nope'",
+        "3:7: undefined name 'c'",
+    ]

@@ -76,13 +76,17 @@ if x == 4 then print("x={{x}}") else print("not 4")
 # a two argument lambda; its type is (i64, i64) -> i64
 (x: i64, y: i64) -> i64 => x + y
 
-# no implicit type conversions
+# no implicit type conversions: to_f64, to_i64 and parse_i64 are explicit
+assert to_f64(3) / 2.0 == 1.5
+assert parse_i64(trim(" 42 ")) == Ok(42)
+
 # Result (Ok / Err) and Optional (Some / None) are built-in enums, and
 # Error is a built-in struct holding a message
 let invert = (n: f64) -> Result[f64, Error] =>
     if n == 0.0 then Err(Error("divide by zero")) else Ok(1.0 / n)
 
-# match destructures enum variants, with optional guards and one-line arms
+# match destructures enum variants, with optional guards and one-line arms;
+# its cases must cover every value (a guarded case doesn't count)
 let describe = (r: Result[f64, Error]) -> str =>
     match r
         case Ok(v) if v > 1.0 => "big"
@@ -124,6 +128,17 @@ assert piped == 6
 let mut xs: [i64] = [1, 2, 3]
 xs[0] = 7
 assert xs[0] == 7 and len(xs) == 3
+
+# a range as an index gives a slice; strings have split, join, find, ...
+assert xs[1..3] == [2, 3]
+assert "hello"[1..=2] == "el"
+assert join(split("a,b,c", ","), "-") == "a-b-c"
+assert find("hello", "ll") == Some(2)
+
+# tuples: items by position, or taken apart with a pattern in let
+let pair = (1, "one")
+let (number, name) = pair
+assert pair.0 == number and pair.1 == name
 
 # values are copied: changing xs doesn't change ys
 let ys = xs

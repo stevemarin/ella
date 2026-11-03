@@ -58,6 +58,7 @@ from ella.syntax import (
     IntLit,
     Lambda,
     Let,
+    LetPattern,
     ListLit,
     ListType,
     LiteralPattern,
@@ -381,7 +382,13 @@ class Parser:
     def parse_body(self) -> Expr:
         """A body (after `then`, `else`, a loop header, ...) is an expression on
         the same line, or an indented block starting on the next line."""
-        return self.parse_block() if self.at_block() else self.parse_expr()
+        return self.parse_block() if self.at_block() else self.parse_inline_body()
+
+    def parse_inline_body(self) -> Expr:
+        """A body on the same line. An assignment there has the value (), as
+        it would as a block's last line, so it is made a block of one line."""
+        expr = self.parse_expr()
+        return Block((expr,), expr.span) if isinstance(expr, Assign) else expr
 
     # Expressions
 
@@ -487,6 +494,15 @@ class Parser:
                 if self.at("$"):
                     splice = self.parse_splice()
                     return FieldSplice(left, splice.code, token.span)
+                # A tuple's item: `t.0`. The lexer reads `t.0.1` as `t`, `.`, `0.1`.
+                items = (
+                    self.peek().text.split(".") if self.at_kind(TokenKind.INT) or self.at_kind(TokenKind.FLOAT) else []
+                )
+                if items and all(item.isdigit() and str(int(item)) == item for item in items):
+                    self.advance()
+                    for item in items:
+                        left = Member(left, item, token.span)
+                    return left
                 name = self.expect_kind(TokenKind.NAME, "a member name")
                 return Member(left, name.text, token.span)
             case _:
@@ -754,7 +770,7 @@ class Parser:
         # Loop labels outside the function aren't visible inside it.
         outer_labels, self.labels = self.labels, []
         if not self.at_block():
-            body = self.parse_expr()
+            body = self.parse_inline_body()
             self.labels = outer_labels
             return (), body
         self.advance()  # NEWLINE
@@ -797,13 +813,20 @@ class Parser:
 
     # Bindings
 
-    def parse_let(self) -> Let:
+    def parse_let(self) -> Let | LetPattern:
         """`let a = mut b: i64 = c = value`: every target in the chain is a new binding.
 
         After each `=`, another target follows if the next tokens are `mut`,
         or a name followed by `=` or `:`. Otherwise the value starts.
+
+        `let (a, b) = value` and `let Point(x, y) = value` take a value apart
+        with a pattern instead.
         """
         token = self.advance()
+        if self.at("(") or (self.at_kind(TokenKind.NAME) and self.at("(", 1)):
+            pattern = self.parse_pattern()
+            self.expect("=")
+            return LetPattern(pattern, self.parse_expr(), token.span)
         bindings = [self.parse_binding()]
         self.expect("=")
         while self.at("mut") or (
@@ -876,7 +899,7 @@ class Parser:
             # `y => 1` isn't read as an untyped lambda.
             guard = self.parse_expr(self.infix["=>"][0] + 1)
         if self.accept("=>"):
-            body = self.parse_expr()
+            body = self.parse_inline_body()
             self.end_of_line()
         else:
             body = self.parse_block()

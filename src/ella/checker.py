@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 
+from ella.exhaustive import missing
 from ella.lexer import EllaError, Span
 from ella.syntax import (
     Assert,
@@ -68,6 +69,7 @@ from ella.syntax import (
     IntLit,
     Lambda,
     Let,
+    LetPattern,
     ListLit,
     ListType,
     LiteralPattern,
@@ -397,6 +399,9 @@ class VarInfo:
     binder: object = None  # the node that binds a local variable
     type_params: tuple[str, ...] = ()  # a generic function's
     constraints: tuple[tuple[str, ...], ...] = ()  # and theirs
+    # A variable of a quote that a function is defined in a splice of, as the
+    # function sees it. The IR can't reach it from inside the function yet.
+    outer_quote: bool = False
 
 
 @dataclass(slots=True)
@@ -439,7 +444,25 @@ class PendingBody:
     quotes: int
 
 
-BUILTINS = ("print", "len", "run", "pool_new", "alloc", "free")
+# The library: built-in functions with fixed types (see ella.library).
+ERROR = EnumTy("Error")
+LIBRARY: dict[str, FuncTy] = {
+    "to_f64": FuncTy((I64,), F64),
+    "to_i64": FuncTy((F64,), I64),
+    "parse_i64": FuncTy((STR,), EnumTy("Result", (I64, ERROR))),
+    "parse_f64": FuncTy((STR,), EnumTy("Result", (F64, ERROR))),
+    "read_line": FuncTy((), EnumTy("Optional", (STR,))),
+    "read_file": FuncTy((STR,), EnumTy("Result", (STR, ERROR))),
+    "args": FuncTy((), ListTy(STR)),
+    "split": FuncTy((STR, STR), ListTy(STR)),
+    "join": FuncTy((ListTy(STR), STR), STR),
+    "find": FuncTy((STR, STR), EnumTy("Optional", (I64,))),
+    "replace": FuncTy((STR, STR, STR), STR),
+    "trim": FuncTy((STR,), STR),
+    "chars": FuncTy((STR,), ListTy(STR)),
+}
+
+BUILTINS = ("print", "len", "run", "pool_new", "alloc", "free", *LIBRARY)
 
 # Built-ins that look at types, and make them, for code that generates code
 # (docs/grammar.md §11), with the types of their arguments and results.
@@ -513,6 +536,8 @@ class Checker:
         self.type_params: dict[str, Type] = {}  # in a generic function's body: T -> ParamTy("T")
         # Checks that need final types, made once everything has been checked.
         self.later_stage_uses: list[tuple[str, Type, Span]] = []  # variables used in a later stage
+        # Patterns that must match every value of a type: a match's cases, a let's or a for's pattern.
+        self.coverage: list[tuple[str, list[Pattern], Type, Span]] = []
         # Uses of generic functions: the function, its type arguments, the
         # constraints of each type parameter, and where.
         self.generic_uses: list[tuple[str, tuple[Type, ...], tuple[tuple[str, tuple[str, ...]], ...], Span]] = []
@@ -877,15 +902,14 @@ class Checker:
                     self.attempt(expr, defined_names(expr), partial(self.declare_function, expr))
                 case Let(bindings):
                     self.pending_globals.update(b.name for b in bindings if b.name not in self.globals.vars)
+                case LetPattern(pattern):
+                    names = (n.name for n in pattern_names(pattern))
+                    self.pending_globals.update(name for name in names if name not in self.globals.vars)
 
         for expr in program.body:
             if not self.attempt(expr, defined_names(expr), partial(self.check, expr, self.globals)):
                 # Give the names it defines unknown types, so that later lines can still be checked.
-                for binding in expr.bindings if isinstance(expr, Let) else ():
-                    if binding.name not in self.globals.vars:
-                        self.bind_name(
-                            self.globals, binding.name, self.fresh(), binding.mutable, binding.span, binding
-                        )
+                self.bind_unknown(expr, self.globals)
         # Now every top-level name has its type, so function bodies can be checked.
         while self.pending_bodies:
             pending = self.pending_bodies.pop(0)
@@ -956,12 +980,41 @@ class Checker:
         except EllaError as error:
             self.level, self.quotes, self.return_type, self.loops, self.type_params = outer
             self.record(error, line, defined_names(line))
-            for binding in line.bindings if isinstance(line, Let) else ():
-                self.bind_name(env, binding.name, self.fresh(), binding.mutable, binding.span, binding)
+            self.bind_unknown(line, env)
             return self.fresh()
+
+    def bind_unknown(self, line: Expr, env: Env) -> None:
+        """After an error in a `let`, give the names it binds unknown types (at the top level, unless bound already)."""
+        top = env is self.globals
+        match line:
+            case Let(bindings):
+                for binding in bindings:
+                    if not (top and binding.name in env.vars):
+                        self.bind_name(env, binding.name, self.fresh(), binding.mutable, binding.span, binding)
+            case LetPattern(pattern):
+                for node in pattern_names(pattern):
+                    info = env.lookup(node.name)
+                    if not (info is not None and (top or info.kind == "variant")):
+                        self.bind_name(env, node.name, self.fresh(), False, node.span, node)
 
     def finish_checks(self) -> None:
         """The checks that need every type decided."""
+        variants = {node for node, kind in self.kinds.items() if kind == "variant"}
+        for what, patterns, t, span in self.coverage:
+            t = finish(t)
+            if any_part(t, self.enums, lambda part: isinstance(part, DeferredTy)):
+                continue  # checked once the code is built
+            example = missing(patterns, t, self.constructors, variants)
+            if example is None:
+                continue
+            if what == "match" and example == "_":
+                raise EllaError(f"'match' on {show_type(t)} needs a 'case _' to cover every value", span)
+            if what == "match":
+                raise EllaError(f"'match' doesn't cover every value: add a case for {example}", span)
+            example = "every value" if example == "_" else example
+            raise EllaError(
+                f"'{what}' needs a pattern that matches every value, and this one doesn't match {example}", span
+            )
         for name, t, span in self.later_stage_uses:
             t = finish(t)
             if not persistable(t, self.enums):
@@ -979,6 +1032,19 @@ class Checker:
                         raise EllaError(
                             f"{name} needs {param} to be {constraint}, and {show_type(arg)} isn't{reason}", span
                         )
+
+    def constructors(self, t: Type) -> list[tuple[str, tuple[Type, ...]]] | None:
+        """For exhaustiveness: a type's constructors, with their fields' types, or None if it has no fixed set."""
+        match t:
+            case EnumTy(name) if name in self.enums:
+                return [(variant, self.variant_fields(t, variant)) for variant in self.enums[name].variants]
+            case TupleTy(items):
+                return [("()", items)]
+            case _ if t == BOOL:
+                return [("true", ()), ("false", ())]
+            case _ if t == UNIT:
+                return [("()", ())]
+        return None
 
     def unmet(self, t: Type, constraint: str) -> str | None:
         """Why a type doesn't meet a constraint (perhaps ""), or None if it does.
@@ -1055,6 +1121,12 @@ class Checker:
                         return enum_type
                     case _:
                         self.check_stage(name, info, span)
+                        if info.outer_quote:
+                            raise EllaError(
+                                f"'{name}' belongs to a quote outside this function, which a quote inside it "
+                                "can't use yet",
+                                span,
+                            )
                         if info.type_params:
                             # Each use of a generic function gets its own type arguments.
                             type_args: dict[str, Type] = {param: self.fresh() for param in info.type_params}
@@ -1095,6 +1167,15 @@ class Checker:
                         type_params,
                         bindings[0].constraints,
                     )
+                return t
+            case LetPattern(pattern, value_expr, span):
+                t = self.check(value_expr, env)
+                bound = Env(env)
+                self.check_pattern(pattern, t, bound)
+                self.coverage.append(("let", [pattern], t, span))
+                for name, info in bound.vars.items():
+                    assert isinstance(info.binder, NamePattern)
+                    self.bind_name(env, name, info.type, False, info.binder.span, info.binder)
                 return t
             case Assign(op, target, value_expr, span):
                 value_type = self.check(value_expr, env)
@@ -1151,6 +1232,8 @@ class Checker:
                 if isinstance(container, BuiltinTy) and container.name == "Pool":
                     self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
                     return container.args[0]
+                if resolve(index_type) == RANGE and (isinstance(container, ListTy) or container == STR):
+                    return container  # a slice: `xs[1..3]`
                 if not self.unify(index_type, I64):
                     raise EllaError(f"an index must be an i64, not {show_type(index_type)}", index.span)
                 match container:
@@ -1232,6 +1315,8 @@ class Checker:
                     match_type = self.join(
                         match_type, self.check(case.body, case_env), case.span, "all cases of 'match'"
                     )
+                unguarded = [case.pattern for case in cases if case.guard is None]
+                self.coverage.append(("match", unguarded, subject_type, span))
                 return match_type
             case For(label, pattern, iterable, body, span):
                 iterable_type = self.known(self.check(iterable, env), iterable.span)
@@ -1258,6 +1343,7 @@ class Checker:
                         raise EllaError(f"can't loop over a {show_type(iterable_type)}", span)
                 loop_env = Env(env)
                 self.check_pattern(pattern, item_type, loop_env)
+                self.coverage.append(("for", [pattern], item_type, span))
                 self.check_loop_body(LoopInfo(label, "for"), body, loop_env)
                 return UNIT
             case While(label, cond, body):
@@ -1361,6 +1447,12 @@ class Checker:
         struct = self.known(t, expr.target.span)
         if isinstance(struct, DeferredTy):
             return DEFERRED
+        if isinstance(struct, TupleTy) and expr.name.isdigit():
+            index = int(expr.name)
+            if index >= len(struct.items):
+                raise EllaError(f"a tuple of {len(struct.items)} items has no item {index}", expr.span)
+            self.members[id(expr)] = index
+            return struct.items[index]
         if isinstance(struct, EnumTy) and self.enums[struct.name].struct:
             info = self.enums[struct.name]
             if expr.name in info.field_names:
@@ -1508,6 +1600,8 @@ class Checker:
                     self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
                     t = container.args[0]
                 else:
+                    if resolve(index_type) == RANGE:
+                        raise EllaError(f"can't {verb} a slice; change the items one by one", span)
                     if not self.unify(index_type, I64):
                         raise EllaError(f"an index must be an i64, not {show_type(index_type)}", index.span)
                     match container:
@@ -1516,7 +1610,10 @@ class Checker:
                         case _:
                             raise EllaError(f"can't {verb} an element of a {show_type(container)}", span)
             case Member(container_expr, _, span):
-                t = self.member_type(target, self.check_place(container_expr, env, verb, False))
+                container = self.check_place(container_expr, env, verb, False)
+                if isinstance(resolve(container), TupleTy):
+                    raise EllaError(f"a tuple can't be changed in place, so you can't {verb} its items", span)
+                t = self.member_type(target, container)
             case _:
                 raise EllaError(f"can only {verb} a variable or a part of one", target.span)
         self.types[id(target)] = t
@@ -1599,7 +1696,10 @@ class Checker:
         for local in reversed(chain):
             for name, info in local.vars.items():
                 if info.kind == "local":
-                    captured.vars[name] = VarInfo(info.type, False, "local", level=info.level, binder=info.binder)
+                    outer = info.outer_quote or (info.level is not None and info.level > self.level)
+                    captured.vars[name] = VarInfo(
+                        info.type, False, "local", level=info.level, binder=info.binder, outer_quote=outer
+                    )
                 else:  # a local enum's variants
                     captured.vars[name] = info
         return captured
@@ -1846,7 +1946,19 @@ class Checker:
         return self.types[id(code)]
 
     def check_builtin(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
-        """`print`, `len`, `run`, the pool functions `pool_new`, `alloc` and `free`, and reflection."""
+        """`print`, `len`, `run`, the pool functions `pool_new`, `alloc` and `free`, reflection, and the library."""
+        if name in LIBRARY:
+            function = LIBRARY[name]
+            self.check_arity(name, len(function.params), args, span)
+            for i, (arg, t) in enumerate(zip(args, function.params), 1):
+                if isinstance(arg, MutArg):
+                    raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
+                self.expect(self.check(arg, env), t, arg.span, f"argument {i} of {name}()")
+            # The runtime makes the built-in Optional, Result and Error, which a program may replace.
+            for part, info in BUILTIN_ENUMS.items():
+                if self.enums[part] != info and part in enum_names(function.result):
+                    raise EllaError(f"{name}() needs the built-in {part}, which this program replaces", span)
+            return function.result
         if name in REFLECTION:
             params, reflected = REFLECTION[name]
             self.check_arity(name, len(params), args, span)
@@ -2009,8 +2121,34 @@ def defined_names(expr: object) -> list[str]:
     match expr:
         case Let(bindings):
             return [binding.name for binding in bindings]
+        case LetPattern(pattern):
+            return [node.name for node in pattern_names(pattern)]
         case EnumDef(name, variants=variants):
             return [name, *(variant.name for variant in variants)]
+    return []
+
+
+def enum_names(t: Type) -> set[str]:
+    """The enums and structs a type is made of, as written: `Result[i64, Error]` has Result and Error."""
+    match t:
+        case EnumTy(name, args):
+            return {name}.union(*map(enum_names, args))
+        case ListTy(item):
+            return enum_names(item)
+        case TupleTy(items) | BuiltinTy(_, items):
+            return set().union(*map(enum_names, items))
+        case FuncTy(params, result):
+            return enum_names(result).union(*map(enum_names, params))
+    return set()
+
+
+def pattern_names(pattern: Pattern) -> list[NamePattern]:
+    """The bare names in a pattern: the variables it binds, and variants like `None`."""
+    match pattern:
+        case NamePattern():
+            return [pattern]
+        case OrPattern(items) | VariantPattern(_, items) | TuplePattern(items):
+            return [node for item in items for node in pattern_names(item)]
     return []
 
 
@@ -2156,6 +2294,9 @@ class CopyChecker:
                 if self.loop_depth == 0:
                     self.movable.update(id(binding) for binding in bindings)
                 self.function_binders.update(id(binding) for binding in bindings)
+            case LetPattern(pattern, value):
+                self.walk(value, "borrow")  # its parts are borrowed, as a match's are
+                self.function_binders.update(id(node) for node in pattern_names(pattern))
             case Assign(_, target, value):
                 if self.nocopy(target):
                     raise EllaError(
@@ -2197,6 +2338,7 @@ class CopyChecker:
             case Match(subject, cases):
                 self.walk(subject, "borrow")
                 for case in cases:
+                    self.function_binders.update(id(node) for node in pattern_names(case.pattern))
                     self.walk(case.guard, "copy")
                     self.walk(case.body, context)
             case If(cond, then, else_):
@@ -2209,8 +2351,9 @@ class CopyChecker:
                 self.walk(exprs[-1], context)
             case Return(value):
                 self.walk(value, "return")
-            case For(_, _, iterable, body):
+            case For(_, pattern, iterable, body):
                 self.walk(iterable, "borrow")
+                self.function_binders.update(id(node) for node in pattern_names(pattern))
                 self.walk_loop(body)
             case While(_, cond, body):
                 self.walk(cond, "copy")

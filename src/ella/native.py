@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -21,6 +22,7 @@ from ella.ir import Module
 from ella.lexer import EllaError, Span
 from ella.lower import compile_program
 from ella.passes import optimize
+from ella.values import MAX_CALL_DEPTH
 
 RUNTIME = Path(__file__).with_name("runtime.c")
 CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra", "-Wpedantic"]
@@ -38,11 +40,11 @@ def runtime_object() -> Path:
     return obj
 
 
-def build(module: Module, executable: Path) -> None:
+def build(module: Module, executable: Path, max_depth: int = MAX_CALL_DEPTH) -> None:
     """Generate assembly for a module and link it with the runtime into an executable."""
     with tempfile.TemporaryDirectory() as directory:
         assembly = Path(directory) / "program.s"
-        assembly.write_text(generate(module))
+        assembly.write_text(generate(module, max_depth))
         subprocess.run(["gcc", str(assembly), str(runtime_object()), "-lm", "-o", str(executable)], check=True)
 
 
@@ -57,23 +59,23 @@ def compile_native(source: str, executable: Path, optimized: bool = True, out: T
     build(module, executable)
 
 
-def run_native(source: str, out: TextIO, optimized: bool = True) -> None:
+def run_native(source: str, out: TextIO, optimized: bool = True, stdin: bytes = b"", args: Sequence[str] = ()) -> None:
     """Compile a program to a native executable and run it, like the interpreters' `run`.
 
-    What the program prints goes to `out`. If it stops with a run-time
-    error, that is raised as an EllaError, as an interpreter would. Freed
-    arena memory is overwritten (ELLA_POISON), so that a program that uses
-    an object after its arena is freed prints nonsense instead of passing
-    by luck.
+    The program reads `stdin` and gets the arguments `args`. What it prints
+    goes to `out`. If it stops with a run-time error, that is raised as an
+    EllaError, as an interpreter would. Freed arena memory is overwritten
+    (ELLA_POISON), so that a program that uses an object after its arena is
+    freed prints nonsense instead of passing by luck.
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
         compile_native(source, executable, optimized, out)
         env = os.environ | {"ELLA_POISON": "1"}
-        result = subprocess.run([str(executable)], check=False, capture_output=True, text=True, env=env)
-    out.write(result.stdout)
+        result = subprocess.run([str(executable), *args], check=False, capture_output=True, input=stdin, env=env)
+    out.write(result.stdout.decode("utf-8"))
     if result.returncode != 0:
-        raise parse_error(result.stderr)
+        raise parse_error(result.stderr.decode("utf-8"))
 
 
 def parse_error(stderr: str) -> EllaError:

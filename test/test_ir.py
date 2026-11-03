@@ -210,8 +210,9 @@ print(f())
 let later = 1
 """,
     "index out of range": "let xs = [1, 2]\nprint(xs[2])",
-    "no case matches": "match 3\n    case 1 => print(1)",
-    "for pattern doesn't match": "for (a, 1) in [(1, 1), (2, 2)]\n    print(a)",
+    "slice out of range": 'print("abc"[1..2])\nprint("abc"[2..1])',
+    "to_i64 out of range": "print(to_i64(-1.5))\nprint(to_i64(1.0e19))",
+    "split by nothing": 'print(split("a b", " "))\nprint(split("a", ""))',
     "stack overflow": "let f = (n: i64) -> i64 => f(n + 1)\nf(0)",
     "division by zero": "print(1 // 0)",
     # Memory: copies, changing lists in place, and arenas (docs/memory-model.md).
@@ -466,7 +467,10 @@ def test_run_time_staging(source: str) -> None:
 
 
 def test_some_programs_fail_the_same_way() -> None:
-    assert outcome(ir_output, PROGRAMS["no case matches"])[1] == "1:1: no case matches 3"
+    assert (
+        outcome(ir_output, PROGRAMS["slice out of range"])[1]
+        == "2:12: slice 2..1 is out of range for a str of length 3"
+    )
     assert outcome(ir_output, PROGRAMS["value used before let in a function"])[1] == (
         "1:22: 'later' is used before its 'let' has run"
     )

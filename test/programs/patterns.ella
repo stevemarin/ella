@@ -1,0 +1,65 @@
+# Destructuring `let`, tuple items, and matches that cover every value.
+
+let pair = (1, "one")
+print(pair.0)
+print(pair.1)
+let nested = ((1, 2), [3, 4], ("x", (true, 2.5)))
+print(nested.0.1)
+print(nested.2.1.1)
+print(nested.1[1])
+
+let (a, b) = pair
+print("{{a}} {{b}}")
+let ((p, q), items, (_, (flag, ratio))) = nested
+print(p + q + len(items))
+print(flag)
+print(ratio)
+
+struct Point
+    x: f64
+    y: f64
+
+let Point(x, y) = Point(3.0, 4.0)
+print(x * y)
+
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+
+let area = (s: Shape) -> f64 =>
+    match s
+        case Circle(r) => 3.0 * r * r
+        case Rect(w, h) => w * h
+
+let divide = (a: i64, b: i64) -> (i64, i64) => (a // b, a % b)
+
+let main = () -> () =>
+    let (quotient, remainder) = divide(17, 5)
+    print("17 = 5 * {{quotient}} + {{remainder}}")
+    let mut sum = 0
+    for (i, word) in [(1, "a"), (2, "bb")]
+        sum += i * len(word)
+    print(sum)
+    print(area(Rect(2.0, 3.0)) + area(Circle(1.0)))
+    let both = (true, None)
+    match both
+        case (true, Some(n)) => print(n)
+        case (true, None) => print("true and nothing")
+        case (false, _) => print("false")
+    let describe = (n: Optional[Result[i64, str]]) -> str =>
+        match n
+            case Some(Ok(0)) => "zero"
+            case Some(Ok(_)) => "a number"
+            case Some(Err(e)) => e
+            case None => "nothing"
+    print(describe(Some(Ok(0))))
+    print(describe(Some(Ok(5))))
+    print(describe(Some(Err("bad"))))
+    print(describe(None))
+    # An assignment as a body has the value ().
+    let mut log: [str] = []
+    let add = (mut xs: [str], x: str) -> () => xs += [x]
+    add(mut log, "first")
+    let flag = true
+    if flag then log += ["second"] else log += ["never"]
+    print(log)

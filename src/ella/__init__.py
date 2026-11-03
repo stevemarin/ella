@@ -11,12 +11,14 @@ from ella.interpreter import Interpreter
 from ella.ir import Module, format_module, format_placement
 from ella.ir_interpreter import IRInterpreter
 from ella.lexer import EllaError, tokenize
+from ella.library import Host
 from ella.lower import compile_program
 from ella.native import build, parse_error
 from ella.parser import parse
 from ella.passes import PASSES, optimize
 from ella.staging import prepare
 from ella.syntax import show
+from ella.values import MAX_CALL_DEPTH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,10 +42,22 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("-o", "--output", type=Path, help="compile to a native executable with this name")
     args.add_argument("-O", "--optimize", action="store_true", help="optimize the IR before running or printing it")
     args.add_argument(
+        "--max-depth",
+        type=int,
+        default=MAX_CALL_DEPTH,
+        help=f"how deeply functions may call each other (default {MAX_CALL_DEPTH})",
+    )
+    args.add_argument(
         "--passes",
         help=f"run these optimization passes, in order, separated by commas ({', '.join(PASSES)})",
     )
-    options = args.parse_args(argv)
+    # Everything after `--` is for the program: `ella prog.ella -- a b`.
+    argv = sys.argv[1:] if argv is None else argv
+    program_args = argv[argv.index("--") + 1 :] if "--" in argv else []
+    options = args.parse_args(argv[: argv.index("--")] if "--" in argv else argv)
+    if options.max_depth < 1:
+        args.error("--max-depth must be at least 1")
+    host = Host(args=program_args)
     passes = None
     if options.passes is not None:
         passes = [name.strip() for name in options.passes.split(",") if name.strip()]
@@ -66,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         elif options.tree:
             program = parse(source)
             program, checker = prepare(program)
-            Interpreter(checker=checker).run(program)
+            Interpreter(checker=checker, host=host, max_depth=options.max_depth).run(program)
         else:
             module = compile_program(source)
             if options.optimize or passes is not None:
@@ -76,20 +90,20 @@ def main(argv: list[str] | None = None) -> int:
             elif options.placement:
                 print(format_placement(module), end="")
             elif options.asm:
-                print(generate(module), end="")
+                print(generate(module, options.max_depth), end="")
             elif options.output is not None:
-                build(module, options.output)
+                build(module, options.output, options.max_depth)
             elif options.native:
-                run_executable(module)
+                run_executable(module, program_args, options.max_depth)
             elif options.profile:
-                interpreter = IRInterpreter(module)
+                interpreter = IRInterpreter(module, host=host, max_depth=options.max_depth)
                 try:
                     interpreter.run()
                 finally:
                     sys.stdout.flush()
                     print(interpreter.format_profile(), end="", file=sys.stderr)
             else:
-                IRInterpreter(module).run()
+                IRInterpreter(module, host=host, max_depth=options.max_depth).run()
     except EllaError as error:
         # Flush what the program printed first, so the error comes after it.
         sys.stdout.flush()
@@ -98,12 +112,16 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run_executable(module: Module) -> None:
-    """Build a native executable in a temporary directory, run it, and pass on its output."""
+def run_executable(module: Module, program_args: list[str], max_depth: int) -> None:
+    """Build a native executable in a temporary directory, and run it with the program's arguments.
+
+    It reads this process's standard input, and its output is passed on.
+    """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
-        build(module, executable)
-        result = subprocess.run([str(executable)], check=False, capture_output=True, text=True)
-    print(result.stdout, end="")
+        build(module, executable, max_depth)
+        sys.stdout.flush()
+        result = subprocess.run([str(executable), *program_args], check=False, capture_output=True)
+    sys.stdout.buffer.write(result.stdout)
     if result.returncode != 0:
-        raise parse_error(result.stderr)
+        raise parse_error(result.stderr.decode("utf-8"))

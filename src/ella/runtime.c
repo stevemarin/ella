@@ -11,6 +11,8 @@
 // is its raw bits); everything else is a pointer to one of the structs
 // below, which live in arenas (see "Arenas" below, and docs/memory-model.md).
 
+#include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
@@ -19,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 typedef int64_t word;
 
@@ -137,14 +141,14 @@ _Noreturn static void out_of_memory(const char *what) {
 // numbered from SLOT_DEPTH up, which is freed when the value is.
 //
 // All the arenas are parts of one range of address space, reserved when the
-// program starts: SCOPE_SIZE bytes for each scope arena, then SLOT_SIZE for
-// each slot arena. So an arena never moves, and the arena an object is in
+// program starts: up to 1 GiB for each scope arena (there is room for two
+// scope levels per nested call, and some more, in at most SCOPE_SPACE), then
+// SLOT_SIZE for each slot arena. So an arena never moves, and the arena an object is in
 // can be worked out from its address. Making an object just bumps the
 // arena's `top` pointer; the system gives the memory pages as they are first
 // used, and freeing an arena sets `top` back to the start.
 
-#define SCOPE_ARENAS 16384
-#define SCOPE_SIZE ((size_t)1 << 30)  // 1 GiB of address space per scope arena
+#define SCOPE_SPACE ((size_t)32 << 40)  // 32 TiB for all the scope arenas
 #define SLOT_ARENAS ((word)1 << 20)
 #define SLOT_SIZE ((size_t)16 << 20)  // 16 MiB per slot arena
 #define SLOT_DEPTH ((word)1 << 20)
@@ -165,7 +169,9 @@ typedef struct {
 } Arena;
 
 static char *space;  // all the arenas' address space
-static Arena scope_arenas[SCOPE_ARENAS];
+static word scope_count;  // how many scope arenas there are
+static size_t scope_size;  // and the address space of each
+static Arena *scope_arenas;
 static Arena *slot_arenas;
 static word *free_slots, free_slot_count, slot_arenas_used;
 
@@ -183,31 +189,38 @@ static size_t in_use, peak;
 
 static size_t round16(size_t size) { return (size + 15) & ~(size_t)15; }
 
+extern const word ella_max_depth;  // in the generated code: how deeply calls may nest
+
 static void reserve(void) {
-    size_t size = SCOPE_ARENAS * SCOPE_SIZE + (size_t)SLOT_ARENAS * SLOT_SIZE;
+    scope_count = 2 * ella_max_depth + 1024;
+    if (scope_count >= SLOT_DEPTH) out_of_memory("can't reserve address space");
+    for (scope_size = (size_t)1 << 30; (size_t)scope_count * scope_size > SCOPE_SPACE;) scope_size /= 2;
+    size_t size = (size_t)scope_count * scope_size + (size_t)SLOT_ARENAS * SLOT_SIZE;
     space = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    scope_arenas = calloc((size_t)scope_count, sizeof(Arena));
     slot_arenas = calloc((size_t)SLOT_ARENAS, sizeof(Arena));
     free_slots = malloc((size_t)SLOT_ARENAS * sizeof(word));
-    if (space == MAP_FAILED || slot_arenas == NULL || free_slots == NULL) out_of_memory("can't reserve address space");
-    for (word i = 0; i < SCOPE_ARENAS; i++) scope_arenas[i].top = space + i * SCOPE_SIZE;
+    if (space == MAP_FAILED || scope_arenas == NULL || slot_arenas == NULL || free_slots == NULL)
+        out_of_memory("can't reserve address space");
+    for (word i = 0; i < scope_count; i++) scope_arenas[i].top = space + i * scope_size;
 }
 
 static char *arena_start(word depth) {
-    if (depth >= SLOT_DEPTH) return space + SCOPE_ARENAS * SCOPE_SIZE + (size_t)(depth - SLOT_DEPTH) * SLOT_SIZE;
-    return space + depth * SCOPE_SIZE;
+    if (depth >= SLOT_DEPTH) return space + scope_count * scope_size + (size_t)(depth - SLOT_DEPTH) * SLOT_SIZE;
+    return space + depth * scope_size;
 }
 
 static Arena *arena(word depth) {
     if (depth >= SLOT_DEPTH) return &slot_arenas[depth - SLOT_DEPTH];
-    if (depth < 0 || depth >= SCOPE_ARENAS) out_of_memory("too many nested scopes");
+    if (depth < 0 || depth >= scope_count) out_of_memory("too many nested scopes");
     return &scope_arenas[depth];
 }
 
 // The arena an object is in, from its address: -1 for static data.
 word ella_region_of(word object) {
     char *p = (char *)object;
-    char *slots = space + SCOPE_ARENAS * SCOPE_SIZE;
-    if (p >= space && p < slots) return (word)((size_t)(p - space) / SCOPE_SIZE);
+    char *slots = space + scope_count * scope_size;
+    if (p >= space && p < slots) return (word)((size_t)(p - space) / scope_size);
     if (p >= slots && p < slots + (size_t)SLOT_ARENAS * SLOT_SIZE) return SLOT_DEPTH + (word)((size_t)(p - slots) / SLOT_SIZE);
     return -1;
 }
@@ -215,7 +228,7 @@ word ella_region_of(word object) {
 static void *alloc(size_t size, word depth) {
     Arena *a = arena(depth);
     char *object = a->top;
-    size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : SCOPE_SIZE;
+    size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : scope_size;
     if ((size_t)(object + round16(size) - arena_start(depth)) > limit) out_of_memory("an arena is full");
     a->top = object + round16(size);
     in_use += round16(size);
@@ -282,7 +295,7 @@ void ella_reset(word first, word end) {
 // A call starts: take `levels` depths, and return the first.
 word ella_enter(word levels) {
     word base = ella_next_depth;
-    if (base + levels > SCOPE_ARENAS) out_of_memory("too many nested scopes");
+    if (base + levels > scope_count) out_of_memory("too many nested scopes");
     ella_next_depth = base + levels;
     return base;
 }
@@ -697,7 +710,7 @@ List *ella_list_append(List *xs, const List *ys, const Type *item, word depth) {
         char *end = (char *)xs + round16(sizeof(List) + (size_t)xs->cap * sizeof(word));
         if (end == a->top) {
             char *new_end = (char *)xs + round16(sizeof(List) + (size_t)cap * sizeof(word));
-            size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : SCOPE_SIZE;
+            size_t limit = depth >= SLOT_DEPTH ? SLOT_SIZE : scope_size;
             if ((size_t)(new_end - arena_start(depth)) > limit) out_of_memory("an arena is full");
             in_use += (size_t)(new_end - end);
             if (in_use > peak) peak = in_use;
@@ -964,13 +977,19 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
     }
 }
 
+// A buffer's text as a new string. The buffer is freed.
+static Str *buffer_str(Buffer *b, word depth) {
+    Str *s = str_alloc(b->len, depth);
+    if (b->len) memcpy(s->chars, b->chars, (size_t)b->len * sizeof(uint32_t));
+    free(b->chars);
+    *b = (Buffer){0};
+    return s;
+}
+
 Str *ella_to_text(word v, const Type *t, word depth) {
     Buffer b = {0};
     put_value(&b, v, t, 0);
-    Str *s = str_alloc(b.len, depth);
-    if (b.len) memcpy(s->chars, b.chars, (size_t)b.len * sizeof(uint32_t));
-    free(b.chars);
-    return s;
+    return buffer_str(&b, depth);
 }
 
 // Output, in UTF-8
@@ -1016,14 +1035,408 @@ _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word 
     exit(1);
 }
 
-// The program starts here, and runs the top-level code (generated as ella_main).
+// Slices: `xs[a..b]` and `s[a..b]`, new lists (of copies of the items) and strings.
 
-extern void ella_main(void);
+static void check_slice(const Range *r, word len, const char *what, word line, word column) {
+    if (0 <= r->start && r->start <= r->stop && r->stop <= len) return;
+    Buffer b = {0};
+    put_i128(&b, r->start);
+    put_ascii(&b, "..");
+    put_i128(&b, r->stop);
+    char text[100];
+    for (word i = 0; i < b.len; i++) text[i] = (char)b.chars[i];
+    text[b.len] = 0;
+    free(b.chars);
+    fail(line, column, "slice %s is out of range for a %s of length %" PRId64, text, what, len);
+}
 
-int main(void) {
+static Str *substring(const Str *s, word start, word stop, word depth) {
+    Str *part = str_alloc(stop - start, depth);
+    memcpy(part->chars, s->chars + start, (size_t)(stop - start) * sizeof(uint32_t));
+    return part;
+}
+
+Str *ella_str_slice(const Str *s, const Range *r, word line, word column, word depth) {
+    check_slice(r, s->len, "str", line, column);
+    return substring(s, r->start, (word)r->stop, depth);
+}
+
+List *ella_list_slice(const List *xs, const Range *r, const Type *item, word line, word column, word depth) {
+    check_slice(r, xs->len, "list", line, column);
+    List *part = ella_list_alloc((word)r->stop - r->start, depth);
+    for (word i = 0; i < part->len; i++) {
+        word x = xs->items[r->start + i];
+        part->items[i] = is_boxed(item) ? ella_copy(x, item, depth) : x;
+    }
+    return part;
+}
+
+// The library: built-in functions with fixed types, which must behave
+// exactly like ella/library.py. Each takes its arguments, then the line and
+// column of the call (for errors), then the depth of the arena for its
+// result.
+
+#define UNUSED(x) (void)(x)
+
+// The variants of the built-in enums, numbered by their positions in
+// ella.checker.BUILTIN_ENUMS.
+enum { TAG_OK = 0, TAG_ERR = 1, TAG_SOME = 0, TAG_NONE = 1, TAG_ERROR = 0 };
+
+static word variant1(word tag, word field, word depth) {
+    Variant *v = ella_variant_alloc(tag, 1, depth);
+    v->fields[0] = field;
+    return (word)v;
+}
+
+static word some(word value, word depth) { return variant1(TAG_SOME, value, depth); }
+static word none(word depth) { return (word)ella_variant_alloc(TAG_NONE, 0, depth); }
+static word ok(word value, word depth) { return variant1(TAG_OK, value, depth); }
+
+// Err(Error(message)), with the message in a buffer, which is freed.
+static word err(Buffer *message, word depth) {
+    return variant1(TAG_ERR, variant1(TAG_ERROR, (word)buffer_str(message, depth), depth), depth);
+}
+
+// One UTF-8 sequence at the start of p (n bytes): its length, and its code
+// point in *c. 0 if it isn't valid: as Python's decoder, no overlong forms,
+// surrogates or code points past U+10FFFF.
+static size_t utf8_sequence(const unsigned char *p, size_t n, uint32_t *c) {
+    size_t len;
+    uint32_t least;
+    if (p[0] < 0x80) {
+        *c = p[0];
+        return 1;
+    } else if (p[0] >= 0xC2 && p[0] <= 0xDF) {
+        len = 2, least = 0x80, *c = p[0] & 0x1F;
+    } else if (p[0] >= 0xE0 && p[0] <= 0xEF) {
+        len = 3, least = 0x800, *c = p[0] & 0x0F;
+    } else if (p[0] >= 0xF0 && p[0] <= 0xF4) {
+        len = 4, least = 0x10000, *c = p[0] & 0x07;
+    } else {
+        return 0;
+    }
+    if (n < len) return 0;
+    for (size_t i = 1; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        *c = (*c << 6) | (p[i] & 0x3F);
+    }
+    if (*c < least || *c > 0x10FFFF || (*c >= 0xD800 && *c <= 0xDFFF)) return 0;
+    return len;
+}
+
+// UTF-8 text as a new string, or NULL if it isn't valid UTF-8.
+static Str *decode(const unsigned char *bytes, size_t n, word depth) {
+    word count = 0;
+    uint32_t c;
+    for (size_t i = 0; i < n; count++) {
+        size_t len = utf8_sequence(bytes + i, n - i, &c);
+        if (len == 0) return NULL;
+        i += len;
+    }
+    Str *s = str_alloc(count, depth);
+    for (size_t i = 0, k = 0; i < n; k++) {
+        i += utf8_sequence(bytes + i, n - i, &c);
+        s->chars[k] = c;
+    }
+    return s;
+}
+
+// A string as a C string in UTF-8, for file names. The caller frees it.
+static char *encode(const Str *s) {
+    char *text = malloc((size_t)s->len * 4 + 1), *p = text;
+    if (text == NULL) out_of_memory("can't encode a string");
+    for (word i = 0; i < s->len; i++) {
+        uint32_t c = s->chars[i];
+        if (c < 0x80) {
+            *p++ = (char)c;
+        } else if (c < 0x800) {
+            *p++ = (char)(0xC0 | (c >> 6));
+            *p++ = (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            *p++ = (char)(0xE0 | (c >> 12));
+            *p++ = (char)(0x80 | ((c >> 6) & 0x3F));
+            *p++ = (char)(0x80 | (c & 0x3F));
+        } else {
+            *p++ = (char)(0xF0 | (c >> 18));
+            *p++ = (char)(0x80 | ((c >> 12) & 0x3F));
+            *p++ = (char)(0x80 | ((c >> 6) & 0x3F));
+            *p++ = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    *p = 0;
+    return text;
+}
+
+static int is_digit(uint32_t c) { return c >= '0' && c <= '9'; }
+
+static int matches_at(const Str *s, word i, const Str *part) {
+    return i + part->len <= s->len && memcmp(s->chars + i, part->chars, (size_t)part->len * sizeof(uint32_t)) == 0;
+}
+
+word ella_lib_to_f64(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits((double)n);
+}
+
+word ella_lib_to_i64(word bits, word line, word column, word depth) {
+    UNUSED(depth);
+    double x = as_f64(bits), whole = trunc(x);
+    if (!(whole >= -9223372036854775808.0 && whole < 9223372036854775808.0)) {  // also false for NaN
+        Buffer b = {0};
+        put_f64(&b, x);
+        char text[40];
+        for (word i = 0; i < b.len; i++) text[i] = (char)b.chars[i];
+        text[b.len] = 0;
+        free(b.chars);
+        fail(line, column, "to_i64() can't convert %s to an i64", text);
+    }
+    return (word)whole;
+}
+
+word ella_lib_parse_i64(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    word i = 0;
+    int negative = 0;
+    if (i < s->len && (s->chars[i] == '+' || s->chars[i] == '-')) negative = s->chars[i++] == '-';
+    int valid = i < s->len, fits = 1;
+    __int128 n = 0;
+    for (; i < s->len && valid; i++) {
+        valid = is_digit(s->chars[i]);
+        if (fits) n = n * 10 + (s->chars[i] - '0');
+        if (n > (__int128)INT64_MAX + 1) fits = 0;
+    }
+    if (negative) n = -n;
+    if (valid && fits && n <= INT64_MAX) return ok((word)n, depth);
+    Buffer message = {0};
+    put_quoted(&message, s);
+    put_ascii(&message, valid ? " doesn't fit in an i64" : " isn't an i64");
+    return err(&message, depth);
+}
+
+word ella_lib_parse_f64(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    // [+-]?, then digits with an optional fraction and exponent, or inf or nan.
+    word i = 0, n = s->len;
+    const uint32_t *c = s->chars;
+    if (i < n && (c[i] == '+' || c[i] == '-')) i++;
+    int valid;
+    if (n - i == 3 && ((c[i] == 'i' && c[i + 1] == 'n' && c[i + 2] == 'f') ||
+                       (c[i] == 'n' && c[i + 1] == 'a' && c[i + 2] == 'n'))) {
+        valid = 1;
+    } else {
+        word digits = 0;
+        for (; i < n && is_digit(c[i]); i++) digits++;
+        if (i < n && c[i] == '.') {
+            for (i++; i < n && is_digit(c[i]); i++) digits++;
+        }
+        valid = digits > 0;
+        if (valid && i < n && (c[i] == 'e' || c[i] == 'E')) {
+            i++;
+            if (i < n && (c[i] == '+' || c[i] == '-')) i++;
+            valid = i < n && is_digit(c[i]);
+            while (i < n && is_digit(c[i])) i++;
+        }
+        valid = valid && i == n;
+    }
+    if (!valid) {
+        Buffer message = {0};
+        put_quoted(&message, s);
+        put_ascii(&message, " isn't an f64");
+        return err(&message, depth);
+    }
+    char *text = encode(s);  // only ASCII, so one byte per character
+    double x = strtod(text, NULL);
+    free(text);
+    return ok(f64_bits(x), depth);
+}
+
+word ella_lib_read_line(word line, word column, word depth) {
+    char *text = NULL;
+    size_t capacity = 0;
+    ssize_t n = getline(&text, &capacity, stdin);
+    if (n < 0) {
+        free(text);
+        return none(depth);
+    }
+    if (n > 0 && text[n - 1] == '\n') n--;
+    if (n > 0 && text[n - 1] == '\r') n--;
+    Str *s = decode((const unsigned char *)text, (size_t)n, depth);
+    free(text);
+    if (s == NULL) fail(line, column, "read_line(): the input isn't valid UTF-8");
+    return some((word)s, depth);
+}
+
+word ella_lib_read_file(const Str *path, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    Buffer message = {0};
+    put_ascii(&message, "can't read ");
+    put_quoted(&message, path);
+    put_ascii(&message, ": ");
+    int error = 0;
+    for (word i = 0; i < path->len; i++) {
+        if (path->chars[i] == 0) error = EINVAL;  // as open() would say, given the whole name
+    }
+    unsigned char *data = NULL;
+    size_t len = 0, capacity = 0;
+    if (!error) {
+        char *name = encode(path);
+        int fd = open(name, O_RDONLY | O_CLOEXEC);
+        free(name);
+        if (fd < 0) error = errno;
+        while (!error) {
+            if (len == capacity) {
+                capacity = capacity ? 2 * capacity : 4096;
+                data = realloc(data, capacity);
+                if (data == NULL) out_of_memory("can't read a file");
+            }
+            ssize_t got = read(fd, data + len, capacity - len);
+            if (got < 0) error = errno;
+            if (got <= 0) break;
+            len += (size_t)got;
+        }
+        if (fd >= 0) close(fd);
+    }
+    if (error) {
+        put_ascii(&message, strerror(error));
+        free(data);
+        return err(&message, depth);
+    }
+    Str *s = decode(data, len, depth);
+    free(data);
+    if (s == NULL) {
+        put_ascii(&message, "it isn't valid UTF-8");
+        return err(&message, depth);
+    }
+    free(message.chars);
+    return ok((word)s, depth);
+}
+
+static int arg_count;
+static char **arg_values;
+
+word ella_lib_args(word line, word column, word depth) {
+    List *args = ella_list_alloc(arg_count, depth);
+    for (int i = 0; i < arg_count; i++) {
+        Str *s = decode((const unsigned char *)arg_values[i], strlen(arg_values[i]), depth);
+        if (s == NULL) fail(line, column, "args(): an argument isn't valid UTF-8");
+        args->items[i] = (word)s;
+    }
+    return (word)args;
+}
+
+word ella_lib_split(const Str *s, const Str *separator, word line, word column, word depth) {
+    if (separator->len == 0) fail(line, column, "split() needs a separator that isn't empty");
+    word count = 1;
+    for (word i = 0; i < s->len;) {
+        if (matches_at(s, i, separator)) {
+            count++;
+            i += separator->len;
+        } else {
+            i++;
+        }
+    }
+    List *parts = ella_list_alloc(count, depth);
+    word start = 0, k = 0;
+    for (word i = 0; i < s->len;) {
+        if (matches_at(s, i, separator)) {
+            parts->items[k++] = (word)substring(s, start, i, depth);
+            i += separator->len;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    parts->items[k] = (word)substring(s, start, s->len, depth);
+    return (word)parts;
+}
+
+Str *ella_lib_join(const List *parts, const Str *separator, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    word len = 0;
+    for (word i = 0; i < parts->len; i++) len += ((const Str *)parts->items[i])->len + (i ? separator->len : 0);
+    Str *s = str_alloc(len, depth);
+    uint32_t *p = s->chars;
+    for (word i = 0; i < parts->len; i++) {
+        const Str *part = (const Str *)parts->items[i];
+        if (i) {
+            memcpy(p, separator->chars, (size_t)separator->len * sizeof(uint32_t));
+            p += separator->len;
+        }
+        memcpy(p, part->chars, (size_t)part->len * sizeof(uint32_t));
+        p += part->len;
+    }
+    return s;
+}
+
+word ella_lib_find(const Str *s, const Str *part, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    for (word i = 0; i + part->len <= s->len; i++) {
+        if (matches_at(s, i, part)) return some(i, depth);
+    }
+    return none(depth);
+}
+
+Str *ella_lib_replace(const Str *s, const Str *old, const Str *new, word line, word column, word depth) {
+    if (old->len == 0) fail(line, column, "replace() needs a string to replace that isn't empty");
+    word count = 0;
+    for (word i = 0; i < s->len;) {
+        if (matches_at(s, i, old)) {
+            count++;
+            i += old->len;
+        } else {
+            i++;
+        }
+    }
+    Str *result = str_alloc(s->len + count * (new->len - old->len), depth);
+    uint32_t *p = result->chars;
+    for (word i = 0; i < s->len;) {
+        if (matches_at(s, i, old)) {
+            memcpy(p, new->chars, (size_t)new->len * sizeof(uint32_t));
+            p += new->len;
+            i += old->len;
+        } else {
+            *p++ = s->chars[i++];
+        }
+    }
+    return result;
+}
+
+static int is_space(uint32_t c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+
+Str *ella_lib_trim(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    word start = 0, stop = s->len;
+    while (start < stop && is_space(s->chars[start])) start++;
+    while (stop > start && is_space(s->chars[stop - 1])) stop--;
+    return substring(s, start, stop, depth);
+}
+
+List *ella_lib_chars(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column);
+    List *chars = ella_list_alloc(s->len, depth);
+    for (word i = 0; i < s->len; i++) chars->items[i] = (word)substring(s, i, i + 1, depth);
+    return chars;
+}
+
+// The program starts here, and runs the top-level code (generated as
+// ella_main) on a stack of its own, big enough for ella_max_depth nested
+// calls. Only the parts it uses take memory. A page at its end that can't
+// be used stops a program that runs past it, rather than letting it
+// overwrite other memory.
+
+#define STACK_PER_CALL ((size_t)256 << 10)
+
+extern void ella_main(char *stack);
+
+int main(int argc, char **argv) {
     poison = getenv("ELLA_POISON") != NULL;
+    arg_count = argc - 1;
+    arg_values = argv + 1;
     reserve();
-    ella_main();
+    size_t stack_size = (size_t)ella_max_depth * STACK_PER_CALL + ((size_t)1 << 30);
+    char *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (stack == MAP_FAILED || mprotect(stack, 4096, PROT_NONE) != 0) out_of_memory("can't make the stack");
+    ella_main(stack + stack_size);
     ella_reset(0, 1);  // the globals, and their finalizers
     fflush(stdout);
     if (getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);

@@ -22,8 +22,10 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import TextIO
 
-from ella.checker import OPERATOR_METHODS, REFLECTION, Checker, check_code, finish
+from ella.checker import LIBRARY, OPERATOR_METHODS, REFLECTION, Checker, check_code, finish, pattern_names
 from ella.lexer import EllaError, Span
+from ella.library import Host
+from ella.library import call as call_library
 from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
 from ella.staging import (
@@ -60,6 +62,7 @@ from ella.syntax import (
     IntLit,
     Lambda,
     Let,
+    LetPattern,
     ListLit,
     LiteralPattern,
     Loop,
@@ -88,6 +91,7 @@ from ella.syntax import (
     mentions_return,
 )
 from ella.values import (
+    MAX_CALL_DEPTH,
     UNIT,
     Builtin,
     Closure,
@@ -102,14 +106,10 @@ from ella.values import (
     VariantValue,
     copy_value,
     equal,
+    run_deep,
     to_text,
     type_name,
 )
-
-# How deeply Ella functions may call each other before we report a stack
-# overflow. Each Ella call uses a few dozen Python frames, so the Python
-# recursion limit is raised to match while a program runs.
-MAX_CALL_DEPTH = 1000
 
 # How `a.compare(b)` decides each ordering comparison.
 ORDERING: dict[str, Callable[[int], bool]] = {
@@ -118,6 +118,8 @@ ORDERING: dict[str, Callable[[int], bool]] = {
     ">": lambda order: order > 0,
     ">=": lambda order: order >= 0,
 }
+# Each Ella call uses a few dozen Python frames, so the Python recursion
+# limit is raised to match while a program runs.
 PYTHON_FRAMES_PER_CALL = 50
 
 
@@ -155,7 +157,7 @@ class ReturnSignal(Exception):
         self.span = span
 
 
-def run(source: str, out: TextIO | None = None) -> None:
+def run(source: str, out: TextIO | None = None, host: Host | None = None) -> None:
     """Parse and run a program, writing what it prints to `out` (standard output by default).
 
     Raises EllaError for syntax and run-time errors. The program isn't type
@@ -165,20 +167,31 @@ def run(source: str, out: TextIO | None = None) -> None:
     program = parse(source)
     if uses_staging(program):
         program, checker = prepare(program, out)
-        Interpreter(out, checker).run(program)
+        Interpreter(out, checker, host=host).run(program)
     else:
-        Interpreter(out).run(program)
+        Interpreter(out, host=host).run(program)
 
 
 class Interpreter:
     def __init__(
-        self, out: TextIO | None = None, checker: Checker | None = None, tables: Tables | None = None
+        self,
+        out: TextIO | None = None,
+        checker: Checker | None = None,
+        tables: Tables | None = None,
+        host: Host | None = None,
+        max_depth: int = MAX_CALL_DEPTH,
     ) -> None:
-        """`checker` is the checked program's checker, which quotes and `run` need; `tables` may share its tables."""
+        """`checker` is the checked program's checker, which quotes and `run` need; `tables` may share its tables.
+
+        `host` has the program's input and arguments, and `max_depth` is how
+        deeply its functions may call each other.
+        """
         # Look up sys.stdout now rather than as a default argument, which
         # would be fixed when this module is imported.
         self.out = out if out is not None else sys.stdout
+        self.host = host if host is not None else Host()
         self.depth = 0  # how many Ella function calls are in progress
+        self.max_depth = max_depth
         self.checker = checker
         self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
         # While compiling, a top-level function's splices are expanded before it runs.
@@ -200,6 +213,8 @@ class Interpreter:
         self.globals.define("run", Builtin("run", 1, self.builtin_run))
         for name, (params, _) in REFLECTION.items():
             self.globals.define(name, Builtin(name, len(params), self.builtin_reflect(name)))
+        for name, function in LIBRARY.items():
+            self.globals.define(name, Builtin(name, len(function.params), self.builtin_library(name)))
         self.globals.define("pool_new", Builtin("pool_new", 0, lambda args, span: self.new_pool()))
         # alloc and free change their pool, and are handled in `call_pool`.
         self.globals.define("alloc", Builtin("alloc", 2, lambda args, span: UNIT))
@@ -215,8 +230,9 @@ class Interpreter:
 
     def run(self, program: Program) -> None:
         """Run the top-level expressions in order, then `main` if there is one."""
-        limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(max(limit, MAX_CALL_DEPTH * PYTHON_FRAMES_PER_CALL))
+        run_deep(lambda: self.run_program(program), self.max_depth, PYTHON_FRAMES_PER_CALL)
+
+    def run_program(self, program: Program) -> None:
         try:
             self.declare_top_level(program)
             self.owners.append([])  # the top-level code's own values
@@ -235,8 +251,6 @@ class Interpreter:
             raise EllaError("'break' outside of a loop", signal.span) from None
         except ContinueSignal as signal:
             raise EllaError("'continue' outside of a loop", signal.span) from None
-        finally:
-            sys.setrecursionlimit(limit)
 
     def declare_top_level(self, program: Program) -> None:
         """Make every top-level name exist before the program starts (docs/grammar.md §3).
@@ -255,6 +269,10 @@ class Interpreter:
                     for binding in bindings:
                         if binding.name not in self.globals.vars:
                             self.globals.vars[binding.name] = Var(UNIT, binding.mutable, ready=False)
+                case LetPattern(pattern):
+                    for node in pattern_names(pattern):
+                        if node.name not in self.globals.vars:
+                            self.globals.vars[node.name] = Var(UNIT, False, ready=False)
                 case EnumDef():
                     self.define_enum(expr, self.globals)
 
@@ -292,6 +310,16 @@ class Interpreter:
                 if isinstance(value, Closure) and isinstance(value_expr, Lambda):
                     for binding in bindings:
                         value.scope.define(binding.name, value)
+                return value
+            case LetPattern(pattern, value_expr, span):
+                value = self.eval(value_expr, scope)
+                bound = self.match_pattern(pattern, value, scope)
+                if bound is None:
+                    raise EllaError(f"the 'let' pattern doesn't match {to_text(value, nested=True)}", span)
+                if scope is self.globals:
+                    self.adopt(value, -1, 0)
+                for name, part in bound.items():
+                    scope.define(name, copy_value(part))
                 return value
             case Assign(op, target, value_expr, span):
                 return self.eval_assign(op, target, value_expr, scope, span)
@@ -444,6 +472,12 @@ class Interpreter:
                 return self.item(container, self.eval(index, scope), span)
             case Member(target, name, span):
                 struct = self.reference(target, scope, for_assignment)
+                if isinstance(struct, tuple) and name.isdigit():
+                    if for_assignment:
+                        raise EllaError("a tuple can't be changed in place", span)
+                    if int(name) >= len(struct):
+                        raise EllaError(f"a tuple of {len(struct)} items has no item {name}", span)
+                    return struct[int(name)]
                 position = self.field_index(struct, name, span)
                 assert isinstance(struct, VariantValue)
                 return struct.fields[position]
@@ -713,8 +747,8 @@ class Interpreter:
         self, lambda_: Lambda, captured: Scope, args: list[Value], span: Span, finals: list[Value] | None = None
     ) -> Value:
         """Run a function's body with its parameters bound, checking its `where` conditions."""
-        if self.depth >= MAX_CALL_DEPTH:
-            raise EllaError(f"stack overflow: more than {MAX_CALL_DEPTH} nested calls", span)
+        if self.depth >= self.max_depth:
+            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
         # Parameters live in a new scope inside the captured one. Only `mut` ones can change.
         local = Scope(captured)
         for param, arg in zip(lambda_.params, args):
@@ -876,6 +910,9 @@ class Interpreter:
 
         return run
 
+    def builtin_library(self, name: str) -> Callable[[list[Value], Span], Value]:
+        return lambda args, span: call_library(name, args, span, self.host)
+
     def builtin_run(self, args: list[Value], span: Span) -> Value:
         """`run(code)`: check the code, then run it like the body of a function with no parameters."""
         code = args[0]
@@ -896,7 +933,7 @@ class Interpreter:
 
     def run_compile_time(self, expr: Expr) -> Value:
         """Run the code of a splice outside quotes, while compiling (see ella.staging)."""
-        return self.run_code(expr)
+        return run_deep(lambda: self.run_code(expr), self.max_depth, PYTHON_FRAMES_PER_CALL)
 
     def check_condition(self, cond: Assert, scope: Scope, kind: str) -> None:
         """Check an `assert` or `where` condition, reporting its source if it is false."""

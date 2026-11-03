@@ -273,3 +273,26 @@ def test_stack_overflow() -> None:
 
 def test_main_runs_after_top_level() -> None:
     assert output("let main = () -> () => print(2)\nprint(1)") == ["1", "2"]
+
+
+# Destructuring, tuple items and slices (checked by the checker in other runs; here, as they run)
+
+
+def test_let_with_a_pattern_runs_unchecked() -> None:
+    assert output("let (a, (b, c)) = (1, (2, 3))\nprint(a + b + c)") == ["6"]
+    assert error("let (a, 1) = (1, 2)").message == "the 'let' pattern doesn't match (1, 2)"
+
+
+def test_tuple_items_and_slices() -> None:
+    assert value("(1, (2, 3)).1.0") == "2"
+    assert error("(1, 2).2").message == "a tuple of 2 items has no item 2"
+    assert value('"hello"[1..3]') == "el"
+    assert value("[1, 2, 3][0..=1]") == "[1, 2]"
+    assert error("[1][0..2]").message == "slice 0..2 is out of range for a list of length 1"
+
+
+def test_deep_recursion() -> None:
+    # The interpreter runs on a big stack, so it reaches the call depth limit (10000) without trouble.
+    source = "let down = (n: i64) -> i64 => if n == 0 then 0 else 1 + down(n - 1)\n"
+    assert output(source + "print(down(9990))") == ["9990"]
+    assert error(source + "print(down(20000))").message == "stack overflow: more than 10000 nested calls"

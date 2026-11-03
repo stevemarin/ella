@@ -332,6 +332,15 @@ class Let:
 
 
 @dataclass(frozen=True, slots=True)
+class LetPattern:
+    """`let (a, b) = pair`: binds the names in a pattern, which must match every value of its type."""
+
+    pattern: Pattern
+    value: Expr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class Assign:
     """`target = value`, or a compound assignment such as `target += value`."""
 
@@ -541,6 +550,7 @@ type Expr = (
     | Member
     | Try
     | Let
+    | LetPattern
     | Assign
     | Lambda
     | Block
@@ -661,6 +671,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("?", show(operand))
         case Let(bindings, value):
             return sexpr("let", f"[{', '.join(map(show_binding, bindings))}]", show(value))
+        case LetPattern(pattern, value):
+            return sexpr("let", show(pattern), show(value))
         case Assign(op, target, value):
             return sexpr(op, show(target), show(value))
         case Lambda(params, return_type, where, body):

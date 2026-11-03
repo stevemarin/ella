@@ -28,7 +28,7 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert len(program.body) == 93
+    assert len(program.body) == 102
 
 
 # Precedence (docs/grammar.md §8)
@@ -128,6 +128,31 @@ def test_let_chain_makes_new_bindings() -> None:
     # parentheses make it an assignment instead
     assert one("let y = (x = 5)") == "(let [y] (= x 5))"
     assert one("let y = x == 5") == "(let [y] (compare x == 5))"
+
+
+def test_let_with_a_pattern() -> None:
+    assert one("let (a, b) = pair") == "(let (tuple a b) pair)"
+    assert one("let (a, (b, _)) = f(x)") == "(let (tuple a (tuple b _)) (call f x))"
+    assert one("let Point(x, y) = p") == "(let (Point x y) p)"
+    assert error("let (a, b): (i64, i64) = p").message == "expected '=', found ':'"
+
+
+def test_tuple_items() -> None:
+    assert one("t.0") == "(. t 0)"
+    assert one("t.1.0") == "(. (. t 1) 0)"  # `1.0` is one token, a float
+    assert one("t.0.x") == "(. (. t 0) x)"
+    assert one("f().2[1]") == "(index (. (call f) 2) 1)"
+    assert error("t.0x1").message == "expected a member name, found '0x1'"
+    assert error("t.1_0").message == "expected a member name, found '1_0'"
+
+
+def test_assignment_as_a_body_is_a_block() -> None:
+    # A body that is an assignment has the value (), as a block's last line does.
+    assert one("(mut xs: [i64]) -> () => xs += [1]") == "(lambda (mut xs: [i64]) -> () (block (+= xs (list 1))))"
+    assert one("if c then x = 1 else x = 2") == "(if c (block (= x 1)) (block (= x 2)))"
+    assert one("match c\n    case _ => x = 1") == "(match c (case _ (block (= x 1))))"
+    assert one("for i in xs x += i") == "(for i xs (block (+= x i)))"
+    assert one("let y = (x = 1)") == "(let [y] (= x 1))"  # a value, not a body
 
 
 def test_assignment() -> None:

@@ -193,6 +193,10 @@ Bodies appear after `=>`, `then`, `else`, `case ...`, `for ... in expr`,
 `while expr`, `loop`, `where`, and `match expr` (whose body is a list of
 cases, never inline).
 
+A body that is an assignment has the value `()` either way, as it would as
+the last line of a block: `(mut xs: [i64]) -> () => xs += [1]` is fine.
+(The parser makes such an inline body a block of one line.)
+
 There are no colons at the ends of block-opening lines.
 
 ## 3. Program structure
@@ -209,7 +213,8 @@ A source file is a sequence of top-level expressions.
    names may be rebound with a different type.)
 3. The top-level expressions run in order, like a script.
 4. Afterwards, if the file defines a top-level `main`, it is called.
-   `main` has type `() -> ()`. Command-line arguments and exit codes come later.
+   `main` has type `() -> ()`. The program's command-line arguments are
+   `args()` ([§10](#10-built-ins)); exit codes come later.
 5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
    structs and enums with methods, can only be defined at the top level.
 
@@ -229,6 +234,26 @@ let mut count = 0
   now: from the value). Function parameters always need annotations.
 * `let` is an expression; it evaluates to the bound value.
 * `let` inside a nested expression still binds in the enclosing block.
+
+### Destructuring
+
+A `let` can take a value apart with a pattern ([§7](#7-patterns)), binding
+each name in it:
+
+```ella
+let (q, r) = divmod(17, 5)
+let (name, (x, y)) = ("origin", (0.0, 0.0))
+let Point(px, py) = p
+```
+
+* The pattern must match every value of the type: a tuple of names, a
+  struct, `_` and so on, never a literal or one variant of an enum (use
+  `match` for those). The checker rejects others, with an example of a
+  value they miss.
+* The pattern starts with `(` or a name and `(`; the value's type comes
+  from the value (there is no annotation).
+* The names are immutable (`let mut x = x` makes a changeable copy), and
+  there are no chains.
 
 ### `let` chains
 
@@ -266,7 +291,9 @@ p.x = 1.5
   Assigning to an immutable binding or an undefined name is a compile error.
 * Targets are names, index expressions (`a[i]`, `pool[h]`) and fields
   (`p.x`), in any combination: `world.players[i].score += 1`.
-* Assignment is right-associative and evaluates to the assigned value.
+* Assignment is right-associative and evaluates to the assigned value, so
+  `a = b = 0` sets both. As a body, or the last line of a block, it has
+  the value `()` instead ([§2](#blocks)).
 * Compound operators: `+= -= *= /= //= %=`. `x op= e` means `x = x op e`, with
   `x` evaluated once.
 * `mut` is deep: if `names` is not `mut`, `names[0] = "x"` is an error.
@@ -409,8 +436,13 @@ match result
 * `match expr` is followed by an indented list of `case` lines.
 * Each case is `case pattern [if guard]`, then either `=> expr` on the same
   line or an indented block.
-* Cases are tried in order. If none matches, it is a run-time error
-  (exhaustiveness checking comes later).
+* Cases are tried in order, and together they must cover every value of
+  the subject's type: the checker rejects a `match` that misses one, with
+  an example (`add a case for None`). A case with a guard doesn't count,
+  since its guard may be false, and literals and ranges never cover a
+  whole `i64`, `f64` or `str`, so a match on one of those needs a `case _`
+  or a name. Enums, structs, tuples and `bool` are covered by naming each
+  variant (or `true` and `false`).
 
 ### Loops
 
@@ -434,7 +466,8 @@ let found = loop
 ```
 
 * `for pattern in expr` iterates over a list, string, or range, or a struct
-  or enum with an `iter` method ([§9](#methods-provisional-syntax)).
+  or enum with an `iter` method ([§9](#methods-provisional-syntax)). The
+  pattern must match every item, as a `let`'s must.
 * `while cond` runs while `cond` (a `bool`) is true.
 * `loop` repeats forever until `break`.
 * `for` and `while` have value `()`. `loop` has the value given to the
@@ -452,7 +485,8 @@ let found = loop
 
 ## 7. Patterns
 
-Patterns appear after `case`, in `for`, and (later) in `let`.
+Patterns appear after `case`, in `for`, and in `let`. In `for` and `let`
+they must match every value ([§4](#destructuring)).
 
 | Pattern | Example | Matches |
 | --- | --- | --- |
@@ -562,6 +596,11 @@ returns `None`. The enclosing function's return type must be compatible.
   handles, and structs and enums with `get` and `set` methods with any key
   ([§9](#methods-provisional-syntax)).
 * `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
+* Indexing a list or string with a range gives a *slice*, a new list or
+  string of those items: `"hello"[1..3]` is `"el"`, `xs[0..=1]` the first
+  two items (copies of them). The range must be in order and within the
+  value: `0 <= a <= b <= len(xs)`, or it is a run-time error. A slice
+  can't be assigned to.
 
 ## 9. Types
 
@@ -583,6 +622,8 @@ $(t)                             a type computed while compiling (§11)
 
 * All integer types are signed. More widths (`i8`–`i32`, `f32`) and SIMD
   vector types come later.
+* A tuple's items are read with `.0`, `.1`, ...: `pair.0`, `t.1.0`. A
+  tuple can't be changed in place; build a new one.
 * Types appear after `:` in annotations, after `->` in lambdas, and inside
   other types. The parser uses a separate type grammar there, so `[str]` (a
   type) and `[1, 2]` (a list literal) do not conflict.
@@ -969,10 +1010,41 @@ Built-in functions (ordinary names, not keywords):
 * `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
   pools ([§9](#pools-provisional-syntax)).
 * `run(code)` runs code made with `quote` ([§11](#11-stages)).
+* The library functions below.
 * `fields(t)`, `field_type(t, name)`, `has_field(t, name)`, `type_name(t)`,
   `type_kind(t)` and `variants(t)` look at a type `t`, and
   `new_struct(name, fields, types)` makes one
   ([§11](#types-as-values-and-generated-code)).
+
+The library: functions with fixed types. They can only be called, like the
+other built-ins, and a program may use their names for its own variables.
+
+| Function | Type | Gives |
+| --- | --- | --- |
+| `to_f64(n)` | `(i64) -> f64` | `n` as the nearest `f64` |
+| `to_i64(x)` | `(f64) -> i64` | `x` without its fraction (toward zero); an error if that doesn't fit, or `x` is NaN |
+| `parse_i64(s)` | `(str) -> Result[i64, Error]` | the number `s` writes: an optional sign and digits, nothing else |
+| `parse_f64(s)` | `(str) -> Result[f64, Error]` | the number `s` writes: `2.5`, `-1e3`, `.5`, `inf`, `nan`, ... |
+| `read_line()` | `() -> Optional[str]` | the next line of standard input, without its `\n` (or `\r\n`); `None` at the end |
+| `read_file(path)` | `(str) -> Result[str, Error]` | the whole file, or why it can't be read |
+| `args()` | `() -> [str]` | the program's command-line arguments |
+| `split(s, sep)` | `(str, str) -> [str]` | the parts of `s` between the `sep`s; `sep` can't be empty |
+| `join(parts, sep)` | `([str], str) -> str` | the parts, with `sep` between each two |
+| `find(s, part)` | `(str, str) -> Optional[i64]` | where `part` first appears in `s` |
+| `replace(s, old, new)` | `(str, str, str) -> str` | `s` with each `old` (left to right, not overlapping) replaced; `old` can't be empty |
+| `trim(s)` | `(str) -> str` | `s` without spaces, tabs, `\n`, `\r`, `\v` and `\f` at either end |
+| `chars(s)` | `(str) -> [str]` | the characters of `s`, as one-character strings |
+
+* Numbers are written in ASCII only, with no `_` and no spaces around them:
+  `parse_i64(trim(line))` reads a number on a line of its own.
+* Text read from outside the program must be UTF-8: `read_line` stops with
+  an error if it isn't, and `read_file` gives an `Err`. An `Err`'s message
+  says what went wrong, like `can't read "data.txt": No such file or
+  directory`.
+* The results that are enums use the built-in `Result`, `Optional` and
+  `Error`, so these functions can't be used in a program that defines its
+  own.
+* Strings count characters (code points), so `find` and slices do too.
 
 The text form of a value (used by `print` and interpolation) is how it would
 be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
@@ -987,9 +1059,15 @@ iteration and `in` with methods ([§9](#methods-provisional-syntax)).
 `assert expr` is a keyword expression rather than a function, so that a
 failure can report the asserted expression's source text. It has type `()`.
 
-Run-time errors (failed `assert`, failed `where`, out-of-range index, no
-matching `case`, division by zero, `i64` overflow) stop the program with a
-message and the source location.
+Run-time errors (failed `assert`, failed `where`, out-of-range index or
+slice, division by zero, `i64` overflow, and a few library errors) stop the
+program with a message and the source location.
+
+Functions can call each other 10,000 deep: one more nested call stops the
+program with "stack overflow: more than 10000 nested calls". `ella
+--max-depth N` changes the limit. Every backend has the same limit, so a
+program behaves the same however it is run. (Native code has room for about
+two scope levels, a function body and one loop, per nested call.)
 
 Type errors such as `1 + true` are found before the program runs. The AST
 interpreter also checks types as it goes, so it can still run programs that
@@ -1036,6 +1114,9 @@ print(run(power(2, quote 5)))     # 25
 * Variables bound inside quoted code are renamed when the code is built
   (`y` becomes `y.1`), so spliced code never captures the wrong variable.
 * `return`, `break` and `continue` can't leave a quote or a splice.
+* A quote inside a function that is defined in a splice can't use the
+  variables of the quote the splice is in, for now: the compiler has no
+  way to reach them from inside the function. The checker reports it.
 * `$` applies to the name or parenthesized expression right after it (`$f(x)`
   calls the spliced `f`), or to an indented block on the next lines.
   `quote` takes everything to its right, or an indented block.
@@ -1135,7 +1216,8 @@ expr        = let | assignment | lambda | if | match | for | while | loop
             | break | continue | return | assert | enum | struct | constraint
             | quote | mut_call | operator_expr ;
 
-let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr ;
+let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr
+            | "let" pattern "=" expr ;            (* destructuring: the pattern starts with "(" or IDENT "(" *)
 type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* built-in or user-defined constraints *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
@@ -1181,7 +1263,7 @@ operator_expr = prefix_op operator_expr
 call        = "(" [ arg { "," arg } [ "," ] ] ")" ;
 arg         = [ "mut" ] expr ;                   (* `mut` only for a place, or before a method call *)
 index       = "[" expr "]" ;
-member      = "." ( IDENT | "$" ( IDENT | "(" expr ")" ) ) ;  (* `.$f`: a spliced field name *)
+member      = "." ( IDENT | INT | "$" ( IDENT | "(" expr ")" ) ) ;  (* `.0`: a tuple's item; `.$f`: a spliced field name *)
 
 primary     = INT | FLOAT | string | "true" | "false" | IDENT
             | "(" ")"                            (* unit *)
@@ -1229,6 +1311,12 @@ Parsing notes:
 * **Trailing binary operator.** If a binary operator is followed by `NEWLINE`
   (which can only happen outside brackets), report the "wrap in parentheses"
   error.
+* **Tuple items.** After `.`, a decimal integer is a tuple's item. The
+  lexer reads `t.0.1` as `t`, `.`, `0.1`, so a float there is two items.
+* **`let` with a pattern.** After `let`, `(` or `IDENT "("` starts a
+  pattern rather than a binding.
+* **Assignments as bodies.** An inline body that is an assignment is made
+  a block of one line, so its value is `()`.
 * **Methods vs. fields and variants.** In a struct or enum, a line starting
   `IDENT "="` is a method; otherwise it is a field or a variant.
 * **`mut` before a method call** (`mut s.items[0].push(1)`) is parsed as a

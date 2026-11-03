@@ -32,6 +32,8 @@ instructions with `copy_value` too.
 """
 
 import json
+import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -41,6 +43,10 @@ from ella.syntax import Expr, Lambda, show
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
+
+# How deeply Ella functions may call each other before the program stops
+# with "stack overflow", by default. Every backend has the same limit.
+MAX_CALL_DEPTH = 10_000
 
 
 @dataclass(eq=False, slots=True)
@@ -303,3 +309,37 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"<code {show(expr)}>"
         case TypeValue(t):
             return f"<type {show_type(t)}>"
+
+
+def run_deep[T](run: Callable[[], T], max_depth: int, frames_per_call: int) -> T:
+    """Run an interpreter, which recurses for each Ella call, so that `max_depth` nested calls fit.
+
+    Python's recursion limit is raised to match, and the interpreter runs in
+    a thread of its own with a big stack: the main thread's is too small
+    for the C code under deep Python recursion. (The stack's memory is only
+    used as it is needed.)
+    """
+    results: list[T] = []
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            results.append(run())
+        except BaseException as error:  # noqa: BLE001  (raised again in the calling thread)
+            errors.append(error)
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, max_depth * frames_per_call + 1000))
+    size = threading.stack_size(max(64 << 20, max_depth * (16 << 10)))
+    try:
+        thread = threading.Thread(target=target, daemon=True)  # a Ctrl-C in the main thread ends the program
+        thread.start()
+    finally:
+        threading.stack_size(size)
+    try:
+        thread.join()
+    finally:
+        sys.setrecursionlimit(limit)
+    if errors:
+        raise errors[0]
+    return results[0]

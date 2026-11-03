@@ -608,8 +608,10 @@ per value). A handle is one word: the slot and the generation. Freeing a
 value bumps its slot's generation, so a stale handle is always caught, even
 after the slot is reused. Natively, all arenas, scope and slot, are parts of
 one reserved range of address space, so the arena an object is in can be
-worked out from its address: 16384 scope arenas of 1 GiB, and about a
-million slot arenas of 16 MiB. A pool is itself a value that can't be
+worked out from its address: scope arenas of 1 GiB, two for each nested
+call the program may make (`--max-depth`) and some more (in at most 32 TiB:
+with very many, each is smaller), and about a million slot arenas of 16
+MiB. A pool is itself a value that can't be
 copied, and when it dies, it frees its values.
 
 ### Non-copyable values and finalizers
@@ -637,4 +639,4 @@ order. Nothing is finalized when a program stops with an error.
 * Running code built at run time in native code.
 * In the IR, a quote inside a function that is defined inside a splice
   can't refer to the variables of the quote the splice is in (the AST
-  interpreter can). The checker doesn't catch this yet.
+  interpreter could). The checker rejects such programs for now.

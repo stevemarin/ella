@@ -1,0 +1,64 @@
+# The library: conversions, strings, slices, input and arguments.
+
+# Numbers
+print(to_f64(7) / 2.0)
+print(to_i64(-3.99))
+print(to_i64(1.0e18))
+for text in ["42", "-17", "+8", "9223372036854775807", "-9223372036854775808", "9223372036854775808", "", "-", "1_000", " 1", "1e3", "٣"]
+    print(parse_i64(text))
+for text in ["2.5", "-0.0", "1e-3", "5.", ".5", "+1E+2", "inf", "-nan", "1e999", ".", "e5", "1.5.2", "0x10", "1_0.0", " 1.0"]
+    print(parse_f64(text))
+let total = (texts: [str]) -> Result[i64, Error] =>
+    let mut sum = 0
+    for text in texts
+        sum += parse_i64(text)?
+    Ok(sum)
+print(total(["1", "2", "3"]))
+print(total(["1", "two", "3"]))
+
+# Strings
+print(split("a,b,,c", ","))
+print(split("one  two", " "))
+print(split("abc", "abc"))
+print(split("", ","))
+print(split("aaa", "aa"))
+print(join(["a", "b", "c"], ", "))
+print(join([], "-"))
+print(join(split("2024-11-02", "-"), "/"))
+print(find("hello", "l"))
+print(find("hello", "lo"))
+print(find("hello", "z"))
+print(find("hello", ""))
+print(find("héllo wörld", "wö"))
+print(replace("a-b-c", "-", " + "))
+print(replace("aaaa", "aa", "b"))
+print(replace("no change", "x", "y"))
+print("[{{trim("  \t padded\r\n ")}}]")
+print("[{{trim("   ")}}]")
+print(chars("héllo"))
+print(chars(""))
+let word = "staging"
+print(word[0..5])
+print(word[3..=6])
+print(word[7..7])
+print(len(word[2..4]))
+let grid = [[1, 2], [3, 4], [5, 6]]
+let mut rows = grid[1..3]
+rows[0][0] = 30
+print(grid)
+print(rows)
+print(grid[0..0])
+
+# Input and arguments
+print(args())
+print(len(args()))
+let mut count = 0
+loop
+    match read_line()
+        case Some(line)
+            count += 1
+            print("{{count}}: [{{line}}] {{parse_i64(trim(line))}}")
+        case None => break
+print(read_line())
+print(read_file("/no/such/ella/file"))
+print(read_file("/"))

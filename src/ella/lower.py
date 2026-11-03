@@ -79,8 +79,10 @@ from typing import TextIO
 from ella.checker import (
     BOOL,
     I64,
+    LIBRARY,
     NEVER,
     OPERATOR_METHODS,
+    RANGE,
     STR,
     UNIT,
     BuiltinTy,
@@ -142,6 +144,7 @@ from ella.syntax import (
     IntLit,
     Lambda,
     Let,
+    LetPattern,
     ListLit,
     LiteralPattern,
     Loop,
@@ -846,6 +849,15 @@ class Lowerer:
                     home = self.home(binding.name, t)
                     value = self.bind(binding.name, value, binding.span, binding.mutable, home)
                 return value
+            case LetPattern(pattern, value_expr):
+                value = self.lower(value_expr, self.here() if self.scopes else "global")
+                no_match = self.new_block("nomatch")
+                self.lower_pattern(pattern, value, no_match)
+                matched = self.block
+                self.block = no_match
+                self.block.terminator = Trap("the 'let' pattern doesn't match {}", value, span)
+                self.block = matched
+                return value
             case Assign(op, target, value_expr):
                 if isinstance(target, Name):
                     return self.lower_assign_name(op, target, value_expr, span)
@@ -874,7 +886,12 @@ class Lowerer:
                 return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
             case Member(target):
                 struct = self.lower(target)
-                return self.field(struct, self.checker.members[id(expr)], self.type_of(expr), span)
+                position = self.checker.members[id(expr)]
+                if isinstance(struct.type, TupleTy):
+                    item = self.emit("tuple_get", self.type_of(expr), [struct], span, index=position)
+                    self.info[item.id] = self.info_of(struct)
+                    return item
+                return self.field(struct, position, self.type_of(expr), span)
             case Quote():
                 return self.lower_quote(expr, span)
             case TypeLit(texpr):
@@ -1024,7 +1041,9 @@ class Lowerer:
         return self.emit(BINARY_OPS[op], t, [a, b], span, region=region)
 
     def lower_index(self, container: Value, index: Value, t: Type, span: Span, dest: str) -> Value:
-        """`xs[i]` is an item already in the list; `s[i]` makes a new string."""
+        """`xs[i]` is an item already in the list; `s[i]` makes a new string, and a slice a new list or string."""
+        if index.type == RANGE:
+            return self.emit("slice", t, [container, index], span, region=dest or self.here())
         result = self.emit("index", t, [container, index], span, region=dest or self.here())
         if isinstance(container.type, ListTy):
             self.info[result.id] = self.info_of(container)
@@ -1269,7 +1288,7 @@ class Lowerer:
         return result
 
     def lower_builtin(self, expr: Call, name: str, args: tuple[Expr, ...], span: Span, dest: str) -> Value:
-        """`print`, `len`, `run`, and the pool functions."""
+        """`print`, `len`, `run`, the pool functions, reflection, and the library."""
         if name in ("alloc", "free"):
             pool_arg, value_expr = args
             assert isinstance(pool_arg, MutArg)
@@ -1281,6 +1300,10 @@ class Lowerer:
             # The pool copies the value into an arena of its own (a value that
             # can't be copied is moved there, with its finalizers).
             return self.emit("alloc", self.type_of(expr), [pool, value], span)
+        if name in LIBRARY:
+            # Its result is all new objects, made where they are wanted.
+            values = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
+            return self.emit("builtin", self.type_of(expr), values, span, name, region=dest or self.here())
         operands = [self.lower(arg) for arg in args]
         match name:
             case "len" if self.has_method(operands[0].type, "len"):

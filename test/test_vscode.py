@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ella.checker import BUILTINS, REFLECTION
 from ella.lexer import KEYWORDS
 
 EXTENSION = Path(__file__).parent.parent / "editors" / "vscode"
@@ -32,3 +33,10 @@ def test_grammar_highlights_every_keyword() -> None:
         assert found, rule["match"]
         words |= set(found.group(1).split("|"))
     assert words == KEYWORDS
+
+
+def test_grammar_highlights_every_built_in_function() -> None:
+    grammar = json.dumps(load("syntaxes/ella.tmLanguage.json"))
+    found = re.search(r"\\\\b\(\?:((?:[a-z_0-9]+\|)+[a-z_0-9]+)\)\(\?=", grammar)
+    assert found, "no rule for built-in functions"
+    assert set(found.group(1).split("|")) == {*BUILTINS, *REFLECTION}

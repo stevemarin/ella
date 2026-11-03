@@ -174,6 +174,13 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   constraints, which any type with the right methods meets
   (`constraint Shape` with `area: (Self) -> f64`, then `let total[T: Shape]`).
   See [docs/grammar.md](docs/grammar.md) §9.
+* Programs can read input (`read_line`, `read_file`, `args`), convert and
+  parse numbers, and work with strings (`split`, `join`, `find`,
+  `replace`, `trim`, `chars`, slices like `s[1..3]`)
+  ([src/ella/library.py](src/ella/library.py)). `let (a, b) = pair` takes
+  values apart, `pair.0` reads a tuple's item, and the checker makes sure
+  every `match` covers every value ([src/ella/exhaustive.py](src/ella/exhaustive.py)).
+  See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)
@@ -189,6 +196,8 @@ uv run ella --profile example_syntax.ella    # run it, then print how much memor
 uv run ella --ast example_syntax.ella     # print the syntax tree
 uv run ella --expanded example_syntax.ella  # print it after running the splices outside quotes
 uv run ella --tokens example_syntax.ella  # print the tokens
+uv run ella prog.ella -- a b              # run a program with the arguments a and b
+uv run ella --max-depth 100000 prog.ella  # let functions call each other deeper than 10,000
 ```
 
 Native programs need gcc, and can't run code built at run time.

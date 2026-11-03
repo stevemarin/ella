@@ -11,7 +11,7 @@ if the operation fails.
 import math
 
 from ella.lexer import EllaError, Span
-from ella.values import Value, equal, fits_i64, type_name
+from ella.values import Value, equal, fits_i64, to_text, type_name
 
 
 def float_div(a: float, b: float) -> float:
@@ -186,7 +186,9 @@ def contains(container: Value, item: Value, span: Span) -> bool:
 
 
 def index_into(container: Value, index: Value, span: Span) -> Value:
-    """`container[index]` for a list, or a string (giving a one-character string)."""
+    """`container[index]` for a list, or a string (giving a one-character string), or a slice of either."""
+    if isinstance(index, range) and isinstance(container, list | str):
+        return slice_of(container, index, span)
     if not isinstance(index, int) or isinstance(index, bool):
         raise EllaError(f"an index must be an i64, not {type_name(index)}", span)
     if not isinstance(container, list | str):
@@ -195,3 +197,12 @@ def index_into(container: Value, index: Value, span: Span) -> Value:
     if not 0 <= index < len(container):
         raise EllaError(f"index {index} is out of range for a {type_name(container)} of length {len(container)}", span)
     return container[index]
+
+
+def slice_of(container: list[Value] | str, part: range, span: Span) -> list[Value] | str:
+    """`container[a..b]`: a new list or string of the items from a up to b, which must be in order and in range."""
+    if not 0 <= part.start <= part.stop <= len(container):
+        raise EllaError(
+            f"slice {to_text(part)} is out of range for a {type_name(container)} of length {len(container)}", span
+        )
+    return container[part.start : part.stop]

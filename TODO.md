@@ -8,20 +8,22 @@ and [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15.
 ## Where things stand
 
 All seven planned stages are done, and work since then added methods,
-protocols, user-defined constraints and editor support. `make check` passes
-(751 tests, ruff, strict mypy).
+protocols, user-defined constraints, editor support, and the quick wins
+below (a small library, destructuring, exhaustiveness checking, deeper
+calls). `make check` passes (827 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification, generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, stages |
+| Type checker | Inference by unification, generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, stages, exhaustive `match` |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, pools with generation-checked handles, `nocopy` and finalizers |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `contains`, `len`) |
-| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, ...; language server (errors, hover, go to definition, semantic tokens, completion); VS Code extension; Makefile |
+| Library | Conversions and parsing of numbers, `read_line`, `read_file`, `args`, `split`, `join`, `find`, `replace`, `trim`, `chars`, slices |
+| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`; language server (errors, hover, go to definition, semantic tokens, completion); VS Code extension; Makefile |
 
 Rough speed, from `fib(32)` (about 3.5 million calls): the native executable
 takes 0.05 s, about 4× slower than C at `gcc -O0`. A `fib(24)` run takes
@@ -36,41 +38,37 @@ programs hard to write today.
 
 ### Standard library and I/O
 
-The only built-ins are `print`, `len`, `run`, the pool functions and
-reflection. Most real programs stop here first.
+The built-ins are `print`, `len`, `run`, the pool functions, reflection,
+and a small library (docs/grammar.md §10): number conversions and parsing,
+`read_line`, `read_file`, `args`, and string functions.
 
-- ★ No numeric conversions: `f64(3)`, `i64(3.7)`, parsing `"3"` into an
-  `i64`. The no-implicit-conversion rule needs explicit ones to exist.
-- ★ No input of any kind: stdin, files, command-line arguments, environment.
-- ★ No string functions: split, join, find, replace, trim, upper and lower,
-  characters and code points (`ord`, `chr`), formatting numbers.
 - ★ No map or set type, and no map literal (`{` is an unexpected character).
   The new protocols mean a `Map[K, V]` could be written in Ella itself.
-- No list helpers (sort, reverse, slicing `xs[1..3]`, `range` with a step)
-  and no math functions (sqrt, abs, min, max, floor).
+- No list helpers (sort, reverse, `range` with a step) and no math
+  functions (sqrt, abs, min, max, floor).
+- Strings still lack upper and lower case, code points (`ord`, `chr`) and
+  formatting numbers (fixed decimals, padding).
+- No writing files, no standard error, no environment variables.
 - `print` takes exactly one argument; printing several values needs a tuple.
 - No exit codes: `main` must be `() -> ()`, and an error always exits with
   the same status.
 
 ### Language
 
-- ★ No destructuring `let`: `let (a, b) = pair` is a parse error, so tuples
-  have to be taken apart with `match`. Tuples also have no `.0` access.
-- ★ Calls nest at most 1000 deep in every backend, native code included, so
-  that all backends agree. Recursive code over deep data overflows early.
-- `match` isn't checked for exhaustiveness; a missing case is a run-time
-  error (`no case matches None`).
-- A one-line function body that is an assignment has the assigned type,
-  not `()`: `(mut xs: [i64]) -> () => xs += [1]` is a type error, while the
-  same assignment as a block works. This is easy to trip over; consider
-  giving assignments the value `()` everywhere.
 - Lambdas need full annotations (`x => x + 1` is rejected), and built-ins
-  and constructors can't be used as values (`let f = print`).
+  and constructors can't be used as values (`let f = print`). The library
+  functions have fixed types, so they could become values easily.
 - Generic functions must be top-level; there are no generic lambdas.
+- Destructuring `let` binds immutable names only (no `let mut (a, b)`), and
+  can't have a type annotation.
 - Only `i64`, `f64`, `bool` and `str`. Narrower integers, `f32` and SIMD
   vectors (a stated goal) aren't designed yet.
-- No negative indexing or slicing (deliberate for now, but slicing is
-  needed).
+- No negative indexing (deliberate for now).
+- Exhaustiveness checking says nothing about cases that can never match
+  (redundant cases), and ranges never count as covering an `i64`.
+- Native code has room for about two scope levels per nested call; a deep
+  recursion through loops can run out of scope arenas before the depth
+  limit, which the interpreters don't.
 - Modules and `import`: one program is one file.
 - `comptime` is still reserved, though `quote`/`$` may make it unnecessary.
 
@@ -107,9 +105,10 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 ### Staging
 
 - Native code can't run code built at run time (`run` needs an interpreter).
-- Known bug: in the IR, a quote inside a function defined inside a splice
-  can't refer to the variables of the quote the splice is in (the AST
-  interpreter can), and the checker doesn't catch it.
+- A quote inside a function defined inside a splice can't refer to the
+  variables of the quote the splice is in. The checker now rejects this
+  (the IR can't reach them); supporting it means passing the outer
+  quote's fresh names into the function.
 
 ### Back end and performance
 
@@ -130,24 +129,43 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
 ## Quick wins
 
-Small, mostly independent changes that would make Ella much easier to use:
+### Done (2026-11-02)
 
-1. Conversion built-ins: `to_f64`, `to_i64` (truncating, with a trap on
-   overflow), `parse_i64` and `parse_f64` returning `Result`.
-2. Destructuring `let` with the pattern grammar that `match` and `for`
-   already use, and tuple field access.
-3. Read input: `read_line() -> Optional[str]`, `read_file(path) ->
-   Result[str, Error]` and `args() -> [str]`. These are a few functions in
-   the C runtime and in `values.py`.
-4. String built-ins: `split`, `join`, `find`, `replace`, `trim`, `chars`,
-   slicing.
-5. Exhaustiveness checking for `match` over enums, `Optional` and `Result`.
-6. Make assignments always have the value `()`, or document the one-line
-   body rule prominently.
-7. Raise the call depth limit, or make it a command-line option, keeping the
-   backends in agreement.
-8. Add the staging bug above to the checker as an error, until the IR
-   supports it.
+1. Conversion built-ins: `to_f64`, `to_i64` (truncating, with a trap if it
+   doesn't fit), `parse_i64` and `parse_f64` returning `Result`.
+2. Destructuring `let` (`let (a, b) = pair`, `let Point(x, y) = p`), with
+   the patterns `match` and `for` use, and tuple items (`pair.0`).
+3. Input: `read_line() -> Optional[str]`, `read_file(path) ->
+   Result[str, Error]` and `args() -> [str]` (`ella prog.ella -- a b`).
+4. Strings: `split`, `join`, `find`, `replace`, `trim`, `chars`, and
+   slicing of strings and lists (`s[1..3]`).
+5. Exhaustiveness checking for `match`, over enums, structs, tuples and
+   bools, with an example of a missed value; `let` and `for` patterns must
+   match every value.
+6. An assignment used as a body has the value `()`, as it does at the end
+   of a block.
+7. Calls can nest 10,000 deep by default in every backend (the
+   interpreters run on a big stack, native code on its own), and
+   `--max-depth` changes it.
+8. The checker rejects the staging case the IR can't compile.
+
+The library is one IR operation (`builtin`), a Python module shared by
+the interpreters (src/ella/library.py), and matching C functions in the
+runtime; new functions with fixed types are cheap to add that way.
+
+### Next
+
+Small steps that build on the above:
+
+1. Math and code points as library functions: `sqrt`, `floor`, `abs`,
+   `min`, `max`, `ord`, `chr`.
+2. Library functions as values (`xs |> map(trim)` once there is a `map`),
+   since their types are fixed.
+3. `let mut (a, b) = ...`, and a type annotation for a destructuring `let`.
+4. `print` with several arguments, and printing to standard error.
+5. Exit codes: let `main` return an `i64`, or add `exit(code)`.
+6. Warnings for `match` cases that can never match, which the
+   exhaustiveness check can find with little more work.
 
 ## Roadmap ideas
 
@@ -159,7 +177,8 @@ Ella's goals: learning, simplicity first, no GC, x64.
 The protocols, constraints and methods are now strong enough to write
 collections in Ella itself: `Map[K, V]`, `Set[T]`, sorting, string
 utilities. Ship them as a prelude that every program sees, with a small
-set of C runtime primitives underneath (I/O, hashing, math). This tests
+set of C runtime primitives underneath (I/O, hashing, math), added as
+library functions are now (src/ella/library.py and the runtime). This tests
 the language on real code, finds rough edges in the type system, and makes
 example programs possible. It naturally leads to idea 2.
 
@@ -184,8 +203,8 @@ optimizations. A benchmark suite in `test/` would keep this honest.
 
 Give `Error` a location and an optional cause, add stack traces for run-time
 errors in all backends (the IR knows each call's span), and let `main`
-return a `Result` or an exit code. Together with exhaustiveness checking,
-this makes failures much easier to understand.
+return a `Result` or an exit code. Together with the exhaustiveness
+checking that exists now, this makes failures much easier to understand.
 
 ### 5. Iterators and views without copying
 

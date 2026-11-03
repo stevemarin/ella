@@ -162,7 +162,7 @@
     "call": {
       "patterns": [
         {
-          "match": "\\b(?:print|len|run|pool_new|alloc|free|fields|field_type|has_field|type_name|type_kind|variants|new_struct)(?=\\s*\\()",
+          "match": "\\b(?:print|len|run|pool_new|alloc|free|fields|field_type|has_field|type_name|type_kind|variants|new_struct|to_f64|to_i64|parse_i64|parse_f64|read_line|read_file|args|split|join|find|replace|trim|chars)(?=\\s*\\()",
           "name": "support.function.builtin.ella"
         },
         {

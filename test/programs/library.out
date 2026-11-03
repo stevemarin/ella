@@ -1,0 +1,68 @@
+3.5
+-3
+1000000000000000000
+Ok(42)
+Ok(-17)
+Ok(8)
+Ok(9223372036854775807)
+Ok(-9223372036854775808)
+Err(Error("\"9223372036854775808\" doesn't fit in an i64"))
+Err(Error("\"\" isn't an i64"))
+Err(Error("\"-\" isn't an i64"))
+Err(Error("\"1_000\" isn't an i64"))
+Err(Error("\" 1\" isn't an i64"))
+Err(Error("\"1e3\" isn't an i64"))
+Err(Error("\"٣\" isn't an i64"))
+Ok(2.5)
+Ok(-0.0)
+Ok(0.001)
+Ok(5.0)
+Ok(0.5)
+Ok(100.0)
+Ok(inf)
+Ok(nan)
+Ok(inf)
+Err(Error("\".\" isn't an f64"))
+Err(Error("\"e5\" isn't an f64"))
+Err(Error("\"1.5.2\" isn't an f64"))
+Err(Error("\"0x10\" isn't an f64"))
+Err(Error("\"1_0.0\" isn't an f64"))
+Err(Error("\" 1.0\" isn't an f64"))
+Ok(6)
+Err(Error("\"two\" isn't an i64"))
+["a", "b", "", "c"]
+["one", "", "two"]
+["", ""]
+[""]
+["", "a"]
+a, b, c
+
+2024/11/02
+Some(2)
+Some(3)
+None
+Some(0)
+Some(6)
+a + b + c
+bb
+no change
+[padded]
+[]
+["h", "é", "l", "l", "o"]
+[]
+stagi
+ging
+
+2
+[[1, 2], [3, 4], [5, 6]]
+[[30, 4], [5, 6]]
+[]
+["first", "second argument", "--flag"]
+3
+1: [ 12 ] Ok(12)
+2: [not a number] Err(Error("\"not a number\" isn't an i64"))
+3: [] Err(Error("\"\" isn't an i64"))
+4: [last line without an end] Err(Error("\"last line without an end\" isn't an i64"))
+None
+Err(Error("can't read \"/no/such/ella/file\": No such file or directory"))
+Err(Error("can't read \"/\": Is a directory"))

@@ -33,6 +33,7 @@ from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 
 from ella.checker import (
+    LIBRARY,
     PRIMITIVE_NAMES,
     Checker,
     EnumTy,
@@ -323,7 +324,7 @@ class Checked:
                 if var in seen or var in ("return", PLACEHOLDER) or later:
                     continue
                 seen.add(var)
-                found.append(Completion(var, name_kind(info, self.checker), describe(info)))
+                found.append(Completion(var, name_kind(info, self.checker), describe(var, info)))
             env = env.parent
         for enum in self.checker.enums:
             if enum not in seen:
@@ -376,11 +377,11 @@ def name_kind(info: VarInfo, checker: Checker) -> str:
     return "function" if isinstance(resolve(info.type), FuncTy) else "variable"
 
 
-def describe(info: VarInfo) -> str:
+def describe(name: str, info: VarInfo) -> str:
     """A name's type, or what it is, for completions."""
     match info.kind:
         case "builtin":
-            return "built-in function"
+            return show_type(LIBRARY[name]) if name in LIBRARY else "built-in function"
         case "variant" | "constructor":
             return f"variant of {info.enum}"
     return ("mut " if info.mutable else "") + show_type(info.type)
@@ -442,7 +443,7 @@ class Symbols:
                 kind = "" if name == "return" else name_kind(info, self.checker)  # `return` in `where` is a keyword
                 hover = f"{name}: {self.show(node)}"
                 if info.kind == "builtin":
-                    hover = f"{name}: built-in function"
+                    hover = f"{name}: {show_type(LIBRARY[name])}" if name in LIBRARY else f"{name}: built-in function"
                 elif info.kind in ("variant", "constructor"):
                     hover = self.variant_text(info.enum, name)
                 self.add(checked.token_at(span), hover, kind, self.modifiers(info), self.definition(info, name))

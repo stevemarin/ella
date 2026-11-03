@@ -17,7 +17,7 @@ uv run pytest          # tests (test/)
 uv run ruff check      # lint
 uv run ruff format     # format (line length 119)
 uv run mypy            # strict type checking of src/ and test/
-uv run ella FILE       # run a program; --help lists --ir, --asm, --native, -O, ...
+uv run ella FILE       # run a program (`-- ARGS` passes it arguments); --help lists --ir, --asm, --native, -O, ...
 uv run ella-lsp        # language server over stdio (editors/vscode starts it)
 make                   # lists the Makefile's recipes: check, lsp, install-extension, package, ...
 ```
@@ -59,14 +59,24 @@ plain:
   level), generic functions, methods and constraints (built-in and
   user-defined, met structurally), and the rules for `nocopy` values
   (`check_copies`). Splices in types run while checking, through
-  `compile_time` (set by `staging.Expander`).
+  `compile_time` (set by `staging.Expander`). `LIBRARY` has the types of
+  the library functions.
+* `src/ella/exhaustive.py`: whether patterns cover every value of a type
+  (`match` cases, and `let`/`for` patterns), with an example of one they
+  miss. The checker runs it once types are final.
 * `src/ella/staging.py`: multi-stage programming: building code from quotes
   (fresh names, constants, and splices of code, types and field names),
   reflection on types (`fields(t)`, ...), and expanding splices outside quotes
   before lowering (`prepare` = check + expand + check again; use it rather
   than `check` to run a program).
 * `src/ella/values.py`: run-time values (plain Python values where possible),
-  scopes, copying, equality and text form. Shared by the interpreters.
+  scopes, copying, equality and text form. Shared by the interpreters, as
+  are `MAX_CALL_DEPTH` (every backend's default call depth limit) and
+  `run_deep` (runs an interpreter on a thread with a big stack).
+* `src/ella/library.py`: the library functions (`split`, `read_line`,
+  `parse_i64`, ...) on run-time values, shared by both interpreters; the
+  runtime's `ella_lib_NAME` functions must match them exactly. `Host` has a
+  program's standard input and arguments.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
@@ -118,7 +128,8 @@ plain:
   compile-time code may not finish; between analyses, symbols follow edits
   (`follow_edits`).
 * `editors/vscode/`: VS Code extension: TextMate grammar (keywords must match
-  `KEYWORDS`, see `test/test_vscode.py`), language configuration, and a
+  `KEYWORDS`, and built-in functions the checker's, see
+  `test/test_vscode.py`), language configuration, and a
   client that starts `ella-lsp`.
 * Tests: `test/test_lexer.py`, `test/test_parser.py`, `test/test_checker.py`,
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
@@ -128,7 +139,8 @@ plain:
   `test/test_vscode.py`. Native tests need
   gcc and are skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
-  `NAME.err` (expected error), run by `test/test_programs.py` through both
+  `NAME.err` (expected error), `NAME.in` (standard input) and `NAME.args`
+  (arguments, one per line), run by `test/test_programs.py` through both
   interpreters, the optimized IR, and native code (plain and optimized).
 
 Stage 7 (staged programming, structs, generics, pools, nocopy and
