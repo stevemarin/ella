@@ -51,3 +51,6 @@ let set_of[T: Eq] = (xs: [T]) -> Set[T] =>
     for x in xs
         mut result.insert(x)
     result
+
+# The items of a list, each once, in the order they first appear.
+let unique[T: Eq] = (xs: [T]) -> [T] => set_of(xs).items()

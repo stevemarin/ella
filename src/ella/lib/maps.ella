@@ -39,6 +39,10 @@ struct Map[K: Eq, V]
     lookup = (m: Map[K, V], key: K) -> Optional[V] =>
         let i = m._position(key)
         if i >= 0 then Some(m._stored[i]) else None
+    # The value of a key, or `default` if it has none.
+    get_or = (m: Map[K, V], key: K, default: V) -> V =>
+        let i = m._position(key)
+        if i >= 0 then m._stored[i] else default
     remove = (mut m: Map[K, V], key: K) -> Optional[V] =>
         let i = m._position(key)
         if i < 0 then return None
@@ -67,3 +71,35 @@ struct Map[K: Eq, V]
             m._buckets[m._bucket(m._hashes[i])] += [i]
 
 let new_map[K: Eq, V] = () -> Map[K, V] => Map([], [], [], [])
+
+# A map of the pairs' keys to their values; a later pair replaces an earlier one's value.
+let map_of[K: Eq, V] = (pairs: [(K, V)]) -> Map[K, V] =>
+    let mut result = new_map()
+    for (key, value) in pairs
+        result[key] = value
+    result
+
+# The items of xs by their keys, each key's in the order they come, the keys
+# in the order they first come.
+let group_by[T, K: Eq] = (xs: [T], key: (T) -> K) -> Map[K, [T]] =>
+    # Each key's group is found by its position, so items are added to the groups in place.
+    let mut positions: Map[K, i64] = new_map()
+    let mut groups: [[T]] = []
+    for x in xs
+        let k = key(x)
+        let i = positions.get_or(k, len(groups))
+        if i == len(groups) then
+            positions[k] = i
+            groups += [[]]
+        groups[i] += [x]
+    let mut result: Map[K, [T]] = new_map()
+    for k in positions
+        result[k] = groups[positions[k]]
+    result
+
+# How many times each item comes in xs, the items in the order they first come.
+let counts[T: Eq] = (xs: [T]) -> Map[T, i64] =>
+    let mut result: Map[T, i64] = new_map()
+    for x in xs
+        result[x] = result.get_or(x, 0) + 1
+    result

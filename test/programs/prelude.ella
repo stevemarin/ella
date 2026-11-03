@@ -27,6 +27,12 @@ let main = () -> () =>
     print(fold(["a", "b"], [0], (acc, _s) => acc + [len(acc)]), flatten([[1], [], [2, 3]]), flatten([[[1]], [[2]]]))
     print(flat_map(xs, (n) => range(0, n, 1)), flat_map(["ab", "c"], chars), position(xs, (n) => n < 3))
     print(position(xs, (n) => n > 3), position([], (_n: i64) -> bool => true))
+    let none: [i64] = []
+    print(first(xs), last(xs), first(none), last(none), index_of(["a", "b", "a"], "a"), index_of(xs, 9))
+    print(unique([3, 1, 3, 2, 1]), unique(none), unique([0.0, -0.0]), chunks([1, 2, 3, 4, 5], 2), chunks(none, 3))
+    print(min_by(people, (p) => p.age), max_by(people, (p) => p.age), min_by(none, (n) => -n), max_by(["bb", "a", "cc"], len))
+    print(partition(xs, (n) => n > 1), partition(none, (n) => n > 1))
+    print(min_of(xs), max_of(["b", "c", "a"]), min_of(none), max_of([-1.5, 0.5]), min_of([2.0, nan]))
 
     # A Map keeps its keys in the order they were first set.
     let mut ages = new_map()
@@ -67,6 +73,11 @@ let main = () -> () =>
     for k in squares
         total += squares[k]
     print(len(squares), total, squares[298], squares.lookup(297), squares.keys()[0..5])
+
+    # get_or, map_of, group_by and counts.
+    print(ages.get_or("ann", 0), ages.get_or("zed", -1), map_of([("a", 1), ("b", 2), ("a", 3)]).items())
+    print(group_by(["bb", "a", "ccc", "dd", "e"], len).items(), group_by(none, (n) => n).items())
+    print(counts(chars("banana")).items(), counts([true, false, true])[true])
 
     # A Map is a value: a copy doesn't change with the original.
     let mut copy = ages

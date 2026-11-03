@@ -1,0 +1,12 @@
+ababab ["", ""] true
+["a", "b", "", "c"] ["a"] [] [""] ["x\r"] ["é", "ü"]
+["hello", "big", "world"] [] [] ["one"] ["a", "b", "c"]
+["a b  ", "  a b", "", "", "x"]
+Some("happy") None Some("") Some("a")
+Some("file") None
+Some(("key", "value=x")) None Some(("a", "b")) Some(("", ""))
+2 2 0 3
+true false false false false
+true false false true false false
+name: ella
+stage: 7

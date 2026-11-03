@@ -118,8 +118,9 @@ plain:
   (`bare_name`).
 * `src/ella/lib/`: the standard library, in Ella: `lists.ella` (`map`,
   `sort_by`, `sum`, `zip`, `fold`, ...), `maps.ella` (`Map[K, V]`, `new_map`),
-  `sets.ella` (`Set[T]` on a `Map`, `new_set`, `set_of`), `math.ella`
-  (`pi`, `e`, `inf`, `nan`, ...) and `iters.ella` (lazy `map`, `filter`, `take`, ... on
+  `sets.ella` (`Set[T]` on a `Map`, `new_set`, `set_of`, `unique`),
+  `strings.ella` (`lines`, `words`, `split_once`, ...), `math.ella` (`pi`,
+  `e`, `inf`, `nan`, ...) and `iters.ella` (lazy `map`, `filter`, `take`, ... on
   generators). Their public names are the prelude, which every module sees
   without importing them, except those of `iters` (`UNPRELUDED` in
   ella.modules), which share names with `lists`'; they can be imported too.

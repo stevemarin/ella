@@ -1459,9 +1459,9 @@ haven't been checked.
 A few library functions, and a type, are written in Ella itself, in the
 modules of the *standard library* (src/ella/lib/): functions that take
 other functions, or work on lists of any type. Its modules are `lists`
-(the functions in the table down to `range`), `maps` (`Map` and `new_map`),
-`sets` (`Set`, `new_set` and `set_of`), `math` (the constants) and `iters`
-(below). Their public names, but those of
+(the functions in the first table down to `range`), `maps` (`Map`,
+`new_map`, `map_of`, `group_by` and `counts`), `sets` (`Set`, `new_set`, `set_of` and `unique`), `math` (the
+constants), `strings` (the second table) and `iters` (below). Their public names, but those of
 `iters`, are the *prelude*: every module sees
 them without importing them, unless it defines or imports the same name
 itself. They can also be imported like any module
@@ -1479,14 +1479,24 @@ itself. They can also be imported like any module
 | `fold(xs, start, f)` | `[T, A] ([T], A, (A, T) -> A) -> A` | `f(... f(f(start, xs[0]), xs[1]) ..., xs[n - 1])`, or `start` for no items |
 | `flatten(xss)` | `[T] ([[T]]) -> [T]` | the items of each list in `xss`, one list after another |
 | `flat_map(xs, f)` | `[T, U] ([T], (T) -> [U]) -> [U]` | the items of `f`'s list for each item of `xs`, called in order |
+| `first(xs)`, `last(xs)` | `[T] ([T]) -> Optional[T]` | the first (or last) item, if there are any |
+| `index_of(xs, x)` | `[T: Eq] ([T], T) -> Optional[i64]` | where the first item `==` to `x` is |
+| `min_of(xs)`, `max_of(xs)` | `[T: Ord] ([T]) -> Optional[T]` | the smallest (or largest) item by `<`, the first of equal ones; `None` for no items |
+| `min_by(xs, key)`, `max_by(xs, key)` | `[T, K: Ord] ([T], (T) -> K) -> Optional[T]` | the item with the smallest (or largest) key, the first of equal ones; `key` is called once per item, in order |
+| `partition(xs, test)` | `[T] ([T], (T) -> bool) -> ([T], [T])` | the items for which `test` is true, and those for which it is false, each in order |
+| `chunks(xs, n)` | `[T] ([T], i64) -> [[T]]` | the items in lists of `n`, the last with what is left; `n` must be above 0 |
 | `position(xs, test)` | `[T] ([T], (T) -> bool) -> Optional[i64]` | where the first item for which `test` is true is; `test` is called in order, until it is |
 | `any(xs, test)`, `all(xs, test)` | `[T] ([T], (T) -> bool) -> bool` | whether `test` is true for some (or every) item; it is called in order, until the answer is known |
 | `zip(xs, ys)` | `[T, U] ([T], [U]) -> [(T, U)]` | pairs of the items at each position, as many as the shorter list has |
 | `enumerate(xs)` | `[T] ([T]) -> [(i64, T)]` | each item with its position: `[(0, xs[0]), (1, xs[1]), ...]` |
 | `range(start, stop, step)` | `(i64, i64, i64) -> [i64]` | `start`, `start + step`, ... while before `stop` (below it, or above it if `step` is negative); `step` can't be 0 |
 | `new_map()` | `[K: Eq, V] () -> Map[K, V]` | an empty `Map` (below) |
+| `map_of(pairs)` | `[K: Eq, V] ([(K, V)]) -> Map[K, V]` | a `Map` of each pair's key to its value; a later pair's value replaces an earlier one's |
+| `group_by(xs, key)` | `[T, K: Eq] ([T], (T) -> K) -> Map[K, [T]]` | the items of `xs` by their keys: each key's items in order, the keys in the order they first come |
+| `counts(xs)` | `[T: Eq] ([T]) -> Map[T, i64]` | how many times each item comes in `xs`, the items in the order they first come |
 | `new_set()` | `[T: Eq] () -> Set[T]` | an empty `Set` (below) |
 | `set_of(xs)` | `[T: Eq] ([T]) -> Set[T]` | a `Set` of the items of `xs`, in the order they first appear |
+| `unique(xs)` | `[T: Eq] ([T]) -> [T]` | the items of `xs`, each once (by `==`), in the order they first appear |
 | `pi`, `tau`, `e` | `f64` | 3.141592653589793, 6.283185307179586 (2π) and 2.718281828459045 |
 | `inf`, `nan` | `f64` | infinity (`1.0 / 0.0`) and not a number (`0.0 / 0.0`) |
 
@@ -1494,6 +1504,20 @@ They are ordinary generic functions ([§9](#generic-functions-provisional-syntax
 so they are values too, and a type given to `sort` must be `Ord`: a
 number, a string, or a struct or enum with a `compare` method. With pipes
 they read left to right: `words |> filter(long) |> map(upper)`.
+
+The module `strings` adds functions on strings to the library's. "Whitespace" is
+what `trim` removes: space, `\t`, `\n`, `\r`, `\v` and `\f`.
+
+| Name | Type | Gives |
+| --- | --- | --- |
+| `repeat(s, n)` | `(str, i64) -> str` | `s`, `n` times over; `""` if `n` is 0 or less |
+| `lines(s)` | `(str) -> [str]` | the lines of `s`, without their `\n` or `\r\n`; a line break at the end doesn't start another line, so `lines("a\nb\n")` is `["a", "b"]` and `lines("")` is `[]` |
+| `words(s)` | `(str) -> [str]` | the parts of `s` between runs of whitespace, none of them empty |
+| `trim_start(s)`, `trim_end(s)` | `(str) -> str` | `s` without whitespace at its start (or end) |
+| `strip_prefix(s, prefix)`, `strip_suffix(s, suffix)` | `(str, str) -> Optional[str]` | `s` without `prefix` at its start (or `suffix` at its end), if it is there |
+| `split_once(s, sep)` | `(str, str) -> Optional[(str, str)]` | the parts before and after the first `sep`, if there is one; `sep` can't be empty |
+| `count_of(s, part)` | `(str, str) -> i64` | how many times `part` appears in `s`, left to right, not overlapping; `part` can't be empty |
+| `is_digit(s)`, `is_alpha(s)`, `is_space(s)` | `(str) -> bool` | whether `s` isn't empty, and each of its characters is an ASCII digit, an ASCII letter, or whitespace |
 
 `Map[K, V]` is a struct ([§9](#structs-provisional-syntax)) mapping keys to
 values, kept in the order the keys were first set, with protocol methods
@@ -1511,7 +1535,7 @@ for name in ages               # the keys, in order
 
 * `m[k]` is the value of key `k`, and stops the program if there is none
   (`precondition failed: key in m`). `m.lookup(k)` gives an `Optional`
-  instead.
+  instead, and `m.get_or(k, default)` gives `default` instead.
 * `mut m.remove(k)` removes a key, giving its value if it had one.
 * `m.keys()`, `m.values()` and `m.items()` give lists of the keys, the
   values, and `(key, value)` pairs, in order.

@@ -126,6 +126,76 @@ let position[T] = (xs: [T], test: (T) -> bool) -> Optional[i64] =>
         if test(xs[i]) then return Some(i)
     None
 
+# The first and last items, if there are any.
+let first[T] = (xs: [T]) -> Optional[T] => if len(xs) > 0 then Some(xs[0]) else None
+
+let last[T] = (xs: [T]) -> Optional[T] => if len(xs) > 0 then Some(xs[len(xs) - 1]) else None
+
+# Where the first item equal to x is, if any.
+let index_of[T: Eq] = (xs: [T], x: T) -> Optional[i64] =>
+    for i in 0..len(xs)
+        if xs[i] == x then return Some(i)
+    None
+
+# The items of xs in lists of n (the last may have fewer).
+let chunks[T] = (xs: [T], n: i64) -> [[T]] =>
+    where
+        n > 0
+    let mut result: [[T]] = []
+    let mut start = 0
+    while start < len(xs)
+        let stop = min(start + n, len(xs))
+        result += [xs[start..stop]]
+        start = stop
+    result
+
+# The smallest and largest items, by `<`, if there are any; the first of equal ones.
+let min_of[T: Ord] = (xs: [T]) -> Optional[T] =>
+    if len(xs) == 0 then return None
+    let mut best = xs[0]
+    for x in xs
+        if x < best then best = x
+    Some(best)
+
+let max_of[T: Ord] = (xs: [T]) -> Optional[T] =>
+    if len(xs) == 0 then return None
+    let mut best = xs[0]
+    for x in xs
+        if best < x then best = x
+    Some(best)
+
+# The items with the smallest and largest keys, by `<`, if there are any; the
+# first of equal ones. `key` is called once per item, in order.
+let min_by[T, K: Ord] = (xs: [T], key: (T) -> K) -> Optional[T] =>
+    if len(xs) == 0 then return None
+    let mut best = 0
+    let mut best_key = key(xs[0])
+    for i in 1..len(xs)
+        let k = key(xs[i])
+        if k < best_key then
+            best = i
+            best_key = k
+    Some(xs[best])
+
+let max_by[T, K: Ord] = (xs: [T], key: (T) -> K) -> Optional[T] =>
+    if len(xs) == 0 then return None
+    let mut best = 0
+    let mut best_key = key(xs[0])
+    for i in 1..len(xs)
+        let k = key(xs[i])
+        if best_key < k then
+            best = i
+            best_key = k
+    Some(xs[best])
+
+# The items for which `test` is true, and those for which it is false, each in order.
+let partition[T] = (xs: [T], test: (T) -> bool) -> ([T], [T]) =>
+    let mut yes: [T] = []
+    let mut no: [T] = []
+    for x in xs
+        if test(x) then yes += [x] else no += [x]
+    (yes, no)
+
 let zip[T, U] = (xs: [T], ys: [U]) -> [(T, U)] =>
     let n = min(len(xs), len(ys))
     let mut pairs: [(T, U)] = []

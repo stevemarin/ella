@@ -222,7 +222,11 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   `flat_map` and `position` on lists, the constants `tau`, `e`, `inf` and
   `nan`, and the library functions `tan`, `asin`, `acos`, `atan`, `atan2`,
   `log10` and `log2`. `hash` works on any value with `==`, and `Map` and
-  `Set` use it with `==` rather than comparing text forms. See [TODO.md](TODO.md) for what could come next.
+  `Set` use it with `==` rather than comparing text forms. A `strings`
+  module adds `lines`, `words`, `split_once`, `repeat`, `is_digit`, ...,
+  `lists` adds `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`,
+  `max_by`, `partition` and `chunks`, and `maps` adds `map_of`,
+  `group_by`, `counts` and `m.get_or(k, default)`. See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

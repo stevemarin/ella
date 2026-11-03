@@ -347,7 +347,11 @@ def test_the_library_gives_no_warnings() -> None:
 
 
 def first_public(path: Path) -> str:
-    return next(line.split()[1].split("[")[0] for line in path.read_text().splitlines() if line.startswith("let "))
+    return next(
+        line.split()[1].split("[")[0]
+        for line in path.read_text().splitlines()
+        if line.startswith("let ") and line[4] != "_"
+    )
 
 
 # Linking
