@@ -33,6 +33,9 @@ A few ideas recur:
   function value.
 * `return` jumps to the function's exit block rather than returning
   directly, so that postconditions are checked however the function ends.
+* A generator becomes two functions: one that makes the `Gen` (`gen_new`),
+  and its body, a generator function, which `resume` runs (see "Generators"
+  in ella.ir). A `yield` ends a block, and the body carries on in the next.
 
 Memory
 ------
@@ -150,6 +153,7 @@ from ella.ir import (
     Return,
     Trap,
     Value,
+    Yield,
     allocates,
     carry_level,
     is_boxed,
@@ -209,6 +213,7 @@ from ella.syntax import (
     VariantPattern,
     While,
     WildcardPattern,
+    is_generator,
     mentions_return,
 )
 from ella.syntax import (
@@ -216,6 +221,9 @@ from ella.syntax import (
 )
 from ella.syntax import (
     Return as ReturnExpr,
+)
+from ella.syntax import (
+    Yield as YieldExpr,
 )
 from ella.values import STATUS_ERROR
 
@@ -831,6 +839,9 @@ class Lowerer:
     def lower_function(self, pending: PendingFunction) -> None:
         """Make the IR function for a lambda: captures and parameters, `where`, body, and exit."""
         function, t = pending.function, pending.type
+        if is_generator(function):
+            self.lower_generator(pending)
+            return
         self.subst = pending.subst
         self.start_function(pending.name, t.result, function.span, function.body)
         self.function.captures = len(pending.captures)
@@ -885,6 +896,94 @@ class Lowerer:
         outs = [self.emit("load", self.function.locals[slot], [], function.span, slot) for slot in mut_slots]
         self.block.terminator = Return(result, outs)
         self.finish_function()
+
+    def lower_generator(self, pending: PendingFunction) -> None:
+        """A generator: a function that makes its Gen, and the generator function for its body.
+
+        The first checks the preconditions and makes the Gen with copies of
+        its captured values and arguments, which the body (named NAME.body)
+        gets as its parameters, in its level 0. They are its own variables,
+        which it can change. The body ends by freeing its levels, then yields
+        None from then on.
+        """
+        function, t = pending.function, pending.type
+        self.subst = pending.subst
+        body_name, n = f"{pending.name}.body", 0
+        while body_name in self.module.functions or any(p.name == body_name for p in self.pending):
+            n += 1
+            body_name = f"{pending.name}.body.{n}"
+        self.start_function(pending.name, t.result, function.span, function.body)
+        self.function.captures = len(pending.captures)
+        self.scopes = [{}]
+        values = self.generator_params(pending, function.span, "param")
+        for cond in function.where:
+            self.lower_condition(cond, "precondition")
+        made = self.emit("gen_new", t.result, values, function.span, body_name, region="result")
+        self.block.terminator = Return(made)
+        self.finish_function()
+
+        assert isinstance(t.result, BuiltinTy)
+        result = EnumTy("Optional", t.result.args)
+        self.start_function(body_name, result, function.span, function.body)
+        self.function.generator = True
+        self.returned = set()  # its variables live on: nothing is built in the caller's region
+        self.scopes = [{}]
+        self.generator_params(pending, function.span, "local")
+        self.exit = self.new_block("exit")
+        self.lower(function.body)  # its value is unused
+        self.jump(self.exit)
+        self.block = self.exit
+        self.emit_effect("reset", [], function.span, index=0)
+        done, again = self.new_block("done"), self.new_block("again")
+        self.jump(done)
+        self.block = done
+        none = self.emit("variant", result, [], function.span, "None", region="result")
+        self.block.terminator = Yield(none, again)
+        again.terminator = Jump(done, [])
+        self.finish_function()
+
+    def generator_params(self, pending: PendingFunction, span: Span, kind: str) -> list[Value]:
+        """A generator's captured values and parameters, as the parameters of the function being lowered.
+
+        In the body (`kind` "local"), its values are in its own level 0, and
+        its parameters are variables it may change.
+        """
+        entry = self.block
+        self.self_info = SelfInfo(pending.name, pending.type)
+        values = []
+        for var, var_type in pending.captures:
+            param = self.new_value(var_type)
+            entry.params.append(param)
+            self.info[param.id] = Info(frozenset(), "0")
+            self.bind(var, param, span, region="0", kind="capture")
+            self.self_info.capture_slots.append(self.scopes[0][var])
+            values.append(param)
+        for self_name in pending.self_names:
+            self.scopes[0][self_name] = SELF
+        for declared, param_type in zip(pending.function.params, pending.type.params):
+            param = self.new_value(param_type)
+            entry.params.append(param)
+            self.info[param.id] = Info(frozenset(), "0")
+            self.bind(declared.name, param, declared.span, kind == "local", "0", kind)
+            values.append(param)
+        return values
+
+    def lower_yield(self, value_expr: Expr, span: Span) -> Value:
+        """`yield value`: give Some(value) to `resume`'s caller, and carry on in a new block next time.
+
+        The generator's variables live on, so a value borrowed from them that
+        could change, or that doesn't outlive the caller's region, is copied.
+        """
+        value = self.lower(value_expr, "result")
+        if is_boxed(value.type):
+            info = self.info_of(value)
+            if (info.borrows and self.needs_copy(value.type, info)) or not outlives(info.lives, "result"):
+                value = self.copy(value, "result", span)
+        some = self.build("variant", self.function.result, [value], span, "result", "Some")
+        after = self.new_block("resume")
+        self.block.terminator = Yield(some, after)
+        self.block = after
+        return self.const((), span)
 
     def lower_condition(self, cond: Assert, kind: str) -> None:
         value = self.lower(cond.expr)
@@ -1011,10 +1110,15 @@ class Lowerer:
                 return self.lower_lambda(expr, [], span, dest)
             case Call(callee, args):
                 return self.lower_call(expr, callee, args, span, dest)
+            case ReturnExpr(value) if self.function.generator:
+                self.jump(self.exit)  # a generator's `return` has no value
+                return self.leave(span)
             case ReturnExpr(value):
                 result = self.const((), span) if value is None else self.lower(value, "result")
                 self.jump(self.exit, [self.place_return(result, span)])
                 return self.leave(span)
+            case YieldExpr(value_expr):
+                return self.lower_yield(value_expr, span)
 
             # Control flow
             case BlockExpr(exprs):
@@ -1408,7 +1512,12 @@ class Lowerer:
         return result
 
     def lower_builtin(self, expr: Call, name: str, args: tuple[Expr, ...], span: Span, dest: str) -> Value:
-        """`print`, `len`, `run`, the pool and arena functions, reflection, and the library."""
+        """`print`, `len`, `run`, `next`, the pool and arena functions, reflection, and the library."""
+        if name == "next":
+            arg = args[0]
+            assert isinstance(arg, MutArg)
+            place, value = self.mut_place(arg)
+            return self.advance(value, place, self.type_of(expr), span, dest)
         if name in ("alloc", "free"):
             pool_arg, *rest = args
             assert isinstance(pool_arg, MutArg)
@@ -1429,7 +1538,7 @@ class Lowerer:
                 self.block.terminator = Trap(f"{name}() returned", None, span)
                 return self.leave(span)
             return result
-        operands = [self.lower(arg) for arg in args]
+        operands = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
         match name:
             case "len" if self.has_method(operands[0].type, "len"):
                 return self.call_method("len", operands, I64, span, dest)
@@ -1718,6 +1827,8 @@ class Lowerer:
                 case LetPattern(pattern) | For(pattern=pattern) | Case(pattern=pattern):
                     declared |= {name.name for name in pattern_names(pattern)}
         changed = changed_in_place(tuple(parts), self.checker, into_lambdas=False)
+        if isinstance(loop, For) and isinstance(loop.iterable, MutArg):
+            changed |= {place_root(loop.iterable.target), CALLS}  # it changes as the loop advances it
         closed = CALLS not in changed and not any(isinstance(node, Lambda | Quote) for node in inside)
         names: list[tuple[str, str]] = []
         for node in inside:
@@ -1793,6 +1904,80 @@ class Lowerer:
             region = self.build_region(self.var_region(c.name, c.kind))
             self.write_name(c.name, c.kind, self.place(value, region, span, mutable=True), span)
 
+    def advance(self, iterator: Value, place: MutPlace, t: Type, span: Span, dest: str) -> Value:
+        """The next item of a generator (`resume`), or of an iterator (its `next` method), as an Optional.
+
+        An iterator's new value is written back to its place; a generator
+        changes in place.
+        """
+        if isinstance(iterator.type, BuiltinTy):
+            return self.emit("resume", t, [iterator], span, region=dest)
+        function = self.method(iterator.type, "next", span)
+        return self.emit_call(function, [iterator], [place], t, span, dest)
+
+    def place_value(self, place: MutPlace) -> Value:
+        """The value at a place found earlier (by `mut_place`), read again."""
+        value = self.read_name(place.root.name, place.kind, place.span)
+        region = self.var_region(place.root.name, place.kind)
+        for step in place.steps:
+            value, region = self.step_into(value, step, region, place.span)
+        return value
+
+    def lower_for_iterator(self, expr: For, via_iter: bool) -> Value:
+        """`for pattern in g`, over a generator or an iterator, asks for each item until it gets None:
+
+        header: free the last iteration; r = the next item; if r is Some go to body, else exit
+        body:   item = the value in r; match the pattern; body; go to header
+
+        In `for x in mut it`, the iterator or generator is at a place, which it
+        changes. Otherwise a generator is a new value, and an iterator is
+        copied into a hidden variable, `for.it`, which the loop changes.
+        """
+        span = expr.span
+        if isinstance(expr.iterable, MutArg):
+            place, iterator = self.mut_place(expr.iterable)
+        else:
+            iterator = self.protect(self.lower(expr.iterable), [expr.body], span)
+            if via_iter:
+                iterator = self.call_method("iter", [iterator], None, span, self.here())
+            self.scopes.append({})
+            self.bind("for.it", iterator, span, mutable=True)
+            place = MutPlace(Name("for.it", span), "local", [], self.here(), span)
+        names = self.carried_by(expr)
+        outer = self.enter_loop(bool(names))
+        carried = self.begin_carrying(names, span)
+        header, body, next_block = (self.new_block(h) for h in ("for", "body", "next"))
+        exit = self.new_block("exit", outer)
+        self.jump(header)
+
+        self.block = header
+        self.end_iteration(carried, span)
+        item_type = self.concrete(self.checker.types[id(expr.pattern)])
+        result_type = EnumTy("Optional", (item_type,))
+        result = self.advance(self.place_value(place), place, result_type, span, self.here())
+        self.branch(self.emit("is_variant", BOOL, [result], span, "Some"), body, exit)
+
+        self.block = body
+        item = self.variant_field(result, "Some", 0, item_type, span)
+        no_match = self.new_block("nomatch")
+        self.scopes.append({})
+        self.lower_pattern(expr.pattern, item, no_match)
+        self.lower_loop_body(LoopTarget(expr.label, exit, next_block, outer), expr.body)
+        self.scopes.pop()
+        self.jump(next_block)
+
+        self.block = no_match
+        self.block.terminator = Trap("the 'for' pattern doesn't match {}", item, span)
+
+        self.block = next_block
+        self.keep_carried(carried, span)
+        self.jump(header)
+
+        self.leave_loop(exit, outer, span, carried)
+        if not isinstance(expr.iterable, MutArg):
+            self.scopes.pop()
+        return self.const((), span)
+
     def lower_for(self, expr: For) -> Value:
         """`for pattern in xs body` counts through the items with a hidden counter:
 
@@ -1802,6 +1987,9 @@ class Lowerer:
         next:   i = i + 1; go to header
         """
         span = expr.span
+        via_iter, kind = self.checker.iterations[id(expr)]
+        if kind != "items":
+            return self.lower_for_iterator(expr, via_iter)
         iterable = self.protect(self.lower(expr.iterable), [expr.body], span)
         if self.has_method(iterable.type, "iter"):
             iterable = self.call_method("iter", [iterable], None, span, self.here())  # a new list, str or range
@@ -2045,7 +2233,11 @@ def calls_method(node: object, checker: Checker) -> bool:
         case Index(target):
             return has(target, "get")
         case For(iterable=iterable):
-            return has(iterable, "iter")
+            # A loop over a generator or an iterator runs its code for each item.
+            t = finish(checker.types.get(id(iterable), UNIT))
+            return has(iterable, "iter") or has(iterable, "next") or (isinstance(t, BuiltinTy) and t.name == "Gen")
+        case Call(Name("next")) if checker.kinds.get(id(node.callee)) == "builtin":
+            return True
         case Unary("-", operand):
             return has(operand, "neg")
         case Compare(first, rest):

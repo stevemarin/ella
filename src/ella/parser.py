@@ -95,6 +95,7 @@ from ella.syntax import (
     VariantPattern,
     While,
     WildcardPattern,
+    Yield,
 )
 
 I64_MIN = -(2**63)
@@ -110,7 +111,7 @@ LOOP_KEYWORDS = ("for", "while", "loop")
 # decide whether a value follows them.
 EXPR_KEYWORDS = frozenset({
     "assert", "break", "constraint", "continue", "enum", "false", "for", "if", "let", "loop", "match", "mut",
-    "nocopy", "not", "quote", "return", "struct", "true", "while",
+    "nocopy", "not", "quote", "return", "struct", "true", "while", "yield",
 })  # fmt: skip
 
 
@@ -591,6 +592,9 @@ class Parser:
                 return Continue(self.parse_optional_label(), token.span)
             case TokenKind.KEYWORD, "return":
                 return self.parse_return()
+            case TokenKind.KEYWORD, "yield":
+                self.advance()
+                return Yield(self.parse_expr(), token.span)
             case TokenKind.KEYWORD, "assert":
                 self.advance()
                 return self.parse_condition()
@@ -964,7 +968,8 @@ class Parser:
         token = self.advance()
         pattern = self.parse_pattern()
         self.expect("in")
-        iterable = self.parse_expr()
+        mut = self.peek()
+        iterable = MutArg(self.parse_expr(), mut.span) if self.accept("mut") else self.parse_expr()
         return For(label, pattern, iterable, self.parse_loop_body(label), token.span)
 
     def parse_while(self, label: str | None) -> While:

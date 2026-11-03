@@ -1,0 +1,79 @@
+# Lazy versions of the list functions, on generators (docs/grammar.md §9).
+# Not part of the prelude, since they share names with the functions on
+# lists: `import iters`, then `iters.map(g, f)` or `g |> iters.map(f)`.
+#
+# Each takes the generators it is given and gives a new one, which asks
+# them for items only as its own are asked for.
+
+# The items of a list, one at a time.
+let each[T] = (xs: [T]) -> Gen[T] =>
+    for x in xs
+        yield x
+
+# start, start + step, start + 2 * step, ... without end.
+let count[T: Num] = (start: T, step: T) -> Gen[T] =>
+    loop
+        yield start
+        start += step
+
+let map[T, U] = (g: Gen[T], f: (T) -> U) -> Gen[U] =>
+    for x in mut g
+        yield f(x)
+
+let filter[T] = (g: Gen[T], keep: (T) -> bool) -> Gen[T] =>
+    for x in mut g
+        if keep(x) then yield x
+
+# The first n items (fewer if there aren't as many).
+let take[T] = (g: Gen[T], n: i64) -> Gen[T] =>
+    while n > 0
+        match next(mut g)
+            case Some(x) => yield x
+            case None => return
+        n -= 1
+
+# The items after the first n.
+let skip[T] = (g: Gen[T], n: i64) -> Gen[T] =>
+    for x in mut g
+        if n > 0 then n -= 1 else yield x
+
+# The items up to the first one for which `keep` is false.
+let take_while[T] = (g: Gen[T], keep: (T) -> bool) -> Gen[T] =>
+    for x in mut g
+        if not keep(x) then return
+        yield x
+
+# The items of a, then those of b.
+let chain[T] = (a: Gen[T], b: Gen[T]) -> Gen[T] =>
+    for x in mut a
+        yield x
+    for x in mut b
+        yield x
+
+# Each item with its position: (0, first), (1, second), ...
+let enumerate[T] = (g: Gen[T]) -> Gen[(i64, T)] =>
+    let mut i = 0
+    for x in mut g
+        yield (i, x)
+        i += 1
+
+# Pairs of the items of a and b, as many as the shorter one has.
+let zip[T, U] = (a: Gen[T], b: Gen[U]) -> Gen[(T, U)] =>
+    for x in mut a
+        match next(mut b)
+            case Some(y) => yield (x, y)
+            case None => return
+
+# The running results of f: start, f(start, first), f(f(start, first), second), ...
+let scan[T, A] = (g: Gen[T], start: A, f: (A, T) -> A) -> Gen[A] =>
+    yield start
+    for x in mut g
+        start = f(start, x)
+        yield start
+
+# All the items left in a generator, in a list.
+let collect[T] = (mut g: Gen[T]) -> [T] =>
+    let mut items: [T] = []
+    for x in mut g
+        items += [x]
+    items

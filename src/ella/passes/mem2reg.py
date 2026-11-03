@@ -45,6 +45,7 @@ from ella.ir import (
     Jump,
     Module,
     Value,
+    Yield,
     next_value_id,
     predecessors,
     remove_param,
@@ -117,20 +118,20 @@ def promote_slots(function: Function, module: Module) -> bool:
 
 
 def split_critical_edges(function: Function) -> None:
-    """Give a new block to each branch that goes to a block with several predecessors.
+    """Give a new block to each branch (or yield) that goes to a block with several predecessors.
 
-    Block parameters are passed by jumps, and a branch can't pass any. So
-    before parameters can be added to a block, every way into it must be a
-    jump. The empty blocks this adds are removed later by the simplify pass
-    where they aren't needed.
+    Block parameters are passed by jumps, and a branch or yield can't pass
+    any. So before parameters can be added to a block, every way into it
+    must be a jump. The empty blocks this adds are removed later by the
+    simplify pass where they aren't needed.
     """
     preds = predecessors(function)
     names = {block.name for block in function.blocks}
     for block in list(function.blocks):
         branch = block.terminator
-        if not isinstance(branch, Branch):
+        if not isinstance(branch, Branch | Yield):
             continue
-        for side in ("then", "else_"):
+        for side in ("then", "else_") if isinstance(branch, Branch) else ("target",):
             target: Block = getattr(branch, side)
             if len(preds[target]) > 1:
                 name, n = f"{block.name}.{target.name}", 0

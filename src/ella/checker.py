@@ -105,6 +105,8 @@ from ella.syntax import (
     VariantPattern,
     While,
     WildcardPattern,
+    Yield,
+    is_generator,
     mentions_return,
 )
 
@@ -165,14 +167,14 @@ class EnumTy:
 
 @dataclass(frozen=True, slots=True)
 class BuiltinTy:
-    """A built-in type: `Code[T]`, `Pool[T]`, `Handle[T]`, `Arena`, `Ref[T]` or `Type[T]`."""
+    """A built-in type: `Code[T]`, `Pool[T]`, `Handle[T]`, `Arena`, `Ref[T]`, `Gen[T]` or `Type[T]`."""
 
     name: str
     args: tuple[Type, ...]
 
 
 # The built-in types, and how many type arguments each takes.
-BUILTIN_TYPES = {"Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Type": 1}
+BUILTIN_TYPES = {"Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Gen": 1, "Type": 1}
 ARENA = BuiltinTy("Arena", ())
 
 
@@ -497,7 +499,7 @@ LIBRARY: dict[str, FuncTy] = {
 GENERIC_LIBRARY = frozenset(name for name, t in LIBRARY.items() if NUM_T in t.params)
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
-BUILTINS = ("print", "eprint", "len", "run", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
+BUILTINS = ("print", "eprint", "len", "run", "next", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
 WRAPPED = frozenset({"print", "eprint", "len"})  # other built-ins that are values (taking one argument)
 
 
@@ -625,6 +627,13 @@ class Checker:
         self.pending_globals: set[str] = set()
 
         self.return_type: Type | None = None  # the current function's result type
+        # In a generator's body: the type of the values it yields, and how many quotes its body is in.
+        self.yield_type: Type | None = None
+        self.yield_quotes = 0
+        self.generators: list[tuple[Type, Span]] = []  # each generator's item type, which mustn't be nocopy
+        # How each `for` loops (by node): whether it calls `iter` first, and over what: "items" (a
+        # list, str or range), "next" (an iterator, by its next method) or "gen" (a generator).
+        self.iterations: dict[int, tuple[bool, str]] = {}
         self.loops: list[LoopInfo] = []  # the loops we are inside, innermost last
         self.pending_bodies: list[PendingBody] = []
 
@@ -934,7 +943,7 @@ class Checker:
             )
         # Methods with these names give operators and built-ins, so their types are fixed.
         binary = "(Self, T) -> R, without 'mut'"
-        iterable = describe_kind(t.result) in ("list", "str", "range")
+        iterable = describe_kind(t.result) in ("list", "str", "range", "Gen") or isinstance(resolve(t.result), EnumTy)
         expected = {
             "finalize": ("(Self) -> ()", t == FuncTy((own,), UNIT)),
             "compare": ("(Self, Self) -> i64", t == FuncTy((own, own), I64)),
@@ -947,7 +956,14 @@ class Checker:
                 "(Self, T) -> bool, without 'mut'",
                 len(t.params) == 2 and not t.mutable and t.result == BOOL,
             ),
-            "iter": ("(Self) -> a list, str or range", len(t.params) == 1 and not t.mutable and iterable),
+            "iter": (
+                "(Self) -> a list, str, range, iterator or Gen",
+                len(t.params) == 1 and not t.mutable and iterable,
+            ),
+            "next": (
+                "(mut Self) -> Optional[T]",
+                len(t.params) == 1 and t.mutable == (0,) and describe_kind(t.result) == "Optional",
+            ),
         }
         if method.name in expected and not expected[method.name][1]:
             what = expected[method.name][0].replace("Self", show_type(own))
@@ -1179,6 +1195,10 @@ class Checker:
             raise EllaError(
                 f"'{what}' needs a pattern that matches every value, and this one doesn't match {example}", span
             )
+        for item, span in self.generators:
+            item = finish(item)
+            if is_nocopy(item, self.enums):
+                raise EllaError(f"a generator can't yield {show_type(item)} values, which can't be copied", span)
         for name, t, span in self.later_stage_uses:
             t = finish(t)
             if not persistable(t, self.enums):
@@ -1461,9 +1481,19 @@ class Checker:
             case Return(value, span):
                 if self.return_type is None:
                     raise EllaError("'return' outside of a function", span)
+                if value is not None and self.yield_type is not None:
+                    raise EllaError("a generator's 'return' can't have a value: it just ends the generator", span)
                 value_type = UNIT if value is None else self.check(value, env)
                 self.expect(value_type, self.return_type, span, "the returned value")
                 return NEVER
+
+            case Yield(value, span):
+                if self.yield_type is None:
+                    raise EllaError("'yield' can only be used in a function, which it makes a generator", span)
+                if self.quotes != self.yield_quotes:
+                    raise EllaError("'yield' can't be used in a quote", span)
+                self.expect(self.check(value, env), self.yield_type, value.span, "the value given to 'yield'")
+                return UNIT
 
             # Control flow
             case Block(exprs):
@@ -1500,28 +1530,7 @@ class Checker:
                 self.matches.append((cases, subject_type))
                 return match_type
             case For(label, pattern, iterable, body, span):
-                iterable_type = self.known(self.check(iterable, env), iterable.span)
-                if (iterator := self.method_type(iterable_type, "iter", span)) is not None:
-                    # `for x in v` loops over what `v.iter()` gives.
-                    given = self.known(iterator.result, iterable.span)
-                    if describe_kind(given) not in ("list", "str", "range"):
-                        raise EllaError(
-                            f"the iter method of {show_type(iterable_type)} must give a list, str or range, "
-                            f"not {show_type(given)}",
-                            span,
-                        )
-                    iterable_type = given
-                match iterable_type:
-                    case DeferredTy():
-                        item_type: Type = DEFERRED
-                    case ListTy(element):
-                        item_type = element
-                    case PrimTy("str"):
-                        item_type = STR
-                    case PrimTy("range"):
-                        item_type = I64
-                    case _:
-                        raise EllaError(f"can't loop over a {show_type(iterable_type)}", span)
+                item_type = self.loop_item(expr, iterable, env, span)
                 loop_env = Env(env)
                 self.check_pattern(pattern, item_type, loop_env)
                 self.coverage.append(("for", [pattern], item_type, span))
@@ -1705,7 +1714,7 @@ class Checker:
         if op not in ("==", "!=") and self.operator_method(a, "compare", span) is not None:
             return
         kind = describe_kind(self.known(a, span))
-        if kind in ("function", "Pool", "Arena", "Code"):
+        if kind in ("function", "Pool", "Arena", "Gen", "Code"):
             raise EllaError(
                 f"{'functions' if kind == 'function' else show_type(a) + ' values'} can't be compared", span
             )
@@ -1858,13 +1867,19 @@ class Checker:
             if function.return_type is not None:
                 result = self.annotation(function.return_type)
             elif infer:
-                result = self.fresh()
+                result = BuiltinTy("Gen", (self.fresh(),)) if is_generator(function) else self.fresh()
             else:
                 raise EllaError(
                     "a top-level function or method needs a return type, like '(x: i64) -> i64 => ...'",
                     function.span,
                 )
             mutable = tuple(i for i, param in enumerate(function.params) if param.mutable)
+            if mutable and is_generator(function):
+                raise EllaError(
+                    "a generator can't have 'mut' parameters; its parameters are its own variables, which it "
+                    "can change",
+                    function.params[mutable[0]].span,
+                )
             return FuncTy(tuple(params), result, mutable)
         finally:
             self.type_params = outer
@@ -1918,16 +1933,33 @@ class Checker:
         function, t = pending.function, pending.type
         self.checked.add(id(function))
         outer = self.return_type, self.loops, self.level, self.type_params, self.quotes
+        outer_yield = self.yield_type, self.yield_quotes
         self.return_type, self.loops = t.result, []  # `break` can't leave a function
         self.level, self.type_params, self.quotes = pending.level, pending.type_params, pending.quotes
+        generator = is_generator(function)
+        self.yield_type = None
+        if generator:
+            # A generator gives a Gen of what it yields; its body's own value is unused.
+            self.yield_type, self.yield_quotes = self.fresh(), self.quotes
+            if not self.unify(t.result, BuiltinTy("Gen", (self.yield_type,))):
+                raise EllaError(
+                    f"a generator (a function with 'yield') gives a Gen[T], not {show_type(t.result)}",
+                    function.return_type.span if function.return_type is not None else function.span,
+                )
+            self.return_type = UNIT
+            self.generators.append((self.yield_type, function.span))
 
         local = Env(pending.captured)
         for param, param_type in zip(function.params, t.params):
             # A `mut` parameter is a variable the function may change; the
             # caller's variable gets its final value (docs/grammar.md §5).
-            local.vars[param.name] = VarInfo(param_type, param.mutable, "local", level=self.level, binder=param)
+            # A generator's parameters are its own variables.
+            mutable = param.mutable or generator
+            local.vars[param.name] = VarInfo(param_type, mutable, "local", level=self.level, binder=param)
             self.declared[id(param)] = param
         for cond in function.where:
+            if mentions_return(cond.expr) and generator:
+                raise EllaError("a generator can't have postconditions, since it returns nothing", cond.span)
             if mentions_return(cond.expr):
                 result_env = Env(local)
                 result_env.vars["return"] = VarInfo(t.result, False, "local", level=self.level, binder=cond)
@@ -1935,9 +1967,11 @@ class Checker:
             else:
                 self.check_bool(cond.expr, local, "a precondition")
         body_type = self.check(function.body, local)
-        self.expect(body_type, t.result, function.body.span, "the function's result")
+        if not generator:
+            self.expect(body_type, t.result, function.body.span, "the function's result")
 
         self.return_type, self.loops, self.level, self.type_params, self.quotes = outer
+        self.yield_type, self.yield_quotes = outer_yield
 
     def check_call(self, callee: Expr, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
         """A call. Built-ins and variant constructors are only ever called directly, and checked here."""
@@ -2197,6 +2231,20 @@ class Checker:
             return UNIT
         if name in ("alloc", "free"):
             return self.check_alloc(name, args, env, span)
+        if name == "next":
+            self.check_arity(name, 1, args, span)
+            arg = args[0]
+            if not isinstance(arg, MutArg):
+                raise EllaError("next() changes its generator or iterator, so mark it: 'next(mut g)'", arg.span)
+            t = self.known(self.check_place(arg.target, env, "pass"), arg.span)
+            self.types[id(arg)] = t
+            found = self.iterator_item(t, span)
+            if found is None:
+                raise EllaError(
+                    f"next() needs a generator or an iterator (a type with a next method), not {show_type(t)}",
+                    arg.span,
+                )
+            return EnumTy("Optional", (found[0],))
         arity = {"len": 1, "run": 1, "pool_new": 0, "arena_new": 0}[name]
         self.check_arity(name, arity, args, span)
         for arg in args:
@@ -2293,6 +2341,65 @@ class Checker:
             raise EllaError(f"{name} takes {arity} argument{plural} but was given {len(args)}", span)
 
     # Loops
+
+    def loop_item(self, loop: For, iterable: Expr, env: Env, span: Span) -> Type:
+        """The type of the items a `for` loop goes through, recording how it loops (`iterations`).
+
+        It can loop over a list, str or range, a generator, an iterator (a
+        struct or enum with a `next` method), or what a type's `iter` method
+        gives. `for x in mut it` advances an iterator or generator in place.
+        """
+        if isinstance(iterable, MutArg):
+            t = self.known(self.check_place(iterable.target, env, "pass"), iterable.span)
+            self.types[id(iterable)] = t
+            found = self.iterator_item(t, span)
+            if found is None:
+                raise EllaError(
+                    f"only an iterator or a generator can be looped over with 'mut', not {a_or_an(show_type(t))} "
+                    f"{show_type(t)}",
+                    iterable.span,
+                )
+            self.iterations[id(loop)] = (False, found[1])
+            return found[0]
+        t = self.known(self.check(iterable, env), iterable.span)
+        via_iter = False
+        if (iterator := self.method_type(t, "iter", span)) is not None:
+            # `for x in v` loops over what `v.iter()` gives.
+            given = self.known(iterator.result, iterable.span)
+            if describe_kind(given) not in ("list", "str", "range", "Gen") and self.iterator_item(given, span) is None:
+                raise EllaError(
+                    f"the iter method of {show_type(t)} must give a list, str, range, iterator or Gen, "
+                    f"not {show_type(given)}",
+                    span,
+                )
+            t, via_iter = given, True
+        if (found := self.iterator_item(t, span)) is not None:
+            self.iterations[id(loop)] = (via_iter, found[1])
+            return found[0]
+        self.iterations[id(loop)] = (via_iter, "items")
+        match t:
+            case DeferredTy():
+                return DEFERRED
+            case ListTy(element):
+                return element
+            case PrimTy("str"):
+                return STR
+            case PrimTy("range"):
+                return I64
+        raise EllaError(f"can't loop over a {show_type(t)}", span)
+
+    def iterator_item(self, t: Type, span: Span) -> tuple[Type, str] | None:
+        """For a generator or an iterator (with a `next` method), the type of its items and "gen" or "next"."""
+        match resolve(t):
+            case BuiltinTy("Gen", (item,)):
+                return item, "gen"
+        method = self.method_type(t, "next", span)
+        if method is None:
+            return None
+        match resolve(method.result):
+            case EnumTy("Optional", (item,)):
+                return item, "next"
+        return None
 
     def check_loop_body(self, info: LoopInfo, body: Expr, env: Env) -> None:
         self.loops.append(info)
@@ -2506,7 +2613,7 @@ def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
 
     def changes(t: Type) -> bool:
         match t:
-            case ListTy() | BuiltinTy("Pool" | "Arena"):
+            case ListTy() | BuiltinTy("Pool" | "Arena" | "Gen"):
                 return True
             case EnumTy(name) if name in enums:
                 return enums[name].struct and bool(enums[name].field_names)
@@ -2516,11 +2623,11 @@ def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
 
 
 def is_nocopy(t: Type, enums: dict[str, EnumInfo]) -> bool:
-    """Whether values of type `t` can't be copied: they are, or hold, a nocopy struct, a pool or an arena."""
+    """Whether values of type `t` can't be copied: they are, or hold, a nocopy struct, a pool, an arena or a generator."""
 
     def nocopy(t: Type) -> bool:
         match t:
-            case BuiltinTy("Pool" | "Arena"):
+            case BuiltinTy("Pool" | "Arena" | "Gen"):
                 return True
             case EnumTy(name) if name in enums:
                 return enums[name].nocopy
@@ -2629,13 +2736,18 @@ class CopyChecker:
                 self.walk_place(target)
                 self.walk(value, "copy")
             case Call(callee, args):
+                takes = self.gives_generator(node)
                 if isinstance(callee, Member) and isinstance(callee.target, MutArg):
                     self.walk_place(callee.target.target)  # `mut v.method(...)`
+                elif isinstance(callee, Member) and id(callee) in self.checker.methods and takes:
+                    self.walk_taken(callee.target)
                 else:
                     self.walk(callee, "borrow")
                 for arg in args:
                     if isinstance(arg, MutArg):
                         self.walk_place(arg.target)
+                    elif takes:
+                        self.walk_taken(arg)
                     elif (
                         isinstance(callee, Name)
                         and callee.name == "alloc"
@@ -2674,7 +2786,18 @@ class CopyChecker:
             case Return(value):
                 self.walk(value, "return")
             case For(_, pattern, iterable, body):
-                self.walk(iterable, "borrow")
+                via_iter, kind = self.checker.iterations.get(id(node), (False, "items"))
+                if isinstance(iterable, MutArg):
+                    self.walk_place(iterable.target)
+                elif not via_iter and kind != "items" and self.nocopy(iterable) and is_place(iterable):
+                    t = show_type(finish(self.checker.types[id(iterable)]))
+                    raise EllaError(
+                        f"{a_or_an(t)} {t} can't be copied, so a loop over it must advance it in place: "
+                        "'for ... in mut ...'",
+                        iterable.span,
+                    )
+                else:
+                    self.walk(iterable, "borrow")
                 self.function_binders.update(id(node) for node in pattern_names(pattern))
                 self.walk_loop(body)
             case While(_, cond, body):
@@ -2695,6 +2818,22 @@ class CopyChecker:
                     self.walk(method.function, "copy")
             case _:
                 self.walk_parts(node)
+
+    def gives_generator(self, call: Call) -> bool:
+        """Whether a call gives a generator, which takes its arguments rather than borrowing them."""
+        t = self.checker.types.get(id(call))
+        return t is not None and describe_kind(finish(t)) == "Gen"
+
+    def walk_taken(self, arg: Expr) -> None:
+        """An argument a generator takes: one that can't be copied must be a new value."""
+        if self.nocopy(arg) and is_place(arg):
+            t = show_type(finish(self.checker.types[id(arg)]))
+            raise EllaError(
+                f"{a_or_an(t)} {t} can't be copied, and a function that gives a generator takes its arguments, "
+                "so this must be a new value",
+                arg.span,
+            )
+        self.walk(arg, "copy")
 
     def walk_parts(self, node: object) -> None:
         """Walk a node's parts, as copies."""
@@ -2728,6 +2867,16 @@ class CopyChecker:
         return info is not None and info.kind == "local" and id(info.binder) in self.movable
 
 
+def is_place(expr: Expr) -> bool:
+    """Whether an expression reads a variable, or a part of one, rather than making a new value."""
+    match expr:
+        case Name():
+            return True
+        case Index(target) | Member(target):
+            return is_place(target)
+    return False
+
+
 def has_type_splice(node: object) -> bool:
     """Whether some syntax has a splice in a type (outside `type ...`, which is a value)."""
     match node:
@@ -2756,7 +2905,7 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
                 if isinstance(part, ParamTy):
                     return "Eq" not in part.constraints
                 return isinstance(part, FuncTy) or (
-                    isinstance(part, BuiltinTy) and part.name in ("Pool", "Arena", "Code")
+                    isinstance(part, BuiltinTy) and part.name in ("Pool", "Arena", "Gen", "Code")
                 )
 
             return not any_part(t, enums, unequal)

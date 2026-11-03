@@ -1,0 +1,17 @@
+# A pipeline of generators over 200,000 items, one of which rebuilds a
+# string for each item: its levels are arenas of its own, freed as it goes.
+import iters
+
+let labels = (g: Gen[i64]) -> Gen[str] =>
+    let mut label = ""
+    for n in mut g
+        label = "item {{n}}"
+        yield label
+
+let main = () -> () =>
+    let mut count = 0
+    let mut longest = ""
+    for s in iters.count(0, 1) |> iters.filter((n) => n % 3 != 0) |> iters.take(200000) |> labels
+        count += 1
+        if len(s) > len(longest) then longest = s
+    print(count, longest)

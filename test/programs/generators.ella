@@ -1,0 +1,203 @@
+# Generators and iterators (docs/grammar.md §9): functions with `yield`,
+# `next`, loops over them, and types with a `next` method.
+
+let count = (n: i64) -> Gen[i64] =>
+    let mut i = 0
+    while i < n
+        yield i
+        i += 1
+
+# A generator takes the generator it is given, and advances it in place.
+let squares = (g: Gen[i64]) -> Gen[i64] =>
+    for x in mut g
+        yield x * x
+
+# Parameters are the generator's own variables.
+let take = (g: Gen[i64], n: i64) -> Gen[i64] =>
+    while n > 0
+        match next(mut g)
+            case Some(x) => yield x
+            case None => return
+        n -= 1
+
+let naturals = () -> Gen[i64] =>
+    let mut i = 0
+    loop
+        yield i
+        i += 1
+
+# Values built across yields: a string and a list that grow, in a loop that carries them.
+let prefixes = (word: str) -> Gen[str] =>
+    let mut s = ""
+    let mut seen: [str] = []
+    for c in word
+        s = s + c
+        seen += [c]
+        yield "{{s}} {{len(seen)}}"
+
+# Recursion: each call makes a new generator.
+enum Tree
+    Leaf(i64)
+    Node(Tree, Tree)
+
+let leaves = (t: Tree) -> Gen[i64] =>
+    match t
+        case Leaf(n) => yield n
+        case Node(left, right)
+            for n in leaves(left)
+                yield n
+            for n in leaves(right)
+                yield n
+
+# A generic generator, and one that calls a function it is given.
+let pairs[T] = (xs: [T]) -> Gen[(i64, T)] =>
+    let mut i = 0
+    for x in xs
+        yield (i, x)
+        i += 1
+
+let mapped = (g: Gen[i64], f: (i64) -> str) -> Gen[str] =>
+    for x in mut g
+        yield f(x)
+
+# An iterator: a struct with a next method.
+struct Countdown
+    n: i64
+    next = (mut c: Countdown) -> Optional[i64] =>
+        if c.n == 0 then return None
+        c.n -= 1
+        Some(c.n + 1)
+
+# A struct whose iter method is a generator.
+struct Bag
+    items: [str]
+    iter = (b: Bag) -> Gen[str] =>
+        for item in b.items
+            yield "<{{item}}>"
+
+# A generator held by a struct, which must be nocopy too.
+nocopy struct Numbered
+    source: Gen[str]
+    n: i64
+    next = (mut it: Numbered) -> Optional[str] =>
+        match next(mut it.source)
+            case Some(s)
+                it.n += 1
+                Some("{{it.n}}. {{s}}")
+            case None => None
+
+# Values with finalizers that a generator makes live until its body moves
+# past them, or the generator dies.
+nocopy struct Res
+    name: str
+    finalize = (r: Res) -> () => print("free {{r.name}}")
+
+let guarded = (name: str) -> Gen[i64] =>
+    let _outer = Res(name)
+    for i in 0..3
+        let _inner = Res("{{name}}{{i}}")
+        yield i
+    print("{{name}} done")
+
+let holds = (r: Res) -> Gen[str] =>
+    yield r.name
+    yield "{{r.name}} again"
+
+# A function can give back a generator it made, which moves it.
+let made = () -> Gen[i64] =>
+    let g = count(3)
+    g
+
+# A parameter the generator gives new values, in a loop that carries it.
+let halves = (s: str) -> Gen[str] =>
+    while len(s) > 0
+        yield s
+        s = s[0..len(s) // 2]
+
+let main = () -> () =>
+    for x in squares(count(4))
+        print(x)
+
+    let mut g = count(2)
+    print(next(mut g))
+    print(next(mut g), next(mut g), next(mut g))
+    print(g)
+
+    # A loop over `mut g` that breaks carries on from there next time.
+    let mut h = naturals()
+    for x in mut h
+        if x == 2 then break
+    print(next(mut h))
+    for x in mut h
+        if x == 5 then break
+        print("again", x)
+
+    let mut firsts: [i64] = []
+    for x in take(squares(naturals()), 4)
+        firsts += [x]
+    print(firsts)
+    print(take(count(10), 0) |> squares |> take(3))
+
+    for p in prefixes("abc")
+        print(p)
+
+    let tree = Node(Node(Leaf(1), Leaf(2)), Node(Leaf(3), Node(Leaf(4), Leaf(5))))
+    let mut total = 0
+    for n in leaves(tree)
+        total += n
+    print(total)
+
+    for (i, word) in pairs(["x", "y"])
+        print(i, word)
+    let suffix = "!"
+    for s in mapped(count(3), (n) => "{{n}}{{suffix}}")
+        print(s)
+
+    # A lambda with yield is a generator too.
+    let evens = (limit: i64) =>
+        for i in 0..limit
+            if i % 2 == 0 then yield i
+    for e in evens(7)
+        print("even", e)
+
+    for n in Countdown(3)
+        print("countdown", n)
+    let mut c = Countdown(5)
+    for n in mut c
+        if n == 4 then break
+    print(c, next(mut c), c)
+
+    for item in Bag(["a", "b"])
+        print(item)
+    for line in Numbered(Bag(["p", "q"]).iter(), 0)
+        print(line)
+
+    for i in guarded("a")
+        print("got", i)
+    let mut early = guarded("b")
+    print(next(mut early))
+    print(next(mut early))
+    print("dropping b")
+    let _unstarted = guarded("c")
+    let mut held = holds(Res("r"))
+    print(next(mut held))
+    let mut m = made()
+    print(next(mut m), next(mut m))
+    let mut pool: Pool[Gen[i64]] = pool_new()
+    let handle = alloc(mut pool, count(2))
+    print(next(mut pool[handle]), next(mut pool[handle]), next(mut pool[handle]))
+    free(mut pool, handle)
+    for h in halves("abcdefgh")
+        print(h)
+    let ticks = (n: i64) =>
+        if n > 0 then
+            yield n
+            for t in ticks(n - 1)
+                yield t
+    let mut all: [i64] = []
+    for t in ticks(4)
+        all += [t]
+    print(all)
+    let mut d = Countdown(2)
+    print(mut d.next(), d)
+    print("end of main")

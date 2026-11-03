@@ -74,6 +74,9 @@ from ella.syntax import (
 )
 
 LIBRARY_DIR = Path(__file__).parent / "lib"
+# Library modules whose names aren't in the prelude, since they share names with
+# those of other modules: they must be imported (`import iters`, then `iters.map`).
+UNPRELUDED = frozenset({"iters"})
 
 # The names a module can use without defining or importing them.
 BUILTIN_NAMES = frozenset({*BUILTINS, *REFLECTION}) | {v for e in BUILTIN_ENUMS.values() for v in e.variants}
@@ -172,9 +175,11 @@ def library_module(name: str) -> Program | None:
 
 @cache
 def prelude() -> dict[str, Item]:
-    """The prelude: each public name of the standard library, by its name as written."""
+    """The prelude: each public name of the standard library (but UNPRELUDED's), by its name as written."""
     names: dict[str, Item] = {}
     for path in sorted(LIBRARY_DIR.glob("*.ella")):
+        if path.stem in UNPRELUDED:
+            continue
         program = library_module(path.stem)
         assert program is not None
         for name, item in top_level(program.body, path.stem + ".", path.stem, f"{STD}/{path.name}").items():

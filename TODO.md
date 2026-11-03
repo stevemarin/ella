@@ -16,20 +16,21 @@ in patterns and more warnings, then inferred lambda types, built-ins and
 constructors as values, a larger prelude with a hash map, prelude error
 locations, and warnings for unused parameters and functions, then modules
 and imports, with the prelude as standard library modules, then loops that
-carry values instead of piling them up, and benchmarks). `make check`
-passes (1044 tests, ruff, strict mypy).
+carry values instead of piling them up, and benchmarks, then generators
+and iterators). `make check`
+passes (1104 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
+| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
-| IR and optimizer | Typed SSA CFG with a verifier; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
+| IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
-| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers |
+| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers, generators that keep their frame and levels in the `Gen` |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
-| User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `contains`, `len`) |
-| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]` |
+| User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
+| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]`; lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
@@ -105,7 +106,19 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 
 - `==` and the text form (`print`) can't be customized; both are structural
   and done by the runtime, so they would need callbacks into Ella code.
-- `iter` builds a whole list; there is no lazy iterator protocol (`next`).
+- A generator takes its nocopy arguments (a `Gen` given to another
+  generator, say) only as new values: `squares(count(4))` works, but
+  `squares(g)` for a variable `g` doesn't. Moving a local variable at its
+  last use, as `return` does, would allow it.
+- A function type can't say that a function takes its arguments, so the
+  rule goes by the result type: every function that gives a `Gen` takes
+  its nocopy arguments, even one that only borrows them.
+- Generators can't yield nocopy values, and an iterator over a list (a
+  generator or a struct with `next`) holds a copy of it, or the list
+  itself when nothing changes it; `Map`'s `iter` still builds a list of
+  its keys.
+- The AST interpreter runs each generator on a thread of its own, so
+  recursion through thousands of generators is slow there.
 - No functions in a type's namespace that don't take a value
   (`Stack.new()`), and no methods on built-in types (`xs.len()`).
 - Constraints can't require other constraints or operators
@@ -306,6 +319,26 @@ Small steps that build on the above:
 6. Benchmarks for speed alone (calls, arithmetic, `Map`), like `fib(32)`
    above, so its numbers are measured rather than by hand.
 
+### Done (2026-11-02, seventh round): generators and iterators
+
+1. A function with `yield` is a generator: calling it gives a `Gen[T]`,
+   which runs its body a step at a time. `next(mut g)` gives the next
+   item as an `Optional`, and `for x in g` and `for x in mut g` (which
+   advances it in place) loop over one. A `Gen` can't be copied, so a
+   function that gives one takes its nocopy arguments, which must be new
+   values (docs/grammar.md §9).
+2. Iterators: a struct or enum with `next = (mut Self) -> Optional[T]` can
+   be looped over, and `iter` may give an iterator or a `Gen`.
+3. The IR has generator functions, which `resume` runs until a `yield`
+   terminator; their frames and scope levels live in the `Gen`, so no
+   state machine is needed (docs/memory-model.md §17). Natively, they
+   address their frame from `r12`. Values with finalizers live across a
+   `yield`, and are finalized when the generator moves past them or dies.
+   The AST interpreter runs each generator's body on a thread.
+4. The standard library module `iters` (imported, not in the prelude) has
+   lazy `map`, `filter`, `take`, `zip`, ... on generators, and a benchmark
+   checks that a pipeline of 200,000 items runs in under 2 KB of arenas.
+
 ### Done (2026-11-02, sixth round): region bloat
 
 1. A loop that gives variables declared outside it new values carries
@@ -362,13 +395,13 @@ errors in all backends (the IR knows each call's span), and let `main`
 return a `Result` or an exit code. Together with the exhaustiveness
 checking that exists now, this makes failures much easier to understand.
 
-### 5. Iterators and views without copying
+### 5. Views without copying
 
-memory-model §12 calls zero-copy views and iterators awkward. A lazy
-iterator protocol (`next`), slices that borrow their list for a single
-expression or loop, and second-class references in loops would remove many
-copies and the list that `iter` builds. This touches the memory model's
-core, so it is a design project first.
+memory-model §12 calls zero-copy views awkward. Generators and the `next`
+protocol are done (above); slices that borrow their list for a single
+expression or loop, and second-class references in loops, would remove
+many copies, and the copy of a list that an iterator over it holds. This
+touches the memory model's core, so it is a design project first.
 
 ### 6. SIMD and narrower number types
 

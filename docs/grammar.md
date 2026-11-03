@@ -55,6 +55,7 @@ constraint  continue    else        enum        false       for
 if          import      in          let         loop        match
 mut         nocopy      not         or          quote       return
 struct      then        true        type        where       while
+yield
 ```
 
 Reserved for later, not yet given a grammar: `comptime`.
@@ -573,9 +574,15 @@ let found = loop
     if done() then break 42
 ```
 
-* `for pattern in expr` iterates over a list, string, or range, or a struct
-  or enum with an `iter` method ([§9](#methods-provisional-syntax)). The
+* `for pattern in expr` iterates over a list, string, or range, a
+  generator ([§9](#generators-provisional-syntax)), or a struct or enum
+  with an `iter` or `next` method ([§9](#methods-provisional-syntax)). The
   pattern must match every item, as a `let`'s must.
+* `for pattern in mut place` advances an iterator or generator that is a
+  `mut` variable (or an element of one), in place: after a `break`, it
+  carries on where the loop stopped. Without `mut`, a loop over a struct
+  or enum iterator goes through a copy of it, and a generator, which can't
+  be copied, must be a new value (`for x in count(3)`).
 * `while cond` runs while `cond` (a `bool`) is true.
 * `loop` repeats forever until `break`.
 * `for` and `while` have value `()`. `loop` has the value given to the
@@ -729,6 +736,7 @@ Result[T, E]   Optional[T]       generic types use [ ]
 Point   Pair[T]                  structs and enums, by name
 Pool[T]   Handle[T]              a pool of values, and a handle to one
 Arena   Ref[T]                   an arena of values, and a ref to one
+Gen[T]                           a generator of T values
 Code[T]                          code that gives a T, for a later stage
 Type[T]                          the type T as a value: `type T`
 Type   Code                      a type, or code, whose type is only known later
@@ -928,7 +936,8 @@ looped over and searched, like the built-in collections:
 | --- | --- | --- |
 | `get` | `v[k]` | `(Self, K) -> V` |
 | `set` | `v[k] = x`, and with `get`, `v[k] += x` and so on | `(mut Self, K, V) -> ()` |
-| `iter` | `for x in v`: loops over what `v.iter()` gives | `(Self) -> R`, R a list, str or range |
+| `iter` | `for x in v`: loops over what `v.iter()` gives | `(Self) -> R`, R a list, str, range, iterator or `Gen` |
+| `next` | `for x in v`: v is an *iterator*, whose next item `next` gives | `(mut Self) -> Optional[T]` |
 | `contains` | `x in v` (`v.contains(x)`), `x not in v` | `(Self, T) -> bool` |
 
 ```ella
@@ -954,8 +963,28 @@ for name in ages
 * An item that `get` gives is a copy, so only the last step of an
   assignment can go through `set`: `world.grids[0][(1, 1)] = 4` works, but
   `table["a"].x = 1` and `f(mut table["a"])` don't.
-* `iter` gives a new list, string or range, which the loop then goes
-  through. (It is called once, before the first iteration.)
+* `iter` gives a new list, string, range, iterator or generator, which
+  the loop then goes through. (It is called once, before the first
+  iteration.) A type with both `iter` and `next` is looped over with
+  `iter`.
+* An iterator's `next` gives `Some(item)` for each item, then `None`. A
+  loop over one calls `next` until it gives `None`, on a copy of the
+  iterator, or on the iterator itself in `for x in mut it`. Like any
+  method that changes its value, it can also be called directly:
+  `mut it.next()`.
+
+```ella
+struct Countdown
+    n: i64
+    next = (mut c: Countdown) -> Optional[i64] =>
+        if c.n == 0 then return None
+        c.n -= 1
+        Some(c.n + 1)
+
+for n in Countdown(3)
+    print(n)                     # 3, 2, 1
+```
+
 * A user-defined constraint can ask for these methods too, so generic code
   can index, loop over and search its values.
 * All these names (and the operators' above, and `finalize`) are kept for
@@ -1004,8 +1033,8 @@ let work = () -> () =>
 work()                 # prints: working, closing app
 ```
 
-* A value of a nocopy type (a nocopy struct, a pool, an arena, or anything holding
-  one) is made where it stays. It can be bound with `let`, passed to
+* A value of a nocopy type (a nocopy struct, a pool, an arena, a generator, or
+  anything holding one) is made where it stays. It can be bound with `let`, passed to
   functions (read-only, or as `mut`), read field by field, compared and
   printed, held by another nocopy struct, and moved into a pool or an
   arena with `alloc`. A function can return a new one, or one of its own local
@@ -1061,7 +1090,7 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 
 | Constraint | Allows on `T` | Met by |
 | --- | --- | --- |
-| `Eq` | `==`, `!=`, `in` | every type except functions, pools, arenas and code |
+| `Eq` | `==`, `!=`, `in` | every type except functions, pools, arenas, generators and code |
 | `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str`, types with a `compare` method |
 | `Add` | `+` | `i64`, `f64`, `str`, lists, types with an `add` method of type `(Self, Self) -> Self` |
 | `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `f64` |
@@ -1184,6 +1213,62 @@ print(level[hall])                                       # error: the ref is sta
 * An arena can't be copied. It can hold pools and other arenas, and pools
   can hold arenas.
 
+### Generators **(provisional syntax)**
+
+A function with `yield` in its body is a *generator*: calling it doesn't
+run the body, but gives a `Gen[T]`, which runs the body a step at a time,
+as its items are asked for. Each `yield value` gives one item:
+
+```ella
+let count = (n: i64) -> Gen[i64] =>
+    let mut i = 0
+    while i < n
+        yield i
+        i += 1
+
+let squares = (g: Gen[i64]) -> Gen[i64] =>
+    for x in mut g
+        yield x * x
+
+for x in squares(count(4))
+    print(x)                     # 0, 1, 4, 9
+
+let mut g = count(2)
+print(next(mut g))               # Some(0)
+print(next(mut g), next(mut g))  # Some(1) None
+```
+
+* `next(mut g)` runs the body until its next `yield` and gives
+  `Some(value)`, or `None` once the body has finished (by its end, or a
+  `return`), and every time after that. `for x in g` and `for x in mut g`
+  call it until it gives `None`.
+* A generator's result type is `Gen[T]`, where `T` is the type of the
+  values it yields (a generator that leaves out its result type gets it
+  from its `yield`s). `yield value` itself has type `()`. `yield` belongs
+  to the function it is written in: one in a nested lambda makes that
+  lambda a generator. It can't be used in a quote, and `return` in a
+  generator has no value.
+* Calling a generator evaluates its arguments and copies them into the
+  new `Gen`, along with the variables it captures; preconditions (`where`)
+  are checked then, and postconditions aren't allowed. A generator can't
+  have `mut` parameters, but its parameters are its own variables, which
+  its body can assign to and pass as `mut`.
+* A `Gen` can't be copied (§9, [values that can't be
+  copied](#values-that-cant-be-copied-provisional-syntax)), so a function
+  that gives one *takes* its arguments that can't be copied: each must be
+  a new value, such as `squares(count(4))`, never a variable. (Pipes read
+  well with this: `count(4) |> squares`.) The values it yields can't be
+  nocopy.
+* A generator's variables, and the values with finalizers that it makes,
+  live as long as it does: until its body finishes, or the `Gen` dies.
+  When a `Gen` dies before its body has finished, those values are
+  finalized as if the body had stopped where it is: the innermost loop
+  iteration's values first, newest first.
+* A run-time error in a generator's body stops the program at its
+  location, from the `next` that ran it. Each `next` counts as a call for
+  the call depth limit.
+* A `Gen` prints as `<gen>`, and isn't `Eq`.
+
 ## 10. Built-ins
 
 Built-in functions (ordinary names, not keywords):
@@ -1195,6 +1280,9 @@ Built-in functions (ordinary names, not keywords):
   everything printed so far.
 * `len(x)` returns the length of a list, string or range as `i64`, or how
   many values a pool or arena holds. On a struct or enum, it calls its `len` method.
+* `next(mut g)` gives the next item of a generator, or of an iterator
+  (its `next` method), as an `Optional`
+  ([§9](#generators-provisional-syntax)).
 * `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
   pools ([§9](#pools-provisional-syntax)); `arena_new()`,
   `alloc(mut arena, value)` and `free(mut arena)` on arenas
@@ -1276,7 +1364,7 @@ be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
 `Some(3)`, `None`, `Point(1.0, 2.0)`. A string is its own text, but is
 quoted when it appears inside another value. A pool is `<pool of 3>`, a
 handle `<handle 0:1>` (its slot and generation), an arena `<arena of 3>`,
-a ref `<ref 2>` (which of the arena's values it is), and code `<code ...>`,
+a ref `<ref 2>` (which of the arena's values it is), a generator `<gen>`, and code `<code ...>`,
 with the code as an S-expression.
 
 Structs and enums can give themselves `len`, operators, indexing,
@@ -1304,8 +1392,9 @@ haven't been checked.
 A few library functions, and a type, are written in Ella itself, in the
 modules of the *standard library* (src/ella/lib/): functions that take
 other functions, or work on lists of any type. Its modules are `lists`
-(every function below but `new_map`), `maps` (`Map` and `new_map`) and
-`math` (`pi`). Their public names are the *prelude*: every module sees
+(every function below but `new_map`), `maps` (`Map` and `new_map`),
+`math` (`pi`) and `iters` (below). Their public names, but those of
+`iters`, are the *prelude*: every module sees
 them without importing them, unless it defines or imports the same name
 itself. They can also be imported like any module
 ([§3](#modules-and-imports-provisional-syntax)): `import maps`, then
@@ -1357,6 +1446,24 @@ for name in ages               # the keys, in order
 * A `Map` is a value like any other: it is copied, compared with `==` (its
   order too) and printed field by field. Its fields are private: they are
   how it works inside.
+
+The module `iters` has lazy versions of the list functions, on generators
+([§9](#generators-provisional-syntax)). They share names with those of
+`lists`, so `iters` isn't part of the prelude: `import iters`, then
+`iters.map(g, f)` or `g |> iters.map(f)`. Each takes the generators it is
+given, and asks them for items only as its own are asked for.
+
+| Name | Type | Gives |
+| --- | --- | --- |
+| `each(xs)` | `[T] ([T]) -> Gen[T]` | the items of `xs` |
+| `count(start, step)` | `[T: Num] (T, T) -> Gen[T]` | `start`, `start + step`, ... without end |
+| `map(g, f)`, `filter(g, keep)` | as for lists, on a `Gen[T]` | `f` of each item; the items for which `keep` is true |
+| `take(g, n)`, `skip(g, n)` | `[T] (Gen[T], i64) -> Gen[T]` | the first `n` items; the items after them |
+| `take_while(g, keep)` | `[T] (Gen[T], (T) -> bool) -> Gen[T]` | the items before the first one for which `keep` is false |
+| `chain(a, b)` | `[T] (Gen[T], Gen[T]) -> Gen[T]` | the items of `a`, then those of `b` |
+| `enumerate(g)`, `zip(a, b)` | as for lists, on generators | items with their positions; pairs of items |
+| `scan(g, start, f)` | `[T, A] (Gen[T], A, (A, T) -> A) -> Gen[A]` | `start`, `f(start, first)`, ...: each running result |
+| `collect(mut g)` | `[T] (mut Gen[T]) -> [T]` | the items left in `g`, in a list |
 
 Library modules are modules like the program's own, so the program's
 names (its own `len`, or a variant `i`) don't change what their code
@@ -1515,7 +1622,7 @@ block       = NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT ;
 body        = expr | block ;
 
 expr        = let | assignment | lambda | if | match | for | while | loop
-            | break | continue | return | assert | enum | struct | constraint
+            | break | continue | return | yield | assert | enum | struct | constraint
             | quote | mut_call | operator_expr ;
 
 let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr
@@ -1536,13 +1643,14 @@ if          = "if" expr "then" body [ [ NEWLINE ] "else" body ] ;
 match       = "match" expr NEWLINE INDENT case { case } DEDENT ;
 case        = "case" pattern [ "if" expr ] ( "=>" expr NEWLINE | block ) ;
 
-for         = [ label ] "for" pattern "in" expr body ;
+for         = [ label ] "for" pattern "in" [ "mut" ] expr body ;
 while       = [ label ] "while" expr body ;
 loop        = [ label ] "loop" body ;
 label       = IDENT ":" ;
 break       = "break" [ IDENT ] [ expr ] ;   (* IDENT only if it names an enclosing loop *)
 continue    = "continue" [ IDENT ] ;
 return      = "return" [ expr ] ;
+yield       = "yield" expr ;
 assert      = "assert" expr ;
 
 enum        = "enum" IDENT [ "[" type_param { "," type_param } "]" ]

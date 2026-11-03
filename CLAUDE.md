@@ -65,8 +65,10 @@ plain:
   (`wrappers`), which the lowering makes into a function. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
   level), generic functions, methods and constraints (built-in and
-  user-defined, met structurally), and the rules for `nocopy` values
-  (`check_copies`). Splices in types run while checking, through
+  user-defined, met structurally), generators (a lambda with `yield`,
+  `syntax.is_generator`; how each `for` loops is in `iterations`), and the
+  rules for `nocopy` values (`check_copies`; a call giving a `Gen` takes
+  its nocopy arguments, which must be new values). Splices in types run while checking, through
   `compile_time` (set by `staging.Expander`). `LIBRARY` has the types of
   the library functions. `Checker.warnings` has the problems that don't
   stop a program: unused local variables, parameters and top-level
@@ -110,19 +112,25 @@ plain:
   (`visible`, by the span's file). Values print with bare type names
   (`bare_name`).
 * `src/ella/lib/`: the standard library, in Ella: `lists.ella` (`map`,
-  `sort_by`, `sum`, `zip`, ...), `maps.ella` (`Map[K, V]`, `new_map`) and
-  `math.ella` (`pi`). Their public names are the prelude, which every
-  module sees without importing them; they can be imported too.
+  `sort_by`, `sum`, `zip`, ...), `maps.ella` (`Map[K, V]`, `new_map`),
+  `math.ella` (`pi`) and `iters.ella` (lazy `map`, `filter`, `take`, ... on
+  generators). Their public names are the prelude, which every module sees
+  without importing them, except those of `iters` (`UNPRELUDED` in
+  ella.modules), which share names with `lists`'; they can be imported too.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
   the reference for the language's behavior. It copies eagerly, passes
   `mut` arguments in and out (value-result), and finalizes values through
-  owners (one per call and loop iteration). It is also the compile-time
-  evaluator for splices.
+  owners (one per call and loop iteration). A generator's body runs on a
+  thread of its own, which `next` and `yield` hand control to and back.
+  It is also the compile-time evaluator for splices.
 * `src/ella/ir.py`: the IR (typed CFG: functions, blocks with parameters,
   three-address instructions, terminators), its printer and its verifier.
-  The module docstring specifies every operation.
+  The module docstring specifies every operation. A generator is a
+  function that makes its `Gen` (`gen_new`) and a generator function, its
+  body, which `resume` runs until a `yield` terminator; its frame and
+  levels live in the Gen (docs/memory-model.md §17).
 * `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
   local slots; lambdas are closure converted. It also decides memory: which
   region (arena) each object is made in, and where `copy` is needed, by
@@ -145,7 +153,8 @@ plain:
   or remove an operation that can fail.
 * `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). A stack slot
   per value, Ella's own calling convention (arguments pushed; see the module
-  docstring), C calling convention for runtime calls. A source line passed
+  docstring), C calling convention for runtime calls. A generator
+  function's frame is in its Gen, addressed from `r12`. A source line passed
   to the runtime has its file's number (in the table `ella_files`) above
   its low 32 bits, for errors in modules.
 * `src/ella/runtime.c`: the C runtime linked into native programs. It must

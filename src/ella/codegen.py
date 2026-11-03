@@ -46,9 +46,26 @@ bytes as it requires; each function's prologue aligns it.
 
 Each call increments a call depth, so that runaway recursion stops with
 the same "stack overflow" error as in the interpreters.
+
+Generators
+----------
+
+A generator function (a generator's body, see "Generators" in ella.ir)
+keeps its frame in its Gen (runtime.c), so that its values survive a
+`yield`: it addresses them from `r12`, which points to the end of the
+frame, instead of from `rbp`. `resume g` calls it like a closure, with the
+Gen as the closure, and its prologue sets `r12` and jumps to where it
+last stopped. A `yield` records the block to carry on at, and returns.
+Ella functions other than generator functions never change `r12`, which
+the C convention preserves, and a generator function restores it before
+it returns. Its scope levels are slot arenas the Gen keeps (`depths`), so
+regions name those rather than depths taken by `ella_enter`. `gen_new`
+fills in the frame's parameters, and the depths of the loops that carry
+values, at offsets known from the body's layout.
 """
 
 import struct
+from dataclasses import dataclass, field
 
 from ella.checker import (
     ARENA,
@@ -76,8 +93,10 @@ from ella.ir import (
     Return,
     Trap,
     Value,
+    Yield,
     carry_level,
     format_instr,
+    is_boxed,
     region_level,
 )
 from ella.lexer import Span
@@ -87,7 +106,10 @@ from ella.values import MAX_CALL_DEPTH
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
 KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0}
 LIST_KIND, TUPLE_KIND, FUNCTION_KIND, ENUM_KIND, POOL_KIND, HANDLE_KIND, CODE_KIND = 6, 7, 8, 9, 10, 11, 12
-ARENA_KIND, REF_KIND = 13, 14
+ARENA_KIND, REF_KIND, GEN_KIND = 13, 14, 15
+
+# A Gen (runtime.c): its code, where it carries on, its number of levels and frame size, then each level's depth.
+GEN_RESUME, GEN_DEPTHS = 8, 32
 
 # The registers for the first six arguments of a C call.
 C_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -111,6 +133,24 @@ class Register(str):
     """A register whose value is passed to the runtime."""
 
 
+@dataclass(slots=True)
+class Layout:
+    """Where a function keeps its values: each one's distance below the frame's base (rbp, or r12 in a
+    generator function), or for declared parameters of other functions, the caller's slot above rbp.
+
+    `levels_at` is the slot of the depth of its scope level 0 (0 if it has none of its own), and `current`
+    and `carried` those of the depths of each loop that carries values, by level. `size` is in bytes.
+    """
+
+    below: dict[int, int] = field(default_factory=dict)  # value id -> offset below the base
+    above: dict[int, int] = field(default_factory=dict)  # value id -> offset above rbp
+    locals: dict[str, int] = field(default_factory=dict)
+    levels_at: int = 0
+    current: dict[int, int] = field(default_factory=dict)
+    carried: dict[int, int] = field(default_factory=dict)
+    size: int = 0
+
+
 def generate(module: Module, max_depth: int = MAX_CALL_DEPTH) -> str:
     """The assembly text for a whole module, whose functions may call each other `max_depth` deep."""
     return CodeGen(module, max_depth).generate()
@@ -128,6 +168,7 @@ class CodeGen:
         self.type_labels: dict[Type, Label] = {}
         self.finalizers: set[str] = set()
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
+        self.layouts: dict[str, Layout] = {}
         self.files = [""]  # the files of spans, numbered for the runtime's errors (0: the entry file)
 
         # The function being generated: the stack slot of each value and local,
@@ -220,38 +261,19 @@ class CodeGen:
     def function_body(self, function: Function) -> None:
         """The prologue, then each block."""
         self.function = function
-        self.slots, self.local_slots = {}, {}
-        self.current_slots, self.carried_slots = {}, {}
-        frame = 0
-
-        def new_slot() -> str:
-            nonlocal frame
-            frame += 8
-            return f"qword ptr [rbp - {frame}]"
-
+        layout = self.layout(function)
+        base = "r12" if function.generator else "rbp"
+        self.slots = {v: f"qword ptr [{base} - {k}]" for v, k in layout.below.items()}
+        self.slots |= {v: f"qword ptr [rbp + {k}]" for v, k in layout.above.items()}
+        self.local_slots = {name: f"qword ptr [{base} - {k}]" for name, k in layout.locals.items()}
+        self.base_slot = f"qword ptr [rbp - {layout.levels_at}]" if layout.levels_at else ""
+        self.current_slots = {level: f"qword ptr [{base} - {k}]" for level, k in layout.current.items()}
+        self.carried_slots = {level: f"qword ptr [{base} - {k}]" for level, k in layout.carried.items()}
         params = function.params
-        for i, param in enumerate(params):
-            if i < function.captures:
-                self.slots[param.id] = new_slot()  # copied in from the closure below
-            else:
-                self.slots[param.id] = self.param_slot(i - function.captures)
-        for block in function.blocks:
-            for value in block.params if block is not function.blocks[0] else []:
-                self.slots[value.id] = new_slot()
-            for instr in block.instrs:
-                for value in [instr.dest, *instr.outs] if instr.dest is not None else []:
-                    self.slots[value.id] = new_slot()
-        for name in function.locals:
-            self.local_slots[name] = new_slot()
-        uses_levels = any(
-            (region_level(instr.region) is not None and instr.op not in ("set_index", "set_field"))
-            or instr.op == "swap"
-            for block in function.blocks
-            for instr in block.instrs
-        )
-        self.base_slot = new_slot() if uses_levels else ""
-        for level in sorted({i.index for block in function.blocks for i in block.instrs if i.op == "swap"}):
-            self.current_slots[level], self.carried_slots[level] = new_slot(), new_slot()
+        if function.generator:
+            self.generator_prologue(function, layout)
+            return
+        frame = layout.size
 
         self.emit("push rbp")
         self.emit("mov rbp, rsp")
@@ -262,7 +284,7 @@ class CodeGen:
             for i in range(function.captures):
                 self.emit(f"mov rcx, qword ptr [rax + {24 + 8 * i}]")
                 self.emit(f"mov {self.slots[params[i].id]}, rcx")
-        if uses_levels:
+        if self.base_slot:
             self.emit(f"mov rdi, {function.levels}")
             self.emit("call ella_enter            # take arenas for the scope levels")
             self.emit(f"mov {self.base_slot}, rax")
@@ -277,6 +299,102 @@ class CodeGen:
                 self.instr(instr)
             self.terminator(block)
 
+    def layout(self, function: Function) -> Layout:
+        """A stack slot (8 bytes) for each of a function's values and locals, and the depths of its levels.
+
+        A generator function's are all in its frame, in the Gen, its
+        parameters too; its levels' depths are in the Gen itself.
+        """
+        if function.name in self.layouts:
+            return self.layouts[function.name]
+        layout = Layout()
+
+        def new_slot() -> int:
+            layout.size += 8
+            return layout.size
+
+        for i, param in enumerate(function.params):
+            if i < function.captures or function.generator:
+                layout.below[param.id] = new_slot()  # copied in from the closure, or by gen_new
+            else:
+                layout.above[param.id] = 32 + 8 * (i - function.captures)
+        for block in function.blocks:
+            for value in block.params if block is not function.blocks[0] else []:
+                layout.below[value.id] = new_slot()
+            for instr in block.instrs:
+                for value in [instr.dest, *instr.outs] if instr.dest is not None else []:
+                    layout.below[value.id] = new_slot()
+        for name in function.locals:
+            layout.locals[name] = new_slot()
+        uses_levels = any(
+            (region_level(instr.region) is not None and instr.op not in ("set_index", "set_field"))
+            or instr.op == "swap"
+            for block in function.blocks
+            for instr in block.instrs
+        )
+        if uses_levels and not function.generator:
+            layout.levels_at = new_slot()
+        for level in sorted({i.index for block in function.blocks for i in block.instrs if i.op == "swap"}):
+            layout.current[level], layout.carried[level] = new_slot(), new_slot()
+        self.layouts[function.name] = layout
+        return layout
+
+    def generator_prologue(self, function: Function, layout: Layout) -> None:
+        """A generator function starts by finding its frame (r12), and carries on where it stopped."""
+        self.emit("push rbp")
+        self.emit("mov rbp, rsp")
+        self.emit("push r12                  # restored before returning")
+        self.emit("and rsp, -16              # align the stack for calls into the runtime")
+        self.emit("mov rax, qword ptr [rbp + 16]   # the Gen")
+        self.emit(f"lea r12, [rax + {GEN_DEPTHS + 8 * function.levels + layout.size}]   # the end of its frame")
+        self.emit(f"jmp qword ptr [rax + {GEN_RESUME}]   # where it stopped")
+        for block in function.blocks:
+            self.text.append(f"{self.block_label(block)}:")
+            for instr in block.instrs:
+                self.instr(instr)
+            self.terminator(block)
+
+    def gen_new(self, instr: Instr) -> None:
+        """A new Gen for a generator function, with its arguments (copied or moved into its level 0) in its frame."""
+        body = self.module.functions[instr.name]
+        layout = self.layout(body)
+        frame_end = GEN_DEPTHS + 8 * body.levels + layout.size
+        code, start = Label(self.function_labels[body.name]), Label(self.block_label(body.blocks[0], body))
+        made = instr.dest
+        assert made is not None
+        self.call_c("ella_gen_new", code, start, body.levels, layout.size, Region(instr.region))
+        self.store(made)
+        for arg, param in zip(instr.args, body.params):
+            if is_boxed(param.type):
+                self.call_c("ella_gen_arg", made, arg, self.type_descriptor(param.type))
+            else:
+                self.load("rax", arg)
+            self.load("rcx", made)
+            self.emit(f"mov qword ptr [rcx + {frame_end - layout.below[param.id]}], rax")
+        self.load("rcx", made)
+        for level in layout.current:
+            for slot, depth in ((layout.current[level], level), (layout.carried[level], level + 1)):
+                self.emit(f"mov rax, qword ptr [rcx + {GEN_DEPTHS + 8 * depth}]")
+                self.emit(f"mov qword ptr [rcx + {frame_end - slot}], rax")
+
+    def resume(self, instr: Instr) -> None:
+        """`resume g`: call the generator's body, as a closure with no arguments; the Gen is the closure."""
+        line, column = self.span_args(instr.span)
+        ok = self.label("depth")
+        self.emit(f"cmp qword ptr [rip + ella_depth], {self.max_depth}")
+        self.emit(f"jl {ok}")
+        self.call_c("ella_stack_overflow", self.max_depth, line, column)
+        self.text.append(f"{ok}:")
+        self.emit("inc qword ptr [rip + ella_depth]")
+        self.region_to("rax", instr.region)
+        self.emit("push rax                  # where the result goes")
+        self.emit(f"push {self.slots[instr.args[0].id]}")
+        self.load("rax", instr.args[0])
+        self.emit("call qword ptr [rax]       # the generator's code")
+        self.emit("add rsp, 16")
+        self.emit("dec qword ptr [rip + ella_depth]")
+        self.store(instr.dest)
+
     def param_slot(self, i: int) -> str:
         """Where declared parameter i is: the caller pushed it."""
         return f"qword ptr [rbp + {32 + 8 * i}]"
@@ -288,6 +406,9 @@ class CodeGen:
             self.emit(f"mov {register}, {self.current_slots[level]}")
         elif carried is not None:
             self.emit(f"mov {register}, {self.carried_slots[carried]}")
+        elif level is not None and self.function.generator:
+            self.emit(f"mov {register}, qword ptr [rbp + 16]")
+            self.emit(f"mov {register}, qword ptr [{register} + {GEN_DEPTHS + 8 * level}]   # its level's slot arena")
         elif level is not None:
             self.emit(f"mov {register}, {self.base_slot}")
             if level:
@@ -301,8 +422,8 @@ class CodeGen:
         else:
             self.emit(f"mov {register}, 0")
 
-    def block_label(self, block: Block) -> str:
-        return f".L{self.function_labels[self.function.name]}_{block.name}"
+    def block_label(self, block: Block, function: Function | None = None) -> str:
+        return f".L{self.function_labels[(function or self.function).name]}_{block.name}"
 
     # Moving values
 
@@ -385,6 +506,8 @@ class CodeGen:
                 kind, count = ARENA_KIND, 0
             case BuiltinTy("Ref"):
                 kind, count = REF_KIND, 0
+            case BuiltinTy("Gen"):
+                kind, count = GEN_KIND, 0
             case BuiltinTy("Code" | "Type"):
                 kind, count = CODE_KIND, 0  # never made: native code can't build code at run time
             case EnumTy(name, args):
@@ -588,6 +711,17 @@ class CodeGen:
             case "copy":
                 self.call_c("ella_copy", args[0], self.type_descriptor(args[0].type), Region(instr.region))
                 self.store(dest)
+            case "swap" if self.function.generator:
+                current, carried = self.current_slots[instr.index], self.carried_slots[instr.index]
+                self.emit("mov rdi, qword ptr [rbp + 16]")
+                self.emit(f"mov rsi, {instr.index + 2}")
+                self.emit(f"mov rdx, {current}")
+                self.emit(f"mov rcx, {carried}")
+                self.emit("call ella_gen_swap")
+                self.emit(f"mov rax, {current}")
+                self.emit(f"mov rcx, {carried}")
+                self.emit(f"mov {current}, rcx")
+                self.emit(f"mov {carried}, rax")
             case "swap":
                 current, carried = self.current_slots[instr.index], self.carried_slots[instr.index]
                 self.emit(f"mov rdi, {self.base_slot}")
@@ -605,6 +739,10 @@ class CodeGen:
                 carried = Region(f"carry{instr.index}")
                 self.call_c("ella_carry", args[0], self.type_descriptor(args[0].type), carried, Region(instr.region))
                 self.store(dest)
+            case "reset" if self.function.generator:
+                self.emit("mov rdi, qword ptr [rbp + 16]")
+                self.emit(f"mov rsi, {instr.index}")
+                self.emit("call ella_gen_reset")
             case "reset":
                 if self.base_slot:
                     self.emit(f"mov rdi, {self.base_slot}")
@@ -658,6 +796,10 @@ class CodeGen:
                 self.store(dest)
             case "call":
                 self.call(instr)
+            case "gen_new":
+                self.gen_new(instr)
+            case "resume":
+                self.resume(instr)
             case "assert":
                 ok = self.label("ok")
                 self.load("rax", args[0])
@@ -833,6 +975,14 @@ class CodeGen:
                     self.load("rax", out)
                     self.emit(f"mov {self.param_slot(position)}, rax   # a mut parameter's final value")
                 self.load("rax", value)
+                self.emit("leave")
+                self.emit("ret")
+            case Yield(value, target):
+                self.emit("mov rax, qword ptr [rbp + 16]   # the Gen")
+                self.emit(f"lea rcx, [rip + {self.block_label(target)}]")
+                self.emit(f"mov qword ptr [rax + {GEN_RESUME}], rcx   # where to carry on next time")
+                self.load("rax", value)
+                self.emit("mov r12, qword ptr [rbp - 8]")
                 self.emit("leave")
                 self.emit("ret")
             case Trap(message, value, span):

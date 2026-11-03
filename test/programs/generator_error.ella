@@ -1,0 +1,8 @@
+# A run-time error in a generator's body stops the program there, from the next that ran it.
+let ratios = (xs: [i64]) -> Gen[i64] =>
+    for x in xs
+        yield 100 // x
+
+let main = () -> () =>
+    for r in ratios([4, 5, 0, 2])
+        print(r)

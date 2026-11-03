@@ -1,0 +1,57 @@
+0
+1
+4
+9
+Some(0)
+Some(1) None None
+<gen>
+Some(3)
+again 4
+[0, 1, 4, 9]
+<gen>
+a 1
+ab 2
+abc 3
+15
+0 x
+1 y
+0!
+1!
+2!
+even 0
+even 2
+even 4
+even 6
+countdown 3
+countdown 2
+countdown 1
+Countdown(3) Some(3) Countdown(2)
+<a>
+<b>
+1. <p>
+2. <q>
+got 0
+free a0
+got 1
+free a1
+got 2
+free a2
+a done
+free a
+Some(0)
+free b0
+Some(1)
+dropping b
+Some("r")
+Some(0) Some(1)
+Some(0) Some(1) None
+abcdefgh
+abcd
+ab
+a
+[4, 3, 2, 1]
+Some(2) Countdown(1)
+end of main
+free r
+free b1
+free b

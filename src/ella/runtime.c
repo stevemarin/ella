@@ -64,9 +64,24 @@ typedef struct {
     word captured[];
 } Closure;
 
+// A generator (docs/memory-model.md §17): the code of its body, a generator
+// function, which `resume` calls as it calls a closure's; where that code
+// carries on (after the `yield` it last stopped at); a slot arena for each
+// of its scope levels; and its frame, `size` bytes holding its values,
+// which the code addresses from the end (in r12; see ella.codegen).
+typedef struct {
+    void *code;
+    void *resume;
+    word levels;
+    word size;
+    word depths[];
+} Gen;
+
+static size_t gen_size(const Gen *g) { return sizeof(Gen) + (size_t)g->levels * sizeof(word) + (size_t)g->size; }
+
 // Type descriptors, emitted as static data by the code generator. Equality
 // and the text form of a list of enums of floats need to know all of that.
-enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE, K_ARENA, K_REF };
+enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE, K_ARENA, K_REF, K_GEN };
 
 struct Type {
     word kind;
@@ -169,14 +184,16 @@ _Noreturn static void out_of_memory(const char *what) {
 #define KEEP_SLOT ((size_t)64 << 10)
 
 // A value with a finalizer, in the arena it lives in: a nocopy struct with
-// its finalizer, a pool (with no closure), which frees its values, or a
-// sub-arena (with SUB_ARENA), which frees its slot arena.
+// its finalizer, a pool (with no closure), which frees its values, a
+// sub-arena (with SUB_ARENA), which frees its slot arena, or a generator
+// (with GEN), which frees its levels.
 typedef struct {
     word object;
     const Closure *finalize;
 } Final;
 
 #define SUB_ARENA ((const Closure *)1)
+#define GEN ((const Closure *)2)
 
 typedef struct {
     char *top;
@@ -281,6 +298,7 @@ static void unregister(word object) {
 extern void ella_call1(const Closure *closure, word argument);  // in the generated code
 static void free_pool(word pool);
 static void free_sub_arena(word arena);
+static void free_gen(word gen);
 
 // Run the finalizers of the values in an arena, newest first.
 static void finalize_all(Arena *a) {
@@ -290,6 +308,8 @@ static void finalize_all(Arena *a) {
             free_pool(final.object);
         } else if (final.finalize == SUB_ARENA) {
             free_sub_arena(final.object);
+        } else if (final.finalize == GEN) {
+            free_gen(final.object);
         } else {
             ella_call1(final.finalize, final.object);
         }
@@ -631,6 +651,15 @@ word ella_move(word v, const Type *t, word depth) {
         ella_register((word)moved, SUB_ARENA, depth);
         return (word)moved;
     }
+    case K_GEN: {
+        // A generator moves with its frame; the values its levels hold stay in its slot arenas.
+        size_t size = gen_size((const Gen *)v);
+        Gen *moved = alloc(size, depth);
+        memcpy(moved, (const void *)v, size);
+        unregister(v);
+        ella_register((word)moved, GEN, depth);
+        return (word)moved;
+    }
     default:
         return is_boxed(t) ? ella_copy(v, t, depth) : v;
     }
@@ -824,6 +853,48 @@ static void free_sub_arena(word object) {
     free(arena->values);
     arena->values = NULL;
     arena->len = 0;
+}
+
+// Generators
+
+// `gen_new`: a generator for the body at `code`, starting at `start`, with a
+// slot arena for each of its `levels` and a frame of `size` bytes, made in
+// the arena at `depth`. The generated code then fills in its arguments.
+Gen *ella_gen_new(void *code, void *start, word levels, word size, word depth) {
+    Gen *g = alloc(sizeof(Gen) + (size_t)levels * sizeof(word) + (size_t)size, depth);
+    g->code = code;
+    g->resume = start;
+    g->levels = levels;
+    g->size = size;
+    for (word i = 0; i < levels; i++) g->depths[i] = new_slot_arena();
+    memset(&g->depths[levels], 0, (size_t)size);
+    ella_register((word)g, GEN, depth);  // when it dies, its levels are freed
+    return g;
+}
+
+// An argument of a new generator: a copy of it in its level 0, or the value
+// itself, moved there, if it can't be copied.
+word ella_gen_arg(const Gen *g, word value, const Type *t) { return ella_move(value, t, g->depths[0]); }
+
+// `reset k` in a generator's body: free its levels k and up, deepest first,
+// keeping their slot arenas.
+void ella_gen_reset(const Gen *g, word first) {
+    for (word i = g->levels - 1; i >= first; i--) free_arena(g->depths[i]);
+}
+
+// `swap k` in a generator's body, as ella_swap: `first` is k + 2.
+void ella_gen_swap(const Gen *g, word first, word current, word carried) {
+    ella_gen_reset(g, first);
+    finalize_all(arena(current));
+    free_arena(carried);
+}
+
+// A generator dies: its levels' values are finalized, deepest level first,
+// and its slot arenas given back.
+static void free_gen(word object) {
+    Gen *g = (Gen *)object;
+    for (word i = g->levels - 1; i >= 0; i--) free_slot_arena(g->depths[i]);
+    g->levels = 0;
 }
 
 // `xs += ys`: add copies of ys's items to xs, which lives in the arena at
@@ -1046,6 +1117,7 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
         put_i128(b, ((const Pool *)v)->live);
         put(b, '>');
         break;
+    case K_GEN: put_ascii(b, "<gen>"); break;
     case K_ARENA:
         put_ascii(b, "<arena of ");
         put_i128(b, ((const SubArena *)v)->len);

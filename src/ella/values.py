@@ -18,6 +18,7 @@ Ella values are represented by plain Python values where one fits:
                     in the AST interpreter; FunctionRef in the IR interpreter
     Pool[T]         PoolValue, and Handle[T] is HandleValue
     Arena           ArenaValue, and Ref[T] is RefValue
+    Gen[T]          GenValue, whose state belongs to the interpreter running it
     Code[T]         CodeValue, holding the code's syntax tree
 
 Python's `bool` is a subclass of `int`, so code that tells values apart must
@@ -107,6 +108,17 @@ class ArenaValue:
     id: int = field(default_factory=lambda: next(arena_ids))
 
 
+@dataclass(eq=False, slots=True)
+class GenValue:
+    """A `Gen[T]`: a generator, which runs its body a step at a time (docs/grammar.md §9).
+
+    `state` is the interpreter's: a thread running the body in the AST
+    interpreter, a kept frame in the IR interpreter. It can't be copied.
+    """
+
+    state: object = None
+
+
 @dataclass(frozen=True, slots=True)
 class RefValue:
     """A `Ref[T]`: which value of an arena, the arena, and the arena's generation when it was put there."""
@@ -184,6 +196,7 @@ type Value = (
     | PoolValue
     | HandleValue
     | ArenaValue
+    | GenValue
     | RefValue
     | CodeValue
     | TypeValue
@@ -274,6 +287,8 @@ def type_name(value: Value) -> str:
             return "Handle"
         case ArenaValue():
             return "Arena"
+        case GenValue():
+            return "Gen"
         case RefValue():
             return "Ref"
         case CodeValue():
@@ -310,7 +325,7 @@ def equal(a: Value, b: Value) -> bool:
         return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
         return a.variant == b.variant and equal(a.fields, b.fields)
-    if isinstance(a, PoolValue | ArenaValue | CodeValue):
+    if isinstance(a, PoolValue | ArenaValue | GenValue | CodeValue):
         return a is b
     return a == b
 
@@ -350,6 +365,8 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"<arena of {len(values)}>"
         case RefValue(index=index):
             return f"<ref {index}>"
+        case GenValue():
+            return "<gen>"
         case CodeValue(expr):
             return f"<code {show(expr)}>"
         case TypeValue(t):

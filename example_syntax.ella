@@ -282,6 +282,29 @@ row[1] = "c"
 for cell in row
     assert cell in row and cell != "b"
 
+# a function with yield is a generator: its body runs a step at a time,
+# each time next (or a loop) asks for an item
+let evens = (limit: i64) -> Gen[i64] =>
+    let mut n = 0
+    while n < limit
+        yield n
+        n += 2
+let mut gen = evens(5)
+assert next(mut gen) == Some(0)
+for n in mut gen
+    assert n == 2 or n == 4
+assert next(mut gen) == None
+
+# an iterator is a type with a next method, which `for` calls until None
+struct Countdown
+    n: i64
+    next = (mut c: Countdown) -> Optional[i64] =>
+        if c.n == 0 then return None
+        c.n -= 1
+        Some(c.n + 1)
+for n in Countdown(3)
+    assert n > 0
+
 # a nocopy struct is never copied, and its finalizer runs when it dies
 nocopy struct Session
     user: str

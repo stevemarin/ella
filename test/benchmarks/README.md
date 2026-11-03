@@ -19,3 +19,5 @@ time and the arena peak. `make bench` does the same for all of them.
 * `running_max`: nested loops, the outer one carrying a list and a string,
   with an early `break`.
 * `words`: splitting, sorting and joining text, with a `Map` of counts.
+* `generators`: a pipeline of generators (the `iters` module, and one of
+  its own that rebuilds a string for each item) over 200,000 items.

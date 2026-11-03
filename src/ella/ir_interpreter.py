@@ -54,6 +54,11 @@ An `Arena` value has one slot arena of its own, which holds all its values.
 borrowed from it are caught) and keeps it for the arena's next values; the
 slot arena is given back when the arena dies.
 
+A generator function's frame (docs/memory-model.md §17) is kept in its
+Gen between resumes, along with its scope levels, which are slot arenas
+the Gen owns: `reset` there clears them, and they are given back when the
+Gen dies, after the values in them are finalized, deepest level first.
+
 When an arena is freed, the finalizers of the values in it run first,
 newest first (docs/memory-model.md §7). The interpreter also adds up roughly how
 many bytes native code would use (`--profile` shows them): the high-water
@@ -76,6 +81,7 @@ from ella.ir import (
     Module,
     Return,
     Trap,
+    Yield,
     allocates,
     carry_level,
     is_boxed,
@@ -96,6 +102,7 @@ from ella.values import (
     ArenaValue,
     CodeValue,
     FunctionRef,
+    GenValue,
     HandleValue,
     PoolValue,
     RefValue,
@@ -120,6 +127,7 @@ type Tag = tuple[int, int] | None
 SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
 POOL = "<pool>"  # the finalizer of a pool: free its values
 ARENA = "<arena>"  # the finalizer of an arena: free its slot arena
+GEN = "<gen>"  # the finalizer of a generator: free its levels
 
 
 def run_ir(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
@@ -151,6 +159,16 @@ class Frame:
     tags: dict[int, Tag] = field(default_factory=dict)
     locals: dict[str, Value] = field(default_factory=dict)
     local_tags: dict[str, Tag] = field(default_factory=dict)
+    # A generator function's frame, kept in its Gen: the slot arena of each scope level.
+    levels: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Generator:
+    """A Gen's state (its GenValue's `state`): the body's frame, and the block to carry on at."""
+
+    frame: Frame
+    block: Block
 
 
 @dataclass(slots=True)
@@ -215,6 +233,9 @@ class IRInterpreter:
 
     def depth_of(self, region: str, frame: Frame) -> int:
         level = region_level(region)
+        if level is not None and frame.levels:
+            # A level nothing allocates in may have been trimmed away; its variables are checked as the deepest's.
+            return frame.current.get(level, frame.levels[min(level, len(frame.levels) - 1)])
         if level is not None:
             return frame.current.get(level, frame.base + level)
         carried = carry_level(region)
@@ -240,6 +261,24 @@ class IRInterpreter:
         for depth in reversed(range(first, end)):
             self.free_arena(depth)
 
+    def free_levels(self, frame: Frame, first: int) -> None:
+        """Free a frame's scope levels `first` and up, deepest first.
+
+        A generator function's levels are slot arenas its Gen keeps, so they
+        are only cleared.
+        """
+        if not frame.levels:
+            self.free(frame.base + first, frame.base + frame.function.levels)
+            return
+        for depth in reversed(frame.levels[first:]):
+            self.clear_arena(depth)
+
+    def clear_arena(self, depth: int) -> None:
+        """Free an arena's values, keeping the arena (a slot arena that something still owns)."""
+        arena = self.finalize_all(depth)
+        arena.generation += 1
+        arena.used = 0
+
     def free_arena(self, depth: int) -> None:
         arena = self.finalize_all(depth)
         arena.generation += 1
@@ -263,12 +302,16 @@ class IRInterpreter:
         finalizers), and the carried arena is freed and becomes the next
         iteration's.
         """
-        self.free(frame.base + level + 2, frame.base + frame.function.levels)
+        self.free_levels(frame, level + 2)
         current, carried = frame.current[level], frame.carried[level]
         self.finalize_all(current)
-        self.free_arena(carried)
+        if frame.levels:
+            self.clear_arena(carried)
+        else:
+            self.free_arena(carried)
         frame.current[level], frame.carried[level] = carried, current
-        self.keys[current], self.keys[carried] = self.key(carried), self.key(current)
+        if not frame.levels:
+            self.keys[current], self.keys[carried] = self.key(carried), self.key(current)
 
     def key(self, depth: int) -> int:
         return self.keys.get(depth, depth)
@@ -279,6 +322,15 @@ class IRInterpreter:
         return max(present, key=lambda tag: self.key(tag[0])) if present else None
 
     def finalize(self, value: Value, finalizer: str) -> None:
+        if finalizer == GEN:
+            # Its levels' values are finalized, deepest level first, and its slot arenas given back.
+            assert isinstance(value, GenValue) and isinstance(value.state, Generator)
+            frame = value.state.frame
+            self.free_levels(frame, 0)
+            for depth in reversed(frame.levels):
+                self.free_arena(depth)
+            frame.levels = []
+            return
         if finalizer == ARENA:
             assert isinstance(value, ArenaValue)
             self.free_arena(self.arena_slots.pop(id(value)))
@@ -340,41 +392,92 @@ class IRInterpreter:
         for level in range(function.levels):
             self.arena(base + level).owner = (function.name, level)
         frame = Frame(function, base, result_depth, mut_depths)
-        if function.name not in self.swaps:
-            self.swaps[function.name] = function_swaps(function)
-        for level in self.swaps[function.name]:
-            frame.current[level], frame.carried[level] = base + level, base + level + 1
-            self.arena(base + level + 1).owner = (function.name, level)
+        self.start_swaps(frame, [base + level for level in range(function.levels)])
         block = function.blocks[0]
         self.enter(block, args, arg_tags, frame)
         try:
-            while True:
-                for instr in block.instrs:
-                    self.execute(instr, frame)
-                match block.terminator:
-                    case Jump(target, jump_args):
-                        values = [frame.values[a.id] for a in jump_args]
-                        self.enter(target, values, [frame.tags.get(a.id) for a in jump_args], frame)
-                        block = target
-                    case Branch(cond, then, else_):
-                        block = then if frame.values[cond.id] else else_
-                    case Return(value, outs):
-                        returned = self.leave(value, outs, frame, span)
-                        self.free(base, base + function.levels)
-                        return returned
-                    case Trap(message, value, trap_span):
-                        if value is not None:
-                            self.check_alive(frame.tags.get(value.id), str(value), trap_span)
-                            message = message.replace("{}", to_text(frame.values[value.id], nested=True))
-                        raise EllaError(message, trap_span)
-                    case None:
-                        raise AssertionError(f"{function.name}: {block.name} has no terminator")
+            returned, _ = self.run_frame(frame, block, span)
+            self.free(base, base + function.levels)
+            return returned
         finally:
             # After an error, the program stops: nothing is freed or finalized.
             self.next_depth = base
             self.depth -= 1
             for depth in range(base, base + function.levels):
                 self.keys.pop(depth, None)
+
+    def start_swaps(self, frame: Frame, depths: list[int]) -> None:
+        """Give each loop of a frame that carries values its two arenas: its level's, and the next one."""
+        function = frame.function
+        if function.name not in self.swaps:
+            self.swaps[function.name] = function_swaps(function)
+        for level in self.swaps[function.name]:
+            frame.current[level], frame.carried[level] = depths[level], depths[level + 1]
+            self.arena(depths[level + 1]).owner = (function.name, level)
+
+    def run_frame(
+        self, frame: Frame, block: Block, span: Span
+    ) -> tuple[tuple[Value, Tag, list[tuple[Value, Tag]]], Block | None]:
+        """Run a function's blocks from `block` until it returns, or yields (giving the block to carry on at)."""
+        function = frame.function
+        while True:
+            for instr in block.instrs:
+                self.execute(instr, frame)
+            match block.terminator:
+                case Jump(target, jump_args):
+                    values = [frame.values[a.id] for a in jump_args]
+                    self.enter(target, values, [frame.tags.get(a.id) for a in jump_args], frame)
+                    block = target
+                case Branch(cond, then, else_):
+                    block = then if frame.values[cond.id] else else_
+                case Return(value, outs):
+                    return self.leave(value, outs, frame, span), None
+                case Yield(value, target):
+                    return self.leave(value, [], frame, span), target
+                case Trap(message, value, trap_span):
+                    if value is not None:
+                        self.check_alive(frame.tags.get(value.id), str(value), trap_span)
+                        message = message.replace("{}", to_text(frame.values[value.id], nested=True))
+                    raise EllaError(message, trap_span)
+                case None:
+                    raise AssertionError(f"{function.name}: {block.name} has no terminator")
+
+    def new_generator(self, instr: Instr, args: list[Value]) -> Value:
+        """`gen_new`: a Gen with a frame for the generator function, and a slot arena for each of its levels.
+
+        The arguments are copied into its level 0 (or moved, with their finalizers, if they can't be copied).
+        """
+        function = self.module.functions[instr.name]
+        levels = [self.new_slot_arena() for _ in range(function.levels)]
+        for level, depth in enumerate(levels):
+            self.arena(depth).owner = (function.name, level)
+        frame = Frame(function, 0, 0, {}, levels=levels)
+        self.start_swaps(frame, levels)
+        values, tags = [], []
+        for arg, param in zip(args, function.params):
+            value = copy_value(arg)  # the same object if it can't be copied
+            self.move_finals(value, levels[0])
+            values.append(value)
+            tags.append(self.allocate(levels[0], deep_size(value), instr, frame) if is_boxed(param.type) else None)
+        block = function.blocks[0]
+        self.enter(block, values, tags, frame)
+        return GenValue(Generator(frame, block))
+
+    def resume(self, generator: Value, depth: int, span: Span) -> tuple[Value, Tag]:
+        """`resume g`: run a generator's body from where it stopped until it yields, giving its result there."""
+        assert isinstance(generator, GenValue) and isinstance(generator.state, Generator)
+        state = generator.state
+        if self.depth >= self.max_depth:
+            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
+        self.depth += 1
+        try:
+            state.frame.result_depth = depth
+            (value, tag, _), target = self.run_frame(state.frame, state.block, span)
+        finally:
+            self.depth -= 1
+        assert target is not None
+        state.block = target
+        return value, tag
 
     def leave(
         self, value: IRValue, outs: list[IRValue], frame: Frame, span: Span
@@ -499,6 +602,10 @@ class IRInterpreter:
             case "arena_new":
                 result = ArenaValue()
                 self.arena_slots[id(result)] = self.new_slot_arena()
+            case "gen_new":
+                result = self.new_generator(instr, args)
+            case "resume":
+                result, tag = self.resume(args[0], depth, span)
             case "alloc" | "pool_get" | "pool_set" | "free" if isinstance(args[0], ArenaValue):
                 result, tag = self.execute_arena(instr, args, frame)
             case "alloc" | "pool_get" | "pool_set" | "free":
@@ -520,7 +627,7 @@ class IRInterpreter:
             case "reflect":
                 result = reflect(instr.name, args, self.module.enums, span)
             case "reset":
-                self.free(frame.base + instr.index, frame.base + frame.function.levels)
+                self.free_levels(frame, instr.index)
             case "swap":
                 self.swap(instr.index, frame)
             case "carry":
@@ -573,10 +680,10 @@ class IRInterpreter:
             case op:
                 raise AssertionError(f"unknown IR operation {op}")
         if instr.dest is not None:
-            if instr.op in ("pool_new", "arena_new"):
-                self.arena(depth).finals.append((result, POOL if instr.op == "pool_new" else ARENA))
+            if instr.op in ("pool_new", "arena_new", "gen_new"):
+                self.arena(depth).finals.append((result, {"pool_new": POOL, "arena_new": ARENA}.get(instr.op, GEN)))
             if allocates(instr) and instr.op not in (
-                "append", "copy", "move", "call", "run", "slice", "builtin", "carry"
+                "append", "copy", "move", "call", "run", "slice", "builtin", "carry", "resume"
             ):  # fmt: skip
                 tag = self.shortest(tag, self.allocate(depth, shallow_size(result), instr, frame))
             frame.values[instr.dest.id] = result
@@ -778,6 +885,6 @@ def held_values(value: Value) -> list[Value]:
             return [value, *(v for item in fields for v in held_values(item))]
         case list() | tuple():
             return [v for item in value for v in held_values(item)]
-        case PoolValue() | ArenaValue():
+        case PoolValue() | ArenaValue() | GenValue():
             return [value]
     return []

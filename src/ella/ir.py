@@ -15,6 +15,8 @@ where control goes next:
     jump target(args)         continue in another block
     branch cond, then, else   continue in one of two blocks, by a bool
     return value              leave the function
+    yield value, target       (in a generator function) give value to `resume`'s
+                              caller; the next `resume` carries on at target
     trap "message", value     stop the program with a run-time error
 
 Instructions are *three-address code*: each does one small thing to
@@ -70,6 +72,20 @@ one names the arena, its *region*, written after an `@`:
 
 `reset k` frees levels k and up when control leaves a loop iteration, and
 returning frees all of the function's levels.
+
+Generators
+----------
+
+A generator becomes two functions (docs/memory-model.md §17). The one the
+program calls makes a `Gen` with `gen_new`, taking the generator's captured
+values and arguments. The other is the body, a *generator function*
+(`Function.generator`), whose parameters are those values: `resume g`
+runs it from where it last stopped until a `yield` terminator, which gives
+`resume` its result, an Optional made in @result. Its values and slots
+live in the Gen between resumes, and so do its scope levels, which are
+arenas the Gen owns rather than depths of the call: they outlive each
+`resume`. A generator function never returns: at its end, it frees its
+levels (`reset 0`) and yields None, from a block that yields to itself.
 
 A loop that assigns new values to variables declared outside it *carries*
 them from one iteration to the next (docs/memory-model.md §6). Such a loop
@@ -128,6 +144,11 @@ Operations
     pool_set arena, r, v         replace that value, with a copy of v in the arena (the
                                  old one stays there until the arena is freed)
     free arena                   free all the arena's values at once
+    gen_new a, ... @r            a new Gen running generator function f (in `name`), with
+                                 arenas of its own for f's levels; copies of the values
+                                 a, ... (moved, if they can't be copied) in its level 0
+                                 are f's parameters
+    resume g @r                  run generator g until it yields: its Optional result
     quote_begin                  start building the code of quote n (in `index`),
                                  choosing fresh names for its variables
     quote begin, outer..., v...  the code of quote n: its splices' code and the
@@ -253,6 +274,14 @@ class Return:
 
 
 @dataclass(slots=True)
+class Yield:
+    """In a generator function: give `value` to the caller of `resume`, which next carries on at `target`."""
+
+    value: Value
+    target: Block
+
+
+@dataclass(slots=True)
 class Trap:
     """Stop with a run-time error. A `{}` in the message is replaced by the value's text."""
 
@@ -261,7 +290,7 @@ class Trap:
     span: Span
 
 
-type Terminator = Jump | Branch | Return | Trap
+type Terminator = Jump | Branch | Return | Yield | Trap
 
 
 @dataclass(eq=False, slots=True)
@@ -282,7 +311,8 @@ class Function:
     The first `captures` parameters are the variables a closure captured;
     the rest are the declared parameters. `mut_params` are the positions of
     the `mut` ones among the declared parameters. `levels` is how many scope
-    levels the function has (see "Memory").
+    levels the function has (see "Memory"). A `generator` function is a
+    generator's body (see "Generators").
     """
 
     name: str
@@ -294,6 +324,7 @@ class Function:
     captures: int = 0
     mut_params: tuple[int, ...] = ()
     levels: int = 1
+    generator: bool = False
 
     @property
     def params(self) -> list[Value]:
@@ -344,6 +375,8 @@ ALLOCATING = frozenset(
         "append",
         "pool_new",
         "arena_new",
+        "gen_new",
+        "resume",
         "run",
         "reflect",
         "slice",
@@ -458,6 +491,8 @@ def successors(block: Block) -> list[Block]:
             return [target]
         case Branch(_, then, else_):
             return [then, else_]
+        case Yield(_, target):
+            return [target]
         case _:
             return []
 
@@ -517,6 +552,8 @@ def replace_values(function: Function, replacements: dict[int, Value]) -> None:
             case Return() as ret:
                 ret.value = resolve(ret.value)
                 ret.outs = [resolve(out) for out in ret.outs]
+            case Yield() as yielded:
+                yielded.value = resolve(yielded.value)
             case Trap(value=value) as trap if value is not None:
                 trap.value = resolve(value)
 
@@ -533,6 +570,8 @@ def used_values(function: Function) -> set[int]:
             case Return(value, outs):
                 used.add(value.id)
                 used.update(out.id for out in outs)
+            case Yield(value):
+                used.add(value.id)
             case Trap(value=value) if value is not None:
                 used.add(value.id)
     return used
@@ -551,6 +590,8 @@ def count_uses(function: Function) -> Counter[int]:
                 uses[cond.id] += 1
             case Return(value, outs):
                 uses.update([value.id, *(out.id for out in outs)])
+            case Yield(value):
+                uses[value.id] += 1
             case Trap(value=value) if value is not None:
                 uses[value.id] += 1
     return uses
@@ -578,7 +619,8 @@ def format_function(function: Function) -> str:
 
     params = ", ".join(param(i, p) for i, p in enumerate(function.params))
     levels = f"  # levels: {function.levels}" if function.levels > 1 else ""
-    lines = [f"function {function.name}({params}) -> {show_type(function.result)}{levels}"]
+    kind = "generator" if function.generator else "function"
+    lines = [f"{kind} {function.name}({params}) -> {show_type(function.result)}{levels}"]
     for slot, t in function.locals.items():
         region = function.local_regions.get(slot, "") if is_boxed(t) else ""
         lines.append(f"    local {slot}: {show_type(t)}" + (f" @{region}" if region else ""))
@@ -607,7 +649,7 @@ def format_instr(instr: Instr) -> str:
             operands = f"{args}, {instr.name}.{instr.index}"
         case "tuple_get":
             operands = f"{args}, {instr.index}"
-        case "closure":
+        case "closure" | "gen_new":
             operands = f"{instr.name}({args})"
         case "call":
             callee, *rest = instr.args
@@ -638,6 +680,8 @@ def format_terminator(terminator: Terminator | None) -> str:
             return f"branch {cond}, {then.name}, {else_.name}"
         case Return(value, outs):
             return f"return {value}" + "".join(f", mut {out}" for out in outs)
+        case Yield(value, target):
+            return f"yield {value}, {target.name}"
         case Trap(message, value):
             return f"trap {show_literal(message)}" + (f", {value}" if value is not None else "")
         case None:
@@ -787,12 +831,18 @@ class Verifier:
                     raise self.fail("branch targets can't take parameters", block)
             case Return(value, outs):
                 check_use(value)
+                self.require(not self.function.generator, "a generator function can't return", block)
                 self.require(value.type == self.function.result, "returns a value of the wrong type", block)
                 for out in outs:
                     check_use(out)
                 declared = self.function.params[self.function.captures :]
                 expected = [declared[i].type for i in self.function.mut_params]
                 self.require([out.type for out in outs] == expected, "returns the wrong mut parameters", block)
+            case Yield(value, target):
+                check_use(value)
+                self.require(self.function.generator, "only a generator function can yield", block)
+                self.require(value.type == self.function.result, "yields a value of the wrong type", block)
+                self.require(not target.params, "a yield's target can't take parameters", block)
             case Trap(_, value):
                 if value is not None:
                     check_use(value)
@@ -924,7 +974,9 @@ class Verifier:
                 first = STR if instr.name == "new_struct" else BuiltinTy("Type", (NEVER,))
                 need(bool(args) and (args[0] == first or (isinstance(args[0], BuiltinTy) and args[0].name == "Type")))
             case "reset":
-                need(not args and 1 <= instr.index < self.function.levels)
+                # A generator function frees all its levels when its body ends.
+                lowest = 0 if self.function.generator else 1
+                need(not args and lowest <= instr.index < self.function.levels)
             case "swap":
                 need(not args and 1 <= instr.index and instr.index + 1 < self.function.levels)
             case "carry":
@@ -964,6 +1016,16 @@ class Verifier:
                     need(len(instr.out_regions) == len(mut_types))
                     for region in instr.out_regions:
                         self.require(self.valid_region(region, "call"), f"unknown region @{region}", block)
+            case "gen_new":
+                function = self.module.functions.get(instr.name)
+                self.require(function is not None, f"gen_new of unknown function {instr.name}", block)
+                assert function is not None
+                self.require(function.generator, f"gen_new of {instr.name}, which isn't a generator", block)
+                need(args == [p.type for p in function.params])
+                need(isinstance(function.result, EnumTy) and dest == BuiltinTy("Gen", function.result.args))
+            case "resume":
+                need(len(args) == 1 and isinstance(args[0], BuiltinTy) and args[0].name == "Gen")
+                need(dest == EnumTy("Optional", args[0].args) if isinstance(args[0], BuiltinTy) else False)
             case "assert":
                 need(args == [BOOL])
             case _:

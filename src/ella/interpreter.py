@@ -16,10 +16,19 @@ until the loop it belongs to catches it.
 There is no type checker yet, so types are checked as the program runs: `1 +
 true` is a run-time error here, where a later stage will reject it before the
 program starts.
+
+A generator's body runs on a thread of its own (`Generator`), so that it
+can stop at a `yield` in the middle of any expression and carry on later.
+Only one thread runs at a time: `next` hands control to the body's thread
+and waits until it yields or finishes, and `yield` hands it back. The body
+has an owner stack of its own (see "Finalizers"), which `next` puts in
+place while it runs.
 """
 
 import sys
-from collections.abc import Callable, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
@@ -90,6 +99,8 @@ from ella.syntax import (
     VariantPattern,
     While,
     WildcardPattern,
+    Yield,
+    is_generator,
     mentions_return,
 )
 from ella.values import (
@@ -100,6 +111,7 @@ from ella.values import (
     Closure,
     CodeValue,
     Constructor,
+    GenValue,
     HandleValue,
     PoolValue,
     RefValue,
@@ -162,6 +174,32 @@ class ReturnSignal(Exception):
         self.span = span
 
 
+class GeneratorClosed(Exception):
+    """Raised at a `yield` when its generator dies before its body finishes, to end the body's thread."""
+
+
+@dataclass(eq=False)
+class Generator:
+    """The state of a generator in the AST interpreter (a GenValue's `state`).
+
+    `owners` is the body's owner stack: the values with finalizers it made,
+    by function call and loop iteration, innermost last; the first holds the
+    arguments it took. The body's thread starts at the first `next`.
+    `outcome` is what the body did last: ("yield", value), ("end", None),
+    ("error", exception) or ("closed", None).
+    """
+
+    function: Lambda
+    scope: Scope
+    owners: list[list[Value]] = field(default_factory=lambda: [[]])
+    thread: threading.Thread | None = None
+    go: threading.Semaphore = field(default_factory=lambda: threading.Semaphore(0))
+    back: threading.Semaphore = field(default_factory=lambda: threading.Semaphore(0))
+    outcome: tuple[str, Value | BaseException | None] = ("end", None)
+    done: bool = False
+    closing: bool = False
+
+
 def run(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
     """Parse and run a program, writing what it prints to `out` (standard output by default). Returns its exit status.
 
@@ -209,6 +247,7 @@ class Interpreter:
         # an owner ends, it finalizes its values, newest first.
         self.owners: list[list[Value]] = [[]]
         self.renamings: list[dict[int, str]] = []  # the fresh names of the quotes being built
+        self.generator: Generator | None = None  # the generator whose body is running, if any
 
         # The global scope holds the built-ins and every top-level `let`.
         self.globals = Scope(None)
@@ -222,9 +261,11 @@ class Interpreter:
             self.globals.define(name, Builtin(name, len(function.params), self.builtin_library(name)))
         self.globals.define("pool_new", Builtin("pool_new", 0, lambda args, span: self.new_pool()))
         self.globals.define("arena_new", Builtin("arena_new", 0, lambda args, span: self.new_arena()))
-        # alloc and free change their pool or arena, and are handled in `call_pool`.
+        # alloc and free change their pool or arena, and are handled in `call_pool`; next changes its
+        # generator or iterator, in `call_next`.
         self.globals.define("alloc", Builtin("alloc", 2, lambda args, span: UNIT))
         self.globals.define("free", Builtin("free", 2, lambda args, span: UNIT))
+        self.globals.define("next", Builtin("next", 1, lambda args, span: UNIT))
         # Result, Optional and Error are ordinary enums and structs that happen to be predefined.
         self.globals.define("Ok", Constructor("Result", "Ok", 1))
         self.globals.define("Err", Constructor("Result", "Err", 1))
@@ -393,11 +434,15 @@ class Interpreter:
                 function = self.eval(callee, scope)
                 if isinstance(function, Builtin) and function.name in ("alloc", "free"):
                     return self.call_pool(function.name, args, scope, span)
+                if isinstance(function, Builtin) and function.name == "next":
+                    return self.call_next(args, scope, span)
                 return self.call_with_args(function, args, scope, span)
             case MutArg(span=span):
                 raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
             case Return(returned, span):
                 raise ReturnSignal(UNIT if returned is None else self.eval(returned, scope), span)
+            case Yield(value_expr, span):
+                return self.yield_value(self.eval(value_expr, scope), span)
 
             # Control flow
             case Block(exprs):
@@ -410,6 +455,11 @@ class Interpreter:
                 return self.eval(else_, scope) if else_ is not None else UNIT
             case Match(subject, cases, span):
                 return self.eval_match(subject, cases, scope, span)
+            case For(label, pattern, MutArg(target), body, span):
+                root, indexes = self.evaluate_place(target, scope)
+                place = (root, indexes, span)
+                iterator = self.read_place(root, indexes, scope)
+                return self.eval_for(label, pattern, iterator, body, scope, span, place)
             case For(label, pattern, iterable, body, span):
                 return self.eval_for(label, pattern, self.eval(iterable, scope), body, scope, span)
             case While(label, cond, body):
@@ -783,9 +833,14 @@ class Interpreter:
     def call_closure(
         self, lambda_: Lambda, captured: Scope, args: list[Value], span: Span, finals: list[Value] | None = None
     ) -> Value:
-        """Run a function's body with its parameters bound, checking its `where` conditions."""
+        """Run a function's body with its parameters bound, checking its `where` conditions.
+
+        Calling a generator only makes its GenValue (`make_generator`).
+        """
         if self.depth >= self.max_depth:
             raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
+        if is_generator(lambda_):
+            return self.make_generator(lambda_, captured, args)
         # Parameters live in a new scope inside the captured one. Only `mut` ones can change.
         local = Scope(captured)
         for param, arg in zip(lambda_.params, args):
@@ -829,7 +884,7 @@ class Interpreter:
             case VariantValue(enum, fields=fields):
                 inner = [v for item in fields for v in self.finalizable(item)]
                 return ([value] if enum in self.finalizers else []) + inner
-            case PoolValue() | ArenaValue():
+            case PoolValue() | ArenaValue() | GenValue():
                 return [value]
             case list() | tuple():
                 return [v for item in value for v in self.finalizable(item)]
@@ -860,6 +915,9 @@ class Interpreter:
         elif isinstance(value, ArenaValue):
             for held in reversed(value.values):
                 self.finalize_held(held)
+        elif isinstance(value, GenValue):
+            assert isinstance(value.state, Generator)
+            self.close_generator(value.state)
         elif isinstance(value, VariantValue) and value.enum in self.finalizers:
             self.call(self.finalizers[value.enum], [value], Span(0, 0))
 
@@ -874,11 +932,151 @@ class Interpreter:
                 self.finalize(value)
                 for item in reversed(fields):
                     self.finalize_held(item)
-            case PoolValue() | ArenaValue():
+            case PoolValue() | ArenaValue() | GenValue():
                 self.finalize(value)
             case list() | tuple():
                 for item in reversed(value):
                     self.finalize_held(item)
+
+    # Generators
+
+    def make_generator(self, function: Lambda, captured: Scope, args: list[Value]) -> Value:
+        """Call a generator: check its preconditions, and make its GenValue, which takes the arguments.
+
+        Its parameters are its own variables, which it can change. The values
+        with finalizers that the arguments hold now belong to the generator.
+        """
+        local = Scope(captured)
+        for param, arg in zip(function.params, args):
+            local.define(param.name, arg, True)
+        for cond in function.where:
+            self.check_condition(cond, local, "precondition")
+        generator = Generator(function, local)
+        for arg in args:
+            moving = {id(v) for v in self.finalizable(arg)}
+            for owner in range(len(self.owners)):
+                generator.owners[0] += [v for v in self.owners[owner] if id(v) in moving]
+                self.owners[owner] = [v for v in self.owners[owner] if id(v) not in moving]
+        value = GenValue(generator)
+        self.owners[-1].append(value)
+        return value
+
+    def resume(self, generator: Generator, span: Span) -> Value:
+        """`next` on a generator: run its body until it yields (Some(value)) or finishes (None, from then on)."""
+        if generator.done:
+            return VariantValue("Optional", "None")
+        if self.depth >= self.max_depth:
+            raise EllaError(f"stack overflow: more than {self.max_depth} nested calls", span)
+        self.switch(generator, "resume")
+        kind, value = generator.outcome
+        if kind == "error":
+            assert isinstance(value, BaseException)
+            raise value
+        if kind == "end":
+            generator.done = True
+            return VariantValue("Optional", "None")
+        assert value is not None and not isinstance(value, BaseException)
+        return VariantValue("Optional", "Some", [value])
+
+    def switch(self, generator: Generator, why: str) -> None:
+        """Hand control to a generator's thread (starting it the first time), until it hands it back.
+
+        While its body runs, the generator's owner stack is the interpreter's.
+        """
+        saved = self.owners, self.generator, self.depth
+        self.owners, self.generator = generator.owners, generator
+        self.depth += 1
+        try:
+            if generator.thread is None:
+                size = threading.stack_size(max(64 << 20, self.max_depth * (16 << 10)))
+                try:
+                    generator.thread = threading.Thread(target=self.run_generator, args=(generator,), daemon=True)
+                    generator.thread.start()
+                finally:
+                    threading.stack_size(size)
+            else:
+                generator.go.release()
+            generator.back.acquire()
+        finally:
+            self.owners, self.generator, self.depth = saved
+
+    def run_generator(self, generator: Generator) -> None:
+        """A generator's thread: run its body, then hand control back with how it ended."""
+        try:
+            try:
+                self.eval(generator.function.body, generator.scope)
+            except ReturnSignal:
+                pass
+            except BreakSignal as signal:
+                raise EllaError("'break' outside of a loop", signal.span) from None
+            except ContinueSignal as signal:
+                raise EllaError("'continue' outside of a loop", signal.span) from None
+            while self.owners:
+                self.close_owner()  # the body's values, then the arguments it took
+            generator.outcome = ("end", None)
+        except GeneratorClosed:
+            generator.outcome = ("closed", None)
+        except BaseException as error:  # noqa: BLE001  (raised again in the thread that called next)
+            generator.outcome = ("error", error)
+        generator.back.release()
+
+    def yield_value(self, value: Value, span: Span) -> Value:
+        """`yield value`, in a generator's thread: hand the value to `next`, and wait for the next `next`."""
+        generator = self.generator
+        if generator is None:
+            raise EllaError("'yield' can only be used in a generator", span)
+        generator.outcome = ("yield", value)
+        generator.back.release()
+        generator.go.acquire()
+        if generator.closing:
+            raise GeneratorClosed
+        return UNIT
+
+    def close_generator(self, generator: Generator) -> None:
+        """A generator dies. If its body hasn't finished, its values are finalized, innermost owner first,
+        and its thread ends without running anything more."""
+        if generator.done:
+            return
+        generator.done = True
+        saved = self.owners
+        self.owners = generator.owners
+        try:
+            while self.owners:
+                self.close_owner()
+        finally:
+            self.owners = saved
+        if generator.thread is not None:
+            generator.closing = True
+            self.switch(generator, "close")
+
+    def call_next(self, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
+        """`next(mut g)`: the next item of a generator, or of an iterator, by its `next` method."""
+        if len(args) != 1 or not isinstance(args[0], MutArg):
+            raise EllaError("next() takes one generator or iterator, marked 'mut'", span)
+        root, indexes = self.evaluate_place(args[0].target, scope)
+        return self.advance(self.read_place(root, indexes, scope), (root, indexes, args[0].span), scope, span)
+
+    def advance(self, iterator: Value, place: Place | list[Value], scope: Scope, span: Span) -> Value:
+        """The next item of a generator or an iterator, as an Optional.
+
+        An iterator's `next` method changes it, and its new value goes back to
+        `place`, or to the one-item list holding a loop's copy of it; a
+        generator changes in place.
+        """
+        if isinstance(iterator, GenValue):
+            assert isinstance(iterator.state, Generator)
+            return self.resume(iterator.state, span)
+        method = self.find_method(iterator, "next")
+        if method is None:
+            raise EllaError(f"next() needs a generator or an iterator, not a {type_name(iterator)}", span)
+        finals: list[Value] = []
+        result = self.call(method, [copy_value(iterator)], span, finals)
+        if isinstance(place, list):
+            place[0] = finals[0]
+        else:
+            root, indexes, place_span = place
+            self.write_place(root, indexes, finals[0], scope, place_span)
+        return result
 
     # Pools
 
@@ -1120,22 +1318,52 @@ class Interpreter:
         self.close_owner()
         return None
 
+    def items_of(self, iterator: Value, place: Place | None, scope: Scope, span: Span) -> Iterator[Value]:
+        """The items of a generator or an iterator, asking for each as the loop needs it.
+
+        An iterator not at a `place` is a copy, which the loop keeps.
+        """
+        holder = [copy_value(iterator)]
+        while True:
+            if place is None:
+                result = self.advance(holder[0], holder, scope, span)
+            else:
+                result = self.advance(self.read_place(place[0], place[1], scope), place, scope, span)
+            assert isinstance(result, VariantValue)
+            if result.variant == "None":
+                return
+            yield result.fields[0]
+
     def check_no_break_value(self, signal: BreakSignal, loop: str) -> None:
         """Only `loop` has a value; `for` and `while` are always ()."""
         if signal.value is not None:
             raise EllaError(f"only 'loop' can break with a value, not '{loop}'", signal.span)
 
     def eval_for(
-        self, label: str | None, pattern: Pattern, iterable: Value, body: Expr, scope: Scope, span: Span
+        self,
+        label: str | None,
+        pattern: Pattern,
+        iterable: Value,
+        body: Expr,
+        scope: Scope,
+        span: Span,
+        place: Place | None = None,
     ) -> Value:
-        """`for pattern in iterable`: run the body once for each item (of what an `iter` method gives)."""
-        if (iterator := self.find_method(iterable, "iter")) is not None:
+        """`for pattern in iterable`: run the body once for each item (of what an `iter` method gives).
+
+        A generator or an iterator gives its items one at a time; in `for x in
+        mut it`, `place` is where it is, and it changes there.
+        """
+        if place is None and (iterator := self.find_method(iterable, "iter")) is not None:
             iterable = self.call(iterator, [iterable], span)
+        items: Iterable[Value]
         match iterable:
             case list() | range():
-                items: list[Value] | range = iterable
+                items = iterable
             case str():
                 items = list(iterable)  # one-character strings
+            case GenValue() | VariantValue() if isinstance(iterable, GenValue) or self.find_method(iterable, "next"):
+                items = self.items_of(iterable, place, scope, span)
             case _:
                 raise EllaError(f"can't loop over a {type_name(iterable)}", span)
         for item in items:

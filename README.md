@@ -210,7 +210,12 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   ([src/ella/lib/](src/ella/lib/): `lists`, `maps`, `math`), which every
   module sees without importing them, and errors in a module name its
   file (`geo/poly.ella:3:5`, `<std>/maps.ella:12:5`) in every backend. The
-  language server follows imports, between open files too. See
+  language server follows imports, between open files too.
+* Generators: a function with `yield` gives a `Gen[T]`, which runs its
+  body a step at a time as `next(mut g)` or a `for` loop asks for items,
+  and types with a `next` method are iterators. The `iters` module has
+  lazy `map`, `filter`, `take`, `zip`, ... on generators. A generator's
+  frame and arenas live in its `Gen` (docs/memory-model.md §17). See
   [TODO.md](TODO.md) for what could come next.
 
 ```sh

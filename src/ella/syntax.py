@@ -454,6 +454,14 @@ class Return:
 
 
 @dataclass(frozen=True, slots=True)
+class Yield:
+    """`yield value`, giving the next item of the generator it is in (docs/grammar.md §9)."""
+
+    value: Expr
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class Assert:
     """`assert expr`, or one condition of a `where` block.
 
@@ -572,6 +580,7 @@ type Expr = (
     | Break
     | Continue
     | Return
+    | Yield
     | Assert
     | EnumDef
     | ConstraintDef
@@ -661,6 +670,29 @@ def mentions_return(node: object) -> bool:
         case _ if is_dataclass(node) and not isinstance(node, type):
             return any(mentions_return(getattr(node, f.name)) for f in fields(node))
     return False
+
+
+def has_yield(node: object) -> bool:
+    """Does a function body use `yield`, making the function a generator?
+
+    Like `mentions_return`, it doesn't look inside nested lambdas, whose
+    `yield` is their own, or inside quotes, which can't have one.
+    """
+    match node:
+        case Yield():
+            return True
+        case Lambda() | Quote():
+            return False
+        case tuple():
+            return any(has_yield(item) for item in node)
+        case _ if is_dataclass(node) and not isinstance(node, type):
+            return any(has_yield(getattr(node, f.name)) for f in fields(node))
+    return False
+
+
+def is_generator(function: Lambda) -> bool:
+    """Whether a lambda is a generator: its body has a `yield`."""
+    return has_yield(function.body)
 
 
 # Printing
@@ -762,6 +794,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("continue", *show_label(label))
         case Return(value):
             return sexpr("return", *([show(value)] if value is not None else []))
+        case Yield(value):
+            return sexpr("yield", show(value))
         case Assert(expr):
             return sexpr("assert", show(expr))
         case EnumDef(variants=variants, struct=True, field_names=names, nocopy=nocopy, methods=methods):

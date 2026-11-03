@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 132
+    assert len(program.body) == 139
 
 
 # Precedence (docs/grammar.md §8)
@@ -287,6 +287,12 @@ def test_loops() -> None:
     assert one("for (i, x) in pairs print(x)") == "(for (tuple i x) pairs (call print x))"
     assert one("while i < 3\n    i += 1") == "(while (compare i < 3) (block (+= i 1)))"
     assert one("loop break") == "(loop (break))"
+    assert one("for x in mut g\n    print(x)") == "(for x (mut g) (block (call print x)))"
+
+
+def test_yield() -> None:
+    assert one("let g = () =>\n    yield 1 + 2") == "(let [g] (lambda () (block (yield (+ 1 2)))))"
+    assert error("yield").message == "expected an expression, found end of line"
 
 
 def test_labels_break_continue() -> None:

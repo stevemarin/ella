@@ -12,7 +12,8 @@ arenas. [What stage 6 built](#14-what-stage-6-built)
 and [what stage 7 built](#15-what-stage-7-built) describe the
 implementation, and where it settles or departs from this design, and
 [loops that carry values](#16-loops-that-carry-values) how region bloat
-is avoided.
+is avoided. [Generators](#17-generators) describes how a suspended
+function keeps its variables and arenas.
 
 The rest of this document is the design, recorded so an implementation can
 start from it without repeating the discussion. Items marked
@@ -345,9 +346,11 @@ Out of scope for now. The intended direction:
   atomics.
 * Data moves between threads by **transferring a whole sub-arena** (or a
   non-copyable value), never by sharing.
-* Async code and generators conflict with second-class references (a
-  suspended coroutine holding a reference is a stored reference). Expect to
-  revisit §4 then.
+* Async code conflicts with second-class references (a suspended
+  coroutine holding a reference is a stored reference). Expect to revisit
+  §4 then. Generators (§17) avoid the conflict: a generator owns
+  everything it holds, its arguments included, and nothing outside it
+  can refer to its variables.
 
 ## 11. Open questions
 
@@ -372,7 +375,9 @@ Out of scope for now. The intended direction:
 
 ## 12. Known drawbacks (accepted for now)
 
-* Zero-copy views and iterators are awkward (§4).
+* Zero-copy views are awkward (§4), and so is an iterator over a list,
+  which holds a copy of it (or the list itself, when nothing changes it).
+  A generator over a list copies it in once (§17).
 * Copy costs are not visible in the source. Mitigated by the move
   optimization, and later by placement and copy reports.
 * Long-running programs (event loops, servers) keep much of their state in
@@ -787,3 +792,62 @@ Two smaller fixes also removed copies: a number read from a variable no
 longer counts as sharing that variable's lifetime (so `(i, "x")` in a loop
 can be made where it goes), and the `moves` pass treats constants as new
 objects, since they are static.
+
+## 17. Generators
+
+A generator ([grammar.md §9](grammar.md#generators-provisional-syntax))
+is a function that stops at each `yield` and carries on from there at the
+next `next`. Its state is what a call has: its variables and the values of
+its expressions in progress, the arenas of its scope levels, and where it
+is. Instead of transforming the function into a state machine, Ella keeps
+that whole state in the `Gen` value, so a generator is lowered like any
+other function.
+
+### A frame and arenas of its own
+
+A generator becomes two IR functions. The one the program calls makes the
+`Gen` (`gen_new`): it copies the arguments and captured values into the
+generator's first arena, and gives the `Gen`, in the caller's chosen
+region like any result. The other is the body, a *generator function*
+(`Function.generator`), which `resume g` runs until the next `yield`
+terminator:
+
+    yield %value, target(args)    give %value to resume's caller; the next
+                                  resume continues at target(args)
+
+The body's result is `Optional[T]`: each `yield value` gives
+`Some(value)`, made in the caller's `@result`. After the end of the body,
+which frees its levels, the function yields `None` from a block that
+yields to itself, so that every later `next` gives `None` too.
+
+* **Frame.** The values of the body's IR (every `%n`) and its local slots
+  live in the `Gen`, not on the stack, so they survive a `yield` without
+  being saved and restored. Natively, a generator function addresses its
+  values from `r12`, which points into the `Gen`, instead of `rbp` (see
+  ella.codegen); in the IR interpreter, the `Gen` keeps the frame.
+* **Arenas.** Each scope level of the body is an arena the `Gen` owns, a
+  slot arena, taken when it is made, rather than a depth arena of the call
+  stack, which `resume` returning would free. So the values a generator's
+  variables hold, and those of a loop iteration in progress, stay alive
+  across a `yield`. Loops reset and swap their levels (§16) as in any
+  function. Calls that the body makes use depth arenas as usual, since
+  they finish before it yields.
+* **Copies.** A yielded value that borrows from the generator's variables
+  is copied into `@result`, like a returned value that borrows something
+  that outlives the call, since the variables live on.
+* **Finalizers.** A `Gen` is nocopy, and is registered for finalization
+  in the arena it is made in. When it dies, its levels are freed deepest
+  first, running the finalizers of the values in them, newest first, and
+  its slot arenas are given back. A generator that finished has freed its
+  levels already. The arguments it took are finalized with its first
+  level: after the body's values, which are newer.
+* **Taking arguments.** A function that gives a `Gen` takes its nocopy
+  arguments (they move into the generator's first arena), so the checker
+  only allows new values there. A generator's parameters are its own
+  variables, which it may change.
+
+The AST interpreter, which has no frames to keep, runs each generator's
+body on a thread of its own, handing control back and forth at `next` and
+`yield`, with an owner stack (§15) of its own; finalizing a `Gen` that is
+suspended finalizes its owners, innermost first, and then ends its thread
+without running anything more.

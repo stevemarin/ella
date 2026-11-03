@@ -810,7 +810,7 @@ def test_protocols() -> None:
         ),
         (
             "struct R\n    n: i64\n    iter = (r: R) -> i64 => 1",
-            "the method 'iter' must have the type (R) -> a list, str or range",
+            "the method 'iter' must have the type (R) -> a list, str, range, iterator or Gen",
         ),
         (
             "struct R\n    n: i64\n    contains = (r: R, x: i64) -> i64 => 1",
@@ -818,7 +818,7 @@ def test_protocols() -> None:
         ),
         (
             "constraint It\n    iter: (Self) -> i64\nlet f[T: It] = (t: T) -> () =>\n    for x in t\n        ()",
-            "the iter method of T must give a list, str or range, not i64",
+            "the iter method of T must give a list, str, range, iterator or Gen, not i64",
         ),
     ],
 )
@@ -1304,3 +1304,84 @@ def test_prelude_modules_are_linked_when_used() -> None:
 def test_prelude_gives_no_warnings() -> None:
     _, checker = prepare(Linker(None, every=True).link(parse("let x = 1")))
     assert checker.warnings == []
+
+
+GEN = "let count = (n: i64) -> Gen[i64] =>\n    yield n\n"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("yield 1", "'yield' can only be used in a function, which it makes a generator"),
+        ("let f = () -> i64 =>\n    yield 1", "a generator (a function with 'yield') gives a Gen[T], not i64"),
+        ("let f = () -> Gen[str] =>\n    yield 1", "the value given to 'yield' should be str, not i64"),
+        (
+            "let f = () -> Gen[i64] =>\n    yield 1\n    return 1",
+            "a generator's 'return' can't have a value: it just ends the generator",
+        ),
+        (
+            "let f = (mut n: i64) -> Gen[i64] =>\n    yield n",
+            "a generator can't have 'mut' parameters; its parameters are its own variables, which it can change",
+        ),
+        (
+            "let f = (n: i64) -> Gen[i64] =>\n    where\n        return == return\n    yield n",
+            "a generator can't have postconditions, since it returns nothing",
+        ),
+        ("let f = () -> Gen[Code[i64]] =>\n    yield quote\n        yield 1", "'yield' can't be used in a quote"),
+        (
+            "nocopy struct R\n    n: i64\nlet f = () -> Gen[R] =>\n    yield R(1)",
+            "a generator can't yield R values, which can't be copied",
+        ),
+        (GEN + "let g = count(1)\nnext(g)", "next() changes its generator or iterator, so mark it: 'next(mut g)'"),
+        (
+            "let mut xs = [1]\nnext(mut xs)",
+            "next() needs a generator or an iterator (a type with a next method), not [i64]",
+        ),
+        (
+            "let mut xs = [1]\nfor x in mut xs\n    ()",
+            "only an iterator or a generator can be looped over with 'mut', not a [i64]",
+        ),
+        (GEN + "let g = count(1)\ng == g", "Gen[i64] values can't be compared"),
+        (
+            "struct R\n    n: i64\n    next = (r: R) -> Optional[i64] => None",
+            "the method 'next' must have the type (mut R) -> Optional[T]",
+        ),
+    ],
+)
+def test_generator_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            GEN + "let g = count(1)\nfor x in g\n    ()",
+            "a Gen[i64] can't be copied, so a loop over it must advance it in place: 'for ... in mut ...'",
+        ),
+        (
+            GEN
+            + "let twice = (g: Gen[i64]) -> Gen[i64] =>\n    for x in mut g\n        yield x\nlet g = count(1)\ntwice(g)",
+            "a Gen[i64] can't be copied, and a function that gives a generator takes its arguments, so this must be a new value",
+        ),
+        (GEN + "let g = count(1)\nlet h = g", "a Gen[i64] can't be copied, so it can't be used here"),
+        (
+            GEN + "let main = () -> () =>\n    let g = count(1)\n    let f = () => print(g)\n    ()",
+            "a Gen[i64] can't be copied, so it can't be captured by a closure",
+        ),
+    ],
+)
+def test_generators_cant_be_copied(source: str, message: str) -> None:
+    with pytest.raises(EllaError) as info:
+        prepare(parse(source))
+    assert info.value.message == message
+
+
+def test_generator_types() -> None:
+    # A lambda with yield gives a Gen of what it yields; next gives an Optional of it.
+    assert (
+        prepared_type_of("let f = () -> () =>\n    let g = (x) =>\n        yield [x]\n    ()\n(1, 2)") == "(i64, i64)"
+    )
+    assert prepared_type_of(GEN + "let mut g = count(1)\nnext(mut g)") == "Optional[i64]"
+    struct = "struct C\n    n: i64\n    next = (mut c: C) -> Optional[str] => None\n"
+    assert prepared_type_of(struct + "let mut c = C(1)\nnext(mut c)") == "Optional[str]"
