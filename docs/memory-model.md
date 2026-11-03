@@ -881,8 +881,10 @@ move. `trim` and the items of `split` are views of their argument too.
 A list's or string's header points at its items, which usually follow it
 in the same object:
 
-    List   len, cap, items*    then cap items, if it isn't a view
-    Str    len, chars*         then len characters, if it isn't a view
+`
+List   len, cap, items*    then cap items, if it isn't a view
+Str    len, chars*         then len characters, if it isn't a view
+`
 
 A view is just such a header whose pointer goes into another object's
 items, with `cap = 0`. Every operation reads through the pointer, so it
@@ -934,7 +936,7 @@ from, and checks on every use of the view that those items haven't changed
 since: a change there would show natively, where they are shared. Native
 tests set `ELLA_POISON`, so a view of freed memory reads nonsense.
 
-### Results
+### Results 2
 
 Measured with `make bench` (the fastest of 15 runs). `halves` and `fields`
 were added for views; the others show what the bigger headers cost: a
@@ -942,7 +944,7 @@ string's header grew from 8 to 16 bytes and a list's from 16 to 24, and
 reading an item loads the pointer to the items first.
 
 | Benchmark | Arena peak before | After | Time before | After |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `halves` (slices of 100,000 numbers) | 4,250,480 B | 2,650,912 B | 43.1 ms | 25.0 ms |
 | `fields` (`split`, `trim`, slices) | 3,476,448 B | 3,156,656 B | 34.2 ms | 31.9 ms |
 | `sort` | 9,518,800 B | 9,491,776 B | 47.1 ms | 50.2 ms |
