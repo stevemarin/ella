@@ -180,6 +180,8 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             if not 0 <= status <= 255:
                 raise EllaError(f"exit() needs a status from 0 to 255, not {status}", span)
             raise Exit(status, span)
+        case "hash", [str() as text]:
+            return hash_str(text)
         case "abs", [int() as n]:
             if not fits_i64(abs(n)):
                 raise EllaError(f"i64 overflow: abs({n}) doesn't fit in 64 bits", span)
@@ -191,6 +193,18 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
         case "max", [int() | float() as a, int() | float() as b]:
             return max(a, b)
     raise AssertionError(f"no library function {name} for {args}")
+
+
+# hash() is FNV-1a over a string's code points, as a signed i64.
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+
+
+def hash_str(text: str) -> int:
+    h = FNV_OFFSET
+    for c in text:
+        h = ((h ^ ord(c)) * FNV_PRIME) % 2**64
+    return h - 2**64 if h >= 2**63 else h
 
 
 # upper and lower change ASCII letters only, as the runtime does.

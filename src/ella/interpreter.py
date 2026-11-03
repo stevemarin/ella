@@ -20,15 +20,16 @@ program starts.
 
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TextIO
 
 from ella.checker import LIBRARY, OPERATOR_METHODS, REFLECTION, Checker, check_code, finish, pattern_names
 from ella.lexer import EllaError, Span
 from ella.library import Exit, Host
 from ella.library import call as call_library
+from ella.modules import link
 from ella.operators import binary, compare, index_into, unary
 from ella.parser import parse
-from ella.prelude import with_prelude
 from ella.staging import (
     AnySplice,
     Tables,
@@ -159,14 +160,14 @@ class ReturnSignal(Exception):
         self.span = span
 
 
-def run(source: str, out: TextIO | None = None, host: Host | None = None) -> int:
+def run(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
     """Parse and run a program, writing what it prints to `out` (standard output by default). Returns its exit status.
 
     Raises EllaError for syntax and run-time errors. The program isn't type
     checked first, unless it builds code (with `quote` or `$`), which needs
-    the checker.
+    the checker. `path` is its file, which its imports are found from.
     """
-    program = with_prelude(parse(source))
+    program = link(parse(source), path)
     if uses_staging(program):
         program, checker = prepare(program, out)
         return Interpreter(out, checker, host=host).run(program)
@@ -227,6 +228,8 @@ class Interpreter:
         self.globals.define("Error", Constructor("Error", "Error", 1))
         self.globals.define("Some", Constructor("Optional", "Some", 1))
         self.globals.define("None", VariantValue("Optional", "None"))
+        # Code in a module other than the entry file always sees these by their names (see `visible`).
+        self.predefined = dict(self.globals.vars)
 
     # Programs
 
@@ -449,9 +452,21 @@ class Interpreter:
 
     # Variables
 
+    def visible(self, name: str, scope: Scope, span: Span) -> Var | None:
+        """The variable a name refers to in code at `span`, if any.
+
+        As in the checker: code in a module other than the entry file only
+        has built-ins left as bare top-level names (see ella.modules), so it
+        gets those, even if the entry file defines the names.
+        """
+        var = scope.lookup(name)
+        if span.file and "." not in name and var is not None and var is self.globals.vars.get(name):
+            return self.predefined.get(name)
+        return var
+
     def lookup(self, name: str, scope: Scope, span: Span) -> Var:
         """Find a variable, which must exist and (for top-level names) have had its `let` run."""
-        var = scope.lookup(name)
+        var = self.visible(name, scope, span)
         if var is None:
             raise EllaError(f"undefined name '{name}'", span)
         if not var.ready:
@@ -974,10 +989,10 @@ class Interpreter:
         match pattern:
             case WildcardPattern():
                 return {}
-            case NamePattern(name):
+            case NamePattern(name, span):
                 # A bare name is a variant (like `None` or `Empty`) if one by
                 # that name is in scope, and otherwise a new binding.
-                var = scope.lookup(name)
+                var = self.visible(name, scope, span)
                 if var is not None and isinstance(var.value, VariantValue) and var.value.variant == name:
                     return {} if equal(value, var.value) else None
                 return {name: value}

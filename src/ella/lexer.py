@@ -37,13 +37,24 @@ from string import ascii_letters
 
 @dataclass(frozen=True, slots=True)
 class Span:
-    """A position in the source: 1-based line and column."""
+    """A position in the source: 1-based line and column.
+
+    `file` is empty for the entry file's code (the file `ella` runs), and
+    for the other modules of a program (ella.modules) it is their path from
+    the entry file's directory, or STD and a name for a standard library
+    module, so that an error there reads `geo/poly.ella:12:5` or
+    `<std>/maps.ella:12:5`.
+    """
 
     line: int
     column: int
+    file: str = ""
 
     def __str__(self) -> str:
-        return f"{self.line}:{self.column}"
+        return f"{self.file}:{self.line}:{self.column}" if self.file else f"{self.line}:{self.column}"
+
+
+STD = "<std>"  # the directory of the standard library's modules, in spans
 
 
 class EllaError(Exception):
@@ -86,8 +97,8 @@ class Token:
 
 
 KEYWORDS = frozenset({
-    "and", "assert", "break", "case", "comptime", "constraint", "continue", "else", "enum", "false", "for", "if",
-    "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return", "struct", "then",
+    "and", "as", "assert", "break", "case", "comptime", "constraint", "continue", "else", "enum", "false", "for",
+    "if", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return", "struct", "then",
     "true", "type", "where", "while",
 })  # fmt: skip
 
@@ -119,9 +130,12 @@ QUOTES = frozenset("\"'")
 ESCAPES = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "r": "\r", "t": "\t", "0": "\0", "{": "{"}
 
 
-def tokenize(source: str) -> list[Token]:
-    """Split `source` into tokens, ending with EOF. Raises EllaError on bad input."""
-    return Lexer(source).run()
+def tokenize(source: str, file: str = "") -> list[Token]:
+    """Split `source` into tokens, ending with EOF. Raises EllaError on bad input.
+
+    `file` is the file of every span (see Span): empty for the entry file.
+    """
+    return Lexer(source, file).run()
 
 
 class Lexer:
@@ -131,9 +145,10 @@ class Lexer:
     token, a string, a line) and consume it, adding the tokens they find.
     """
 
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, file: str = "") -> None:
         # Windows line endings become plain "\n", so nothing else has to care.
         self.source = source.replace("\r\n", "\n")
+        self.file = file
         self.pos = 0  # index of the next character to read
         self.line = 1  # line and column of that character, for spans
         self.column = 1
@@ -174,7 +189,7 @@ class Lexer:
 
     def span(self) -> Span:
         """The position of the next character."""
-        return Span(self.line, self.column)
+        return Span(self.line, self.column, self.file)
 
     def add(self, kind: TokenKind, start: int, span: Span, value: TokenValue = None) -> Token:
         """Add a token whose text runs from index `start` to the current position."""

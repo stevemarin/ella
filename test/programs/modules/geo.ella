@@ -1,0 +1,22 @@
+# Shapes and points.
+import geo.units
+
+enum Shape
+    Circle(f64)
+    Rect(f64, f64)
+    area = (s: Shape) -> f64 =>
+        match s
+            case Circle(r) => pi * r * r
+            case Rect(w, h) => w * h
+
+struct Point
+    x: f64
+    y: f64
+    add = (a: Point, b: Point) -> Point => Point(a.x + b.x, a.y + b.y)
+
+let describe = (s: Shape) -> str => geo.units.square_meters(s.area())
+
+# Private to geo and the modules below it, like geo.poly.
+let _twice = (x: f64) -> f64 => x * 2.0
+
+let twice = (x: f64) -> f64 => _twice(x)

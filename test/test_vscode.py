@@ -7,7 +7,7 @@ from typing import Any
 
 from ella.checker import BUILTINS, REFLECTION
 from ella.lexer import KEYWORDS
-from ella.prelude import FUNCTIONS
+from ella.modules import prelude
 
 EXTENSION = Path(__file__).parent.parent / "editors" / "vscode"
 
@@ -40,4 +40,8 @@ def test_grammar_highlights_every_built_in_function() -> None:
     grammar = json.dumps(load("syntaxes/ella.tmLanguage.json"))
     found = re.search(r"\\\\b\(\?:((?:[a-z_0-9]+\|)+[a-z_0-9]+)\)\(\?=", grammar)
     assert found, "no rule for built-in functions"
-    assert set(found.group(1).split("|")) == {*BUILTINS, *REFLECTION, *FUNCTIONS}
+    assert set(found.group(1).split("|")) == {
+        *BUILTINS,
+        *REFLECTION,
+        *(name for name, item in prelude().items() if item.kind == "function"),
+    }

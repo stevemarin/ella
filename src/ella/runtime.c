@@ -91,11 +91,23 @@ word ella_depth = 1;
 
 // Errors
 
-// Stop the program with a run-time error: "line:column: message", after
-// everything the program printed so far.
-_Noreturn static void fail(word line, word column, const char *format, ...) {
+// The files of the program's modules, made by the code generator. A line
+// passed to the runtime has the number of its file above its low 32 bits;
+// file 0 is the entry file, whose errors don't name it.
+extern const char *const ella_files[];
+
+// Start a run-time error, after everything the program printed so far:
+// "line:column: ", or "file:line:column: " in a module other than the entry file.
+static void start_error(word line, word column) {
     fflush(stdout);
-    fprintf(stderr, "%" PRId64 ":%" PRId64 ": ", line, column);
+    word file = line >> 32;
+    if (file) fprintf(stderr, "%s:", ella_files[file]);
+    fprintf(stderr, "%" PRId64 ":%" PRId64 ": ", line & 0xffffffff, column);
+}
+
+// Stop the program with a run-time error: "line:column: message".
+_Noreturn static void fail(word line, word column, const char *format, ...) {
+    start_error(line, column);
     va_list args;
     va_start(args, format);
     vfprintf(stderr, format, args);
@@ -1035,8 +1047,7 @@ void ella_eprint(word v, const Type *t) {
 
 // Stop with a run-time error whose message is in a buffer.
 _Noreturn static void fail_with(word line, word column, Buffer *message) {
-    fflush(stdout);
-    fprintf(stderr, "%" PRId64 ":%" PRId64 ": ", line, column);
+    start_error(line, column);
     write_utf8(stderr, message->chars, message->len);
     fputc('\n', stderr);
     exit(1);
@@ -1047,8 +1058,8 @@ _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word 
     Buffer b = {0};
     put_value(&b, v, t, 1);
     const char *hole = strstr(message, "{}");
-    fflush(stdout);
-    fprintf(stderr, "%" PRId64 ":%" PRId64 ": %.*s", line, column, (int)(hole - message), message);
+    start_error(line, column);
+    fprintf(stderr, "%.*s", (int)(hole - message), message);
     write_utf8(stderr, b.chars, b.len);
     fprintf(stderr, "%s\n", hole + 2);
     exit(1);
@@ -1439,6 +1450,14 @@ List *ella_lib_chars(const Str *s, word line, word column, word depth) {
     List *chars = ella_list_alloc(s->len, depth);
     for (word i = 0; i < s->len; i++) chars->items[i] = (word)substring(s, i, i + 1, depth);
     return chars;
+}
+
+// FNV-1a over the code points (library.py's hash_str).
+word ella_lib_hash(const Str *s, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    uint64_t h = 0xCBF29CE484222325u;
+    for (word i = 0; i < s->len; i++) h = (h ^ s->chars[i]) * 0x100000001B3u;
+    return (word)h;
 }
 
 word ella_lib_ord(const Str *s, word line, word column, word depth) {

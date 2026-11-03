@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from ella import main
+from ella.modules import LIBRARY_DIR
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
 
@@ -42,6 +43,19 @@ def test_reports_runtime_errors_after_output(tmp_path: Path, capsys: pytest.Capt
     captured = capsys.readouterr()
     assert captured.out == "before\n"
     assert captured.err == f"{path}:2:8: assertion failed: 1 == 2\n"
+
+
+@pytest.mark.parametrize("mode", [[], ["--tree"], ["-O"], ["--native"]])
+def test_errors_in_the_library_give_its_location(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: list[str]
+) -> None:
+    if "--native" in mode and shutil.which("gcc") is None:
+        pytest.skip("native code needs gcc")
+    path = write(tmp_path, "print(range(0, 5, 0))\n")
+    assert main([*mode, path]) == 1
+    source = (LIBRARY_DIR / "lists.ella").read_text()
+    line = next(i for i, text in enumerate(source.splitlines(), 1) if text.strip() == "step != 0")
+    assert capsys.readouterr().err == f"<std>/lists.ella:{line}:9: precondition failed: step != 0\n"
 
 
 @pytest.mark.parametrize("mode", [[], ["--tree"], ["-O"]])

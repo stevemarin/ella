@@ -1,6 +1,13 @@
 # Ella syntax tour. docs/grammar.md is the reference; this file should always
 # parse, and later run, without errors.
 
+# Imports come first. A file is a module: `import geo.poly` would bind the
+# path geo.poly (geo/poly.ella beside this file), and `as` gives it another
+# name. These are standard library modules, whose names every module sees
+# anyway, without their module's name (the prelude).
+import lists
+import maps.new_map as empty_map
+
 # this is a comment
 
 # Functions are lambdas bound with let: (params) -> ReturnType => body
@@ -60,6 +67,7 @@ print("{{ len(names) }} names, first is {{ names[0] }}")
 
 # ifs are expressions like everything
 let iseven = (n: i64) -> bool => if n % 2 == 0 then true else false
+assert iseven(4)
 
 # both of these ifs are valid; else may start its own line
 if x == 4 then
@@ -75,6 +83,9 @@ if x == 4 then print("x={{x}}") else print("not 4")
 
 # a two argument lambda; its type is (i64, i64) -> i64
 (x: i64, y: i64) -> i64 => x + y
+
+# a lambda passed to a function can leave out its types, which are inferred
+assert ([1, 2] |> map(n => n * 10)) == [10, 20]
 
 # no implicit type conversions: to_f64, to_i64 and parse_i64 are explicit
 assert to_f64(3) / 2.0 == 1.5
@@ -92,11 +103,13 @@ let describe = (r: Result[f64, Error]) -> str =>
         case Ok(v) if v > 1.0 => "big"
         case Ok(_) => "small"
         case Err(e) => "error: {{e.message}}"
+assert describe(invert(4.0)) == "small"
 
 # ? propagates errors: Err(e)? returns Err(e) from the enclosing function
 let double_inverse = (n: f64) -> Result[f64, Error] =>
     let v = invert(n)?
     Ok(v * 2.0)
+assert double_inverse(0.0) == Err(Error("divide by zero"))
 
 # / always returns f64; // floors to an integer and % matches it
 assert 7 / 2 == 3.5
@@ -149,6 +162,8 @@ assert pad_left("7", 3, "0") == "007" and format_f64(2.0 / 3.0, 2) == "0.67"
 let squares = [3, 1, 2] |> map((n: i64) -> i64 => n * n)
 assert sort(squares) == [1, 4, 9] and reverse(squares) == [4, 1, 9]
 assert filter(squares, (n: i64) -> bool => n > 3) == [9, 4]
+let no_ages: Map[str, i64] = empty_map()
+assert lists.sum(squares, 0) == 14 and len(no_ages) == 0
 
 # tuples: items by position, or taken apart with a pattern in let
 let pair = (1, "one")
@@ -212,6 +227,7 @@ let area = (s: Shape) -> f64 =>
         case Circle(r) => 3.14159 * r * r
         case Rect(w, h) => w * h
         case Empty => 0.0
+assert area(Rect(2.0, 3.0)) == 6.0
 
 # structs have named fields; generic types and functions take type parameters
 struct Point

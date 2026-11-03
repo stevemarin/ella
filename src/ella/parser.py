@@ -54,6 +54,7 @@ from ella.syntax import (
     For,
     FunctionType,
     If,
+    Import,
     Index,
     IntLit,
     Lambda,
@@ -123,9 +124,9 @@ class Assoc(Enum):
     POSTFIX = auto()  # call, index, member and `?`, which have no right operand
 
 
-def parse(source: str) -> Program:
-    """Tokenize and parse a source file. Raises EllaError on bad input."""
-    return Parser(tokenize(source), source).parse_program()
+def parse(source: str, file: str = "") -> Program:
+    """Tokenize and parse a source file, whose spans have the file `file` (see Span). Raises EllaError on bad input."""
+    return Parser(tokenize(source, file), source).parse_program()
 
 
 def parse_partial(tokens: list[Token], source: str) -> tuple[Program, list[EllaError]]:
@@ -310,11 +311,39 @@ class Parser:
     # Program structure and blocks
 
     def parse_program(self) -> Program:
-        """A file is a sequence of expressions, one per line."""
+        """A file is its `import` lines, then a sequence of expressions, one per line."""
+        imports = []
+        while self.at("import"):
+            start = self.pos
+            try:
+                imports.append(self.parse_import())
+            except EllaError as error:
+                if self.errors is None:
+                    raise
+                self.errors.append(error)
+                self.skip_line(start)
         body = []
         while not self.at_kind(TokenKind.EOF):
             body.append(self.parse_line())
-        return Program(tuple(body), Span(1, 1))
+        return Program(tuple(body), Span(1, 1, self.tokens[0].span.file), tuple(imports))
+
+    def parse_import(self) -> Import:
+        """`import geo.poly`, or `import geo.poly as p`."""
+        span = self.expect("import").span
+        path = [self.expect_kind(TokenKind.NAME, "a module name").text]
+        while self.accept("."):
+            path.append(self.expect_kind(TokenKind.NAME, "a name after '.'").text)
+        alias = self.expect_kind(TokenKind.NAME, "a name after 'as'").text if self.accept("as") else None
+        self.end_of_line()
+        return Import(tuple(path), alias, span)
+
+    def parse_dotted(self, first: Token) -> str:
+        """A name that may be a path into a module, after its first part: `geo.Point` in a type or pattern."""
+        name = first.text
+        while self.at(".") and self.at_kind(TokenKind.NAME, 1):
+            self.advance()
+            name += "." + self.advance().text
+        return name
 
     def parse_line(self) -> Expr:
         """A line of the program or of a block, through its end.
@@ -583,7 +612,9 @@ class Parser:
             case TokenKind.KEYWORD, "type":
                 self.advance()
                 return TypeLit(self.parse_type(), token.span)
-            case TokenKind.KEYWORD, ("comptime" | "import"):
+            case TokenKind.KEYWORD, "import":
+                raise EllaError("'import' lines must come first in a file, before any other line", token.span)
+            case TokenKind.KEYWORD, "comptime":
                 raise EllaError(f"'{token.text}' is reserved for later and can't be used yet", token.span)
         raise self.unexpected("an expression")
 
@@ -858,9 +889,9 @@ class Parser:
         name = self.parse_type_param()
         constraints: list[str] = []
         if self.accept(":"):
-            constraints.append(self.expect_kind(TokenKind.NAME, "a constraint").text)
+            constraints.append(self.parse_dotted(self.expect_kind(TokenKind.NAME, "a constraint")))
             while self.accept("+"):
-                constraints.append(self.expect_kind(TokenKind.NAME, "a constraint").text)
+                constraints.append(self.parse_dotted(self.expect_kind(TokenKind.NAME, "a constraint")))
         return name, tuple(constraints)
 
     def parse_type_param(self) -> str:
@@ -1091,10 +1122,11 @@ class Parser:
             return TypeSplice(splice.code, token.span)
         if self.at_kind(TokenKind.NAME):
             self.advance()
+            name = self.parse_dotted(token)
             args: list[TypeExpr] = []
             if self.accept("["):
                 args, _ = self.parse_comma_list(self.parse_type, "]")
-            return NamedType(token.text, tuple(args), token.span)
+            return NamedType(name, tuple(args), token.span)
         if self.accept("["):
             element = self.parse_type()
             self.expect("]")
@@ -1149,12 +1181,13 @@ class Parser:
             self.advance()
             if token.text == "_":
                 return WildcardPattern(token.span)
+            text = self.parse_dotted(token)  # a path like `geo.Circle` is always a variant
             if self.accept("("):
                 args, _ = self.parse_comma_list(self.parse_pattern, ")")
-                return VariantPattern(token.text, tuple(args), token.span)
+                return VariantPattern(text, tuple(args), token.span)
             # Whether a bare name like `None` is a variant or a new binding is
             # decided later, by name resolution.
-            return NamePattern(token.text, token.span)
+            return NamePattern(text, token.span)
         if self.accept("("):
             items, trailing_comma = self.parse_comma_list(self.parse_pattern, ")")
             if len(items) < 2 and not trailing_comma:

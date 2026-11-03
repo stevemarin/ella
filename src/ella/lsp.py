@@ -6,13 +6,17 @@ It gives editors:
   which keeps going after errors, unlike `ella FILE`).
 * Hover: a name's type, or an operator's.
 * Go to definition, for variables, functions, parameters, fields, methods,
-  variants and types.
+  variants, types and modules, in the file or in the modules it imports
+  (the standard library's too).
 * Semantic tokens: highlighting by what names are (parameters, functions,
   types, ...), on top of the grammar's.
 * Completion: the names in scope, or the fields and methods after `.`.
 
 Each open document is analyzed when it's opened, and after each change once
-typing pauses for `DELAY` seconds. Hover, definitions and highlighting come
+typing pauses for `DELAY` seconds. So is every other open document, which
+may import the one that changed: the analysis reads imported modules from
+the open documents, saved or not, and from disk otherwise, finding them
+from the workspace folder. Hover, definitions and highlighting come
 from the latest analysis, moved to follow the edits made since
 (`follow_edits`). When the text is too broken to analyze, the last analysis
 is kept.
@@ -39,6 +43,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
@@ -51,6 +56,7 @@ from ella.analysis import (
     Analysis,
     Completion,
     Location,
+    Place,
     Problem,
     Symbol,
     analyze,
@@ -75,6 +81,7 @@ COMPLETION_KINDS = {
     "enumMember": types.CompletionItemKind.EnumMember,
     "interface": types.CompletionItemKind.Interface,
     "type": types.CompletionItemKind.Class,
+    "namespace": types.CompletionItemKind.Module,
     "keyword": types.CompletionItemKind.Keyword,
 }
 
@@ -185,7 +192,7 @@ class EllaServer(LanguageServer):
             document = self.workspace.get_text_document(uri)
             source, version = document.source, document.version
             try:
-                analysis = await self.run(analyze, source)
+                analysis = await self.run(analyze, source, self.place(document))
             except TimeoutError:
                 message = f"checking took over {self.timeout:g} seconds; does some compile-time code never finish?"
                 analysis = Analysis([Problem(message, 1, 1)], None)
@@ -214,6 +221,12 @@ class EllaServer(LanguageServer):
         if analysis.symbols is not None and tokens and tokens.refresh_support:
             self.workspace_semantic_tokens_refresh(None)
 
+    def place(self, document: TextDocument) -> Place:
+        """Where a document is, for its imports: its file, the workspace folder, and the open documents' text."""
+        open_files = {d.path: d.source for d in self.workspace.text_documents.values() if d.uri.startswith("file:")}
+        path = document.path if document.uri.startswith("file:") else None
+        return Place(path, self.workspace.root_path, open_files)
+
     async def run[*Args, R](self, function: Callable[[*Args], R], *args: *Args) -> R:
         """Run a function in the worker, which is replaced if it takes too long or fails."""
         try:
@@ -239,7 +252,8 @@ class EllaServer(LanguageServer):
         server = document.position_codec.position_from_client_units(document.lines, position)
         async with self.working:
             try:
-                return await self.run(complete, document.source, server.line + 1, server.character + 1)
+                place = self.place(document)
+                return await self.run(complete, document.source, server.line + 1, server.character + 1, place)
             except Exception:
                 log.exception("completion failed")
                 return []
@@ -254,7 +268,9 @@ def make_server(timeout: float = TIMEOUT) -> EllaServer:
 
     @server.feature(types.TEXT_DOCUMENT_DID_CHANGE)
     async def did_change(ls: EllaServer, params: types.DidChangeTextDocumentParams) -> None:
-        ls.schedule(params.text_document.uri, DELAY)
+        # Other open documents may import this one.
+        for uri in ls.workspace.text_documents:
+            ls.schedule(uri, DELAY)
 
     @server.feature(types.TEXT_DOCUMENT_DID_CLOSE)
     async def did_close(ls: EllaServer, params: types.DidCloseTextDocumentParams) -> None:
@@ -281,6 +297,11 @@ def make_server(timeout: float = TIMEOUT) -> EllaServer:
         symbol = ls.symbol_at(document, params.position)
         if symbol is None or symbol.definition is None:
             return None
+        if symbol.definition.file:  # another file, which may not be open: its range is in characters
+            where = symbol_range(symbol.definition)
+            start = types.Position(where.start.line, where.start.character)
+            end = types.Position(where.end.line, where.end.character)
+            return types.Location(Path(symbol.definition.file).as_uri(), types.Range(start, end))
         return types.Location(document.uri, document.range_to_client_units(symbol_range(symbol.definition)))
 
     @server.feature(

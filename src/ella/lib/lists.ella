@@ -1,0 +1,123 @@
+# Functions on lists. Part of the prelude: every module sees these names.
+
+let reverse[T] = (xs: [T]) -> [T] =>
+    let mut result: [T] = []
+    let mut i = len(xs)
+    while i > 0
+        i -= 1
+        result += [xs[i]]
+    result
+
+let map[T, U] = (xs: [T], f: (T) -> U) -> [U] =>
+    let mut result: [U] = []
+    for x in xs
+        result += [f(x)]
+    result
+
+let filter[T] = (xs: [T], keep: (T) -> bool) -> [T] =>
+    let mut result: [T] = []
+    for x in xs
+        if keep(x) then result += [x]
+    result
+
+# A merge sort, which is stable and compares items with `<` only: runs of
+# 1, 2, 4, ... items are merged in pairs, left to right.
+let sort[T: Ord] = (xs: [T]) -> [T] =>
+    let n = len(xs)
+    let mut items = xs
+    let mut width = 1
+    while width < n
+        let mut merged: [T] = []
+        let mut start = 0
+        while start < n
+            let middle = if start + width < n then start + width else n
+            let stop = if middle + width < n then middle + width else n
+            let mut i = start
+            let mut j = middle
+            while i < middle and j < stop
+                if items[j] < items[i] then
+                    merged += [items[j]]
+                    j += 1
+                else
+                    merged += [items[i]]
+                    i += 1
+            merged += items[i..middle]
+            merged += items[j..stop]
+            start = stop
+        items = merged
+        width *= 2
+    items
+
+# The same merge sort, comparing the keys of the items, each found once:
+# it sorts the items' positions, then picks the items in that order.
+let sort_by[T, K: Ord] = (xs: [T], key: (T) -> K) -> [T] =>
+    let n = len(xs)
+    let mut keys: [K] = []
+    let mut order: [i64] = []
+    for i in 0..n
+        keys += [key(xs[i])]
+        order += [i]
+    let mut width = 1
+    while width < n
+        let mut merged: [i64] = []
+        let mut start = 0
+        while start < n
+            let middle = if start + width < n then start + width else n
+            let stop = if middle + width < n then middle + width else n
+            let mut i = start
+            let mut j = middle
+            while i < middle and j < stop
+                if keys[order[j]] < keys[order[i]] then
+                    merged += [order[j]]
+                    j += 1
+                else
+                    merged += [order[i]]
+                    i += 1
+            merged += order[i..middle]
+            merged += order[j..stop]
+            start = stop
+        order = merged
+        width *= 2
+    let mut result: [T] = []
+    for i in order
+        result += [xs[i]]
+    result
+
+let sum[T: Add] = (xs: [T], start: T) -> T =>
+    let mut total = start
+    for x in xs
+        total += x
+    total
+
+let any[T] = (xs: [T], test: (T) -> bool) -> bool =>
+    for x in xs
+        if test(x) then return true
+    false
+
+let all[T] = (xs: [T], test: (T) -> bool) -> bool =>
+    for x in xs
+        if not test(x) then return false
+    true
+
+let zip[T, U] = (xs: [T], ys: [U]) -> [(T, U)] =>
+    let n = min(len(xs), len(ys))
+    let mut pairs: [(T, U)] = []
+    for i in 0..n
+        pairs += [(xs[i], ys[i])]
+    pairs
+
+let enumerate[T] = (xs: [T]) -> [(i64, T)] =>
+    let mut pairs: [(i64, T)] = []
+    for i in 0..len(xs)
+        pairs += [(i, xs[i])]
+    pairs
+
+let range = (start: i64, stop: i64, step: i64) -> [i64] =>
+    where
+        step != 0
+    let mut numbers: [i64] = []
+    let mut n = start
+    while (step > 0 and n < stop) or (step < 0 and n > stop)
+        numbers += [n]
+        n += step
+    numbers

@@ -53,22 +53,22 @@ class Client:
         def publish(params: types.PublishDiagnosticsParams) -> None:
             self.published.put_nowait(params)
 
-    def open(self, source: str) -> None:
+    def open(self, source: str, uri: str = URI) -> None:
         self.version += 1
-        document = types.TextDocumentItem(uri=URI, language_id="ella", version=self.version, text=source)
+        document = types.TextDocumentItem(uri=uri, language_id="ella", version=self.version, text=source)
         self.client.text_document_did_open(types.DidOpenTextDocumentParams(text_document=document))
 
-    def change(self, source: str) -> None:
+    def change(self, source: str, uri: str = URI) -> None:
         self.version += 1
         self.client.text_document_did_change(
             types.DidChangeTextDocumentParams(
-                text_document=types.VersionedTextDocumentIdentifier(uri=URI, version=self.version),
+                text_document=types.VersionedTextDocumentIdentifier(uri=uri, version=self.version),
                 content_changes=[types.TextDocumentContentChangeWholeDocument(text=source)],
             )
         )
 
-    def document(self) -> types.TextDocumentIdentifier:
-        return types.TextDocumentIdentifier(uri=URI)
+    def document(self, uri: str = URI) -> types.TextDocumentIdentifier:
+        return types.TextDocumentIdentifier(uri=uri)
 
     async def hover(self, line: int, character: int) -> str | None:
         position = types.Position(line=line, character=character)
@@ -79,13 +79,21 @@ class Client:
         return result.contents.value
 
     async def definition(self, line: int, character: int) -> tuple[int, int, int, int] | None:
+        found = await self.definition_in(line, character)
+        return None if found is None else found[1]
+
+    async def definition_in(
+        self, line: int, character: int, uri: str = URI
+    ) -> tuple[str, tuple[int, int, int, int]] | None:
+        """A definition, and the document it is in."""
         position = types.Position(line=line, character=character)
-        result = await self.client.text_document_definition_async(types.DefinitionParams(self.document(), position))
+        params = types.DefinitionParams(self.document(uri), position)
+        result = await self.client.text_document_definition_async(params)
         if result is None:
             return None
         assert isinstance(result, types.Location)
         where = result.range
-        return where.start.line, where.start.character, where.end.line, where.end.character
+        return result.uri, (where.start.line, where.start.character, where.end.line, where.end.character)
 
     async def completions(self, line: int, character: int) -> list[str]:
         position = types.Position(line=line, character=character)
@@ -99,10 +107,11 @@ class Client:
         assert isinstance(result, types.SemanticTokens)
         return list(result.data)
 
-    async def diagnostics(self) -> list[tuple[int, int, int, int, str]]:
-        """The next diagnostics published: each one's range and message."""
+    async def diagnostics(self, uri: str = URI) -> list[tuple[int, int, int, int, str]]:
+        """The next diagnostics published for a document: each one's range and message."""
         params = await asyncio.wait_for(self.published.get(), 30)
-        assert params.uri == URI
+        while params.uri != uri:
+            params = await asyncio.wait_for(self.published.get(), 30)
         return [
             (d.range.start.line, d.range.start.character, d.range.end.line, d.range.end.character, d.message)
             for d in params.diagnostics
@@ -110,12 +119,13 @@ class Client:
 
 
 @asynccontextmanager
-async def server(*args: str) -> AsyncIterator[Client]:
+async def server(*args: str, root: Path | None = None) -> AsyncIterator[Client]:
     client = Client()
     await client.client.start_io(str(SERVER), *args)
     try:
+        root_uri = root.as_uri() if root is not None else None
         await client.client.initialize_async(
-            types.InitializeParams(process_id=None, root_uri=None, capabilities=types.ClientCapabilities())
+            types.InitializeParams(process_id=None, root_uri=root_uri, capabilities=types.ClientCapabilities())
         )
         client.client.initialized(types.InitializedParams())
         yield client
@@ -172,6 +182,23 @@ def test_server_hover_and_definition() -> None:
             assert await client.definition(4, 51) == (1, 4, 1, 5)  # .x, its field
             assert await client.definition(5, 13) == (4, 4, 4, 9)  # scale
             assert await client.definition(4, 16) == (0, 7, 0, 12)  # Point in an annotation
+
+    asyncio.run(session())
+
+
+def test_server_follows_imports_between_open_documents(tmp_path: Path) -> None:
+    (tmp_path / "tool.ella").write_text("let f = () -> i64 => 1\n")
+    main, tool = (tmp_path / "main.ella").as_uri(), (tmp_path / "tool.ella").as_uri()
+
+    async def session() -> None:
+        async with server(root=tmp_path) as client:
+            client.open("import tool\nprint(tool.f())\n", main)
+            assert await client.diagnostics(main) == []
+            assert await client.definition_in(1, 11, main) == (tool, (0, 4, 0, 5))  # f, in tool.ella
+            client.open("let f = () -> i64 => 1\n", tool)
+            assert await client.diagnostics(tool) == []
+            client.change("let g = () -> i64 => 1\n", tool)  # not saved, and main.ella sees it
+            assert await client.diagnostics(main) == [(1, 11, 1, 12, "module 'tool' has no 'f'")]
 
     asyncio.run(session())
 

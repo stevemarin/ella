@@ -1,0 +1,6 @@
+# A module with top-level code, which runs once, before the modules that import it.
+print("counter's code runs")
+let mut total = 0
+for n in 1..=4
+    total += n
+let loaded = true

@@ -16,3 +16,9 @@ later stages reuse these files.
   nothing there. A run-time error isn't part of it.
 * `NAME.status`, if present, is the exit status the program must give (its
   `main` returns it); without it, the status must be 0.
+
+A program of several modules is a directory, `NAME/`, whose entry file is
+`NAME/main.ella`, with its modules beside it. Its other files are named
+after the entry file: `NAME/main.out`, `NAME/main.err`, and so on. An
+error in a module gives its file, from the directory: `geo/poly.ella:3:5:
+message`.

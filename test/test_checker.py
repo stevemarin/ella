@@ -18,8 +18,8 @@ from ella.checker import (
     show_type,
 )
 from ella.lexer import EllaError, Span
+from ella.modules import Linker, link
 from ella.parser import parse
-from ella.prelude import NAMES, with_prelude
 from ella.staging import prepare
 from ella.syntax import Binary, Block, Lambda, Let
 
@@ -147,7 +147,8 @@ def test_error_type() -> None:
         ("1 and true", "'and' needs a bool, not i64"),
         ("1 < true", "'<' needs two values of the same type, not i64 and bool"),
         ("[1] < [2]", "'<' doesn't work on [i64]"),
-        ("print == print", "'print' can only be called, not used as a value"),
+        ("print == print", "functions can't be compared"),
+        ("run == run", "'run' can only be called, not used as a value"),
         ("let f = () -> () => ()\nf == f", "functions can't be compared"),
         ("1 in 5", "'in' needs a list, str or range on the right, not i64"),
         ('1 in "abc"', "the value looked for with 'in' should be str, not i64"),
@@ -167,8 +168,18 @@ def test_error_type() -> None:
         ("for x in 5 print(x)", "can't loop over a i64"),
         ("assert 1", "an assertion needs a bool, not i64"),
         ("nope", "undefined name 'nope'"),
-        ("x => x", "parameter 'x' needs a type, like 'x: i64'"),
-        ("(x: i64) => x", "a lambda needs a return type, like '(x: i64) -> i64 => ...'"),
+        (
+            "let f = x => x",
+            "parameter 'x' needs a type, like 'x: i64', as a top-level function's or a method's always do",
+        ),
+        (
+            "let f = (x: i64) => x",
+            "a top-level function or method needs a return type, like '(x: i64) -> i64 => ...'",
+        ),
+        (
+            "let g = () -> () =>\n    let f = (x) => -x\n    ()",
+            "can't tell the type of this value yet; add a type annotation",
+        ),
         ("let x: Foo = 1", "unknown type 'Foo'"),
         ("let x: Optional[i64, str] = None", "Optional takes 1 type arguments, not 2"),
         ("let xs = []\nlet y = -xs[0]", "can't tell the type of this value yet; add a type annotation"),
@@ -903,7 +914,7 @@ def test_library_types(source: str, t: str) -> None:
         ('abs("a")', "abs needs T to be Num, and str isn't"),
         ("min(1, 2.5)", "argument 2 of min() should be i64, not f64"),
         ("let f = abs\nf(true)", "abs needs T to be Num, and bool isn't"),
-        ("let f = print", "'print' can only be called, not used as a value"),
+        ("let f = pool_new", "'pool_new' can only be called, not used as a value"),
         ("let x = 1\nprint(mut x)", "print() has no 'mut' parameter"),
         (
             "enum Optional[T]\n    Some(T)\n    Nothing\nlet f = read_line",
@@ -1094,6 +1105,7 @@ f(1, 2)
 let top = 5
 """
     assert warnings(source) == [
+        "1:18: parameter 'unused_param' is never used; start its name with '_' if that is on purpose",
         "2:9: 'a' is never used; start its name with '_' if that is on purpose",
         "4:13: 'd' is never used; start its name with '_' if that is on purpose",
         "5:9: 'i' is never used; start its name with '_' if that is on purpose",
@@ -1140,6 +1152,50 @@ g()
     ]
 
 
+def test_unused_functions_and_parameters() -> None:
+    source = """\
+let used = (n: i64) -> i64 => n
+let unused = (n: i64) -> i64 => used(n)
+let _kept = () -> () => ()
+let loops = (n: i64) -> i64 => if n > 0 then loops(n - 1) else 0
+let apply = (g: (i64) -> i64) -> i64 => g(0)
+let main = () -> () =>
+    let f = (a: i64, _b: i64) -> i64 => 1
+    print(apply((x) => 2), f(1, 2))
+"""
+    assert warnings(source) == [
+        "2:5: function 'unused' is never used",
+        "3:5: function '_kept' is never used",
+        "4:5: function 'loops' is never used",
+        "7:14: parameter 'a' is never used; start its name with '_' if that is on purpose",
+        "8:18: parameter 'x' is never used; start its name with '_' if that is on purpose",
+    ]
+
+
+def test_mut_variables_that_never_change() -> None:
+    source = """\
+let f = (xs: [i64]) -> i64 =>
+    let mut same = 1
+    let mut added = []
+    added += [1]
+    let mut items = [1]
+    items[0] = 2
+    let mut (a, b) = (1, 2)
+    a += 1
+    let mut pool = pool_new()
+    let h = alloc(mut pool, 1)
+    match Some(xs)
+        case Some(mut ys) => len(ys) + same + len(added) + items[0] + a + b + pool[h]
+        case None => 0
+f([])
+"""
+    assert warnings(source) == [
+        "2:13: 'same' never changes, so it doesn't need 'mut'",
+        "7:17: 'b' never changes, so it doesn't need 'mut'",
+        "12:23: 'ys' never changes, so it doesn't need 'mut'",
+    ]
+
+
 def test_no_unused_warnings_after_an_error() -> None:
     checker = Checker()
     checker.errors = []
@@ -1170,26 +1226,61 @@ def test_exit_can_only_be_called() -> None:
 
 
 def test_prelude_functions() -> None:
-    def prepared(source: str) -> str:
-        program, checker = prepare(parse(source))
-        return show_type(checker.type_of(program.body[-1]))
-
-    assert prepared("map([1], (n: i64) -> str => 'x')") == "[str]"
-    assert prepared("sort(['b', 'a'])") == "[str]"
-    assert prepared("pi") == "f64"
-    assert prepared("let map = (n: i64) -> i64 => n\nmap(1)") == "i64"  # a program's own definition wins
+    assert prepared_type_of("map([1], (n: i64) -> str => 'x')") == "[str]"
+    assert prepared_type_of("sort(['b', 'a'])") == "[str]"
+    assert prepared_type_of("pi") == "f64"
+    assert prepared_type_of("let map = (n: i64) -> i64 => n\nmap(1)") == "i64"  # a program's own definition wins
     with pytest.raises(EllaError, match="sort needs T to be Ord, and bool isn't"):
         prepare(parse("sort([true])"))
 
 
-def test_prelude_is_only_added_when_used() -> None:
-    program = parse("let x = 1")
-    assert with_prelude(program) is program
-    used = with_prelude(parse("sort([1])"))
-    assert [d for d in used.body if d in NAMES.values()] == [NAMES["sort"]]
-    assert with_prelude(used) is used
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("map([1], (n) => n > 0)", "[bool]"),
+        ("[1] |> map(n => [n])", "[[i64]]"),
+        ("let apply = (f: (i64) -> str, x: i64) -> str => f(x)\napply((n) => 'x', 1)", "str"),
+        ("(x) => x + 1.0", "(f64) -> f64"),
+        ("(x: str, y) => x + y", "(str, str) -> str"),
+        ("let f = () -> (i64) -> bool =>\n    let g: (i64) -> bool = (n) => n > 0\n    g\nf()", "(i64) -> bool"),
+        ("let ys = map([1], (n) => n * 2)\n-ys[0]", "i64"),  # the lambda's body is checked when ys[0] needs its type
+        ("map(['a'], len)", "[i64]"),
+        ("map([1], Some)", "[Optional[i64]]"),
+        ("map([1], print)", "[()]"),
+        ("let p = Error\np", "(str) -> Error"),
+        ("enum E\n    Two(i64, str)\nTwo", "(i64, str) -> E"),
+    ],
+)
+def test_lambda_types_are_inferred(source: str, expected: str) -> None:
+    assert prepared_type_of(source) == expected
+
+
+def test_inferred_lambda_errors() -> None:
+    with pytest.raises(EllaError, match="can't tell the type of this value yet"):
+        prepare(parse("let f = () -> () =>\n    let add = (x, y) => x + y\n    ()"))
+    with pytest.raises(EllaError, match="'..' doesn't work on str"):
+        prepare(parse("map(['a'], (s) => s..s)"))
+    with pytest.raises(EllaError, match="argument 1 should be i64, not str"):
+        prepare(parse("let f = () -> () =>\n    let g = (x) => x\n    g(1)\n    g('a')\n    ()"))
+    with pytest.raises(EllaError, match="len[(][)] needs a list, str, range or Pool, not i64"):
+        prepare(parse("map([1], len)"))
+
+
+def test_prelude_code_keeps_its_own_meaning() -> None:
+    # The program's own len, hash and variants named like the prelude's variables don't change it.
+    source = "let len = 5\nlet hash = 'h'\nenum E\n    x\n    i\nlet mut m = new_map()\nm[1] = 2\n(len, m[1], reverse([x, i]))"
+    assert prepared_type_of(source) == "(i64, i64, [E])"
+
+
+def test_prelude_modules_are_linked_when_used() -> None:
+    assert link(parse("let x = 1")).modules == (("", "main"),)
+    used = link(parse("sort([1])"))
+    assert used.modules == (("<std>/lists.ella", "lists"), ("", "main"))
+    assert link(used) is used
+    # A type in an annotation counts.
+    assert link(parse("let f = (m: Map[str, i64]) -> i64 => len(m)")).modules[0] == ("<std>/maps.ella", "maps")
 
 
 def test_prelude_gives_no_warnings() -> None:
-    _, checker = prepare(with_prelude(parse("let x = 1"), every=True))
+    _, checker = prepare(Linker(None, every=True).link(parse("let x = 1")))
     assert checker.warnings == []

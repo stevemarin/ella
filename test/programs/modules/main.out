@@ -1,0 +1,10 @@
+counter's code runs
+circle 1.0 3.14 m2
+rect 2.0 3.0 6.0
+4.0 true
+Point(4.0, 6.0) 3.0
+10 true
+Some(2)
+1 Stack([1])
+27 [1, 8, 27]
+7

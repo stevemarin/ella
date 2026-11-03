@@ -1,0 +1,6 @@
+# Code that builds code. The quotes' names mean what they mean here, even
+# private ones, wherever the code ends up.
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote _times($x, $(power(n - 1, x)))
+
+let _times = (a: i64, b: i64) -> i64 => a * b

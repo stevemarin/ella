@@ -138,7 +138,7 @@
           "name": "storage.modifier.ella"
         },
         {
-          "match": "\\b(?:assert|import|quote|where)\\b",
+          "match": "\\b(?:as|assert|import|quote|where)\\b",
           "name": "keyword.other.ella"
         }
       ]
@@ -162,7 +162,7 @@
     "call": {
       "patterns": [
         {
-          "match": "\\b(?:print|len|run|pool_new|alloc|free|fields|field_type|has_field|type_name|type_kind|variants|new_struct|to_f64|to_i64|parse_i64|parse_f64|read_line|read_file|args|split|join|find|replace|trim|chars|ord|chr|sqrt|floor|abs|min|max|eprint|ceil|round|exp|ln|sin|cos|upper|lower|starts_with|ends_with|pad_left|pad_right|format_f64|env|write_file|exit|reverse|sort|map|filter)(?=\\s*\\()",
+          "match": "\\b(?:print|len|run|pool_new|alloc|free|fields|field_type|has_field|type_name|type_kind|variants|new_struct|to_f64|to_i64|parse_i64|parse_f64|read_line|read_file|args|split|join|find|replace|trim|chars|ord|chr|sqrt|floor|abs|min|max|eprint|ceil|round|exp|ln|sin|cos|upper|lower|starts_with|ends_with|pad_left|pad_right|format_f64|env|write_file|exit|reverse|sort|map|filter|hash|sum|any|all|zip|enumerate|sort_by|range|new_map)(?=\\s*\\()",
           "name": "support.function.builtin.ella"
         },
         {

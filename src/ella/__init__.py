@@ -11,14 +11,15 @@ from ella.codegen import generate
 from ella.interpreter import Interpreter
 from ella.ir import Module, format_module, format_placement
 from ella.ir_interpreter import IRInterpreter
-from ella.lexer import EllaError, tokenize
+from ella.lexer import STD, EllaError, tokenize
 from ella.library import Host
 from ella.lower import compile_program
+from ella.modules import link
 from ella.native import build, finish_run
 from ella.parser import parse
 from ella.passes import PASSES, optimize
-from ella.staging import prepare
-from ella.syntax import show
+from ella.staging import has_splices, prepare
+from ella.syntax import Import, Program, show
 from ella.values import MAX_CALL_DEPTH
 
 
@@ -30,7 +31,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--tokens", action="store_true", help="print the tokens")
     mode.add_argument("--ast", action="store_true", help="print the syntax tree")
     mode.add_argument(
-        "--expanded", action="store_true", help="print the syntax tree after running the splices outside quotes"
+        "--expanded",
+        action="store_true",
+        help="print the syntax tree after running the splices outside quotes (of each module that has some)",
     )
     mode.add_argument("--ir", action="store_true", help="print the IR")
     mode.add_argument("--asm", action="store_true", help="print the x64 assembly")
@@ -73,19 +76,20 @@ def main(argv: list[str] | None = None) -> int:
             for token in tokenize(source):
                 print(f"{token.span}\t{token.kind.name}\t{token.text!r}")
         elif options.ast:
-            for expr in parse(source).body:
-                print(show(expr))
-        elif options.expanded:
-            program, _ = prepare(parse(source))
+            program = parse(source)
+            for line in program.imports:
+                print(show_import(line))
             for expr in program.body:
                 print(show(expr))
+        elif options.expanded:
+            linked = link(parse(source), options.file)
+            show_expanded(options.file, linked, prepare(linked)[0])
         elif options.tree:
-            program = parse(source)
-            program, checker = prepare(program)
+            program, checker = prepare(parse(source), path=options.file)
             warn(options.file, checker)
             status = Interpreter(checker=checker, host=host, max_depth=options.max_depth).run(program)
         else:
-            module = compile_program(source)
+            module = compile_program(source, path=options.file)
             warn(options.file, module.checker)
             if options.optimize or passes is not None:
                 optimize(module, passes)
@@ -111,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     except EllaError as error:
         # Flush what the program printed first, so the error comes after it.
         sys.stdout.flush()
-        print(f"{options.file}:{error}", file=sys.stderr)
+        print(f"{where(options.file, error)}: {error.message}", file=sys.stderr)
         return 1
     return status
 
@@ -119,7 +123,41 @@ def main(argv: list[str] | None = None) -> int:
 def warn(file: Path, checker: Checker) -> None:
     """Print the checker's warnings, which don't stop the program."""
     for warning in checker.warnings:
-        print(f"{file}:{warning.span}: warning: {warning.message}", file=sys.stderr)
+        print(f"{where(file, warning)}: warning: {warning.message}", file=sys.stderr)
+
+
+def where(file: Path, error: EllaError) -> str:
+    """Where an error is: `prog.ella:3:5`, `geo/poly.ella:3:5` in a module (from the entry file's
+    directory, as the entry file was given), or `<std>/maps.ella:12:5` in the standard library."""
+    span = error.span
+    if not span.file:
+        return f"{file}:{span}"
+    if span.file.startswith(STD):
+        return str(span)
+    return f"{(file.parent / span.file).as_posix()}:{span.line}:{span.column}"
+
+
+def show_import(line: Import) -> str:
+    return f"(import {'.'.join(line.path)}{f' as {line.alias}' if line.alias else ''})"
+
+
+def show_expanded(entry: Path, linked: Program, expanded: Program) -> None:
+    """The program with its splices expanded: the modules that have splices (the entry file's, at least).
+
+    With more than one module, each comes after a comment line with its file.
+    """
+
+    def shown(file: str) -> bool:
+        code = tuple(expr for expr in linked.body if expr.span.file == file)
+        return not file or not file.startswith(STD) and has_splices(code)
+
+    files = [file for file, _ in expanded.modules if shown(file)]
+    for file in files:
+        if len(files) > 1:
+            print(f"# {(entry.parent / file).as_posix() if file else entry}")
+        for expr in expanded.body:
+            if expr.span.file == file:
+                print(show(expr))
 
 
 def run_executable(module: Module, program_args: list[str], max_depth: int) -> int:

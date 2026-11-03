@@ -14,9 +14,10 @@ For example, `let x = 1 + 2 * 3` is shown as `(let [x] (+ 1 (* 2 3)))`.
 """
 
 import json
-from dataclasses import dataclass, fields, is_dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, fields, is_dataclass, replace
 
-from ella.lexer import Span
+from ella.lexer import EllaError, Span
 
 # Type annotations
 
@@ -582,14 +583,66 @@ type Expr = (
 
 
 @dataclass(frozen=True, slots=True)
-class Program:
-    """A source file: top-level expressions, run in order."""
+class Import:
+    """`import geo.poly`, or `import geo.Shape as Shape`: a module, or an item of one, by its path."""
 
-    body: tuple[Expr, ...]
+    path: tuple[str, ...]
+    alias: str | None
     span: Span
 
 
+@dataclass(frozen=True, slots=True)
+class Program:
+    """A source file: its imports, then top-level expressions, run in order.
+
+    A program made of several modules is *linked* (ella.modules) into one,
+    with every module's code in the order it runs. `modules` then has each
+    module's file (as in spans) and name, and `warnings` the problems found
+    while linking, which the checker passes on.
+    """
+
+    body: tuple[Expr, ...]
+    span: Span
+    imports: tuple[Import, ...] = ()
+    modules: tuple[tuple[str, str], ...] = ()
+    warnings: tuple[EllaError, ...] = ()
+
+
 # Helpers
+
+
+def bare_name(name: str) -> str:
+    """A top-level name without the module in front, as linking gave it (ella.modules): `Point` for `geo.Point`.
+
+    This is how values print. Type arguments in brackets stay as they are.
+    """
+    head, bracket, rest = name.partition("[")
+    return head.rpartition(".")[2] + bracket + rest
+
+
+def parts(node: object) -> list[object]:
+    """The parts of a syntax tree node (or the items of a tuple of nodes)."""
+    if isinstance(node, tuple):
+        return list(node)
+    if is_dataclass(node) and not isinstance(node, type | Span):
+        return [getattr(node, f.name) for f in fields(node)]
+    return []
+
+
+def rebuild(node: object, walk: Callable[[object], object]) -> object:
+    """A node with `walk` applied to its parts. Unchanged nodes are kept as they are."""
+    if isinstance(node, tuple):
+        items = tuple(walk(item) for item in node)
+        return node if all(a is b for a, b in zip(items, node)) else items
+    if is_dataclass(node) and not isinstance(node, type | Span):
+        changes = {}
+        for f in fields(node):
+            old = getattr(node, f.name)
+            new = walk(old)
+            if new is not old:
+                changes[f.name] = new
+        return replace(node, **changes) if changes else node
+    return node
 
 
 def mentions_return(node: object) -> bool:

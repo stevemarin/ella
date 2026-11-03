@@ -65,6 +65,7 @@ from ella.checker import (
 )
 from ella.ir import Block, Branch, Function, Instr, Jump, Module, Return, Trap, Value, format_instr, region_level
 from ella.lexer import Span
+from ella.syntax import bare_name
 from ella.values import MAX_CALL_DEPTH
 
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
@@ -110,6 +111,7 @@ class CodeGen:
         self.type_labels: dict[Type, Label] = {}
         self.finalizers: set[str] = set()
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
+        self.files = [""]  # the files of spans, numbered for the runtime's errors (0: the entry file)
 
         # The function being generated: the stack slot of each value and local,
         # and of the depth of its scope level 0 if it allocates in its levels.
@@ -167,8 +169,18 @@ class CodeGen:
         # descriptors hold addresses, which the loader fills in when the
         # program starts (it is a position-independent executable). They are
         # read-only after that.
+        # The file names, for errors in modules other than the entry file.
+        files = [f"    .quad {self.c_string(file)}" for file in self.files]
         lines += ["", "    .section .data.rel.ro", *self.rodata]
-        # Ella names can't contain dots, so these symbols can't clash with each other.
+        lines += [
+            "",
+            "# The files of the program's modules.",
+            "    .globl ella_files",
+            "    .balign 8",
+            "ella_files:",
+            *files,
+        ]
+        # Different global names give different symbols (a name with dots is a module's).
         lines += [
             "",
             "# How deeply Ella functions may call each other, for the runtime's stack.",
@@ -287,7 +299,10 @@ class CodeGen:
         self.emit(f"call {function}")
 
     def span_args(self, span: Span) -> tuple[int, int]:
-        return span.line, span.column
+        """A place in the source for the runtime's errors: the line, with the number of its file above its low 32 bits."""
+        if span.file not in self.files:
+            self.files.append(span.file)
+        return self.files.index(span.file) << 32 | span.line, span.column
 
     # Constants
 
@@ -346,7 +361,7 @@ class CodeGen:
                     self.rodata += [
                         "    .balign 8",
                         f"{variant_label}:",
-                        f"    .quad {self.c_string(variant)}, {len(fields)}, {finalize}"
+                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}"
                         + "".join(f", {f}" for f in field_labels),
                     ]
                     parts.append(variant_label)
@@ -756,10 +771,11 @@ class CodeGen:
                 self.emit("leave")
                 self.emit("ret")
             case Trap(message, value, span):
+                line, column = self.span_args(span)
                 if value is None:
-                    self.call_c("ella_error", span.line, span.column, self.c_string(message))
+                    self.call_c("ella_error", line, column, self.c_string(message))
                 else:
                     descriptor = self.type_descriptor(value.type)
-                    self.call_c("ella_trap_value", self.c_string(message), value, descriptor, span.line, span.column)
+                    self.call_c("ella_trap_value", self.c_string(message), value, descriptor, line, column)
             case None:
                 raise AssertionError(f"{block.name} has no terminator")

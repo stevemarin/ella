@@ -1,0 +1,67 @@
+# The prelude: functions and a Map written in Ella (docs/grammar.md §10).
+
+struct Money
+    cents: i64
+    add = (a: Money, b: Money) -> Money => Money(a.cents + b.cents)
+
+struct Person
+    name: str
+    age: i64
+
+let main = () -> () =>
+    let xs = [3, 1, 2]
+    print(sum(xs, 0), sum([0.5, 0.25], 0.0), sum(["a", "b", "c"], ""), sum([[1], [2, 3]], []))
+    print(sum([Money(5), Money(7)], Money(0)), sum([], 10))
+    print(any(xs, (n) => n > 2), all(xs, (n) => n > 2))
+    print(any([], (_n: i64) -> bool => true), all([], (_n: i64) -> bool => false))
+    # any and all stop as soon as they know.
+    print(any(xs, (n) => n == 3 or n // 0 > 1))
+    print(zip(xs, ["a", "b"]), zip([], xs), enumerate(["x", "y"]))
+    print(range(0, 10, 3), range(10, 0, -4), range(5, 5, 1), range(0, -3, -1), range(3, 0, 1))
+    let people = [Person("cy", 30), Person("al", 25), Person("bo", 30)]
+    print(sort_by(people, (p) => p.age))
+    print(sort_by(people, (p) => p.name))
+    print(sort_by(["ccc", "a", "bb", "d"], len), sort_by([], (n: i64) -> i64 => n))
+    print(reverse(xs), sort(xs), map(xs, (n) => n * n), filter(xs, (n) => n != 1))
+
+    # A Map keeps its keys in the order they were first set.
+    let mut ages = new_map()
+    ages["ann"] = 31
+    ages["bob"] = 40
+    ages["ann"] += 1
+    print(ages["ann"], len(ages), "bob" in ages, "cy" in ages, "cy" not in ages)
+    for name in ages
+        print(name, ages[name])
+    print(ages.lookup("cy"), ages.lookup("bob"))
+    print(mut ages.remove("ann"), mut ages.remove("ann"), len(ages))
+    ages["ann"] = 1
+    print(ages.items(), ages.keys(), ages.values())
+
+    # Any key with Eq will do; keys are told apart by their text forms.
+    let mut grid: Map[(i64, i64), str] = new_map()
+    grid[(0, 1)] = "a"
+    grid[(1, 0)] = "b"
+    print(grid[(1, 0)], (0, 0) in grid, len(grid))
+    let mut floats = new_map()
+    floats[0.0] = "zero"
+    floats[-0.0] = "minus zero"
+    print(len(floats), floats.lookup(nan), 0.0 == -0.0)
+
+    # Many keys, so it grows and puts them in new buckets several times.
+    let mut squares: Map[i64, i64] = new_map()
+    for i in 0..300
+        squares[i] = i * i
+    for i in 0..300
+        if i % 3 == 0 then mut squares.remove(i)
+    let mut total = 0
+    for k in squares
+        total += squares[k]
+    print(len(squares), total, squares[298], squares.lookup(297), squares.keys()[0..5])
+
+    # A Map is a value: a copy doesn't change with the original.
+    let mut copy = ages
+    copy["new"] = 0
+    print(len(ages), len(copy), ages == copy)
+    print(hash(""), hash("a"), hash("héllo"))
+
+let nan = 0.0 / 0.0

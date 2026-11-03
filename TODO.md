@@ -12,21 +12,25 @@ protocols, user-defined constraints, editor support, and the quick wins
 below (a small library, destructuring, exhaustiveness checking, deeper
 calls, then math, library functions as values, `eprint`, exit statuses
 and warnings, then a prelude written in Ella, more of the library, `mut`
-in patterns and more warnings). `make check` passes (933 tests, ruff,
-strict mypy).
+in patterns and more warnings, then inferred lambda types, built-ins and
+constructors as values, a larger prelude with a hash map, prelude error
+locations, and warnings for unused parameters and functions, then modules
+and imports, with the prelude as standard library modules). `make check`
+passes (1020 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification, generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, stages, exhaustive `match`, warnings (cases that never match, unused variables, code that never runs) |
+| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, pools with generation-checked handles, `nocopy` and finalizers |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `contains`, `len`) |
-| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values; `print` and `eprint` with any number of values; a prelude in Ella with `map`, `filter`, `sort`, `reverse` and `pi` |
-| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion); VS Code extension; Makefile |
+| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]` |
+| Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
+| Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main`, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile |
 
 Rough speed, from `fib(32)` (about 3.5 million calls): the native executable
 takes 0.05 s, about 4× slower than C at `gcc -O0`. A `fib(24)` run takes
@@ -43,21 +47,26 @@ programs hard to write today.
 
 The built-ins are `print`, `eprint`, `len`, `run`, the pool functions,
 reflection, and the library (docs/grammar.md §10): number conversions and
-parsing, math, code points, string functions, files, arguments, the
-environment and `exit`. The prelude (src/ella/prelude.py) adds `map`,
-`filter`, `sort`, `reverse` and `pi`, written in Ella.
+parsing, math, code points, string functions, `hash`, files, arguments,
+the environment and `exit`. The standard library's modules (src/ella/lib/,
+whose names are the prelude) add list functions (`map`, `filter`, `sort`,
+`sort_by`, `sum`, `zip`, ...), `pi`, and `Map[K, V]`, written in Ella.
 
-- ★ No map or set type, and no map literal (`{` is an unexpected character).
-  The protocols and the prelude mean a `Map[K, V]` could be written in Ella
-  itself, given a hash function in the library.
-- The prelude is small: no `sum`, `any`, `all`, `zip`, `enumerate`,
-  `sort_by` with a key, or `range` with a step.
-- `sort` piles up a copy of the list per merge pass in the caller's arena
-  (42 MB for 200,000 numbers): the region bloat described under Memory
-  model below.
-- A run-time error inside prelude code (a stack overflow at a call it
-  makes, say) reports a line and column of the prelude, as if they were
-  the program's.
+- No set type, and no map literal (`{` is an unexpected character). A
+  `Set[T]` would be a small layer over `Map`.
+- `Map` tells keys apart by their text forms, so each lookup builds the
+  key's text: simple, and right for every `Eq` type, but slow for big
+  keys, and `0.0` and `-0.0` are different keys. A `Hash` constraint (a
+  `hash` method) would let a type do better. A `Map` also prints, and
+  compares with `==`, by its inner fields.
+- `sum` takes a start value (`sum(xs, 0)`): a generic function has no way
+  to make the zero of a `Num` type.
+- `sort` and `sort_by` pile up a copy of the list per merge pass in the
+  caller's arena (42 MB for 200,000 numbers): the region bloat described
+  under Memory model below.
+- A run-time error inside library code gives a location in the library
+  (`<std>/maps.ella:14:13: precondition failed: key in m` for a missing
+  key), not the program's line that called it; that needs stack traces.
 - `upper` and `lower` only change ASCII letters; the rest of Unicode would
   need case tables in the runtime.
 - Missing math: `tan`, `atan2`, `log10`, `f64` powers other than `**`,
@@ -67,23 +76,31 @@ environment and `exit`. The prelude (src/ella/prelude.py) adds `map`,
 
 ### Language
 
-- ★ Lambdas need full annotations (`x => x + 1` is rejected), which makes
-  `map` and `filter` wordy: `map(xs, (n: i64) -> i64 => n * 2)`. Library
-  and prelude functions are values, but `print`, `len` and constructors
-  aren't (`let f = print`, `xs |> map(Some)`).
+- Top-level functions and methods must give their whole type, even
+  `let f: (i64) -> i64 = (x) => x + 1`, whose declared type could supply
+  it. Lambdas with inferred types have one type, decided by their first
+  use; only top-level generic functions can be used at several.
+- `print` and `eprint` as values take one argument, not any number.
 - Generic functions must be top-level; there are no generic lambdas.
 - Only `i64`, `f64`, `bool` and `str`. Narrower integers, `f32` and SIMD
   vectors (a stated goal) aren't designed yet.
 - No negative indexing (deliberate for now).
 - The warning for cases that never match doesn't compare ranges with
   literals or each other (`case 1` after `case 0..5` isn't reported), and
-  ranges never count as covering an `i64`. Unused parameters, top-level
-  names and functions aren't reported, nor a `mut` variable that never
-  changes.
+  ranges never count as covering an `i64`. Unused top-level variables,
+  methods and enum variants aren't reported, nor two unused functions
+  that only call each other.
 - Native code has room for about two scope levels per nested call; a deep
   recursion through loops can run out of scope arenas before the depth
   limit, which the interpreters don't.
-- Modules and `import`: one program is one file.
+- Imports name one module or item each: there's no way to import several
+  names of a module at once (`import geo: area, Shape`), no re-exports,
+  and no libraries other than the program's own files and the standard
+  library. Imports can't form cycles.
+- Errors name types with their module (`maps.Map[str, i64]`, the name in
+  the linked program), while values print without it (`Map(...)`).
+- A `match` outside a module on its enum with a private variant suggests
+  adding a case for that variant, which can't be written there (`_` works).
 - `comptime` is still reserved, though `quote`/`$` may make it unnecessary.
 
 ### Types, methods and protocols
@@ -134,6 +151,11 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
 ### Tooling
 
+- The language server re-analyzes every open document after each change
+  (one may import another), and checks the whole standard library each
+  time; checked modules aren't kept between analyses. A file's imports
+  are found from the workspace folder, and whether a file without `main`
+  is a program or a module is a guess (for unused-function warnings).
 - The language server has no rename, find references, formatting, signature
   help or code actions.
 - No formatter, REPL or debugger support (no DWARF line info in native code).
@@ -202,25 +224,80 @@ runtime; new functions with fixed types are cheap to add that way.
 6. Warnings for unused local variables (`_name` says it's on purpose)
    and for code after a line that never finishes.
 
+### Done (2026-11-02, fourth round)
+
+1. Lambdas other than top-level functions and methods can leave out
+   their parameter and result types: `map(xs, (n) => n * 2)`,
+   `xs |> filter(n => n > 0)`, `let inc = (x) => x + 1`. The missing types
+   are type variables, decided by the lambda's use or its body. Bodies
+   are still checked after the line they are in, except when a type they
+   may decide is needed sooner (`-ys[0]` right after
+   `let ys = map(xs, (n) => n * 2)`).
+2. More of the prelude: `sum(xs, start)`, `any`, `all`, `zip`,
+   `enumerate`, `sort_by(xs, key)` and `range(start, stop, step)`.
+3. `print`, `eprint`, `len` and constructors are values:
+   `map(xs, Some)`, `let make = Point`. The checker makes a lambda that
+   calls each (`(_1) => Some(_1)`), with inferred types, and the lowering
+   makes it a function; to the interpreters they were values already.
+4. Prelude code has its own file in spans, so an error in it reads
+   `<prelude>:12:5` in every backend and the CLI. That also lets prelude
+   code use built-ins and bind names in patterns: there, a built-in's
+   name always means the built-in, and a bare name always binds, whatever
+   the program defines.
+5. `hash(str) -> i64` (FNV-1a over code points) and `Map[K, V]` in the
+   prelude, made with `new_map()`: `m[k]`, `m[k] = v`, `k in m`,
+   `len(m)`, `for k in m`, `lookup`, `remove`, `keys`, `values` and
+   `items`, keeping keys in the order they were first set.
+6. Warnings for unused parameters, for top-level functions not used
+   outside their own bodies, and for `mut` variables that never change.
+
+### Done (2026-11-02, fifth round): modules
+
+1. A file is a module, `import geo.poly` binds its whole path, and `as`
+   gives a module, or an imported item, another name. An enum's variants
+   come with it (bare with `as`), and paths work in types, patterns and
+   constraints. Imports come first in a file, are found from the entry
+   file's directory and then the standard library, and can't form
+   cycles.
+2. Names starting with `_` are private to their module and the modules
+   below it: top-level names, fields (a struct with one can only be made
+   or taken apart there), methods and variants. Other modules' variables
+   can be read but not changed.
+3. Linking (src/ella/modules.py) makes one program of the modules, with
+   module names in front of their top-level names, so the checker,
+   interpreters and back end are mostly unchanged; quoted code keeps the
+   meaning of its names, private ones too, wherever it is spliced or run.
+   Unused functions of modules aren't compiled.
+4. The prelude is the standard library's modules, `lists`, `maps` and
+   `math` (src/ella/lib/), which can be imported too; `Map`'s fields and
+   helper methods are private. Their code means what it says whatever
+   the program defines.
+5. Errors in a module give its file in every backend
+   (`geo/poly.ella:3:5`, `<std>/lists.ella:117:9`); native code passes a
+   file number with each line. Warnings for unused imports, for a module
+   named like a library module, and for unused private functions
+   (public ones may be used elsewhere, except in the entry file).
+6. `ella --expanded` shows each module with splices; the language server
+   links each file with its imports, reading open documents first, shows
+   errors from imports at the import line, finds definitions in other
+   files (the standard library's too), and completes a module's names
+   after `geo.`. Test programs can be directories (`NAME/main.ella`).
+
 ### Next
 
 Small steps that build on the above:
 
-1. Lambda parameters without annotations where the type is known from
-   the call: `map(xs, (n) => n * 2)`. The checker knows `map`'s parameter
-   types before it checks the lambda, so this is checking with an
-   expected type, not full inference.
-2. More of the prelude: `sum`, `any`, `all`, `zip`, `enumerate`,
-   `sort_by(xs, key)` and `range` with a step.
-3. `print`, `len` and constructors as values (`map(xs, Some)`), made like
-   the library functions' small IR functions.
-4. Prelude spans: give prelude code its own file name in spans, so that an
-   error inside it reads `<prelude>:12:5` rather than pointing into the
-   program.
-5. A `hash(str) -> i64` library function and a `Map[K, V]` in the
-   prelude, the first real collection (★ above).
-6. Warnings for unused functions and parameters, and for a `mut`
-   variable that never changes.
+1. `Set[T]` in the prelude, on top of `Map`, and a `Hash` constraint so
+   that a key type can hash itself without building its text.
+2. Take a top-level function's missing types from its `let`'s declared
+   type: `let inc: (i64) -> i64 = (x) => x + 1`.
+3. Report the program's call site for errors inside library code: a
+   one-entry stack trace, a first step to roadmap idea 4.
+4. A way for generic code to make the zero of a `Num` type, so that
+   `sum(xs)` needs no start value.
+5. Warnings for unused methods, enum variants and top-level variables.
+6. A small benchmark suite in `test/`, so the speed numbers above are
+   measured rather than by hand.
 
 ## Roadmap ideas
 
@@ -229,26 +306,24 @@ Ella's goals: learning, simplicity first, no GC, x64.
 
 ### 1. A standard library written in Ella
 
-The protocols, constraints and methods are now strong enough to write
-collections in Ella itself: `Map[K, V]`, `Set[T]`, string utilities. The
-prelude (src/ella/prelude.py) is the start: `map`, `filter`, `sort` and
-`reverse` are Ella code that every program can use, with C runtime
-primitives underneath (I/O, math) added as library functions
-(src/ella/library.py and the runtime). Growing it tests the language on
-real code, finds rough edges in the type system, and makes example
-programs possible. Writing the prelude showed two: lambdas need full
-annotations, and its code must avoid built-ins and name patterns, since a
-program's own definitions would change them (modules would fix that). It
-naturally leads to idea 2.
+The protocols, constraints and methods are strong enough to write
+collections in Ella itself, and the standard library (src/ella/lib/) now
+has list functions and `Map[K, V]`, with C runtime primitives underneath
+(I/O, math, `hash`) added as library functions (src/ella/library.py and
+the runtime). Growing it tests the language on real code, finds rough
+edges in the type system, and makes example programs possible. Writing
+`Map` showed some: `sum` can't make a zero, `==` and printing can't be
+customized, there is no `Map.new()` (so `new_map()`), and keys are told
+apart by their text forms for lack of a `Hash` constraint. Now that it is
+made of modules, it can grow by topic (`strings`, `sets`, ...).
 
-### 2. Modules and packages
+### 2. Packages
 
-`import` is reserved but undesigned. A simple design: one file is one
-module, top-level names are exported unless private, and imports are
-resolved relative to the file or a library path. Open questions are how
-generics and methods are specialized across modules (probably still whole
-program, since monomorphization needs all uses) and how staging sees
-imported functions at compile time.
+Modules are done (see above): whole-program compilation, with generics and
+methods specialized across modules, and compile-time code calling imported
+functions. What's left is code from outside the program: a library path
+or packages, importing several names at once, re-exports, and perhaps
+separate compilation of modules that don't change.
 
 ### 3. A real back end: register allocation and inlining
 

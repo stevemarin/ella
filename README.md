@@ -186,13 +186,30 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   `main` can return the exit status, `let mut (a, b): (i64, i64) = ...`
   makes changeable names, and the checker warns about `match` cases that
   can never match.
-* A prelude written in Ella ([src/ella/prelude.py](src/ella/prelude.py))
-  gives `map`, `filter`, `sort` and `reverse`. The library adds more math
+* A prelude written in Ella gives `map`, `filter`, `sort` and `reverse`. The library adds more math
   (`round`, `ceil`, `exp`, `ln`, `sin`, `cos`, `pi`), strings (`upper`,
   `lower`, `starts_with`, `ends_with`, padding, `format_f64`), `env`,
   `write_file` and `exit`. `mut` can mark one name in a pattern
   (`let (mut a, b)`), and the checker also warns about unused variables
-  and code that never runs. See [TODO.md](TODO.md) for what could come next.
+  and code that never runs.
+* Lambdas other than top-level functions can leave out their types, which
+  are inferred from where they are passed: `xs |> map(n => n * 2)`.
+  `print`, `len` and constructors are values too (`map(xs, Some)`). The
+  prelude adds `sum`, `any`, `all`, `zip`, `enumerate`, `sort_by` and
+  `range` with a step, and a hash map, `Map[K, V]`, written in Ella on
+  top of a new `hash` library function. An error in prelude code says
+  `<prelude>:12:5`, and the checker warns about unused parameters and
+  functions, and `mut` variables that never change.
+* Modules: a file is a module, and `import geo.poly` (or `import geo.poly
+  as p`, or `import geo.Shape as Shape` for one item) uses another file's
+  names, `geo.poly.area(s)`. Names starting with `_` are private to their
+  module and the ones below it, and other modules' variables can't be
+  changed. The prelude is now the standard library's modules
+  ([src/ella/lib/](src/ella/lib/): `lists`, `maps`, `math`), which every
+  module sees without importing them, and errors in a module name its
+  file (`geo/poly.ella:3:5`, `<std>/maps.ella:12:5`) in every backend. The
+  language server follows imports, between open files too. See
+  [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

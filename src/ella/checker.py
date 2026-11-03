@@ -84,6 +84,7 @@ from ella.syntax import (
     NamedType,
     NamePattern,
     OrPattern,
+    Param,
     Pattern,
     Program,
     Quote,
@@ -435,7 +436,10 @@ class LoopInfo:
 
 @dataclass(slots=True)
 class PendingBody:
-    """A function body waiting to be checked, with the scope and stage it was created in."""
+    """A function body waiting to be checked, with the scope and stage it was created in.
+
+    `inferred` says the function left out types, which checking its body may decide.
+    """
 
     function: Lambda
     captured: Env
@@ -443,6 +447,7 @@ class PendingBody:
     level: int
     type_params: dict[str, Type]
     quotes: int
+    inferred: bool = False
 
 
 # The library: built-in functions with fixed types (see ella.library). A few
@@ -480,6 +485,7 @@ LIBRARY: dict[str, FuncTy] = {
     "pad_left": FuncTy((STR, I64, STR), STR),
     "pad_right": FuncTy((STR, I64, STR), STR),
     "format_f64": FuncTy((F64, I64), STR),
+    "hash": FuncTy((STR,), I64),
     "env": FuncTy((STR,), EnumTy("Optional", (STR,))),
     "write_file": FuncTy((STR, STR), EnumTy("Result", (UNIT, ERROR))),
     "exit": FuncTy((I64,), NEVER),
@@ -491,6 +497,7 @@ GENERIC_LIBRARY = frozenset(name for name, t in LIBRARY.items() if NUM_T in t.pa
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
 BUILTINS = ("print", "eprint", "len", "run", "pool_new", "alloc", "free", *LIBRARY)
+WRAPPED = frozenset({"print", "eprint", "len"})  # other built-ins that are values (taking one argument)
 
 
 def show_library(name: str) -> str:
@@ -531,7 +538,21 @@ def check_code(code: Expr, program: Checker) -> Checker:
     checker.globals = Env(None, dict(program.globals.vars))
     checker.constraints = program.constraints
     checker.method_functions = program.method_functions
-    for table in ("types", "kinds", "resolved", "members", "methods", "instances", "type_values", "quote_levels"):
+    checker.predefined = program.predefined
+    checker.module_names = program.module_names
+    checker.enum_files = program.enum_files
+    tables = (
+        "types",
+        "kinds",
+        "resolved",
+        "members",
+        "methods",
+        "instances",
+        "type_values",
+        "quote_levels",
+        "wrappers",
+    )
+    for table in tables:
         setattr(checker, table, dict(getattr(program, table)))
     checker.checked = set(program.checked)
     checker.check(code, checker.globals)
@@ -564,6 +585,7 @@ class Checker:
         self.constraints: dict[str, dict[str, FuncTy]] = {}  # user-defined constraint -> its methods' types, with SELF
         self.method_functions: dict[tuple[str, str], Lambda] = {}  # (struct or enum, method) -> its function
         self.methods: dict[int, str] = {}  # `.name` node called as a method -> the method's name
+        self.wrappers: dict[int, Lambda] = {}  # `print`, `len` or a constructor used as a value -> a lambda calling it
         self.defined: set[int] = set()  # top-level enums already defined
         self.item_sets: set[int] = set()  # `v[k]` places stored with v's `set` method
         self.level = 0  # the stage being checked
@@ -575,17 +597,29 @@ class Checker:
         self.matches: list[tuple[tuple[Case, ...], Type]] = []  # every match's cases, to find ones that never match
         # Problems that don't stop the program, such as a case that can never match.
         self.warnings: list[EllaError] = []
-        self.declared: dict[int, Binding | NamePattern] = {}  # local variables, to find the ones never used
+        # For warnings: local variables and parameters, to find the ones never used, the local
+        # variables declared `mut` and those changed (by binder), and the top-level functions.
+        self.declared: dict[int, Binding | NamePattern | Param] = {}
+        self.mutable_vars: set[int] = set()
+        self.changed_vars: set[int] = set()
+        self.functions: dict[int, Let] = {}
         # Uses of generic functions: the function, its type arguments, the
         # constraints of each type parameter, and where.
         self.generic_uses: list[tuple[str, tuple[Type, ...], tuple[tuple[str, tuple[str, ...]], ...], Span]] = []
 
         self.globals = Env(None)
-        for name in (*BUILTINS, *REFLECTION):
-            self.globals.vars[name] = VarInfo(UNIT, False, "builtin")
+        self.builtins = {name: VarInfo(UNIT, False, "builtin") for name in (*BUILTINS, *REFLECTION)}
+        self.globals.vars.update(self.builtins)
         self.env = self.globals
         for enum in BUILTIN_ENUMS.values():
             self.define_variants(enum, self.globals)
+        # The built-ins and built-in variants, which code in a module other than the entry file always
+        # sees by their names, even if the entry file defines the names (see `visible`).
+        self.predefined = dict(self.globals.vars)
+        # For private names: the name of the module of each file, as in spans (see ella.modules),
+        # and the file each top-level struct or enum is defined in.
+        self.module_names: dict[str, str] = {}
+        self.enum_files: dict[str, str] = {}
         # Top-level names whose `let` hasn't been checked yet, for a clearer error.
         self.pending_globals: set[str] = set()
 
@@ -598,6 +632,9 @@ class Checker:
         # definitions had errors. `scopes` has the scope each name was looked
         # up in, for completing names.
         self.errors: list[EllaError] | None = None
+        # Whether the entry file is looked at as a module of some program (by an editor), whose
+        # unused public functions may be used by other modules, so they aren't reported.
+        self.library = False
         self.failed: set[str] = set()
         self.scopes: dict[int, Env] = {}
 
@@ -683,16 +720,47 @@ class Checker:
         """A type that must already be decided, such as an operand whose operator depends on it.
 
         A deferred type counts as known: it is checked once the code is built.
+        A lambda that left out types may decide it, as in `let ys = map(xs,
+        (n) => n * 2)` followed by `-ys[0]`, so the waiting bodies of such
+        lambdas are checked first.
         """
         t = resolve(t)
+        if isinstance(t, TyVar):
+            for pending in [pending for pending in self.pending_bodies if pending.inferred]:
+                if any(other is pending for other in self.pending_bodies):  # (checking one may check another)
+                    self.pending_bodies = [other for other in self.pending_bodies if other is not pending]
+                    self.check_body(pending)
+            t = resolve(t)
         if isinstance(t, TyVar):
             raise EllaError("can't tell the type of this value yet; add a type annotation", span)
         return t
 
     # Names and annotations
 
-    def lookup(self, name: str, env: Env, span: Span) -> VarInfo:
+    def visible(self, name: str, env: Env, span: Span) -> VarInfo | None:
+        """What a name refers to in code at `span`, if anything.
+
+        Linking (ella.modules) gave the top-level names of modules other
+        than the entry file names with dots in them, and left only the
+        built-ins bare in their code. So such code finds a bare top-level
+        name only if it is predefined, and then always the built-in one.
+        """
         info = env.lookup(name)
+        if span.file and "." not in name and info is not None and info is self.globals.vars.get(name):
+            return self.predefined.get(name)
+        return info
+
+    def private(self, name: str, owner: str, span: Span) -> None:
+        """A private field or method (`_name`) of a type can only be used in the type's module, and those below it."""
+        if not name.startswith("_"):
+            return
+        defined = self.module_names.get(self.enum_files.get(owner, ""), "")
+        used = self.module_names.get(span.file, "")
+        if used != defined and not used.startswith(defined + "."):
+            raise EllaError(f"'{name}' is private to module '{defined}'", span)
+
+    def lookup(self, name: str, env: Env, span: Span) -> VarInfo:
+        info = self.visible(name, env, span)
         if info is not None:
             return info
         if name in self.pending_globals:
@@ -734,6 +802,8 @@ class Checker:
             env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=binder)
             if isinstance(binder, Binding | NamePattern):
                 self.declared[id(binder)] = binder
+                if mutable:
+                    self.mutable_vars.add(id(binder))
 
     def annotation(self, texpr: TypeExpr, params: dict[str, Type] | None = None) -> Type:
         """The type a type annotation stands for. `params` are an enum's type parameters.
@@ -791,6 +861,7 @@ class Checker:
         """Read an enum's variants (or a struct's fields) and methods, and make the variants names in `env`."""
         if env is self.globals:
             self.defined.add(id(enum))
+            self.enum_files[enum.name] = enum.span.file
         self.declare_enum(enum)
         params: dict[str, Type] = {name: ParamTy(name) for name in enum.type_params}
         if any(has_type_splice(f) for v in enum.variants for f in v.fields):
@@ -917,6 +988,8 @@ class Checker:
     # Programs
 
     def check_program(self, program: Program) -> None:
+        self.module_names = dict(program.modules)
+        self.warnings += program.warnings
         # Enums first, in two steps so that they can refer to each other.
         # Constraints come in between: their methods' types may use enums,
         # and enums' type parameters may have constraints.
@@ -959,22 +1032,41 @@ class Checker:
         self.attempt(None, [], self.finish_checks)
         if not self.errors:  # after an error, some uses may not have been found
             self.warn_unused()
-        self.warnings.sort(key=lambda warning: (warning.span.line, warning.span.column))
+        self.warnings.sort(key=lambda warning: (warning.span.file, warning.span.line, warning.span.column))
         if not self.errors:  # the copy rules need everything checked
             self.attempt(None, [], partial(check_copies, program.body, self))
 
     def warn_unused(self) -> None:
-        """Warn about local variables that are never used, unless their names start with `_`."""
+        """Warn about names that are never used, and `mut` variables that never change.
+
+        Local variables and parameters count, unless their names start
+        with `_`. So do top-level functions (other than `main`) of the entry
+        file, which nothing imports, and the private ones (`_name`) of other
+        modules. A function's uses in its own body don't count.
+        """
         used = {id(info.binder) for info in self.resolved.values()}
+        hint = "start its name with '_' if that is on purpose"
         for node in self.declared.values():
-            if id(node) not in used and not node.name.startswith("_"):
-                self.warnings.append(
-                    EllaError(f"'{node.name}' is never used; start its name with '_' if that is on purpose", node.span)
-                )
+            if node.name.startswith("_"):
+                continue
+            what = "parameter " if isinstance(node, Param) else ""
+            if id(node) not in used:
+                self.warnings.append(EllaError(f"{what}'{node.name}' is never used; {hint}", node.span))
+            elif id(node) in self.mutable_vars and id(node) not in self.changed_vars:
+                self.warnings.append(EllaError(f"'{node.name}' never changes, so it doesn't need 'mut'", node.span))
+        for let in self.functions.values():
+            inside = {id(node) for node in nodes(let.value)}
+            outside = {id(info.binder) for name, info in self.resolved.items() if name not in inside}
+            for binding in let.bindings:
+                name = binding.name.rpartition(".")[2]
+                reported = (not binding.span.file and not self.library) or name.startswith("_")
+                if id(binding) not in outside and binding.name != "main" and reported:
+                    self.warnings.append(EllaError(f"function '{name}' is never used", binding.span))
 
     def declare_function(self, let: Let) -> None:
         """Give a top-level function's names its type, from its annotations, before anything is checked."""
         assert isinstance(let.value, Lambda)
+        self.functions[id(let)] = let
         type_params, constraints = let.bindings[0].type_params, let.bindings[0].constraints
         t = self.lambda_type(let.value, type_params, constraints)
         for binding in let.bindings:
@@ -1184,7 +1276,11 @@ class Checker:
                 match info.kind:
                     case "builtin" if name in LIBRARY and name not in NOT_VALUES:
                         return self.library_type(name, span)
-                    case "builtin" | "constructor":
+                    case "builtin" if name in WRAPPED:
+                        return self.wrap(expr, 1, env)
+                    case "constructor":
+                        return self.wrap(expr, len(self.enums[info.enum].variants[name]), env)
+                    case "builtin":
                         raise EllaError(f"'{name}' can only be called, not used as a value", span)
                     case "variant":
                         enum_type, _ = self.instantiate(info.enum, name)
@@ -1215,7 +1311,9 @@ class Checker:
                     # A `let`-bound function can call itself by name. (A generic
                     # function's own name is its top-level name.)
                     self_names = [] if type_params else list(bindings)
-                    t: Type = self.check_lambda(value_expr, env, self_names, type_params, bindings[0].constraints)
+                    t: Type = self.check_lambda(
+                        value_expr, env, self_names, type_params, bindings[0].constraints, env is not self.globals
+                    )
                     self.types[id(value_expr)] = t
                 else:
                     t = self.check(value_expr, env)
@@ -1354,7 +1452,7 @@ class Checker:
 
             # Functions
             case Lambda():
-                return self.check_lambda(expr, env, [])
+                return self.check_lambda(expr, env, [], infer=True)
             case Call(callee, args, span):
                 return self.check_call(callee, args, env, span)
             case Return(value, span):
@@ -1536,6 +1634,7 @@ class Checker:
         if isinstance(struct, EnumTy) and self.enums[struct.name].struct:
             info = self.enums[struct.name]
             if expr.name in info.field_names:
+                self.private(expr.name, struct.name, expr.span)
                 index = info.field_names.index(expr.name)
                 self.members[id(expr)] = index
                 return self.variant_fields(struct, struct.name)[index]
@@ -1662,6 +1761,7 @@ class Checker:
                 if info.level is not None and info.level != self.level:
                     raise EllaError(f"can't change '{name}' from a later stage", span)
                 t = info.type
+                self.changed_vars.add(id(info.binder))
             case Index(container_expr, index, span):
                 container = self.known(self.check_place(container_expr, env, verb, False), container_expr.span)
                 index_type = self.check(index, env)
@@ -1720,26 +1820,50 @@ class Checker:
         return result
 
     def lambda_type(
-        self, function: Lambda, type_params: tuple[str, ...] = (), constraints: tuple[tuple[str, ...], ...] = ()
+        self,
+        function: Lambda,
+        type_params: tuple[str, ...] = (),
+        constraints: tuple[tuple[str, ...], ...] = (),
+        infer: bool = False,
     ) -> FuncTy:
-        """A function's type, from its annotations, which are required for now.
+        """A function's type, from its annotations.
 
         A generic function's type parameters stand for themselves: `T` is
         ParamTy("T"), which only matches itself until a use fills it in.
+
+        With `infer`, the types left out are type variables, which the
+        lambda's use decides (passing it to `map` makes its parameter the
+        list's item type), or failing that its body, checked later. Without,
+        they are required: a top-level function's type, and a method's, are
+        known before anything is checked.
         """
         outer = self.type_params
         self.type_params = outer | self.param_types(type_params, constraints, function.span)
         try:
-            params = []
+            params: list[Type] = []
             for param in function.params:
-                if param.type is None:
-                    raise EllaError(f"parameter '{param.name}' needs a type, like '{param.name}: i64'", param.span)
-                params.append(self.annotation(param.type))
+                if param.type is not None:
+                    params.append(self.annotation(param.type))
+                elif infer:
+                    params.append(self.fresh())
+                else:
+                    raise EllaError(
+                        f"parameter '{param.name}' needs a type, like '{param.name}: i64', as a top-level "
+                        "function's or a method's always do",
+                        param.span,
+                    )
                 self.types[id(param)] = params[-1]
-            if function.return_type is None:
-                raise EllaError("a lambda needs a return type, like '(x: i64) -> i64 => ...'", function.span)
+            if function.return_type is not None:
+                result = self.annotation(function.return_type)
+            elif infer:
+                result = self.fresh()
+            else:
+                raise EllaError(
+                    "a top-level function or method needs a return type, like '(x: i64) -> i64 => ...'",
+                    function.span,
+                )
             mutable = tuple(i for i, param in enumerate(function.params) if param.mutable)
-            return FuncTy(tuple(params), self.annotation(function.return_type), mutable)
+            return FuncTy(tuple(params), result, mutable)
         finally:
             self.type_params = outer
 
@@ -1750,18 +1874,21 @@ class Checker:
         self_names: list[Binding],
         type_params: tuple[str, ...] = (),
         constraints: tuple[tuple[str, ...], ...] = (),
+        infer: bool = False,
     ) -> FuncTy:
         """A lambda's type. Its body is checked later, once all top-level names are known.
 
-        `self_names` are the `let` bindings it can call itself by.
+        `self_names` are the `let` bindings it can call itself by. `infer`
+        allows types to be left out (see `lambda_type`).
         """
-        t = self.lambda_type(function, type_params, constraints)
+        t = self.lambda_type(function, type_params, constraints, infer)
         captured = self.capture(env)
         for binding in self_names:
             captured.vars[binding.name] = VarInfo(t, False, "local", level=self.level, binder=binding)
         params = self.type_params | self.param_types(type_params, constraints, function.span)
         if id(function) not in self.checked:
-            self.pending_bodies.append(PendingBody(function, captured, t, self.level, params, self.quotes))
+            inferred = any(param.type is None for param in function.params) or function.return_type is None
+            self.pending_bodies.append(PendingBody(function, captured, t, self.level, params, self.quotes, inferred))
         return t
 
     def capture(self, env: Env) -> Env:
@@ -1797,6 +1924,7 @@ class Checker:
             # A `mut` parameter is a variable the function may change; the
             # caller's variable gets its final value (docs/grammar.md §5).
             local.vars[param.name] = VarInfo(param_type, param.mutable, "local", level=self.level, binder=param)
+            self.declared[id(param)] = param
         for cond in function.where:
             if mentions_return(cond.expr):
                 result_env = Env(local)
@@ -1907,6 +2035,8 @@ class Checker:
             return self.check_function_call(field_type, callee, args, env, span)
         if name == "finalize" and isinstance(value_type, EnumTy) and self.enums[value_type.name].finalize:
             raise EllaError("a finalize method runs by itself when the value dies, so it can't be called", span)
+        if isinstance(value_type, EnumTy):
+            self.private(name, value_type.name, callee.span)
         self.methods[id(callee)] = name
         self.types[id(callee)] = method
         if 0 in method.mutable and not isinstance(receiver, MutArg):
@@ -2090,6 +2220,23 @@ class Checker:
             return I64
         return UNIT
 
+    def wrap(self, name: Name, arity: int, env: Env) -> Type:
+        """`print`, `eprint`, `len` or a constructor used as a value: a lambda that calls it, like `(_1) => Some(_1)`.
+
+        The lambda's types are inferred, so each use has its own: `map(xs,
+        Some)` makes Optionals of xs's items. It is kept in `wrappers`, for
+        the lowering to make into a function. (The interpreters' built-ins
+        and constructors are values already.)
+        """
+        span = name.span
+        params = tuple(Param(f"_{i}", None, span) for i in range(1, arity + 1))
+        call = Call(Name(name.name, span), tuple(Name(param.name, span) for param in params), span)
+        wrapper = Lambda(params, None, (), call, span)
+        self.wrappers[id(name)] = wrapper
+        t = self.check_lambda(wrapper, env, [], infer=True)
+        self.types[id(wrapper)] = t
+        return t
+
     def library_type(self, name: str, span: Span) -> FuncTy:
         """The type of a library function at one use: abs, min and max get their own T, which must be Num."""
         function = LIBRARY[name]
@@ -2134,7 +2281,7 @@ class Checker:
                 pass
             case NamePattern(name, span, mutable):
                 # A name is a variant (like `None`) if one is in scope, and otherwise a new variable.
-                info = env.lookup(name)
+                info = self.visible(name, env, span)
                 if info is not None and info.kind == "variant":
                     if mutable:
                         raise EllaError(f"'mut' marks a variable, and '{name}' is a variant", span)
@@ -2145,6 +2292,8 @@ class Checker:
                     self.kinds[id(pattern)] = "binding"
                     env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=pattern)
                     self.declared[id(pattern)] = pattern
+                    if mutable:
+                        self.mutable_vars.add(id(pattern))
             case LiteralPattern(value, span):
                 self.expect(literal_type(value), t, span, "this pattern")
             case RangePattern(low, high, _, span):
@@ -2173,7 +2322,7 @@ class Checker:
                     for node in pattern_names(alternative):
                         self.declared.pop(id(node), None)
             case VariantPattern(name, args, span):
-                info = env.lookup(name)
+                info = self.visible(name, env, span)
                 if info is None or info.kind not in ("variant", "constructor"):
                     raise EllaError(f"'{name}' isn't an enum variant", span)
                 enum_type, fields = self.instantiate(info.enum, name)
@@ -2221,6 +2370,17 @@ def names_used(node: object, inside_lambdas: bool = False) -> set[str]:
         case _ if dataclasses.is_dataclass(node) and not isinstance(node, type):
             return set().union(*(names_used(getattr(node, f.name), inside_lambdas) for f in dataclasses.fields(node)))
     return set()
+
+
+def nodes(node: object) -> Iterable[object]:
+    """Every syntax tree node in some syntax, itself included."""
+    if isinstance(node, tuple):
+        for item in node:
+            yield from nodes(item)
+    elif dataclasses.is_dataclass(node) and not isinstance(node, type | Span):
+        yield node
+        for f in dataclasses.fields(node):
+            yield from nodes(getattr(node, f.name))
 
 
 def start_of(node: object) -> Span:

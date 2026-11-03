@@ -613,7 +613,7 @@ def format_placement(module: Module) -> str:
                 if not allocates(instr):
                     continue
                 assert instr.dest is not None
-                site = f"{instr.span.line}:{instr.span.column}"
+                site = str(instr.span)
                 region = f"@{instr.region}"
                 text = f"  {site:<8} {instr.op:<9} {region:<8} {show_type(instr.dest.type)}"
                 if level > 0 and region_level(instr.region) != level:

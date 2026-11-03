@@ -4,7 +4,7 @@ Each program is run five ways: by the tree-walking interpreter, through the
 IR, through the optimized IR, and as native code made from the plain and the
 optimized IR. All must give the expected output and error. This is what
 checks that lowering, optimization and code generation keep the program's
-meaning.
+meaning. A program of several modules is a directory with a `main.ella`.
 """
 
 import io
@@ -28,32 +28,33 @@ from ella.staging import prepare
 PROGRAMS = Path(__file__).parent / "programs"
 
 
-def run_tree(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+def run_tree(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Type check, then run with the tree-walking interpreter."""
-    program = parse(source)
-    program, checker = prepare(program, out)
+    program, checker = prepare(parse(path.read_text()), out, path)
     return Interpreter(out, checker, host=Host(io.BytesIO(stdin), args, err)).run(program)
 
 
-def run_ir(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+def run_ir(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Compile to IR and run it."""
-    return IRInterpreter(compile_program(source, out), out, Host(io.BytesIO(stdin), args, err)).run()
+    module = compile_program(path.read_text(), out, path)
+    return IRInterpreter(module, out, Host(io.BytesIO(stdin), args, err)).run()
 
 
-def run_optimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+def run_optimized(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
     """Compile to IR, optimize it, and run it."""
-    return IRInterpreter(optimize(compile_program(source, out)), out, Host(io.BytesIO(stdin), args, err)).run()
+    module = optimize(compile_program(path.read_text(), out, path))
+    return IRInterpreter(module, out, Host(io.BytesIO(stdin), args, err)).run()
 
 
-def run_native_unoptimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
-    return run_native(source, out, False, stdin, args, err)
+def run_native_unoptimized(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+    return run_native(path.read_text(), out, False, stdin, args, err, path)
 
 
-def run_native_optimized(source: str, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
-    return run_native(source, out, True, stdin, args, err)
+def run_native_optimized(path: Path, out: TextIO, err: TextIO, stdin: bytes, args: list[str]) -> int:
+    return run_native(path.read_text(), out, True, stdin, args, err, path)
 
 
-RUNNERS: dict[str, Callable[[str, TextIO, TextIO, bytes, list[str]], int]] = {
+RUNNERS: dict[str, Callable[[Path, TextIO, TextIO, bytes, list[str]], int]] = {
     "tree": run_tree,
     "ir": run_ir,
     "optimized": run_optimized,
@@ -63,7 +64,11 @@ RUNNERS: dict[str, Callable[[str, TextIO, TextIO, bytes, list[str]], int]] = {
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
-@pytest.mark.parametrize("path", sorted(PROGRAMS.glob("*.ella")), ids=lambda path: path.stem)
+@pytest.mark.parametrize(
+    "path",
+    sorted(PROGRAMS.glob("*.ella")) + sorted(PROGRAMS.glob("*/main.ella")),
+    ids=lambda path: path.parent.name if path.name == "main.ella" else path.stem,
+)
 def test_program(path: Path, runner: str) -> None:
     if runner.startswith("native") and shutil.which("gcc") is None:
         pytest.skip("native code needs gcc")
@@ -73,10 +78,10 @@ def test_program(path: Path, runner: str) -> None:
     expected_error = path.with_suffix(".err")
     if expected_error.exists():
         with pytest.raises(EllaError) as info:
-            RUNNERS[runner](path.read_text(), out, err, stdin, args)
+            RUNNERS[runner](path, out, err, stdin, args)
         assert str(info.value) == expected_error.read_text().strip()
     else:
-        status = RUNNERS[runner](path.read_text(), out, err, stdin, args)
+        status = RUNNERS[runner](path, out, err, stdin, args)
         expected_status = path.with_suffix(".status")
         assert status == (int(expected_status.read_text()) if expected_status.exists() else 0)
     assert out.getvalue() == path.with_suffix(".out").read_text()

@@ -131,7 +131,7 @@ constraint Measured
 struct Square
     side: f64
     area = (s: Square) -> f64 => s.side * s.side
-    name = (s: Square) -> str => "square"
+    name = (_s: Square) -> str => "square"
 
 # Any type with those methods meets the constraint: Shape and Square here.
 let report[T: Measured] = (xs: [T]) -> str =>

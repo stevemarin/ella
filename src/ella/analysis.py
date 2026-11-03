@@ -19,6 +19,16 @@ Unlike `ella FILE`, which stops at the first error, an analysis keeps going:
 Splices outside quotes are expanded only when everything else is right, as
 `prepare` would, to find errors in the code they make.
 
+A file is analyzed as the entry file of a program, linked with the modules
+it imports (ella.modules), found from its root: the directory between the
+file's and the editor's workspace folder they are found from
+(`find_root`). Their files are read from the editor's open documents if they are
+open, so that a change shows in the files that import it before it is
+saved. An error in an imported module is shown at the import line that
+leads to it. A file without `main` or other top-level code than
+definitions is taken to be a module, so its unused public functions, which
+other modules may use, aren't reported.
+
 A *symbol* is a name in the source (or an operator), with what the checker
 knows of it: text to show on hover (its type), where it is defined, and its
 kind for highlighting (a semantic token type, as LSP names them). Each comes
@@ -31,6 +41,7 @@ from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from ella.checker import (
     LIBRARY,
@@ -48,10 +59,10 @@ from ella.checker import (
     show_type,
     substitute,
 )
-from ella.lexer import KEYWORDS, EllaError, Span, Token, TokenKind, tokenize
+from ella.lexer import KEYWORDS, STD, EllaError, Span, Token, TokenKind, tokenize
+from ella.modules import LIBRARY_DIR, Linker, Module, find_root, module_name, prelude, read_file
 from ella.parser import parse_partial
-from ella.prelude import in_prelude, with_prelude
-from ella.staging import Expander, has_splices, parts, uses_staging
+from ella.staging import Expander, has_splices, uses_staging
 from ella.syntax import (
     Binary,
     Binding,
@@ -60,6 +71,8 @@ from ella.syntax import (
     EnumDef,
     Expr,
     If,
+    Let,
+    LetPattern,
     Loop,
     Match,
     Member,
@@ -67,11 +80,14 @@ from ella.syntax import (
     NamedType,
     NamePattern,
     Param,
+    Program,
     Quote,
     Splice,
     Try,
     Unary,
     VariantPattern,
+    bare_name,
+    parts,
     show,
 )
 
@@ -91,6 +107,7 @@ TOKEN_TYPES = (
     "interface",
     "type",
     "typeParameter",
+    "namespace",
 )
 TOKEN_MODIFIERS = ("declaration", "readonly", "defaultLibrary")
 
@@ -109,9 +126,12 @@ class Problem:
 
 @dataclass(frozen=True, slots=True)
 class Location:
+    """A place in the file being analyzed, or in another one (`file`, its path)."""
+
     line: int
     column: int
     length: int
+    file: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,10 +170,20 @@ class Completion:
     detail: str = ""
 
 
-def analyze(source: str) -> Analysis:
+@dataclass(frozen=True, slots=True)
+class Place:
+    """Where the source being analyzed is: its file, if it has one, the root its imports are found from,
+    and the text of the files the editor has open, by path."""
+
+    path: str | None = None
+    root: str | None = None
+    files: dict[str, str] | None = None
+
+
+def analyze(source: str, place: Place | None = None) -> Analysis:
     """The errors in a program, and its symbols."""
     try:
-        checked = Checked(source, expand=True)
+        checked = Checked(source, expand=True, place=place or Place())
     except EllaError as error:
         return Analysis([problem(error)], None)
     except RecursionError:
@@ -161,8 +191,9 @@ def analyze(source: str) -> Analysis:
     return Analysis(checked.problems, Symbols(checked).find())
 
 
-def complete(source: str, line: int, column: int) -> list[Completion]:
-    """What could be typed at `line` and `column`: the names in scope there, or the fields and methods after `.`."""
+def complete(source: str, line: int, column: int, place: Place | None = None) -> list[Completion]:
+    """What could be typed at `line` and `column`: the names in scope there, or the fields and methods after `.`,
+    or the names of a module after its name and `.`."""
     lines = source.split("\n")
     if not 1 <= line <= len(lines):
         return []
@@ -173,9 +204,12 @@ def complete(source: str, line: int, column: int) -> list[Completion]:
         # Nothing typed yet: put a name there to find the scope of.
         lines[line - 1] = before + PLACEHOLDER + lines[line - 1][column - 1 :]
     try:
-        checked = Checked("\n".join(lines), expand=False)
+        checked = Checked("\n".join(lines), expand=False, place=place or Place())
     except EllaError, RecursionError:
         return keywords()
+    path = re.search(r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.$", before[: start - 1])
+    if path is not None and isinstance(checked.linker.entry.bindings.get(path.group(1)), Module):
+        return checked.module_names(checked.linker.entry.bindings[path.group(1)])  # type: ignore[arg-type]
     token = checked.token_at(Span(line, start))
     if token is not None and token.kind is TokenKind.KEYWORD:
         return keywords()
@@ -207,7 +241,12 @@ def follow_edits(symbols: list[Symbol], old: str, new: str) -> list[Symbol]:
             continue
         where = replace(symbol.where, line=moved[symbol.where.line])
         target = symbol.definition
-        definition = None if target is None or target.line not in moved else replace(target, line=moved[target.line])
+        if target is not None and target.file:  # in another file
+            definition: Location | None = target
+        else:
+            definition = (
+                None if target is None or target.line not in moved else replace(target, line=moved[target.line])
+            )
         result.append(replace(symbol, where=where, definition=definition))
     return result
 
@@ -271,30 +310,109 @@ def fix(source: str, error: EllaError) -> str:
 class Checked:
     """A program, parsed and checked as far as possible."""
 
-    def __init__(self, source: str, expand: bool) -> None:
+    def __init__(self, source: str, expand: bool, place: Place) -> None:
         self.tokens, source, lex_errors = tokenize_leniently(source)
         self.starts = {(token.span.line, token.span.column): i for i, token in enumerate(self.tokens)}
-        self.program, parse_errors = parse_partial(self.tokens, source)
+        parsed, parse_errors = parse_partial(self.tokens, source)
+        path = Path(place.path) if place.path is not None else None
+        root = Path(place.root) if place.root is not None else None
+        files = place.files or {}
+
+        def read(file: Path) -> str | None:
+            return files[str(file)] if str(file) in files else read_file(file)
+
+        if path is not None and root is not None:
+            root = find_root(path, parsed.imports, root, read)
+        # Every prelude module is linked in, so that completions offer its names.
+        link_errors: list[EllaError] = []
+        self.linker = Linker(path, read, root, every=True, errors=link_errors)
+        self.root = self.linker.root
+        self.linked = self.linker.link(parsed)
+        # This file's code is last in the linked program; the checker's tables are about it.
+        self.program = replace(parsed, body=self.linked.body[len(self.linked.body) - len(parsed.body) :])
         self.checker = Checker()
         self.checker.errors = []
-        # Every prelude definition is checked, so that completions offer them.
-        program = with_prelude(self.program, every=True)
-        expander = Expander(program, self.checker, io.StringIO()) if uses_staging(program) else None
-        self.checker.check_program(program)
+        self.checker.library = path is not None and is_library(parsed)
+        expander = Expander(self.linked, self.checker, io.StringIO()) if uses_staging(self.linked) else None
+        self.checker.check_program(self.linked)
 
         # Errors in a top-level line with a parse error likely follow from it.
         lines = self.top_level_lines()
         broken = {bisect_right(lines, error.span.line) for error in parse_errors}
-        errors = lex_errors + parse_errors
-        errors += [error for error in self.checker.errors if bisect_right(lines, error.span.line) not in broken]
-        if expand and not errors and expander is not None and has_splices(self.program):
+        errors = lex_errors + parse_errors + link_errors
+        errors += [
+            error
+            for error in self.checker.errors
+            if error.span.file or bisect_right(lines, error.span.line) not in broken
+        ]
+        if expand and not errors and expander is not None and has_splices(self.linked):
             try:
                 check(expander.expand_program())
             except EllaError as error:
                 errors.append(error)
-        problems = [problem(error) for error in errors]
-        problems += [problem(warning, True) for warning in self.checker.warnings]
-        self.problems = sorted(dict.fromkeys(problems), key=lambda p: (p.line, p.column))
+        problems = [self.problem(error) for error in errors]
+        problems += [problem(warning, True) for warning in self.checker.warnings if not warning.span.file]
+        self.problems = sorted(dict.fromkeys(p for p in problems if p is not None), key=lambda p: (p.line, p.column))
+
+    def problem(self, error: EllaError) -> Problem | None:
+        """An error, shown in this file: one in an imported module is shown at the import line it comes through."""
+        if not error.span.file:
+            return problem(error)
+        if error.span.file.startswith(STD):
+            return None  # the standard library's own code (it has no errors)
+        line = self.import_line(module_name(error.span.file))
+        return Problem(f"{error.span}: {error.message}", line.line, line.column)
+
+    def import_line(self, name: str) -> Span:
+        """Where this file imports the module `name`, directly or through other modules."""
+
+        def needs(module: Module, seen: set[str]) -> bool:
+            if module.name == name:
+                return True
+            seen.add(module.name)
+            targets = [t if isinstance(t, Module) else self.linker.files.get(t.file) for t in module.bindings.values()]
+            return any(t is not None and t.name not in seen and needs(t, seen) for t in targets)
+
+        for key, target in self.linker.entry.bindings.items():
+            module = target if isinstance(target, Module) else self.linker.files.get(target.file)
+            if module is not None and needs(module, set()):
+                return self.linker.entry.uses[key].span
+        return self.program.imports[0].span if self.program.imports else Span(1, 1)
+
+    def file_path(self, file: str) -> str:
+        """The path of a file of the program, from its name in spans."""
+        if file.startswith(STD + "/"):
+            return str(LIBRARY_DIR / file.removeprefix(STD + "/"))
+        return str((self.root or Path()) / file)
+
+    def locate(self, span: Span, name: str) -> Location | None:
+        """Where something named `name` is, at `span`: at its token in this file, or in another file."""
+        if span.file:
+            return Location(span.line, span.column, len(bare_name(name)), self.file_path(span.file))
+        token = self.token_at(span)
+        return None if token is None else location(token)
+
+    def module_names(self, module: Module) -> list[Completion]:
+        """The public names of a module, after its name and `.`."""
+        found = []
+        for name, item in module.top.items():
+            if name.startswith("_"):
+                continue
+            info = self.checker.globals.vars.get(item.name)
+            kind = {"enum": "enum", "struct": "struct", "variant": "enumMember", "constraint": "interface"}
+            if item.kind in kind:
+                found.append(Completion(name, kind[item.kind]))
+            else:
+                detail = "" if info is None else describe(name, info)
+                found.append(Completion(name, "function" if item.kind == "function" else "variable", detail))
+        return found
+
+    def shown(self, name: str) -> str | None:
+        """How a top-level name is written in this file, or None if it can't be: the prelude's without their module."""
+        if "." not in name:
+            return name
+        item = prelude().get(bare_name(name))
+        return bare_name(name) if item is not None and item.name == name else None
 
     def top_level_lines(self) -> list[int]:
         """The lines where top-level lines of the program start."""
@@ -330,16 +448,38 @@ class Checked:
             for var, info in env.vars.items():
                 bound = getattr(info.binder, "span", None)
                 later = info.kind == "local" and bound is not None and (bound.line, bound.column) > (line, column)
-                if var in seen or var in ("return", PLACEHOLDER) or later:
+                shown = self.shown(var) if env.parent is None else var
+                if shown is None or shown in seen or shown in ("return", PLACEHOLDER) or later:
                     continue
-                seen.add(var)
-                found.append(Completion(var, name_kind(info, self.checker), describe(var, info)))
+                seen.add(shown)
+                found.append(Completion(shown, name_kind(info, self.checker), describe(shown, info)))
             env = env.parent
-        for enum in self.checker.enums:
-            if enum not in seen:
-                found.append(Completion(enum, "struct" if self.checker.enums[enum].struct else "enum"))
-        found += [Completion(constraint, "interface", "constraint") for constraint in self.checker.constraints]
+        for key, target in self.linker.entry.bindings.items():
+            if key not in seen:
+                seen.add(key)
+                found.append(Completion(key, "namespace", "module") if isinstance(target, Module) else self.item(key))
+        for enum, enum_info in self.checker.enums.items():
+            shown = self.shown(enum)
+            if shown is not None and shown not in seen:
+                found.append(Completion(shown, "struct" if enum_info.struct else "enum"))
+        found += [
+            Completion(shown, "interface", "constraint")
+            for constraint in self.checker.constraints
+            if (shown := self.shown(constraint)) is not None
+        ]
         return found
+
+    def item(self, key: str) -> Completion:
+        """An imported item, by the name the import gives it."""
+        target = self.linker.entry.bindings[key]
+        assert not isinstance(target, Module)
+        kinds = {"enum": "enum", "struct": "struct", "variant": "enumMember", "constraint": "interface"}
+        info = self.checker.globals.vars.get(target.name)
+        if target.kind in kinds:
+            return Completion(key, kinds[target.kind])
+        return Completion(
+            key, "function" if target.kind == "function" else "variable", describe(key, info) if info else ""
+        )
 
     def members(self, member: Member) -> list[Completion]:
         """The fields and methods of the value before `.`."""
@@ -406,7 +546,7 @@ class Symbols:
         # Where the program defines each enum, struct and constraint.
         self.enums: dict[str, EnumDef] = {}
         self.constraints: dict[str, ConstraintDef] = {}
-        for node in walk(checked.program):
+        for node in walk(checked.linked):
             if isinstance(node, EnumDef):
                 self.enums.setdefault(node.name, node)
             elif isinstance(node, ConstraintDef):
@@ -414,6 +554,8 @@ class Symbols:
 
     def find(self) -> list[Symbol]:
         program = self.checked.program
+        for line in program.imports:
+            self.import_line(line.path, line.span)
         for node in walk(program):
             self.named(node)
         # Operators and keyword expressions show their type, where nothing else is.
@@ -502,10 +644,23 @@ class Symbols:
     def show_annotation(self, param: Param) -> str:
         return "?" if param.type is None else show(param.type)
 
+    def import_line(self, path: tuple[str, ...], span: Span) -> None:
+        """The names in an import line: each module in its path, and an item at its end."""
+        i = self.checked.starts.get((span.line, span.column))
+        if i is None:
+            return
+        names = [t for t in self.checked.tokens[i + 1 : i + 2 * len(path)] if t.kind is TokenKind.NAME]
+        for n, token in enumerate(names):
+            name = ".".join(path[: n + 1])
+            module = self.checked.linker.modules.get(name) or self.checked.linker.libraries.get(name)
+            if module is not None:
+                where = Location(1, 1, 0, self.checked.file_path(module.file))
+                self.add(token, f"module {module.name}", "namespace", (), where)
+
     def modifiers(self, info: VarInfo) -> tuple[str, ...]:
         if info.kind == "builtin" or (info.kind in ("variant", "constructor") and info.enum in BUILTIN_ENUMS):
             return ("defaultLibrary",)
-        if in_prelude(info.binder):
+        if in_library(info.binder):
             return ("defaultLibrary", "readonly")
         return () if info.mutable else ("readonly",)
 
@@ -513,9 +668,8 @@ class Symbols:
         """Where a name is defined: its `let`, parameter or pattern, or its variant."""
         if info.kind in ("variant", "constructor"):
             return self.variant_location(info.enum, name)
-        if isinstance(info.binder, Binding | Param | NamePattern) and not in_prelude(info.binder):
-            token = self.checked.token_at(info.binder.span)
-            return None if token is None else location(token)
+        if isinstance(info.binder, Binding | Param | NamePattern):
+            return self.checked.locate(info.binder.span, info.binder.name)
         return None
 
     def variant_text(self, enum: str, variant: str) -> str:
@@ -535,14 +689,15 @@ class Symbols:
             return None
         for v in definition.variants:
             if v.name == variant:
-                token = self.checked.token_at(v.span)
-                return None if token is None else location(token)
+                return self.checked.locate(v.span, v.name)
         return None
 
     def enum_location(self, enum: str) -> Location | None:
         definition = self.enums.get(enum)
         if definition is None:
             return None
+        if definition.span.file:
+            return self.checked.locate(definition.variants[0].span if definition.struct else definition.span, enum)
         token = self.checked.after(definition.span)
         return None if token is None else location(token)
 
@@ -623,14 +778,12 @@ class Symbols:
             case EnumTy(enum) if enum in self.enums:
                 for method in self.enums[enum].methods:
                     if method.name == name:
-                        token = self.checked.token_at(method.span)
-                        return None if token is None else location(token)
+                        return self.checked.locate(method.span, name)
             case ParamTy(_, constraints):
                 for constraint in sorted(constraints):
                     for param in self.constraints[constraint].methods if constraint in self.constraints else ():
                         if param.name == name:
-                            token = self.checked.token_at(param.span)
-                            return None if token is None else location(token)
+                            return self.checked.locate(param.span, name)
         return None
 
     def field_location(self, enum: str, field: str) -> Location | None:
@@ -638,9 +791,36 @@ class Symbols:
         if definition is None or field not in definition.field_names:
             return None
         texpr = definition.variants[0].fields[definition.field_names.index(field)]
+        if texpr.span.file:  # the field's name is at the start of its line, before its type
+            return Location(
+                texpr.span.line,
+                texpr.span.column - len(field) - 2,
+                len(field),
+                self.checked.file_path(texpr.span.file),
+            )
         i = self.checked.starts.get((texpr.span.line, texpr.span.column))
         return None if i is None or i < 2 else location(self.checked.tokens[i - 2])
 
 
 def location(token: Token) -> Location:
     return Location(token.span.line, token.span.column, len(token.text))
+
+
+def in_library(node: object) -> bool:
+    """Whether a syntax tree node (a name's binder, say) is in the standard library."""
+    span = getattr(node, "span", None)
+    return isinstance(span, Span) and span.file.startswith(STD)
+
+
+def is_library(program: Program) -> bool:
+    """Whether a file seems to be a module of a program rather than its entry file: it has no
+    `main`, and nothing at the top level but definitions."""
+    for expr in program.body:
+        match expr:
+            case Let(bindings) if any(b.name == "main" for b in bindings):
+                return False
+            case Let() | LetPattern() | EnumDef() | ConstraintDef():
+                continue
+            case _:
+                return False
+    return True

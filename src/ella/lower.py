@@ -74,6 +74,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from itertools import count
+from pathlib import Path
 from typing import TextIO
 
 from ella.checker import (
@@ -98,6 +99,7 @@ from ella.checker import (
     has_pool,
     is_nocopy,
     literal_type,
+    names_used,
     place_root,
     show_type,
     substitute,
@@ -209,13 +211,14 @@ SELF = "<self>"
 CALLS = "<calls>"
 
 
-def compile_program(source: str, out: TextIO | None = None) -> Module:
+def compile_program(source: str, out: TextIO | None = None, path: Path | None = None) -> Module:
     """Parse, type check and lower a program, and verify the IR. Raises EllaError.
 
     Splices outside quotes run first, while compiling (see ella.staging);
-    what they print goes to `out`.
+    what they print goes to `out`. `path` is the program's file, which its
+    imports are found from.
     """
-    program, checker = prepare(parse(source), out)
+    program, checker = prepare(parse(source), out, path)
     module = Lowerer(checker).lower_program(program)
     verify(module)
     return module
@@ -681,10 +684,12 @@ class Lowerer:
         for type_name, info in self.module.enums.items():
             if info.finalize:
                 self.specialize(info.finalize, (), program.span)
-        # Top-level functions exist from the start (docs/grammar.md §3).
+        # Top-level functions exist from the start (docs/grammar.md §3). Those
+        # of other modules than the entry file that nothing uses are left out.
         hoisted: dict[int, Value] = {}
+        unused = unused_functions(program)
         for expr in program.body:
-            if isinstance(expr, Let) and expr.bindings[0].type_params:
+            if isinstance(expr, Let) and (expr.bindings[0].type_params or id(expr) in unused):
                 continue
             if isinstance(expr, Let) and isinstance(expr.value, Lambda):
                 function = self.lower_lambda(expr.value, [b.name for b in expr.bindings], expr.span, "global")
@@ -695,7 +700,7 @@ class Lowerer:
         # How many top-level `let`s bind each name.
         lets = Counter(b.name for expr in program.body if isinstance(expr, Let) for b in expr.bindings)
         for expr in program.body:
-            if isinstance(expr, Let) and expr.bindings[0].type_params:
+            if isinstance(expr, Let) and (expr.bindings[0].type_params or id(expr) in unused):
                 continue
             if isinstance(expr, Let) and id(expr) in hoisted:
                 # Bind it again where its `let` is if the name could hold
@@ -843,6 +848,13 @@ class Lowerer:
                 kind = self.checker.kinds[id(expr)]
                 if kind == "variant":
                     return self.emit("variant", self.type_of(expr), [], span, name, region=dest)
+                if (wrapper := self.checker.wrappers.get(id(expr))) is not None:
+                    # `print`, `len` or a constructor as a value: a lambda that calls it, which captures nothing.
+                    scopes, self.scopes = self.scopes, []
+                    try:
+                        return self.lower_lambda(wrapper, [], span, dest)
+                    finally:
+                        self.scopes = scopes
                 if id(expr) in self.checker.instances:
                     args = tuple(self.concrete(arg) for arg in self.checker.instances[id(expr)])
                     function = self.specialize(name, args, span)
@@ -1685,6 +1697,32 @@ class Lowerer:
 
 
 # Finding what code does, for the decisions above
+
+
+def unused_functions(program: Program) -> set[int]:
+    """The top-level functions of modules other than the entry file that nothing in the program uses, by `let`.
+
+    Linking (ella.modules) brings in whole modules, the prelude's too, so
+    this keeps their unused functions out of the IR. A function is used if
+    code other than such functions uses its name (in a quote too), or a
+    used function does.
+    """
+    functions = {
+        binding.name: expr
+        for expr in program.body
+        if isinstance(expr, Let) and isinstance(expr.value, Lambda) and expr.span.file
+        for binding in expr.bindings
+    }
+    others = [expr for expr in program.body if not any(expr is f for f in functions.values())]
+    wanted = set().union(*(names_used(expr, inside_lambdas=True) for expr in others))
+    used: set[str] = set()
+    while wanted:
+        name = wanted.pop()
+        if name not in used:
+            used.add(name)
+            if name in functions:
+                wanted |= names_used(functions[name].value, inside_lambdas=True)
+    return {id(expr) for expr in functions.values() if not any(b.name in used for b in expr.bindings)}
 
 
 def type_splices(node: object) -> list[TypeSplice]:

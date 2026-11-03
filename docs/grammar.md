@@ -50,14 +50,14 @@ identifiers, not keywords.
 ### Keywords
 
 ```text
-and         assert      break       case        comptime    constraint
-continue    else        enum        false       for         if
-import      in          let         loop        match       mut
-nocopy      not         or          quote       return      struct
-then        true        type        where       while
+and         as          assert      break       case        comptime
+constraint  continue    else        enum        false       for
+if          import      in          let         loop        match
+mut         nocopy      not         or          quote       return
+struct      then        true        type        where       while
 ```
 
-Reserved for later, not yet given a grammar: `comptime`, `import`.
+Reserved for later, not yet given a grammar: `comptime`.
 
 ### Labels
 
@@ -201,7 +201,10 @@ There are no colons at the ends of block-opening lines.
 
 ## 3. Program structure
 
-A source file is a sequence of top-level expressions.
+A source file is a *module*: its `import` lines
+([below](#modules-and-imports-provisional-syntax)), then a sequence of
+top-level expressions. A program is the file `ella` is given (the *entry
+file*) and the modules it imports, directly or not.
 
 1. Top-level `let` names are visible throughout the file, regardless of order.
    This is what lets top-level functions call each other in any order.
@@ -212,7 +215,8 @@ A source file is a sequence of top-level expressions.
    `let`, because functions anywhere in the file may refer to it. (Local
    names may be rebound with a different type.)
 3. The top-level expressions run in order, like a script.
-4. Afterwards, if the file defines a top-level `main`, it is called.
+4. Afterwards, if the entry file defines a top-level `main`, it is called.
+   (In other modules, `main` is an ordinary function.)
    `main` has type `() -> ()`, or `() -> i64` to give the program's exit
    status, which must be from 0 to 255 (anything else is a run-time error).
    Without it the status is 0, and a run-time error makes it 1.
@@ -220,6 +224,90 @@ A source file is a sequence of top-level expressions.
    program's command-line arguments are `args()` ([§10](#10-built-ins)).
 5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
    structs and enums with methods, can only be defined at the top level.
+
+### Modules and imports **(provisional syntax)**
+
+A file is a module, named by its path from the *root* without `.ella`,
+with `.` between directories: `geo/poly.ella` is the module `geo.poly`.
+The root is the entry file's directory. An editor, which may show any
+file of a program, takes as root the directory, from the file's up to the
+workspace folder, that the file's imports are found from. A directory's own module is the file of the same name beside
+it: `geo.ella` is the module `geo`, and `geo/poly.ella` is below it. A
+directory needn't have one. Each part of a module's name must be an
+identifier.
+
+```ella
+import geo                 # geo.ella
+import geo.poly            # geo/poly.ella
+import geo.poly as p       # the same module, named p here
+import geo.Shape as Shape  # one item of geo
+
+let main = () -> () =>
+    let s = geo.Circle(1.0)
+    print(geo.area(s), p.perimeter([]), geo.poly.perimeter([]))
+```
+
+* `import` lines come first in a file, before any other line. An import
+  names a module, or a public item of one (a top-level variable or
+  function, a struct, an enum or a constraint): `import geo.Shape`.
+* An import binds its whole path: after `import geo.poly`, the module's
+  names are `geo.poly.perimeter`, and so on. It doesn't bind `geo`'s own
+  names; that needs `import geo` as well. `as` gives the module or item
+  a name of its own instead: `p.perimeter`, or `Shape`.
+* An enum's variants come with it, named alongside it: with `import geo`,
+  they are `geo.Circle`, ... (in patterns too: `case geo.Circle(r)`), as
+  they are with `import geo.Shape`. An enum imported with `as` brings
+  its variants as bare names: after `import geo.Shape as Shape`, they
+  are `Circle`, `Rect` and `Empty`. A struct's name is its constructor,
+  so `geo.Point(1.0, 2.0)` makes one and `case geo.Point(x, y)` matches
+  one.
+* Imported types and constraints are named the same way in types:
+  `geo.Point`, `p.Pair[i64]`, `[T: geo.Ring]`.
+* Methods come with their type: `s.area()` works wherever `s` is a
+  `geo.Shape`, even in a module that doesn't import `geo`.
+* A module isn't a value: `geo` alone, or `print(geo.poly)`, is an
+  error. Imports aren't passed on: a module that imports `geo` doesn't
+  give its importers `geo`'s names.
+* It is an error for two imports, or an import and a top-level
+  definition, to bind the same name (or a top-level definition to have
+  the name an import's path starts with). A local variable can shadow an
+  imported name, as it can any top-level name.
+* A top-level variable of another module can be read but not changed:
+  it can't be assigned or passed as `mut`, even if it is `let mut`.
+* Imports are found first from the root, then in the standard library
+  ([§10](#the-prelude)). A module of the program with the name of a
+  library module is used instead of it by imports, with a warning (the
+  prelude's names still come from the library).
+* Imports can't form a cycle (`a` imports `b`, which imports `a`); the
+  error names the modules in it.
+
+**Private names.** A top-level name, method, field or variant that starts
+with `_` is *private* to its module and the modules below it: `_helper`
+in `geo.ella` can be used in `geo.ella`, `geo/poly.ella` and
+`geo/poly/edges.ella`, but not in `main.ella`, nor in `geo.ella` if it is
+defined in `geo/poly.ella`. Everything else is public.
+
+* Outside, a struct with a private field can't be made with its
+  constructor or matched by a pattern that destructures it (`Point(x,
+  y)`), and the field can't be named. Making one is up to the module's
+  functions (`new_map()`). `==` and the text form still look at every
+  field.
+* Outside, a private variant can't be made or matched, so a `match` there
+  over its enum needs a `_` case.
+* A public function may use private types in its type: callers can use
+  the values, but not name the types.
+
+**Running a program.** Each module is checked, and its top-level code
+runs, once. A module's imports come first, in the order of its `import`
+lines, each with its own imports before it, and the library modules
+whose prelude names it uses; then the module itself, as in rules 1 to 3
+above. Last comes the entry file, and then its `main`. A module's
+functions that nothing in the program uses aren't compiled.
+
+**Locations.** Errors and warnings give `file:line:column`. The file is
+the entry file as given to `ella`, other modules by their path from its
+directory, joined to it (`geo/poly.ella:12:5` for `ella main.ella`), and
+`<std>/maps.ella:136:13` for a library module.
 
 ## 4. Bindings and assignment
 
@@ -233,8 +321,9 @@ let mut count = 0
 
 * `let` introduces a new name in the enclosing block. Bindings are
   **immutable** unless marked `mut`.
-* The type annotation is optional where the type checker can infer it (for
-  now: from the value). Function parameters always need annotations.
+* The type annotation is optional where the type checker can infer it
+  (from the value, and how it is used). A top-level function's parameters
+  and result always need annotations ([§5](#5-functions)).
 * `let` is an expression; it evaluates to the bound value.
 * `let` inside a nested expression still binds in the enclosing block.
 
@@ -343,8 +432,17 @@ let fibonacci = (n: i64) -> i64 =>
 * Each parameter is `name: Type`. Parameters are immutable, except `mut`
   ones (below).
 * Functions take multiple arguments; there is no currying.
-* `-> ReturnType` is required for now. Untyped lambdas such as `x => x + 2`
-  parse, but the type checker rejects them until there is type inference.
+* A function bound at the top level, and a method, give their whole type:
+  every parameter's, and `-> ReturnType`. Their types are known before
+  anything is checked, which is what lets them call each other in any order.
+* Other lambdas may leave out any of these types, and the checker infers
+  them, mostly from where the lambda is passed: in `map(xs, (n) => n * 2)`,
+  `n` is an item of `xs`. A single parameter needs no parentheses then:
+  `xs |> filter(n => n > 0)`. A type nothing decides is an error where it
+  is needed (`can't tell the type of this value yet`), and a lambda's
+  types, once decided, are the same at every call: a local `let id = (x)
+  => x` can't be called with an `i64` and then a `str` (a generic
+  function can).
 * The body extends as far to the right as possible.
 * A `let` bound to a lambda can refer to its own name inside the body
   (automatic `let rec`). Combined with [§3](#3-program-structure), top-level
@@ -649,9 +747,9 @@ $(t)                             a type computed while compiling (§11)
 
 ### Type checking
 
-Programs are type checked before they run. Function parameters and results
-must be annotated; everything else is inferred from values and how they are
-used:
+Programs are type checked before they run. The parameters and results of
+top-level functions and methods must be annotated; everything else is
+inferred from values and how they are used:
 
 ```ella
 let x = 1 + 2            # i64
@@ -669,9 +767,10 @@ let found = None         # Optional of something; used as Optional[str] later
 * The bodies of `for`, `while` and `loop`, the `then` of an `if` without
   `else`, and all but the last line of a block can have any type; their
   values are discarded.
-* `print`, `len` and variant constructors like `Some` can only be called, not
-  used as values (for now). Library functions like `trim` can be both
-  ([§10](#10-built-ins)).
+* `print`, `eprint` and `len` are values too, taking one argument
+  (`map(xs, print)`), as are variant constructors (`map(xs, Some)`, or
+  `let make = Point`) and library functions like `trim`
+  ([§10](#10-built-ins)). The other built-ins can only be called.
 * Enums, structs and top-level functions can be generic.
 
 ### Warnings
@@ -684,8 +783,18 @@ editors show them.
 * A `match` case that can never match ([§6](#match)).
 * A local variable that is never used: a `let`, or a name in a pattern.
   A name that starts with `_`, like `_guard`, says that is on purpose (for
-  a value kept only for its finalizer, say). Parameters and top-level
-  names aren't reported.
+  a value kept only for its finalizer, say). The same goes for a
+  parameter that is never used.
+* A private top-level function ([§3](#modules-and-imports-provisional-syntax))
+  that is never used outside its own body. Public ones may be used by
+  other modules, so they aren't reported, except in the entry file, which
+  nothing imports (and other than `main`). Top-level variables aren't
+  reported.
+* An import that is never used.
+* A module of the program that has the name of a standard library
+  module, and so is used instead of it.
+* A `mut` local variable that never changes: nothing assigns to it,
+  passes it as `mut`, or calls a `mut` method on it.
 * Code that never runs, after a line that never finishes: `return`,
   `break`, `continue`, `exit(...)`, an `if` or `match` whose every branch
   is one of those, or a `loop` that never breaks. Only the first such line
@@ -1055,8 +1164,8 @@ Built-in functions (ordinary names, not keywords):
   ([§11](#types-as-values-and-generated-code)).
 
 The library: functions with fixed types. A program may use their names for
-its own variables. Unlike the other built-ins they are values too, so
-`apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
+its own variables. They are values too, as `print`, `eprint` and `len`
+are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 `let parse = parse_i64` work; such a value prints as `<function>`.
 
 | Function | Type | Gives |
@@ -1079,6 +1188,7 @@ its own variables. Unlike the other built-ins they are values too, so
 | `upper(s)`, `lower(s)` | `(str) -> str` | `s` with its ASCII letters in upper (or lower) case; other characters stay as they are |
 | `starts_with(s, part)`, `ends_with(s, part)` | `(str, str) -> bool` | whether `s` starts (or ends) with `part` |
 | `pad_left(s, width, fill)`, `pad_right(s, width, fill)` | `(str, i64, str) -> str` | `s` with copies of `fill`, which must be one character, before (or after) it to make it `width` characters long; `s` itself if it is that long already |
+| `hash(s)` | `(str) -> i64` | a number made from the characters of `s` (64-bit FNV-1a over its code points), the same in every run and backend |
 | `format_f64(x, digits)` | `(f64, i64) -> str` | `x` with `digits` decimals (from 0 to 100), rounded: `format_f64(2.5, 2)` is `"2.50"`; `nan`, `inf` and `-inf` as `print` writes them |
 | `env(name)` | `(str) -> Optional[str]` | the environment variable `name`; `None` if there is none |
 | `write_file(path, text)` | `(str, str) -> Result[(), Error]` | writes `text` to the file in UTF-8, replacing what it held, or gives why it can't |
@@ -1147,23 +1257,67 @@ haven't been checked.
 
 ### The prelude
 
-A few library functions are written in Ella itself, in the *prelude*
-(src/ella/prelude.py): functions that take other functions, or work on
-lists of any type. A program sees them as if it had defined them at its
-start, unless it defines the same name at the top level itself.
+A few library functions, and a type, are written in Ella itself, in the
+modules of the *standard library* (src/ella/lib/): functions that take
+other functions, or work on lists of any type. Its modules are `lists`
+(every function below but `new_map`), `maps` (`Map` and `new_map`) and
+`math` (`pi`). Their public names are the *prelude*: every module sees
+them without importing them, unless it defines or imports the same name
+itself. They can also be imported like any module
+([§3](#modules-and-imports-provisional-syntax)): `import maps`, then
+`maps.new_map()`.
 
 | Name | Type | Gives |
 | --- | --- | --- |
 | `reverse(xs)` | `[T] ([T]) -> [T]` | the items of `xs` in the opposite order |
 | `sort(xs)` | `[T: Ord] ([T]) -> [T]` | the items of `xs` from smallest to largest, by `<`; equal items keep their order |
+| `sort_by(xs, key)` | `[T, K: Ord] ([T], (T) -> K) -> [T]` | the items of `xs` sorted by their keys, as `sort` sorts; `key` is called once per item, in order |
 | `map(xs, f)` | `[T, U] ([T], (T) -> U) -> [U]` | `f` of each item of `xs`, called in order |
 | `filter(xs, keep)` | `[T] ([T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
+| `sum(xs, start)` | `[T: Add] ([T], T) -> T` | `start + xs[0] + xs[1] + ...`: `sum(xs, 0)`, `sum(prices, 0.0)`, `sum(words, "")` |
+| `any(xs, test)`, `all(xs, test)` | `[T] ([T], (T) -> bool) -> bool` | whether `test` is true for some (or every) item; it is called in order, until the answer is known |
+| `zip(xs, ys)` | `[T, U] ([T], [U]) -> [(T, U)]` | pairs of the items at each position, as many as the shorter list has |
+| `enumerate(xs)` | `[T] ([T]) -> [(i64, T)]` | each item with its position: `[(0, xs[0]), (1, xs[1]), ...]` |
+| `range(start, stop, step)` | `(i64, i64, i64) -> [i64]` | `start`, `start + step`, ... while before `stop` (below it, or above it if `step` is negative); `step` can't be 0 |
+| `new_map()` | `[K: Eq, V] () -> Map[K, V]` | an empty `Map` (below) |
 | `pi` | `f64` | 3.141592653589793 |
 
 They are ordinary generic functions ([§9](#generic-functions-provisional-syntax)),
 so they are values too, and a type given to `sort` must be `Ord`: a
 number, a string, or a struct or enum with a `compare` method. With pipes
 they read left to right: `words |> filter(long) |> map(upper)`.
+
+`Map[K, V]` is a struct ([§9](#structs-provisional-syntax)) mapping keys to
+values, kept in the order the keys were first set, with protocol methods
+([§9](#methods-provisional-syntax)):
+
+```ella
+let mut ages = new_map()       # a Map[str, i64], once it is used
+ages["ann"] = 31               # set
+ages["ann"] += 1
+print(ages["ann"], len(ages))  # 32 1
+print("bob" in ages)           # false
+for name in ages               # the keys, in order
+    print(name, ages[name])
+```
+
+* `m[k]` is the value of key `k`, and stops the program if there is none
+  (`precondition failed: key in m`). `m.lookup(k)` gives an `Optional`
+  instead.
+* `mut m.remove(k)` removes a key, giving its value if it had one.
+* `m.keys()`, `m.values()` and `m.items()` give lists of the keys, the
+  values, and `(key, value)` pairs, in order.
+* Keys are told apart by their text forms (`"{{key}}"`), which are hashed
+  with `hash`: they are the same key exactly when they print the same. (So
+  `0.0` and `-0.0` are different keys, though they are `==`.)
+* A `Map` is a value like any other: it is copied, compared with `==` (its
+  order too) and printed field by field. Its fields are private: they are
+  how it works inside.
+
+Library modules are modules like the program's own, so the program's
+names (its own `len`, or a variant `i`) don't change what their code
+means. An error in their code, such as a failed precondition, gives a
+location in the library module: `<std>/maps.ella:12:5`.
 
 ## 11. Stages
 
@@ -1184,7 +1338,8 @@ print(run(power(2, quote 5)))     # 25
   one stage later, and a splice one stage earlier. They nest without limit:
   `quote quote 1` is code that makes code.
 * `run(c)` runs code at the stage it is used in, and gives its value. Code
-  is checked when it is run; it can use the program's top-level names.
+  is checked when it is run; the top-level names in it mean what they
+  mean where it was quoted (below).
 * A splice outside any quote is stage -1: it runs **while compiling**, and
   the code it gives becomes part of the program. A splice inside that one
   runs earlier still, making the code that runs while compiling:
@@ -1194,7 +1349,12 @@ print(run(power(2, quote 5)))     # 25
   ```
 
   What compile-time code prints comes out before the program runs.
-  `ella --expanded` shows a program with its splices expanded.
+  `ella --expanded` shows a program with its splices expanded: the
+  entry file, and each other module of the program that has splices,
+  in the order they run. With more than one, each comes after a comment
+  line with its file (`# geo/poly.ella`). Library modules aren't shown.
+* Compile-time code can call the functions of the modules its module
+  imports, since they are checked (and their own splices expanded) first.
 * A variable belongs to the stage it is bound in. It can be used at a later
   stage, where its value is carried into the code as a constant: with
   `let n = 3`, `quote n + 1` is `3 + 1`. Only data can be carried, not
@@ -1205,6 +1365,10 @@ print(run(power(2, quote 5)))     # 25
   compile-time code can't read them.
 * Variables bound inside quoted code are renamed when the code is built
   (`y` becomes `y.1`), so spliced code never captures the wrong variable.
+* A top-level name in quoted code means what it means in the module where
+  the quote is written, even a private one, wherever the code is spliced
+  or run: `quote _helper(x)` in `geo.ella` still calls `geo`'s `_helper`
+  when `main.ella` splices it in.
 * `return`, `break` and `continue` can't leave a quote or a splice.
 * A quote inside a function that is defined in a splice can't use the
   variables of the quote the splice is in, for now: the compiler has no
@@ -1276,8 +1440,8 @@ print(s)                                  # Stack[i64]([3], 1)
 * `new_struct(name, fields, types)` makes a struct type with those field
   names and types. Its name is what makes it the same type: asking again
   for the same name with the same fields gives the same type, so
-  `$(Stack(type i64))` is one type wherever it is written. A different
-  struct with the same name is an error.
+  `$(Stack(type i64))` is one type wherever it is written, in any
+  module. A different struct with the same name is an error.
 * `type ...` builds a type from type values: `type [$t]` is a list of the
   type `t` holds. (`type` is like a quote of a type, so `$t` in it is a value
   of the current stage.)
@@ -1300,7 +1464,9 @@ Informal EBNF. `NEWLINE`, `INDENT`, `DEDENT` are layout tokens from
 [§8](#precedence) rather than encoded here; the parser is a Pratt parser.
 
 ```ebnf
-program     = { expr NEWLINE } EOF ;
+program     = { import NEWLINE } { expr NEWLINE } EOF ;
+import      = "import" path [ "as" IDENT ] ;
+path        = IDENT { "." IDENT } ;              (* a module, or an item of one: geo.poly, geo.Shape *)
 block       = NEWLINE INDENT expr { NEWLINE expr } NEWLINE DEDENT ;
 body        = expr | block ;
 
@@ -1310,14 +1476,14 @@ expr        = let | assignment | lambda | if | match | for | while | loop
 
 let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr
             | "let" [ "mut" ] pattern [ ":" type ] "=" expr ;  (* destructuring: the pattern starts with "(" or IDENT "(" *)
-type_param  = IDENT [ ":" IDENT { "+" IDENT } ] ;    (* built-in or user-defined constraints *)
+type_param  = IDENT [ ":" path { "+" path } ] ;      (* built-in or user-defined constraints *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
 target      = IDENT | operator_expr "[" expr "]" | operator_expr "." IDENT ;
 
-lambda      = "(" [ param { "," param } [ "," ] ] ")" "->" type "=>" lambda_body
-            | IDENT "=>" body ;                  (* untyped; rejected for now *)
-param       = [ "mut" ] IDENT ":" type ;
+lambda      = "(" [ param { "," param } [ "," ] ] ")" [ "->" type ] "=>" lambda_body
+            | IDENT "=>" body ;                  (* one parameter, of an inferred type *)
+param       = "mut" IDENT ":" type | IDENT [ ":" type ] ;  (* types inferred (§5) *)
 lambda_body = expr
             | NEWLINE INDENT [ where NEWLINE ] expr { NEWLINE expr } NEWLINE DEDENT ;
 where       = "where" block ;
@@ -1368,10 +1534,10 @@ string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING
 
 pattern     = pattern_atom { "|" pattern_atom } ;
 pattern_atom = "_" | [ "mut" ] IDENT | literal | literal ( ".." | "..=" ) literal
-            | IDENT "(" pattern { "," pattern } ")"
+            | path [ "(" pattern { "," pattern } ")" ]  (* a dotted path is a variant or struct: geo.Circle(r) *)
             | "(" pattern "," [ pattern { "," pattern } ] ")" ;
 
-type        = IDENT [ "[" type { "," type } "]" ]
+type        = path [ "[" type { "," type } "]" ]  (* geo.Point, p.Pair[i64] *)
             | "$" ( IDENT | "(" expr ")" )      (* in a quote: a spliced type *)
             | "[" type "]"
             | "(" ")"
@@ -1409,6 +1575,10 @@ Parsing notes:
   pattern rather than a binding.
 * **Assignments as bodies.** An inline body that is an assignment is made
   a block of one line, so its value is `()`.
+* **Imported names.** In expressions, `geo.poly.area` parses as members
+  of the name `geo`; the checker reads it as a name when an import binds
+  `geo.poly` (the longest path that one binds), and a local variable `geo`
+  shadows it. In patterns and types, a dotted path is always a name.
 * **Methods vs. fields and variants.** In a struct or enum, a line starting
   `IDENT "="` is a method; otherwise it is a field or a variant.
 * **`mut` before a method call** (`mut s.items[0].push(1)`) is parsed as a
@@ -1438,4 +1608,8 @@ Parsing notes:
   code that constraints can't express. See docs/memory-model.md §15.
 * Generic computed types (`new_struct` makes structs without type
   parameters) and splicing types into struct definitions.
-* Modules and `import`.
+* Importing several names of a module at once (`import geo: area,
+  Shape`), passing imports on (re-exports), and libraries outside the
+  program's root and the standard library.
+* Whether imports should be allowed to form cycles, for functions in two
+  modules that call each other.

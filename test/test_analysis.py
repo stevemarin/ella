@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from ella.analysis import Location, Symbol, analyze, complete, follow_edits
+from ella.modules import LIBRARY_DIR
 
 ROOT = Path(__file__).parent.parent
 PROGRAMS = sorted((ROOT / "test" / "programs").glob("*.ella"))
@@ -86,7 +87,7 @@ def test_compile_time_output_isnt_printed(capsys: pytest.CaptureFixture[str]) ->
 
 def test_expanded_code_is_checked() -> None:
     # Code fits anything, so the error only shows once the splice has made its code (from the quote, as in `ella`).
-    source = 'let make = () -> Code => quote "a"\nlet f = (x: i64) -> i64 => $(make())\n'
+    source = 'let make = () -> Code => quote "a"\nlet f = (_x: i64) -> i64 => $(make())\nprint(f(1))\n'
     assert problems(source) == ["1:32: the function's result should be i64, not str"]
 
 
@@ -202,12 +203,27 @@ def test_errors_in_a_let_pattern_leave_its_names_defined() -> None:
 
 def test_prelude_functions() -> None:
     found = symbols("let xs = sort([2, 1])\nprint(xs, pi)\n")
-    assert found[(1, 10)].hover == "sort: ([i64]) -> [i64]"
+    assert found[(1, 10)].hover == "lists.sort: ([i64]) -> [i64]"  # the prelude's names say their module
     assert found[(1, 10)].modifiers == ("defaultLibrary", "readonly")
-    assert found[(1, 10)].definition is None  # the prelude isn't in the file
-    assert found[(2, 11)].hover == "pi: f64"
+    definition = found[(1, 10)].definition
+    assert definition is not None and definition.file == str(LIBRARY_DIR / "lists.ella")
+    line = (LIBRARY_DIR / "lists.ella").read_text().splitlines()[definition.line - 1]
+    assert line[definition.column - 1 :].startswith("sort[T: Ord] =")
+    assert found[(2, 11)].hover == "math.pi: f64"
     assert {"map", "filter", "sort", "reverse", "pi"} <= set(names("let x = 1\nprint()\n", 2, 7))
     assert problems("let x = 1\n") == []  # nothing from the prelude, though all of it is checked
+
+
+def test_inferred_lambdas_and_new_warnings() -> None:
+    source = "let ys = map([1], (n) => n * 2)\nlet zs = map(ys, Some)\nlet f = (x: i64) -> i64 => 1\nprint(zs)\n"
+    found = symbols(source)
+    assert found[(1, 20)].hover == "n: i64"
+    assert found[(2, 10)].hover == "lists.map: ([i64], (i64) -> Optional[i64]) -> [Optional[i64]]"
+    assert problems(source) == [
+        "3:5: function 'f' is never used",
+        "3:10: parameter 'x' is never used; start its name with '_' if that is on purpose",
+    ]
+    assert "new_map" in names("let x = 1\nprint()\n", 2, 7)
 
 
 def test_mut_names_in_patterns() -> None:

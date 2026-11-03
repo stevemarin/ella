@@ -44,25 +44,34 @@ plain:
 
 ## Layout (stages 1 to 7 done)
 
-* `src/ella/lexer.py`: `Span`, `EllaError`, `TokenKind`, `Token`,
-  `tokenize(source)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
+* `src/ella/lexer.py`: `Span` (line, column, and a file: empty for the
+  entry file, else the module's path from it, or `<std>/NAME.ella`),
+  `EllaError`, `TokenKind`, `Token`, `tokenize(source, file)`. Handles comments, INDENT/DEDENT/NEWLINE layout, bracket
   depth (newlines ignored inside `()`/`[]`), number formats, escapes, and
   string interpolation (`STRING_START`, `STRING_TEXT`, `INTERP_START` …
   tokens … `INTERP_END`, `STRING_END`).
 * `src/ella/syntax.py`: AST node dataclasses, and `show()` for S-expressions.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
-  parsing notes in §12.
+  parsing notes in §12. A file's `import` lines come first
+  (`Program.imports`); paths in types and patterns are dotted names.
 * `src/ella/checker.py`: static type checker with simple inference
   (unification of type variables). Records each node's type and what each
-  name refers to, in tables keyed by `id(node)`, for the lowering. Also the
+  name refers to, in tables keyed by `id(node)`, for the lowering. Lambdas
+  other than top-level functions and methods may leave out types: they get
+  type variables, and their bodies (checked later, like every function's)
+  are checked early when `known` needs a type they may decide. `print`,
+  `len` and constructors used as values get a small lambda calling them
+  (`wrappers`), which the lowering makes into a function. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
   level), generic functions, methods and constraints (built-in and
   user-defined, met structurally), and the rules for `nocopy` values
   (`check_copies`). Splices in types run while checking, through
   `compile_time` (set by `staging.Expander`). `LIBRARY` has the types of
   the library functions. `Checker.warnings` has the problems that don't
-  stop a program: unused local variables (`warn_unused`, skipped after an
-  error), code after a line of type never, and cases that never match.
+  stop a program: unused local variables, parameters and top-level
+  functions, and `mut` variables that never change (`warn_unused`, skipped
+  after an error), code after a line of type never, and cases that never
+  match.
 * `src/ella/exhaustive.py`: whether patterns cover every value of a type
   (`match` cases, and `let`/`for` patterns), with an example of one they
   miss, and which `match` cases can never match. The checker runs it once
@@ -85,12 +94,24 @@ plain:
   `Exit`, which the interpreters catch at the top (finalizers don't run).
   A library function used as a value becomes a small IR function
   (`trim(str)`) made by the lowering.
-* `src/ella/prelude.py`: library functions written in Ella (`map`,
-  `filter`, `sort`, `reverse`, `pi`). `with_prelude` puts the ones a
-  program uses (and doesn't define itself) at its start; `prepare` and the
-  interpreter's `run` call it, and the analysis adds them all. Prelude
-  code uses no built-ins and binds no names in patterns, so a program's
-  own names can't change it.
+* `src/ella/modules.py`: modules and imports (docs/grammar.md §3).
+  `link` loads the modules a program's entry file imports (found from its
+  directory) and the library modules whose prelude names it uses, and
+  makes one program of them, in the order their code runs: each module's
+  top-level names get its name in front (`geo.area`; the entry file's stay
+  bare), and every use of a top-level name becomes that name, tracking
+  local scopes. It also checks private names (`_x`), imports and
+  read-only variables of other modules; the checker checks private fields
+  and methods. `prepare` and the interpreter's `run` call it; `Linker`
+  takes more options, for editors. Code of a module other than the entry
+  file only has built-ins left as bare top-level names, so the checker and
+  the interpreters give it those even if the entry file defines the names
+  (`visible`, by the span's file). Values print with bare type names
+  (`bare_name`).
+* `src/ella/lib/`: the standard library, in Ella: `lists.ella` (`map`,
+  `sort_by`, `sum`, `zip`, ...), `maps.ella` (`Map[K, V]`, `new_map`) and
+  `math.ella` (`pi`). Their public names are the prelude, which every
+  module sees without importing them; they can be imported too.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
@@ -120,7 +141,9 @@ plain:
   or remove an operation that can fail.
 * `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). A stack slot
   per value, Ella's own calling convention (arguments pushed; see the module
-  docstring), C calling convention for runtime calls.
+  docstring), C calling convention for runtime calls. A source line passed
+  to the runtime has its file's number (in the table `ella_files`) above
+  its low 32 bits, for errors in modules.
 * `src/ella/runtime.c`: the C runtime linked into native programs. It must
   match `operators.py` and `values.py` exactly, including error messages and
   float formatting (Python's `repr`). Objects live in arenas, all in one
@@ -131,7 +154,9 @@ plain:
   `ELLA_POISON` so freed arena memory is overwritten).
 * `src/ella/analysis.py`: what editors need, as plain data: every error,
   symbols (hover text, definition, semantic token kind per name), and
-  completions. It keeps going after errors: it patches lexer errors in the
+  completions. A file is linked with its imports (`Place`: its path, the
+  workspace root, open documents' text); errors in an imported module are
+  shown at the import line, and definitions can be in other files. It keeps going after errors: it patches lexer errors in the
   text (`tokenize_leniently`), and uses `parse_partial` (a line with an error
   becomes `()`) and `Checker.errors` (each top-level step and block line
   records its error and goes on; `scopes` gives each name's scope). Both are
@@ -150,14 +175,17 @@ plain:
   of both interpreters, the optimized IR and native code), `test/test_passes.py`,
   `test/test_native.py`, `test/test_cli.py`, `test/test_analysis.py`,
   `test/test_lsp.py` (starts `ella-lsp` as a client would),
-  `test/test_vscode.py`. Native tests need
+  `test/test_vscode.py`, `test/test_modules.py` (programs of several
+  files). Native tests need
   gcc and are skipped without it. `test/programs/` holds
   `NAME.ella` programs with `NAME.out` (expected output) and optionally
   `NAME.err` (expected error), `NAME.in` (standard input), `NAME.args`
   (arguments, one per line), `NAME.stderr` (expected standard error) and
   `NAME.status` (expected exit status), run by `test/test_programs.py` through both
-  interpreters, the optimized IR, and native code (plain and optimized).
+  interpreters, the optimized IR, and native code (plain and optimized). A
+  program of several modules is a directory `NAME/` with `main.ella`
+  (and `main.out`, ...).
 
 Stage 7 (staged programming, structs, generics, pools, nocopy and
-finalizers) is done; see README.md and docs/memory-model.md §15 for what is
-still open.
+finalizers) is done, and so are modules; see README.md, TODO.md and
+docs/memory-model.md §15 for what is still open.

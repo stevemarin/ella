@@ -1,0 +1,42 @@
+# Lambdas whose types are inferred, and built-ins and constructors as values (docs/grammar.md §5, §9).
+
+enum Shape
+    Circle(f64)
+    Square(f64)
+    Empty
+
+struct Point
+    x: i64
+    y: i64
+
+let apply[T, U] = (f: (T) -> U, x: T) -> U => f(x)
+let twice[T] = (f: (T) -> T, x: T) -> T => f(f(x))
+let wrap_all[T] = (xs: [T]) -> [Optional[T]] => map(xs, Some)
+
+let main = () -> () =>
+    let xs = [3, 1, 2]
+    # From where the lambda is passed.
+    print(map(xs, (n) => n * 2), xs |> filter(n => n > 1) |> map(n => "<{{n}}>"))
+    print(apply((n) => -n, 5), twice((s) => s + "!", "hi"), apply((p) => p.x + p.y, Point(1, 2)))
+    # From the lambda's own body, and how its result is used right after.
+    let inc = (x) => x + 1
+    let halves = map(xs, (n) => to_f64(n) / 2.0)
+    print(inc(41), -halves[0], halves[1] + 0.5)
+    # From a declared type.
+    let ops: [(i64, i64) -> i64] = [(a, b) => a + b, (a, b) => a * b, max]
+    print(map(ops, (op) => op(6, 7)))
+    # A lambda that calls itself, with a result type given and parameters inferred.
+    let countdown = (n) -> [i64] => if n == 0 then [] else [n] + countdown(n - 1)
+    print(countdown(3))
+
+    # print, eprint, len and constructors are values too.
+    map(["a", "b"], print)
+    let say = eprint
+    say("to standard error")
+    print(map(["ab", "", "c"], len), [[1, 2], []] |> map(len))
+    print(map(xs, Some), wrap_all(["a"]), map([1.0, 2.0], Circle))
+    let make = Point
+    print(make(1, 2), map(zip(xs, xs), (pair) => Point(pair.0, pair.1)))
+    let shapes = [Square(2.0), Empty]
+    print(shapes, map(shapes, (s) => s == Empty))
+    print(Some, print, apply(Some, 4))

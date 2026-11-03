@@ -37,9 +37,9 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ella.checker import LIBRARY, Type, show_type
+from ella.checker import Type, show_type
 from ella.lexer import EllaError, Span
-from ella.syntax import Expr, Lambda, show
+from ella.syntax import Expr, Lambda, bare_name, show
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
@@ -303,13 +303,9 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"{value.start}..{value.stop}"
         case VariantValue(variant=variant, fields=fields):
             if not fields:
-                return variant
-            return f"{variant}(" + ", ".join(to_text(item, True) for item in fields) + ")"
-        case Builtin(name=name) if name not in LIBRARY:  # (a library function is a value, as in compiled code)
-            return f"<built-in function {name}>"
-        case Constructor(variant=variant):
-            return f"<constructor {variant}>"
-        case Closure() | FunctionRef() | Builtin():
+                return bare_name(variant)
+            return f"{bare_name(variant)}(" + ", ".join(to_text(item, True) for item in fields) + ")"
+        case Closure() | FunctionRef() | Builtin() | Constructor():
             return "<function>"
         case PoolValue():
             return f"<pool of {value.live()}>"

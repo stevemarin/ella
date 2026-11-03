@@ -1,0 +1,14 @@
+# A stack, whose items only its methods can reach.
+struct Stack[T]
+    _items: [T]
+    push = (mut s: Stack[T], x: T) -> () =>
+        s._items += [x]
+    pop = (mut s: Stack[T]) -> Optional[T] =>
+        let n = len(s._items)
+        if n == 0 then return None
+        let top = s._items[n - 1]
+        s._items = s._items[0..n - 1]
+        Some(top)
+    len = (s: Stack[T]) -> i64 => len(s._items)
+
+let empty[T] = () -> Stack[T] => Stack([])

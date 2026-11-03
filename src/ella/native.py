@@ -48,12 +48,14 @@ def build(module: Module, executable: Path, max_depth: int = MAX_CALL_DEPTH) -> 
         subprocess.run(["gcc", str(assembly), str(runtime_object()), "-lm", "-o", str(executable)], check=True)
 
 
-def compile_native(source: str, executable: Path, optimized: bool = True, out: TextIO | None = None) -> None:
+def compile_native(
+    source: str, executable: Path, optimized: bool = True, out: TextIO | None = None, path: Path | None = None
+) -> None:
     """Compile Ella source into a native executable. Raises EllaError for errors in the program.
 
-    What the program prints while compiling (in splices) goes to `out`.
+    What the program prints while compiling (in splices) goes to `out`. `path` is its file, which imports are found from.
     """
-    module = compile_program(source, out)
+    module = compile_program(source, out, path)
     if optimized:
         optimize(module)
     build(module, executable)
@@ -66,6 +68,7 @@ def run_native(
     stdin: bytes = b"",
     args: Sequence[str] = (),
     err: TextIO | None = None,
+    path: Path | None = None,
 ) -> int:
     """Compile a program to a native executable and run it, like the interpreters' `run`. Returns its exit status.
 
@@ -78,7 +81,7 @@ def run_native(
     """
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "program"
-        compile_native(source, executable, optimized, out)
+        compile_native(source, executable, optimized, out, path)
         env = os.environ | {"ELLA_POISON": "1"}
         result = subprocess.run([str(executable), *args], check=False, capture_output=True, input=stdin, env=env)
     out.write(result.stdout.decode("utf-8"))
@@ -104,8 +107,11 @@ def finish_run(status: int, stderr: str, err: TextIO | None) -> int:
 
 
 def parse_error(stderr: str) -> EllaError | None:
-    """The "line:column: message" run-time error at the end of a native program's standard error, if there is one."""
-    match = re.search(r"(?:^|\n)(\d+):(\d+): ([^\n]*)\n?\Z", stderr)
+    """The "line:column: message" run-time error at the end of a native program's standard error, if there is one.
+
+    An error in a module other than the entry file starts with its file: `geo/poly.ella:3:5: ...`.
+    """
+    match = re.search(r"(?:^|\n)(?:([^\n:]+):)?(\d+):(\d+): ([^\n]*)\n?\Z", stderr)
     if match is None:
         return None
-    return EllaError(match[3], Span(int(match[1]), int(match[2])))
+    return EllaError(match[4], Span(int(match[2]), int(match[3]), match[1] or ""))

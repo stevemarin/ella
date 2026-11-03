@@ -1,0 +1,15 @@
+# Polygons, as lists of points. This module is below geo, so it can use geo's private names.
+import geo
+
+let perimeter = (points: [geo.Point]) -> f64 =>
+    let mut total = 0.0
+    for i in 0..len(points)
+        total += _distance(points[i], points[(i + 1) % len(points)])
+    total
+
+let doubled = (x: f64) -> f64 => geo._twice(x)
+
+let _distance = (a: geo.Point, b: geo.Point) -> f64 =>
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    sqrt(dx * dx + dy * dy)

@@ -1,0 +1,1 @@
+let square_meters = (area: f64) -> str => "{{format_f64(area, 2)}} m2"

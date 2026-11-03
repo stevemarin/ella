@@ -50,8 +50,9 @@ again and compiled like any other; `ella --expanded` shows it.
 """
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import count
+from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from ella.checker import (
@@ -72,7 +73,7 @@ from ella.checker import (
     substitute,
 )
 from ella.lexer import EllaError, Span
-from ella.prelude import with_prelude
+from ella.modules import link
 from ella.syntax import (
     Binary,
     Binding,
@@ -106,6 +107,8 @@ from ella.syntax import (
     UnitLit,
     UnitType,
     Variant,
+    parts,
+    rebuild,
 )
 from ella.values import CodeValue, TypeValue, Value, VariantValue
 
@@ -280,31 +283,6 @@ def binders(pattern: object, tables: Tables) -> list[NamePattern]:
     if isinstance(pattern, NamePattern):
         return [pattern] if tables.kinds.get(id(pattern)) == "binding" else []
     return [b for part in parts(pattern) for b in binders(part, tables)]
-
-
-def parts(node: object) -> list[object]:
-    """The parts of a syntax tree node (or the items of a tuple of nodes)."""
-    if isinstance(node, tuple):
-        return list(node)
-    if is_dataclass(node) and not isinstance(node, type | Span):
-        return [getattr(node, f.name) for f in fields(node)]
-    return []
-
-
-def rebuild(node: object, walk: Callable[[object], object]) -> object:
-    """A node with `walk` applied to its parts. Unchanged nodes are kept as they are."""
-    if isinstance(node, tuple):
-        items = tuple(walk(item) for item in node)
-        return node if all(a is b for a, b in zip(items, node)) else items
-    if is_dataclass(node) and not isinstance(node, type | Span):
-        changes = {}
-        for f in fields(node):
-            old = getattr(node, f.name)
-            new = walk(old)
-            if new is not old:
-                changes[f.name] = new
-        return replace(node, **changes) if changes else node
-    return node
 
 
 def reify(value: Value, span: Span) -> Expr:
@@ -488,15 +466,16 @@ def type_kind(t: Type, enums: dict[str, EnumInfo]) -> str:
 # Expanding splices outside quotes
 
 
-def prepare(program: Program, out: TextIO | None = None) -> tuple[Program, Checker]:
+def prepare(program: Program, out: TextIO | None = None, path: Path | None = None) -> tuple[Program, Checker]:
     """Check a program, and expand its splices outside quotes. Returns the program to run, and its checker.
 
     A splice in a type runs while the program is being checked, since the
     checker needs the type; other splices run after checking. What the
-    compile-time code prints goes to `out`. The program gets the prelude
-    definitions it uses (see ella.prelude). Raises EllaError.
+    compile-time code prints goes to `out`. The program is first linked
+    with the modules it uses (see ella.modules); `path` is its file, which
+    its imports are found from. Raises EllaError.
     """
-    program = with_prelude(program)
+    program = link(program, path)
     if not uses_staging(program):
         return program, check(program)
     checker = Checker()
@@ -505,7 +484,10 @@ def prepare(program: Program, out: TextIO | None = None) -> tuple[Program, Check
     if not has_splices(program):
         return program, checker
     expanded = expander.expand_program()
-    return expanded, check(expanded)
+    final = check(expanded)
+    # The warnings are about the program as written, splices and all (a function only they call is used).
+    final.warnings = checker.warnings
+    return expanded, final
 
 
 def uses_staging(node: object) -> bool:
@@ -577,7 +559,7 @@ class Expander:
                 body.append(replace(expr, methods=methods))
             else:
                 body.append(self.expand(expr))
-        return Program(tuple(body), self.program.span)
+        return replace(self.program, body=tuple(body))
 
     def expand_function(self, function: Lambda) -> Lambda:
         """A top-level function with its splices expanded: needed before it can run while compiling."""

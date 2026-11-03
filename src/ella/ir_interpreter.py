@@ -51,6 +51,7 @@ mark of each scope level, and what each allocating instruction made.
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TextIO
 
 from ella.checker import EnumTy, ListTy, check_code
@@ -105,9 +106,9 @@ SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
 POOL = "<pool>"  # the finalizer of a pool: free its values
 
 
-def run_ir(source: str, out: TextIO | None = None, host: Host | None = None) -> int:
+def run_ir(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
     """Compile a program to IR and run it, returning its exit status. Raises EllaError."""
-    return IRInterpreter(compile_program(source, out), out, host).run()
+    return IRInterpreter(compile_program(source, out, path), out, host).run()
 
 
 @dataclass(slots=True)
@@ -611,7 +612,7 @@ class IRInterpreter:
             lines.append(f"  {size:>12,}  {scope}")
         lines += ["", "Allocations by site:"]
         for (function, span, op), site in sorted(self.sites.items(), key=lambda item: -item[1].bytes):
-            lines.append(f"  {site.bytes:>12,}  {site.count:>8,}x  {span.line}:{span.column} {op} in {function}")
+            lines.append(f"  {site.bytes:>12,}  {site.count:>8,}x  {span} {op} in {function}")
         return "\n".join(lines) + "\n"
 
 

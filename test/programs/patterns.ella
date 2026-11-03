@@ -53,6 +53,7 @@ let main = () -> () =>
     let (quotient, remainder) = divide(17, 5)
     print("17 = 5 * {{quotient}} + {{remainder}}")
     let mut (q, r): (i64, i64) = divide(20, 6)
+    r *= 2
     q += r
     print(q)
     let mut sum = 0

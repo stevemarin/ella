@@ -1,0 +1,35 @@
+# A program of several modules: imports with and without `as`, an imported
+# enum's variants, a module below another, generic types and methods from
+# modules, and code a module builds for this one's compile-time splices.
+import counter
+import gen
+import geo
+import geo.poly
+import geo.poly as p
+import geo.Shape as Shape
+import stack
+
+# gen.power builds the code, while compiling; its quote calls gen's private _times.
+let cube = (x: i64) -> i64 => $(gen.power(3, quote x))
+
+let main = () -> () =>
+    # With `as`, an enum's variants are bare names; without, they go with the module's name.
+    let shapes: [Shape] = [Circle(1.0), geo.Rect(2.0, 3.0)]
+    for s in shapes
+        match s
+            case Circle(r) => print("circle", r, geo.describe(s))
+            case geo.Rect(w, h) => print("rect", w, h, s.area())
+    let square = [geo.Point(0.0, 0.0), geo.Point(1.0, 0.0), geo.Point(1.0, 1.0), geo.Point(0.0, 1.0)]
+    print(p.perimeter(square), geo.poly.perimeter(square) == p.perimeter(square))
+    print(geo.Point(1.0, 2.0) + geo.Point(3.0, 4.0), p.doubled(1.5))
+    # A module's top-level code ran before this one's.
+    print(counter.total, counter.loaded)
+    let mut s: stack.Stack[i64] = stack.empty()
+    mut s.push(1)
+    mut s.push(2)
+    print(mut s.pop())
+    print(len(s), s)
+    print(cube(3), map([1, 2, 3], cube))
+    # A program can use the names its modules use for their own things.
+    let total = 7
+    print(total)

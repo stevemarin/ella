@@ -56,8 +56,8 @@ def test_to_text() -> None:
 
 
 def test_functions_print() -> None:
-    assert value("print") == "<built-in function print>"
-    assert value("Some") == "<constructor Some>"
+    assert value("print") == "<function>"  # as in compiled code, where they are values too
+    assert value("Some") == "<function>"
     assert value("() -> () => ()") == "<function>"
 
 
