@@ -43,6 +43,7 @@ from ella.syntax import (
     Assign,
     Binding,
     Block,
+    Call,
     ConstraintDef,
     EnumDef,
     Expr,
@@ -52,6 +53,8 @@ from ella.syntax import (
     Lambda,
     Let,
     LetPattern,
+    ListLit,
+    MapLit,
     Match,
     Member,
     Method,
@@ -64,6 +67,8 @@ from ella.syntax import (
     Pattern,
     Program,
     Quote,
+    SetLit,
+    TupleLit,
     TuplePattern,
     TypeExpr,
     UnitLit,
@@ -690,7 +695,21 @@ class Resolver:
                 return ConstraintDef(self.top_name(name), methods, span)
             case Quote(body, span):
                 return Quote(self.expr(body, Scope(scope)), span)
+            case MapLit(entries, span):
+                pairs = ListLit(tuple(TupleLit((key, value), key.span) for key, value in entries), span)
+                return Call(
+                    Name(self.library_function("maps", "map_of", span), span), (self.expr(pairs, scope),), span
+                )
+            case SetLit(items, span):
+                items_list = self.expr(ListLit(items, span), scope)
+                return Call(Name(self.library_function("sets", "set_of", span), span), (items_list,), span)
         return rebuild(expr, lambda part: self.part(part, scope))  # type: ignore[return-value]
+
+    def library_function(self, module: str, name: str, span: Span) -> str:
+        """The linked name of a standard library function that syntax stands for, whatever this module defines."""
+        library = self.linker.library(module, span)
+        assert library is not None
+        return library.top[name].name
 
     def enum(self, enum: EnumDef, scope: Scope) -> EnumDef:
         """An enum or struct definition. At the top level, it and its variants get their linked names."""

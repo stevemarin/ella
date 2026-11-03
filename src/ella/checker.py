@@ -76,6 +76,7 @@ from ella.syntax import (
     LiteralPattern,
     LiteralValue,
     Loop,
+    MapLit,
     Match,
     Member,
     Method,
@@ -90,6 +91,7 @@ from ella.syntax import (
     Quote,
     RangePattern,
     Return,
+    SetLit,
     Splice,
     StringLit,
     Try,
@@ -108,6 +110,7 @@ from ella.syntax import (
     Yield,
     is_generator,
     mentions_return,
+    parts,
 )
 
 # Types
@@ -583,6 +586,7 @@ def check_code(code: Expr, program: Checker) -> Checker:
         "type_values",
         "quote_levels",
         "wrappers",
+        "updates",
     )
     for table in tables:
         setattr(checker, table, dict(getattr(program, table)))
@@ -618,6 +622,8 @@ class Checker:
         self.method_functions: dict[tuple[str, str], Lambda] = {}  # (struct or enum, method) -> its function
         self.methods: dict[int, str] = {}  # `.name` node called as a method -> the method's name
         self.wrappers: dict[int, Lambda] = {}  # `print`, `len` or a constructor used as a value -> a lambda calling it
+        self.updates: dict[int, Block] = {}  # `v[k] op= x` with v's `update` method -> the code that runs instead
+        self.lines: set[int] = set()  # assignments that are lines of blocks, whose values aren't used
         self.defined: set[int] = set()  # top-level enums already defined
         self.item_sets: set[int] = set()  # `v[k]` places stored with v's `set` method
         self.level = 0  # the stage being checked
@@ -948,6 +954,15 @@ class Checker:
                     f"{show_type(get.result)})",
                     enum.span,
                 )
+        if "update" in methods:
+            if "get" not in methods or "set" not in methods:
+                raise EllaError("a type with an update method needs get and set methods too", enum.span)
+            get, update = methods["get"], methods["update"]
+            if update.params[1:] != (get.params[1], FuncTy((get.result,), UNIT, (0,))):
+                raise EllaError(
+                    f"update must take the key type get uses, and a (mut {show_type(get.result)}) -> ()",
+                    enum.span,
+                )
         self.enums[enum.name] = dataclasses.replace(info, methods=methods)
         self.define_variants(self.enums[enum.name], env)
 
@@ -977,10 +992,21 @@ class Checker:
             "finalize": ("(Self) -> ()", t == FuncTy((own,), UNIT)),
             "compare": ("(Self, Self) -> i64", t == FuncTy((own, own), I64)),
             "len": ("(Self) -> i64", t == FuncTy((own,), I64)),
+            "text": ("(Self) -> str", t == FuncTy((own,), STR)),
             "neg": ("(Self) -> R, without 'mut'", len(t.params) == 1 and not t.mutable),
             **{name: (binary, len(t.params) == 2 and not t.mutable) for name in OPERATOR_METHODS.values()},
             "get": ("(Self, K) -> V, without 'mut'", len(t.params) == 2 and not t.mutable),
             "set": ("(mut Self, K, V) -> ()", len(t.params) == 3 and t.mutable == (0,) and t.result == UNIT),
+            "update": (
+                "(mut Self, K, (mut V) -> ()) -> ()",
+                len(t.params) == 3
+                and t.mutable == (0,)
+                and t.result == UNIT
+                and isinstance(change := resolve(t.params[2]), FuncTy)
+                and len(change.params) == 1
+                and change.mutable == (0,)
+                and change.result == UNIT,
+            ),
             "contains": (
                 "(Self, T) -> bool, without 'mut'",
                 len(t.params) == 2 and not t.mutable and t.result == BOOL,
@@ -1299,6 +1325,46 @@ class Checker:
         self.types[id(expr)] = t
         return t
 
+    def item_update(self, assign: Assign, env: Env) -> Block | None:
+        """An assignment through an item of a type with an `update` method: the code that runs instead.
+
+        `v[k] op= x`, or `v[k].f = x`, `v[k][j] op= x` and so on, changes the item in place: it is
+        `let %value = x`, then `mut v.update(k, (mut %item) => %item... op= %value)`, so the item
+        isn't copied out with `get` and back in with `set` (which can't store a part of one).
+        `v[k] = x` still uses `set`, which can add a key. The first such item from the variable
+        is used; the assignment in the lambda is changed the same way if it needs to be.
+
+        None if there's no such item, or the assignment's value is used: only a line of a block
+        is changed this way. The places are checked here to find their types, and again in that
+        code, so they may not hold functions, whose second check would differ.
+        """
+        if has_functions(assign.target):
+            return None
+        steps: list[Index | Member] = []  # the place's steps, from the variable out
+        place: Expr = assign.target
+        while isinstance(place, Index | Member):
+            steps.insert(0, place)
+            place = place.target
+        for i, step in enumerate(steps):
+            last = i == len(steps) - 1
+            if not isinstance(step, Index) or (last and assign.op == "="):
+                continue
+            if self.method_type(self.check(step.target, env), "update", assign.span) is None:
+                continue
+            span = assign.span
+            # The rest of the place, from the item.
+            rest: Name | Index | Member = Name("%item", span)
+            for outer in steps[i + 1 :]:
+                rest = dataclasses.replace(outer, target=rest)
+            value = Binding("%value", False, None, span)
+            item = Param("%item", None, span, mutable=True)
+            body = Block((Assign(assign.op, rest, Name("%value", span), span),), span)
+            change = Lambda((item,), None, (), body, span)
+            receiver = Member(MutArg(step.target, step.span), "update", span)
+            call = Call(receiver, (step.index, change), span)
+            return Block((Let((value,), assign.value, span), call), span)
+        return None
+
     def check_bool(self, expr: Expr, env: Env, what: str) -> None:
         t = self.check(expr, env)
         if not self.unify(t, BOOL):
@@ -1413,6 +1479,10 @@ class Checker:
                     assert isinstance(info.binder, NamePattern)
                     self.bind_name(env, name, info.type, mutable or info.mutable, info.binder.span, info.binder)
                 return t
+            case Assign(span=span) if id(expr) in self.lines and (update := self.item_update(expr, env)):
+                self.updates[id(expr)] = update
+                self.check(update, env)
+                return UNIT  # its value isn't used
             case Assign(op, target, value_expr, span):
                 value_type = self.check(value_expr, env)
                 target_type = self.check_place(target, env)
@@ -1538,6 +1608,7 @@ class Checker:
             # Control flow
             case Block(exprs):
                 local = Env(env)
+                self.lines.update(id(line) for line in exprs if isinstance(line, Assign))
                 t = UNIT
                 finished = True  # whether the lines so far can finish, so that the next one runs
                 for line in exprs:
@@ -1611,6 +1682,9 @@ class Checker:
                 if env is not self.globals or name not in self.constraints:
                     raise EllaError("a constraint can only be defined at the top level", span)
                 return UNIT
+            case MapLit(span=span) | SetLit(span=span):
+                # Linking (ella.modules) makes them calls of the library's map_of and set_of.
+                raise EllaError("a map or set literal in a program that wasn't linked", span)
 
     # Stages
 
@@ -2623,6 +2697,11 @@ def pattern_names(pattern: Pattern) -> list[NamePattern]:
         case OrPattern(items) | VariantPattern(_, items) | TuplePattern(items):
             return [node for item in items for node in pattern_names(item)]
     return []
+
+
+def has_functions(node: object) -> bool:
+    """Whether code has a lambda or a quote in it."""
+    return isinstance(node, Lambda | Quote) or any(has_functions(part) for part in parts(node))
 
 
 def any_part(

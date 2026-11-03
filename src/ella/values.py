@@ -372,12 +372,18 @@ def equal(a: Value, b: Value) -> bool:
     return a == b
 
 
-def to_text(value: Value, nested: bool = False) -> str:
+def to_text(value: Value, nested: bool = False, custom: Callable[[VariantValue], str | None] | None = None) -> str:
     """The text form of a value, used by `print` and string interpolation.
 
     A string is its own text, but inside a list or other value it is quoted, so
-    that `["a, b"]` and `["a", "b"]` print differently.
+    that `["a, b"]` and `["a", "b"]` print differently. `custom` gives the text
+    of a struct or enum value whose type has a `text` method (by calling it),
+    or None; without it, as in error messages, every value has its built-in form.
     """
+
+    def part(item: Value) -> str:
+        return to_text(item, True, custom)
+
     match value:
         case bool():
             return "true" if value else "false"
@@ -386,19 +392,21 @@ def to_text(value: Value, nested: bool = False) -> str:
         case str():
             return json.dumps(value, ensure_ascii=False) if nested else value
         case tuple() if len(value) == 1:
-            return f"({to_text(value[0], True)},)"
+            return f"({part(value[0])},)"
         case tuple():
-            return "(" + ", ".join(to_text(item, True) for item in value) + ")"
+            return "(" + ", ".join(map(part, value)) + ")"
         case list():
-            return "[" + ", ".join(to_text(item, True) for item in value) + "]"
+            return "[" + ", ".join(map(part, value)) + "]"
         case range():
             return f"{value.start}..{value.stop}"
+        case VariantValue() if custom is not None and (text := custom(value)) is not None:
+            return text
         case VariantValue(fields=[message, VariantValue(fields=cause), _], error=True):
-            return f"Error({to_text(message, True)}" + "".join(f", {to_text(c, True)}" for c in cause) + ")"
+            return f"Error({part(message)}" + "".join(f", {part(c)}" for c in cause) + ")"
         case VariantValue(variant=variant, fields=fields):
             if not fields:
                 return bare_name(variant)
-            return f"{bare_name(variant)}(" + ", ".join(to_text(item, True) for item in fields) + ")"
+            return f"{bare_name(variant)}(" + ", ".join(map(part, fields)) + ")"
         case Closure() | FunctionRef() | Builtin() | Constructor():
             return "<function>"
         case PoolValue():

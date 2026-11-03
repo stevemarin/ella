@@ -77,7 +77,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from ella.checker import EnumTy, ListTy, check_code, is_builtin_error
+from ella.checker import EnumTy, ListTy, TupleTy, Type, check_code, is_builtin_error, substitute
 from ella.ir import (
     VIEWS,
     Block,
@@ -96,13 +96,13 @@ from ella.ir import (
     verify,
 )
 from ella.ir import Value as IRValue
-from ella.lexer import CallSite, EllaError, Span
+from ella.lexer import FINALIZER_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
 from ella.operators import binary, compare, contains, index_into, slice_of, unary
 from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
-from ella.syntax import Expr, Name
+from ella.syntax import Expr, Name, bare_name
 from ella.values import (
     MAX_CALL_DEPTH,
     UNIT,
@@ -398,7 +398,44 @@ class IRInterpreter:
                     self.free_arena(self.pool_arenas[id(value)][slot])
                     value.slots[slot] = None
             return
-        self.call(self.module.functions[finalizer], [value], [None], 0, {}, Span(0, 0), CallSite(Span(0, 0), ""))
+        self.call(
+            self.module.functions[finalizer], [value], [None], 0, {}, FINALIZER_SITE, CallSite(FINALIZER_SITE, "")
+        )
+
+    def text(self, value: Value, t: Type, span: Span, nested: bool = False) -> str:
+        """A value's text form, as `print` writes it: through the `text` methods of the types in it (Module.texts).
+
+        Their functions are specialized for type arguments, so this follows the value's type.
+        """
+        match t:
+            case _ if not self.module.texts:
+                return to_text(value, nested)
+            case EnumTy() if t in self.module.texts:
+                # The method's result goes in a level of its own, freed once it has been read.
+                scratch = self.next_depth
+                self.next_depth += 1
+                try:
+                    function = self.module.functions[self.module.texts[t]]
+                    result, _, _ = self.call(function, [value], [None], scratch, {}, span, CallSite(TEXT_SITE, ""))
+                finally:
+                    self.free(scratch, scratch + 1)
+                    self.next_depth = scratch
+                assert isinstance(result, str)
+                return result
+            case ListTy(element):
+                assert isinstance(value, list)
+                return "[" + ", ".join(self.text(item, element, span, True) for item in value) + "]"
+            case TupleTy(items) if items:
+                assert isinstance(value, tuple)
+                texts = [self.text(item, item_type, span, True) for item, item_type in zip(value, items)]
+                return "(" + ", ".join(texts) + ("," if len(texts) == 1 else "") + ")"
+            case EnumTy(name, args) if isinstance(value, VariantValue) and not value.error and value.fields:
+                info = self.module.enums[name]
+                mapping = dict(zip(info.params, args))
+                types = [substitute(f, mapping) for f in info.variants[value.variant]]
+                texts = [self.text(item, item_type, span, True) for item, item_type in zip(value.fields, types)]
+                return f"{bare_name(value.variant)}(" + ", ".join(texts) + ")"
+        return to_text(value, nested)
 
     def move_finals(self, value: Value, depth: int) -> None:
         """Move the finalizers of the values `value` holds to the arena at `depth`, keeping their order."""
@@ -728,13 +765,13 @@ class IRInterpreter:
                     assert isinstance(container, list | str | range)
                     result = len(container)
             case "to_text":
-                result = to_text(args[0])
+                result = self.text(args[0], instr.args[0].type, instr.span)
             case "print":
-                self.out.write(to_text(args[0]) + "\n")
+                self.out.write(self.text(args[0], instr.args[0].type, instr.span) + "\n")
             case "eprint":
                 self.out.flush()
                 stderr = self.host.stderr if self.host.stderr is not None else sys.stderr
-                stderr.write(to_text(args[0]) + "\n")
+                stderr.write(self.text(args[0], instr.args[0].type, instr.span) + "\n")
                 stderr.flush()
             case "variant":
                 assert instr.dest is not None and isinstance(instr.dest.type, EnumTy)

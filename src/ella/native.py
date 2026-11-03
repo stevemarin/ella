@@ -19,7 +19,7 @@ from typing import TextIO
 
 from ella.codegen import generate
 from ella.ir import Module
-from ella.lexer import CallSite, EllaError, Span
+from ella.lexer import FINALIZER_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.lower import compile_program
 from ella.passes import optimize
 from ella.values import MAX_CALL_DEPTH
@@ -136,7 +136,9 @@ def parse_error(stderr: str) -> tuple[EllaError, int] | None:
     error.trace = []
     for line in match[6].splitlines()[1:]:
         if line == "  called to finalize a value":
-            error.trace.append(CallSite(Span(0, 0), ""))
+            error.trace.append(CallSite(FINALIZER_SITE, ""))
+        elif line == "  called to make a value's text":
+            error.trace.append(CallSite(TEXT_SITE, ""))
         elif omitted := re.fullmatch(r"  \.\.\. (\d+) more calls", line):
             error.omitted = int(omitted[1])
         elif call := CALL.fullmatch(line):

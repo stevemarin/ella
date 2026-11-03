@@ -42,7 +42,7 @@ from ella.checker import (
     finish,
     pattern_names,
 )
-from ella.lexer import CallSite, EllaError, Span
+from ella.lexer import FINALIZER_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.library import Exit, Host
 from ella.library import call as call_library
 from ella.modules import link
@@ -86,6 +86,7 @@ from ella.syntax import (
     ListLit,
     LiteralPattern,
     Loop,
+    MapLit,
     Match,
     Member,
     MutArg,
@@ -97,6 +98,7 @@ from ella.syntax import (
     Quote,
     RangePattern,
     Return,
+    SetLit,
     Splice,
     StringLit,
     Try,
@@ -372,7 +374,7 @@ class Interpreter:
                 return literal
             case StringLit(parts):
                 # Interpolated expressions are evaluated and turned into text.
-                return "".join(part if isinstance(part, str) else to_text(self.eval(part, scope)) for part in parts)
+                return "".join(part if isinstance(part, str) else self.text(self.eval(part, scope)) for part in parts)
             case UnitLit():
                 return UNIT
             case TupleLit(items):
@@ -419,6 +421,10 @@ class Interpreter:
                     scope.define(name, copy_value(part), mutable or name in mutables)
                 return value
             case Assign(op, target, value_expr, span):
+                if self.checker and (update := self.checker.updates.get(id(expr))) is not None:
+                    # `v[k] op= x` changing the item in place, with v's `update` method.
+                    self.eval(update, scope)
+                    return UNIT
                 return self.eval_assign(op, target, value_expr, scope, span)
 
             # Operators
@@ -526,6 +532,9 @@ class Interpreter:
                 return UNIT
             case ConstraintDef():
                 return UNIT  # constraints are only for the checker
+            case MapLit(span=span) | SetLit(span=span):
+                # Linking (ella.modules) makes them calls of the library's map_of and set_of.
+                raise EllaError("a map or set literal in a program that wasn't linked", span)
 
     def eval_bool(self, expr: Expr, scope: Scope, what: str) -> bool:
         """Evaluate an expression that must give a bool, since only bools are truthy."""
@@ -763,6 +772,19 @@ class Interpreter:
             return self.call_with_args(value.fields[self.field_index(value, name, callee.span)], args, scope, span)
         return self.call_with_args(self.method(value, name, callee.span), args, scope, span, (value, None))
 
+    def text(self, value: Value) -> str:
+        """A value's text form, as `print` writes it: through the `text` methods of the types in it."""
+
+        def custom(variant: VariantValue) -> str | None:
+            method = self.find_method(variant, "text")
+            if method is None:
+                return None
+            result = self.call(method, [variant], TEXT_SITE)
+            assert isinstance(result, str)
+            return result
+
+        return to_text(value, custom=custom)
+
     def find_method(self, value: Value, name: str) -> Value | None:
         """The method `name` of a struct or enum value, if its type has one."""
         if isinstance(value, VariantValue):
@@ -989,7 +1011,7 @@ class Interpreter:
             assert isinstance(value.state, Generator)
             self.close_generator(value.state)
         elif isinstance(value, VariantValue) and value.enum in self.finalizers:
-            self.call(self.finalizers[value.enum], [value], Span(0, 0))
+            self.call(self.finalizers[value.enum], [value], FINALIZER_SITE)
 
     def finalize_held(self, value: Value) -> None:
         """Finalize everything a value holds: itself first, then its parts, last first.
@@ -1483,14 +1505,14 @@ class Interpreter:
 
     def builtin_print(self, args: list[Value], span: Span) -> Value:
         """`print(a, b, ...)` writes the values' text, with spaces between them, and a newline."""
-        self.out.write(" ".join(map(to_text, args)) + "\n")
+        self.out.write(" ".join(self.text(arg) for arg in args) + "\n")
         return UNIT
 
     def builtin_eprint(self, args: list[Value], span: Span) -> Value:
         """`eprint(a, b, ...)` writes like `print`, to standard error (after what was printed so far)."""
         self.out.flush()
         stderr = self.host.stderr if self.host.stderr is not None else sys.stderr
-        stderr.write(" ".join(map(to_text, args)) + "\n")
+        stderr.write(" ".join(self.text(arg) for arg in args) + "\n")
         stderr.flush()
         return UNIT
 

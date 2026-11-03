@@ -104,12 +104,15 @@ struct Type {
 // A variant (or struct). A nocopy struct may have a finalizer, a closure run
 // on each value when it dies. `error` marks the built-in Error, whose fields
 // are its message, its cause (an Optional) and where it was made: equality and
-// the text form leave that out, and show the cause without its Some.
+// the text form leave that out, and show the cause without its Some. `text`
+// is the closure of its type's `text` method, if it has one, which `print`
+// calls for its text form.
 typedef struct {
     const char *name;
     word count;
     const Closure *finalize;
     word error;
+    const Closure *text;
     const Type *fields[];
 } VariantType;
 
@@ -136,6 +139,7 @@ typedef struct {
 
 extern const Site *ella_trace[];  // in the generated code, by depth
 const Site ella_finalizer_site = {0, 0, ""};
+const Site ella_text_site = {0, 1, ""};  // a `text` method's call, for print
 
 // A stack trace of more calls than twice this shows only this many at each
 // end (TRACE_ENDS in ella.lexer).
@@ -168,8 +172,12 @@ static void print_trace(word depth) {
             continue;
         }
         const Site *site = ella_trace[d];
-        if (site->line == 0 && site->column == 0) {
+        if (site == &ella_finalizer_site) {
             fputs("  called to finalize a value\n", stderr);
+            continue;
+        }
+        if (site == &ella_text_site) {
+            fputs("  called to make a value's text\n", stderr);
             continue;
         }
         fputs("  called at ", stderr);
@@ -376,7 +384,8 @@ static void unregister(word object) {
     }
 }
 
-extern void ella_call1(const Closure *closure, word argument);  // in the generated code
+// In the generated code: call an Ella closure, with its result at `depth`, counting the call at `site`.
+extern word ella_call1(const Closure *closure, word argument, word depth, const Site *site);
 static void free_pool(word pool);
 static void free_sub_arena(word arena);
 static void free_gen(word gen);
@@ -392,7 +401,7 @@ static void finalize_all(Arena *a) {
         } else if (final.finalize == GEN) {
             free_gen(final.object);
         } else {
-            ella_call1(final.finalize, final.object);
+            ella_call1(final.finalize, final.object, 0, &ella_finalizer_site);
         }
     }
 }
@@ -1211,7 +1220,9 @@ static void put_quoted(Buffer *b, const Str *s) {
     put(b, '"');
 }
 
-static void put_value(Buffer *b, word v, const Type *t, int nested) {
+// `custom`: the text form `print` writes, through `text` methods; without it,
+// as in error messages, every value has its built-in form.
+static void put_value(Buffer *b, word v, const Type *t, int nested, int custom) {
     switch (t->kind) {
     case K_UNIT: put_ascii(b, "()"); break;
     case K_I64: put_i128(b, v); break;
@@ -1263,7 +1274,7 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
         put(b, '[');
         for (word i = 0; i < xs->len; i++) {
             if (i) put_ascii(b, ", ");
-            put_value(b, xs->items[i], t->parts[0], 1);
+            put_value(b, xs->items[i], t->parts[0], 1, custom);
         }
         put(b, ']');
         break;
@@ -1273,7 +1284,7 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
         put(b, '(');
         for (word i = 0; i < t->count; i++) {
             if (i) put_ascii(b, ", ");
-            put_value(b, xs->items[i], t->parts[i], 1);
+            put_value(b, xs->items[i], t->parts[i], 1, custom);
         }
         if (t->count == 1) put(b, ',');
         put(b, ')');
@@ -1282,21 +1293,29 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
     case K_ENUM: {
         const Variant *x = (const Variant *)v;
         const VariantType *variant = t->parts[x->tag];
+        if (custom && variant->text) {
+            // Its text method's result goes in a level of its own, freed once it has been read.
+            word scratch = ella_enter(1);
+            const Str *s = (const Str *)ella_call1(variant->text, v, scratch, &ella_text_site);
+            for (word i = 0; i < s->len; i++) put(b, s->chars[i]);
+            ella_leave(scratch);
+            break;
+        }
         put_ascii(b, variant->name);
         if (variant->error) {  // Error("message"), or Error("message", cause)
             put(b, '(');
-            put_value(b, x->fields[0], variant->fields[0], 1);
+            put_value(b, x->fields[0], variant->fields[0], 1, custom);
             const Variant *cause = (const Variant *)x->fields[1];
             if (cause->count) {
                 put_ascii(b, ", ");
-                put_value(b, cause->fields[0], t, 1);
+                put_value(b, cause->fields[0], t, 1, custom);
             }
             put(b, ')');
         } else if (variant->count) {
             put(b, '(');
             for (word i = 0; i < variant->count; i++) {
                 if (i) put_ascii(b, ", ");
-                put_value(b, x->fields[i], variant->fields[i], 1);
+                put_value(b, x->fields[i], variant->fields[i], 1, custom);
             }
             put(b, ')');
         }
@@ -1316,7 +1335,7 @@ static Str *buffer_str(Buffer *b, word depth) {
 
 Str *ella_to_text(word v, const Type *t, word depth) {
     Buffer b = {0};
-    put_value(&b, v, t, 0);
+    put_value(&b, v, t, 0, 1);
     return buffer_str(&b, depth);
 }
 
@@ -1345,7 +1364,7 @@ static void write_utf8(FILE *f, const uint32_t *chars, word len) {
 
 void ella_print(word v, const Type *t) {
     Buffer b = {0};
-    put_value(&b, v, t, 0);
+    put_value(&b, v, t, 0, 1);
     write_utf8(stdout, b.chars, b.len);
     fputc('\n', stdout);
     free(b.chars);
@@ -1355,7 +1374,7 @@ void ella_print(word v, const Type *t) {
 void ella_eprint(word v, const Type *t) {
     fflush(stdout);
     Buffer b = {0};
-    put_value(&b, v, t, 0);
+    put_value(&b, v, t, 0, 1);
     write_utf8(stderr, b.chars, b.len);
     fputc('\n', stderr);
     free(b.chars);
@@ -1371,7 +1390,7 @@ _Noreturn static void fail_with(word line, word column, Buffer *message) {
 // A trap whose message shows a value: "no case matches {}".
 _Noreturn void ella_trap_value(const char *message, word v, const Type *t, word line, word column) {
     Buffer b = {0};
-    put_value(&b, v, t, 1);
+    put_value(&b, v, t, 1, 0);
     const char *hole = strstr(message, "{}");
     word depth = start_error(line, column);
     fprintf(stderr, "%.*s", (int)(hole - message), message);

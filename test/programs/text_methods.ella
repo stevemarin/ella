@@ -1,0 +1,50 @@
+# A struct or enum with a `text` method prints through it (docs/grammar.md §9), wherever
+# its values are: in lists, tuples, other structs, maps and interpolation.
+
+struct Celsius
+    degrees: f64
+    text = (c: Celsius) -> str => "{{c.degrees}}°C"
+
+# A generic tree that prints its children through their own text.
+enum Tree[T]
+    Leaf
+    Node(Tree[T], T, Tree[T])
+    text = (t: Tree[T]) -> str =>
+        match t
+            case Leaf => "."
+            case Node(left, value, right) => "({{left}} {{value}} {{right}})"
+
+struct Strict
+    n: i64
+    text = (s: Strict) -> str =>
+        where
+            s.n >= 0
+        "Strict {{s.n}}"
+
+let insert = (t: Tree[i64], x: i64) -> Tree[i64] =>
+    match t
+        case Leaf => Node(Leaf, x, Leaf)
+        case Node(l, v, r) => if x < v then Node(insert(l, x), v, r) else Node(l, v, insert(r, x))
+
+let show[T] = (x: T) -> str => "<{{x}}>"
+
+let main = () -> () =>
+    let t = Celsius(21.5)
+    print(t, [t, Celsius(-3.0)], (t,), Some(t), Ok(t))
+    print("it is {{t}}", show(t), show([t]))
+    eprint("warm:", t)
+    let mut tree: Tree[i64] = Leaf
+    for x in [5, 2, 8, 1]
+        tree = insert(tree, x)
+    print(tree)
+    let words: Tree[str] = Node(Leaf, "hi", Leaf)
+    print(words, [words])
+
+    # Maps and sets print as their literals are written.
+    print({"a": 1, "b": 2}, {1, 2}, {"t": t}, [{(1, 2): ["x"]}], {{1}: Some({2: 3})})
+    let empty: Map[str, i64] = {}
+    print(empty, new_set().union({"only"}))
+
+    # The text method runs each time a value is written, and can fail.
+    print(Strict(1))
+    print([Strict(2), Strict(-1)])

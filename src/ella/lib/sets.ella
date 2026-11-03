@@ -9,11 +9,22 @@ struct Set[T: Eq]
     len = (s: Set[T]) -> i64 => len(s._map)
     iter = (s: Set[T]) -> [T] => s._map.keys()
     items = (s: Set[T]) -> [T] => s._map.keys()
+    is_empty = (s: Set[T]) -> bool => len(s._map) == 0
+    # A Set prints as its literal is written: {1, 2, 3} ({} if it is empty).
+    text = (s: Set[T]) -> str =>
+        let text = "{{s._map.keys()}}"
+        "{" + text[1..len(text) - 1] + "}"
     # Adds an item, giving whether it is new.
     insert = (mut s: Set[T], item: T) -> bool =>
         if item in s._map then return false
         s._map[item] = ()
         true
+    # Adds each item of a list, giving how many were new.
+    insert_all = (mut s: Set[T], items: [T]) -> i64 =>
+        let mut added = 0
+        for item in items
+            if mut s.insert(item) then added += 1
+        added
     # Takes an item out, giving whether it was there.
     remove = (mut s: Set[T], item: T) -> bool =>
         if item not in s._map then return false

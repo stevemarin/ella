@@ -173,6 +173,12 @@ assert filter(squares, (n: i64) -> bool => n > 3) == [9, 4]
 let no_ages: Map[str, i64] = empty_map()
 assert lists.sum(squares, 0) == 14 and len(no_ages) == 0
 
+# map and set literals: {key: value, ...} is a Map ({} an empty one), {x, ...} a Set
+let mut ages = {"ann": 31, "bob": 40}
+ages["ann"] += 1
+let vowels = {"a", "e", "i", "o", "u"}
+assert ages["ann"] == 32 and "e" in vowels and len(vowels) == 5
+
 # tuples: items by position, or taken apart with a pattern in let
 let pair = (1, "one")
 let (number, name) = pair

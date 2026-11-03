@@ -77,11 +77,12 @@ Longest match wins (`//=` before `//` before `/`).
 ==   !=   <    <=   >    >=
 =    +=   -=   *=   /=   //=  %=
 ->   =>   |>   ..   ..=  ?
-.    ,    :    (    )    [    ]    $
+.    ,    :    (    )    [    ]    {    }    $
 ```
 
-`{`, `}`, `;`, `!` (alone), `@` and `` ` `` are not tokens; they are errors
-outside strings and comments.
+`;`, `!` (alone), `@` and `` ` `` are not tokens; they are errors outside
+strings and comments. `{` and `}` make map and set literals
+([§10](#the-prelude)).
 
 ### Integer literals
 
@@ -151,7 +152,8 @@ print("{{ greet("bob") }}")
 
 * A single `{` or `}` is ordinary text. Only `{{` starts interpolation.
 * The interpolation ends at the first `}}` that is not inside a nested
-  bracket or string.
+  bracket or string, nor a map or set literal: in `"{{ {1: 2}}}"`, the
+  first `}` closes the literal.
 * In a single-line string, the expression may not contain a newline.
 * `{{ }}` with no expression is an error.
 
@@ -167,8 +169,9 @@ Indentation defines blocks, as in Python.
   enforced.
 * Every logical line ends with a `NEWLINE` token. At end of file the tokenizer
   emits `NEWLINE` (if needed), the remaining `DEDENT`s, then `EOF`.
-* **Inside `(` `)` and `[` `]`, newlines and indentation are ignored.** This is
-  the only way to continue an expression over several lines.
+* **Inside `(` `)`, `[` `]` and `{` `}`, newlines and indentation are
+  ignored.** This is the only way to continue an expression over several
+  lines.
 * **A line may not end with a binary operator.** This is a parse error with
   the hint "wrap the expression in parentheses":
 
@@ -228,12 +231,13 @@ file*) and the modules it imports, directly or not.
    made, with its causes after it; any other is reported as what main
    returned:
 
-   ```
+   ```text
    prog.ella:16:44: bad row 2
      caused by prog.ella:8:44: bad field ' x'
      caused by prog.ella:6:24: "x" isn't an i64
    prog.ella:1:1: main returned Err("no input")
    ```
+
    `exit(status)` stops the program anywhere, with that status. The
    program's command-line arguments are `args()` ([§10](#10-built-ins)).
 5. Constraints ([§9](#user-defined-constraints-provisional-syntax)), and
@@ -951,9 +955,11 @@ looped over and searched, like the built-in collections:
 | --- | --- | --- |
 | `get` | `v[k]` | `(Self, K) -> V` |
 | `set` | `v[k] = x`, and with `get`, `v[k] += x` and so on | `(mut Self, K, V) -> ()` |
+| `update` | with `get` and `set`: `v[k] += x`, `v[k].f = x`, ... as a line, changing the item in place | `(mut Self, K, (mut V) -> ()) -> ()` |
 | `iter` | `for x in v`: loops over what `v.iter()` gives | `(Self) -> R`, R a list, str, range, iterator or `Gen` |
 | `next` | `for x in v`: v is an *iterator*, whose next item `next` gives | `(mut Self) -> Optional[T]` |
 | `contains` | `x in v` (`v.contains(x)`), `x not in v` | `(Self, T) -> bool` |
+| `text` | the text form, for `print`, `eprint` and `{{v}}` | `(Self) -> str` |
 
 ```ella
 struct Table[V]
@@ -975,9 +981,19 @@ for name in ages
 * The key can have any type: a grid can be indexed with `(row, column)`
   tuples. If a type has both `get` and `set`, they must agree on the key
   and value types.
-* An item that `get` gives is a copy, so only the last step of an
-  assignment can go through `set`: `world.grids[0][(1, 1)] = 4` works, but
-  `table["a"].x = 1` and `f(mut table["a"])` don't.
+* An item that `get` gives is a copy, so without `update` only the last
+  step of an assignment can go through `set`: `world.grids[0][(1, 1)] =
+  4` works, but `table["a"].x = 1` doesn't, and `f(mut table["a"])`
+  never does.
+* `update(k, change)` must call `change` on the item of key `k`, in place:
+  `mut t.update(k, (mut v) => v += x)` must do what `t[k] = t[k] + x`
+  would. An assignment that is a line of a block (so its value isn't used)
+  and goes through an item of a type with `update` uses it: `t[k] += [x]`
+  runs as `mut t.update(k, (mut item) => item += [x])`, after working out
+  `[x]`, so a list in a `Map` grows in place instead of being copied out
+  and back in. Parts of items can be assigned to this way too:
+  `table["a"].x = 1`, `grid[(1, 1)][0] += 1`. (`v[k] = x` still uses
+  `set`, which can add a key.)
 * `iter` gives a new list, string, range, iterator or generator, which
   the loop then goes through. (It is called once, before the first
   iteration.) A type with both `iter` and `next` is looped over with
@@ -999,6 +1015,22 @@ struct Countdown
 for n in Countdown(3)
     print(n)                     # 3, 2, 1
 ```
+
+* `text` gives a value's text form wherever it is written: alone, or inside
+  a list, a tuple or another struct or enum (`[Celsius(1.5)]` prints
+  `[1.5°C]`), whose text is built around it. Its result is used as it is,
+  never quoted. It is called each time the value is written, and an error
+  in it shows `called to make a value's text` in the stack trace. Error
+  messages that show a value (`no case matches ...`) use the built-in
+  form, without calling it.
+
+  ```ella
+  struct Celsius
+      degrees: f64
+      text = (c: Celsius) -> str => "{{c.degrees}}°C"
+
+  print([Celsius(21.5)])           # [21.5°C]
+  ```
 
 * A user-defined constraint can ask for these methods too, so generic code
   can index, loop over and search its values.
@@ -1413,7 +1445,8 @@ a ref `<ref 2>` (which of the arena's values it is), a generator `<gen>`, and co
 with the code as an S-expression.
 
 Structs and enums can give themselves `len`, operators, indexing,
-iteration and `in` with methods ([§9](#methods-provisional-syntax)).
+iteration, `in` and their text form with methods ([§9](#methods-provisional-syntax)).
+A `Map` or `Set` is written as its literal is: `{"a": 1}`, `{1, 2}`.
 
 `assert expr` is a keyword expression rather than a function, so that a
 failure can report the asserted expression's source text. It has type `()`.
@@ -1424,7 +1457,7 @@ program with a message and the source location, then a *stack trace*: the
 calls in progress, innermost first, each where it is and in which function
 (nothing for the top-level code). It goes to standard error:
 
-```
+```text
 lists.ella:5:53: index 5 is out of range for a list of length 3
   called at lists.ella:10:44 in pick
   called at <std>/lists.ella:14:21 in lists.map
@@ -1533,17 +1566,35 @@ for name in ages               # the keys, in order
     print(name, ages[name])
 ```
 
+* `{k: v, ...}` is a `Map` literal, and `{}` an empty `Map`; `{x, ...}` is
+  a `Set` (below). They are `map_of([(k, v), ...])` and `set_of([x, ...])`,
+  the library's whatever the program defines, so later keys replace
+  earlier ones and a set keeps each item once:
+
+  ```ella
+  let mut ages = {"ann": 31, "bob": 40}
+  let primes = {2, 3, 5, 7}
+  let empty: Map[str, i64] = {}
+  ```
+
 * `m[k]` is the value of key `k`, and stops the program if there is none
   (`precondition failed: key in m`). `m.lookup(k)` gives an `Optional`
   instead, and `m.get_or(k, default)` gives `default` instead.
 * `mut m.remove(k)` removes a key, giving its value if it had one.
 * `m.keys()`, `m.values()` and `m.items()` give lists of the keys, the
-  values, and `(key, value)` pairs, in order.
+  values, and `(key, value)` pairs, in order; `m.is_empty()` tells whether
+  it has none.
+* `m.merge(other)` has the keys of `m`, then the new ones of `other`, with
+  `other`'s values where both have a key.
+* `Map` has `update` ([§9](#methods-provisional-syntax)), so as a line,
+  `m[k] += [x]` adds to the list in place, and `m[k].count += 1` changes
+  a field of a struct in the map; the key must be there already.
 * Keys are told apart by `==`, finding them by their `hash`. So `0.0` and
   `-0.0` are the same key, and a NaN key is never found (`nan != nan`):
   setting one adds a new key each time.
-* A `Map` is a value like any other: it is copied, compared with `==` (its
-  order too) and printed field by field. Its fields are private: they are
+* A `Map` is a value like any other: it is copied, and compared with `==`
+  (its order too) field by field. It prints as its literal is written
+  (`{"a": 1, "b": 2}`), through its `text` method. Its fields are private: they are
   how it works inside.
 
 `Set[T]` is a struct holding a `Map[T, ()]`: a set of values, kept in the
@@ -1561,14 +1612,16 @@ for n in odd                   # the items, in order
 ```
 
 * `mut s.insert(x)` adds `x`, and `mut s.remove(x)` takes it out; each
-  gives whether it changed the set.
+  gives whether it changed the set. `mut s.insert_all(xs)` adds each item
+  of a list, giving how many were new, and `s.is_empty()` tells whether
+  it has none.
 * `s.items()` gives a list of the items, in order.
 * `s.union(t)` has the items of `s`, then those of `t` that aren't in `s`;
   `s.intersection(t)` and `s.difference(t)` the items of `s` that are (or
   aren't) in `t`, in `s`'s order. `s.is_subset(t)` tells whether every
   item of `s` is in `t`.
-* Like a `Map`, a `Set` is copied, compared with `==` (its order too) and
-  printed field by field.
+* Like a `Map`, a `Set` is copied, and compared with `==` (its order too);
+  it prints as `{1, 2, 3}`, and as `{}` when it is empty.
 
 The module `iters` has lazy versions of the list functions, on generators
 ([§9](#generators-provisional-syntax)). They share names with those of
@@ -1803,6 +1856,8 @@ primary     = INT | FLOAT | string | "true" | "false" | IDENT
             | "(" expr ")"                       (* grouping *)
             | "(" expr "," [ expr { "," expr } ] [ "," ] ")"  (* tuple *)
             | "[" [ expr { "," expr } [ "," ] ] "]"  (* list *)
+            | "{" [ expr ":" expr { "," expr ":" expr } [ "," ] ] "}"  (* map; `{}` is an empty one *)
+            | "{" expr { "," expr } [ "," ] "}"  (* set *)
             | "type" type                        (* a type, as a value *)
             | splice ;
 string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING_END ;
@@ -1866,7 +1921,7 @@ Parsing notes:
 
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
-* Whether `==` and the text form (`print`) should use methods too, and
+* Whether `==` should use a method too (the text form can, with `text`), and
   whether iteration should use a stateful iterator (`next`) rather than
   making a list.
 * Methods for built-in types (`xs.len()`), and functions in a type's

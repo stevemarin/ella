@@ -226,7 +226,11 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   module adds `lines`, `words`, `split_once`, `repeat`, `is_digit`, ...,
   `lists` adds `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`,
   `max_by`, `partition` and `chunks`, and `maps` adds `map_of`,
-  `group_by`, `counts` and `m.get_or(k, default)`. See [TODO.md](TODO.md) for what could come next.
+  `group_by`, `counts` and `m.get_or(k, default)`. Maps and sets have
+  literals, `{"a": 1}` and `{1, 2}`, and an `update` method lets
+  `m[k] += [x]` and `m[k].count += 1` change the item in place. A `text`
+  method gives a type its own text form for `print`, so maps and sets
+  print as their literals. See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

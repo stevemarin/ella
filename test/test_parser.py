@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 141
+    assert len(program.body) == 145
 
 
 # Precedence (docs/grammar.md §8)
@@ -584,3 +584,25 @@ def test_parse_still_stops_at_the_first_error() -> None:
         str(error("let x = 1 +\nlet y = [1 2]\n"))
         == "1:11: a line can't end with '+'; wrap the expression in parentheses"
     )
+
+
+def test_map_and_set_literals() -> None:
+    assert one('{1: "a", 2: "b",}') == '(map (1 "a") (2 "b"))'
+    assert one("{}") == "(map)"
+    assert one("{x, y + 1}") == "(set x (+ y 1))"
+    assert one("{x,}") == "(set x)"
+    assert one("{\n    1: [2],\n    3: [],\n}") == "(map (1 (list 2)) (3 (list)))"
+    assert one("{(0, 1): {2}}") == "(map ((tuple 0 1) (set 2)))"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("{1: 2, 3}", "1:9: expected ':', found '}'"),
+        ("{1, 2: 3}", "1:6: expected '}', found ':'"),
+        ("{1: }", "1:5: expected an expression, found '}'"),
+        ("{1", "1:1: '{' is never closed"),
+    ],
+)
+def test_bad_map_and_set_literals(source: str, message: str) -> None:
+    assert str(error(source)) == message

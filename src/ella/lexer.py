@@ -61,10 +61,15 @@ STD = "<std>"  # the directory of the standard library's modules, in spans
 @dataclass(frozen=True, slots=True)
 class CallSite:
     """A call in progress when a run-time error stopped the program: where it is, and the function it is in
-    ("" for the top-level code). A finalizer's call, which the program doesn't write, is at Span(0, 0)."""
+    ("" for the top-level code). Calls the program doesn't write are at FINALIZER_SITE or TEXT_SITE."""
 
     span: Span
     function: str
+
+
+# Where calls the program doesn't write are: a finalizer's, and a `text` method's for `print`.
+FINALIZER_SITE = Span(0, 0)
+TEXT_SITE = Span(0, 1)
 
 
 def parse_place(text: str) -> Span | None:
@@ -127,8 +132,10 @@ class EllaError(Exception):
         for i, call in enumerate(self.trace or []):
             if i == TRACE_ENDS and self.omitted:
                 lines.append(f"  ... {self.omitted} more calls")
-            if call.span == Span(0, 0):
+            if call.span == FINALIZER_SITE:
                 lines.append("  called to finalize a value")
+            elif call.span == TEXT_SITE:
+                lines.append("  called to make a value's text")
             else:
                 lines.append(f"  called at {where(call.span)}{f' in {call.function}' if call.function else ''}")
         return "\n".join(lines)
@@ -176,14 +183,14 @@ OPERATORS = sorted(
     [
         "+", "-", "*", "/", "//", "%", "**", "&", "|", "^", "~", "<<", ">>",
         "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "//=", "%=",
-        "->", "=>", "|>", "..", "..=", "?", ".", ",", ":", "(", ")", "[", "]", "$",
+        "->", "=>", "|>", "..", "..=", "?", ".", ",", ":", "(", ")", "[", "]", "{", "}", "$",
     ],
     key=len,
     reverse=True,
 )  # fmt: skip
 
 # Each closing bracket and the opening bracket it must match.
-CLOSING_BRACKETS = {")": "(", "]": "["}
+CLOSING_BRACKETS = {")": "(", "]": "[", "}": "{"}
 
 # Character classes. These are sets rather than strings because `peek` returns
 # "" at the end of the source, and "" is "in" every string but in no set.
@@ -378,7 +385,7 @@ class Lexer:
 
     def track_bracket(self, token: Token) -> None:
         """Keep the stack of open brackets up to date, checking that they match."""
-        if token.text in ("(", "["):
+        if token.text in ("(", "[", "{"):
             self.brackets.append(token)
         elif token.text in CLOSING_BRACKETS:
             if not self.brackets or self.brackets[-1].text != CLOSING_BRACKETS[token.text]:
@@ -519,8 +526,9 @@ class Lexer:
         """Scan `{{ expr }}` as INTERP_START, ordinary tokens, then INTERP_END.
 
         The expression is scanned with the same `scan_token` as everywhere
-        else. Since `}` on its own is never a token, the first `}}` we reach
-        must be the end. A nested string such as `{{ f("}}") }}` is scanned by
+        else. The first `}}` reached while no brace (of a map or set literal)
+        is open in it must be the end: in `{{ {1: 2}}}`, the first `}` closes
+        the literal. A nested string such as `{{ f("}}") }}` is scanned by
         a recursive `scan_string`, so a `}}` inside it doesn't count.
         """
         start, span = self.pos, self.span()
@@ -530,7 +538,7 @@ class Lexer:
         # Brackets inside the interpolation must match among themselves, so
         # `f("{{ ) }}")` is an error rather than closing the `(` outside.
         outer_brackets, self.brackets = self.brackets, []
-        while not self.at("}}"):
+        while not self.at("}}") or any(bracket.text == "{" for bracket in self.brackets):
             char = self.peek()
             if char == "":
                 raise EllaError("this interpolation is never closed with '}}'", span)

@@ -19,7 +19,7 @@ and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
 and iterators, then direct calls, inlining and register allocation, then
 stack traces, errors with causes and locations, and `main` giving a
-`Result`, then sets and more of the standard library). `make check` passes (1243 tests, ruff, strict mypy).
+`Result`, then sets and more of the standard library). `make check` passes (1269 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -57,15 +57,14 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 `sort_by`, `sum`, `fold`, `zip`, ...), constants, `Map[K, V]` and
 `Set[T]`, written in Ella.
 
-- No map or set literals (`{` is an unexpected character).
+- An empty `Set` prints as `{}`, which reads as an empty `Map`.
 - `hash` is structural, like `==`, and can't be customized: a type
   can't hash only the fields that matter, and since `==` can't be
   customized either, there is no use for a `Hash` constraint yet. A `Map`
-  (or `Set`) also prints, and compares with `==`, by its inner fields.
-- `m[k] += [x]` on a `Map` (or any type with `get` and `set`) gets a
-  copy of the value, changes it and sets it back, so growing a list kept
-  in a map costs its whole length each time. A protocol that changes a
-  value in place (or moving it out and back) would make it O(1).
+  (or `Set`) also compares with `==` by its inner fields, its order too.
+- `update` changes an item in place only for an assignment that is a line
+  of a block; one whose value is used (`let y = (m[k] += 1)`) still gets
+  and sets the item, and `f(mut m[k])` isn't allowed.
 - `sum` takes a start value (`sum(xs, 0)`): a generic function has no way
   to make the zero of a `Num` type.
 - `upper` and `lower` only change ASCII letters; the rest of Unicode would
@@ -111,8 +110,8 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 
 ### Types, methods and protocols
 
-- `==` and the text form (`print`) can't be customized; both are structural
-  and done by the runtime, so they would need callbacks into Ella code.
+- `==` can't be customized; it is structural and done by the runtime,
+  which would need to call Ella code, as it does for `text` methods.
 - A generator takes its nocopy arguments (a `Gen` given to another
   generator, say) only as new values: `squares(count(4))` works, but
   `squares(g)` for a variable `g` doesn't. Moving a local variable at its
@@ -354,8 +353,37 @@ Small steps that build on the above:
    module).
 7. `min_by`, `max_by` and `partition` on lists; `m.get_or(k, default)`,
    and `map_of`, `group_by` and `counts`, which make `Map`s. `group_by`
-   adds items to lists in place, since `m[k] += [x]` copies the list out
-   of the map and back.
+   adds items to lists in place.
+8. `m.is_empty()`, `m.merge(other)`, `s.is_empty()` and
+   `mut s.insert_all(xs)`.
+9. Map and set literals: `{"a": 1, "b": 2}`, `{}` (an empty `Map`) and
+   `{1, 2, 3}`. The parser makes `MapLit` and `SetLit`, which linking
+   turns into calls of the library's `map_of` and `set_of` (whatever the
+   program defines), so nothing after it changes. Braces are brackets,
+   so newlines inside are ignored; an interpolation ends at `}}` only
+   when no brace is open in it.
+10. An `update` protocol method, `(mut Self, K, (mut V) -> ()) -> ()`, which
+    `Map` has: an assignment line through an item of such a type runs as
+    `mut v.update(k, (mut item) => item op= x)` (the checker makes that
+    code, `Checker.updates`, which the interpreter and the lowering run
+    instead). So `m[k] += [x]` grows the list in place, and parts of items
+    can be assigned to: `m[k].count += 1`, `m[a][b] = x`. Lists grown
+    in a map went from quadratic to linear: 400,000 appends to one went
+    from 41 s to 0.01 s (benchmark `map_lists`).
+11. Lambdas capture only the local variables their code names, rather
+    than every variable in scope; each capture is a copy, so a lambda made
+    next to a big local (such as the map `update` changes) no longer
+    copies it.
+12. A `text` protocol method, `(Self) -> str`, gives a struct's or enum's
+    text form for `print`, `eprint` and interpolation, inside other values
+    too; `Map` and `Set` print as their literals (`{"a": 1}`, `{1, 2}`).
+    The lowering makes the text methods of the types a printed value may
+    hold (`Module.texts`, specialized per type arguments); the IR
+    interpreter follows the value's type to call them, and native code
+    finds each in its type descriptor, which the runtime calls through
+    `ella_call1` with a level of its own for the result. Error messages
+    keep the built-in form, and a call shows as `called to make a value's
+    text` in stack traces.
 
 ### Done (2026-11-02, ninth round): errors and diagnostics
 

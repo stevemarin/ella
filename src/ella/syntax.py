@@ -247,6 +247,22 @@ class ListLit:
 
 
 @dataclass(frozen=True, slots=True)
+class MapLit:
+    """`{k: v, ...}`, or `{}`: a Map. Linking makes it a call of the library's `map_of`."""
+
+    entries: tuple[tuple[Expr, Expr], ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class SetLit:
+    """`{x, ...}`: a Set. Linking makes it a call of the library's `set_of`."""
+
+    items: tuple[Expr, ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class Name:
     name: str
     span: Span
@@ -558,6 +574,8 @@ type Expr = (
     | UnitLit
     | TupleLit
     | ListLit
+    | MapLit
+    | SetLit
     | Name
     | Unary
     | Binary
@@ -745,6 +763,10 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("tuple", *map(show, items))
         case ListLit(items):
             return sexpr("list", *map(show, items))
+        case MapLit(entries):
+            return sexpr("map", *(sexpr(show(key), show(value)) for key, value in entries))
+        case SetLit(items):
+            return sexpr("set", *map(show, items))
         case Name(name):
             return name
         case Unary(op, operand):

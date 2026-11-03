@@ -55,9 +55,21 @@ def test_operators_longest_match() -> None:
     assert texts("a**b<<c>>d!=e") == ["a", "**", "b", "<<", "c", ">>", "d", "!=", "e"]
 
 
-@pytest.mark.parametrize("char", ["{", "}", ";", "!", "@", "`", "é"])
+@pytest.mark.parametrize("char", [";", "!", "@", "`", "é"])
 def test_invalid_characters(char: str) -> None:
     assert "unexpected character" in error(f"a {char} b").message
+
+
+def test_braces_are_brackets() -> None:
+    # Map and set literals: newlines inside are ignored, and braces must match.
+    assert texts("{1: [2,\n  3]}") == ["{", "1", ":", "[", "2", ",", "3", "]", "}"]
+    assert error("a { b").message == "'{' is never closed"
+    assert error("a } b").message == "unmatched '}'"
+    assert error("(1}").message == "unmatched '}'"
+
+
+def test_interpolation_ends_at_double_brace_with_no_brace_open() -> None:
+    assert texts('"{{ {1: {2}}}}"') == ['"', "{{", "{", "1", ":", "{", "2", "}", "}", "}}", '"']
 
 
 def test_tabs_are_errors() -> None:

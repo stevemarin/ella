@@ -834,6 +834,25 @@ def test_protocols() -> None:
             "the method 'set' must have the type (mut R, K, V) -> ()",
         ),
         (
+            "struct R\n    n: i64\n    update = (mut r: R, i: i64, f: (i64) -> ()) -> () => ()",
+            "the method 'update' must have the type (mut R, K, (mut V) -> ()) -> ()",
+        ),
+        (
+            "struct R\n    n: i64\n    update = (mut r: R, i: i64, f: (mut i64) -> ()) -> () => ()",
+            "a type with an update method needs get and set methods too",
+        ),
+        (
+            (
+                "struct R\n    n: i64\n    get = (r: R, i: i64) -> i64 => i\n    set = (mut r: R, i: i64, v: i64) -> () => ()\n"
+                "    update = (mut r: R, i: i64, f: (mut str) -> ()) -> () => ()"
+            ),
+            "update must take the key type get uses, and a (mut i64) -> ()",
+        ),
+        (
+            "struct R\n    n: i64\n    text = (r: R) -> i64 => 1",
+            "the method 'text' must have the type (R) -> str",
+        ),
+        (
             "struct R\n    n: i64\n    iter = (r: R) -> i64 => 1",
             "the method 'iter' must have the type (R) -> a list, str, range, iterator or Gen",
         ),
@@ -849,6 +868,38 @@ def test_protocols() -> None:
 )
 def test_protocol_errors(source: str, message: str) -> None:
     assert error(source).message == message
+
+
+UPDATED = BAG.replace(
+    "    iter =",
+    "    update = (mut b: Bag, i: i64, f: (mut str) -> ()) -> () =>\n        f(mut b.items[i])\n    iter =",
+)
+
+BOXES = """\
+struct Box
+    x: i64
+struct Boxes
+    items: [Box]
+    get = (b: Boxes, i: i64) -> Box => b.items[i]
+    set = (mut b: Boxes, i: i64, x: Box) -> () =>
+        b.items[i] = x
+    update = (mut b: Boxes, i: i64, f: (mut Box) -> ()) -> () =>
+        f(mut b.items[i])
+"""
+
+
+def test_assignments_through_update() -> None:
+    # A line of a block assigning through an item uses `update`, and has the value ().
+    assert prepared_type_of(UPDATED + "let f = () -> () =>\n    bag[0] += 'b'\n    bag[0] += 'c'") == "() -> ()"
+    # Elsewhere the assignment's value is used: it gets and sets the item.
+    assert prepared_type_of(UPDATED + "let f = () -> str =>\n    let y = (bag[0] += 'b')\n    y\nf()") == "str"
+    boxed = BOXES + "let mut bag = Boxes([Box(1)])\n"
+    assert prepared_type_of(boxed + "let f = () -> () =>\n    bag[0].x += 1\n    bag[0].x = 2\nf()") == "()"
+    # A part of an item can only change through update, as a line.
+    assert error(PS + "let mut ps = Ps([])\nps[0].x = 1").message == COPIED_ITEM.format("Ps")
+    assert error(boxed + "let f = () -> i64 =>\n    let y = (bag[0].x = 1)\n    y").message == COPIED_ITEM.format(
+        "Boxes"
+    )
 
 
 def all_errors(source: str) -> list[str]:

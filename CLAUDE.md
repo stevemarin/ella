@@ -54,6 +54,8 @@ plain:
   string interpolation (`STRING_START`, `STRING_TEXT`, `INTERP_START` …
   tokens … `INTERP_END`, `STRING_END`).
 * `src/ella/syntax.py`: AST node dataclasses, and `show()` for S-expressions.
+  `MapLit` and `SetLit` (`{k: v}`, `{x}`) only live until linking, which
+  makes them calls of the library's `map_of` and `set_of`.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
   parsing notes in §12. A file's `import` lines come first
   (`Program.imports`); paths in types and patterns are dotted names.
@@ -67,7 +69,10 @@ plain:
   (`wrappers`), which the lowering makes into a function. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
   level), generic functions, methods and constraints (built-in and
-  user-defined, met structurally), generators (a lambda with `yield`,
+  user-defined, met structurally), the `update` protocol (an assignment
+  line through an item of such a type becomes code that calls it,
+  `updates`, which the interpreters and lowering run instead), the `text` protocol (a type's text form for `print`),
+  generators (a lambda with `yield`,
   `syntax.is_generator`; how each `for` loops is in `iterations`), and the
   rules for `nocopy` values (`check_copies`; a call giving a `Gen` takes
   its nocopy arguments, which must be new values). Splices in types run while checking, through
@@ -90,7 +95,8 @@ plain:
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters, as
   are `MAX_CALL_DEPTH` (every backend's default call depth limit),
-  `run_deep` (runs an interpreter on a thread with a big stack),
+  `run_deep` (runs an interpreter on a thread with a big stack), `to_text`
+  (whose `custom` calls `text` methods, for `print`; error messages leave it out),
   `make_error` (a built-in `Error`, whose `error` flag makes `==` and the
   text form leave out its `at`) and `main_error` (the error of an `Err`
   that `main` returns).
@@ -111,7 +117,8 @@ plain:
   local scopes. It also checks private names (`_x`), imports and
   read-only variables of other modules; the checker checks private fields
   and methods. `prepare` and the interpreter's `run` call it; `Linker`
-  takes more options, for editors. Code of a module other than the entry
+  takes more options, for editors. It also turns map and set literals into
+  calls. Code of a module other than the entry
   file only has built-ins left as bare top-level names, so the checker and
   the interpreters give it those even if the entry file defines the names
   (`visible`, by the span's file). Values print with bare type names
@@ -140,7 +147,8 @@ plain:
   levels live in the Gen (docs/memory-model.md §17). A call's `within` is
   the function it is in, for stack traces, kept when inlining moves it.
 * `src/ella/lower.py`: checked AST to IR (`compile_program`). Variables are
-  local slots; lambdas are closure converted. It also decides memory: which
+  local slots; lambdas are closure converted, capturing (copying) the
+  variables their code names. It also decides memory: which
   region (arena) each object is made in, and where `copy` is needed, by
   tracking what each value borrows and how long it lives (see its docstring
   and docs/memory-model.md §14). A loop that gives outer variables new
@@ -150,7 +158,9 @@ plain:
   list's items, borrowing what the list borrows (memory-model.md §18).
   Generic functions are specialized per type arguments, and so are methods
   (functions named `Type.method`); operators on structs with methods like
-  `add` become calls.
+  `add` become calls. Printing a value makes the `text` methods of the
+  types it may hold (`Module.texts`), which the IR interpreter and the
+  runtime (through type descriptors and `ella_call1`) call.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
   ("memory check failed" means a compiler bug; a list's view, `View`, checks

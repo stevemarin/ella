@@ -184,6 +184,15 @@ def test_library_modules_can_be_imported(tmp_path: Path) -> None:
     assert run(tmp_path, files) == "1 [2, 1]\n"
 
 
+def test_literals_mean_the_librarys_maps_and_sets(tmp_path: Path) -> None:
+    # Whatever the program calls map_of, set_of or Map, and in a module that imports nothing.
+    files = {
+        "tool.ella": "let pairs = () -> i64 => len({1: 2, 3: 4})\n",
+        "main.ella": "import tool\nlet map_of = 1\nlet set_of = 2\nprint(len({'a': 1}), {3, 3}.items(), tool.pairs(), map_of)\n",
+    }
+    assert run(tmp_path, files) == "1 [3] 2 1\n"
+
+
 # The names a module sees
 
 

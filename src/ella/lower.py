@@ -195,6 +195,7 @@ from ella.syntax import (
     ListLit,
     LiteralPattern,
     Loop,
+    MapLit,
     Match,
     Member,
     MutArg,
@@ -205,6 +206,7 @@ from ella.syntax import (
     Program,
     Quote,
     RangePattern,
+    SetLit,
     Splice,
     StringLit,
     Try,
@@ -859,14 +861,21 @@ class Lowerer:
         return self.variant_field(result, "Ok", 0, value_type, span)
 
     def lower_lambda(self, function: Lambda, self_names: list[str], span: Span, dest: str = "") -> Value:
-        """A lambda expression: a `closure` of a new IR function, capturing every local variable."""
+        """A lambda expression: a `closure` of a new IR function, capturing the local variables its code names.
+
+        Captures are copies, so it takes only the variables some name in its code (or in the
+        lambdas and quotes inside it) may refer to: a name bound inside it too is taken anyway.
+        """
         region = dest or self.here()
         visible: dict[str, str] = {}
         for scope in self.scopes:  # outermost first, so inner names shadow outer ones
             visible.update(scope)
+        named = names_in(function)
         # Values that can't be copied can't be captured either (the checker makes sure no lambda uses one).
         visible = {
-            n: slot for n, slot in visible.items() if slot == SELF or not self.nocopy(self.function.locals[slot])
+            n: slot
+            for n, slot in visible.items()
+            if n in named and (slot == SELF or not self.nocopy(self.function.locals[slot]))
         }
         captured = [self.read_local(name, span) for name in visible]
         # Captured values can't change inside the closure, but they mustn't share
@@ -1101,6 +1110,10 @@ class Lowerer:
                 self.block = matched
                 return value
             case Assign(op, target, value_expr):
+                if (update := self.checker.updates.get(id(expr))) is not None:
+                    # `v[k] op= x` changing the item in place, with v's `update` method.
+                    self.lower(update)
+                    return self.const((), span)
                 if isinstance(target, Name):
                     return self.lower_assign_name(op, target, value_expr, span, self.last_uses.get(id(expr), ""))
                 if isinstance(target, Index) and self.has_method(self.type_of(target.target), "set"):
@@ -1247,6 +1260,8 @@ class Lowerer:
                 return self.const((), span)
             case EnumDef() | ConstraintDef():
                 return self.const((), span)  # enums and constraints are only types; nothing runs
+            case MapLit() | SetLit():
+                raise AssertionError("linking makes map and set literals calls")
 
     def type_of(self, expr: Expr) -> Type:
         return self.concrete(self.checker.types[id(expr)])
@@ -1269,9 +1284,7 @@ class Lowerer:
             else:
                 value = self.lower(part)
                 region = dest if count == 1 else self.here()
-                pieces.append(
-                    value if value.type == STR else self.emit("to_text", STR, [value], part.span, region=region)
-                )
+                pieces.append(value if value.type == STR else self.emit_text(value, part.span, region))
         if not pieces:
             return self.const("", span)
         result = pieces[0]
@@ -1613,8 +1626,9 @@ class Lowerer:
     def printed(self, values: list[Value], span: Span) -> Value:
         """What `print` writes for several values: their text forms with spaces between (one is printed as it is)."""
         if len(values) == 1:
+            self.need_texts(values[0].type, span)
             return values[0]
-        texts = [v if v.type == STR else self.emit("to_text", STR, [v], span, region=self.here()) for v in values]
+        texts = [v if v.type == STR else self.emit_text(v, span, self.here()) for v in values]
         result = texts[0] if texts else self.const("", span)
         for text in texts[1:]:
             spaced = self.emit("add", STR, [result, self.const(" ", span)], span, region=self.here())
@@ -1680,6 +1694,36 @@ class Lowerer:
     def has_method(self, t: Type, name: str) -> bool:
         """Whether values of type `t` (a struct or enum) have a method, such as the `add` that gives them `+`."""
         return isinstance(t, EnumTy) and name in self.module.enums[t.name].methods
+
+    def emit_text(self, value: Value, span: Span, region: str) -> Value:
+        """The text form of a value, as `print` writes it."""
+        self.need_texts(value.type, span)
+        return self.emit("to_text", STR, [value], span, region=region)
+
+    def need_texts(self, t: Type, span: Span) -> None:
+        """Make the `text` methods that writing a value of type t calls: those of the structs and enums in it.
+
+        A value of a type with one is written by calling it, so its parts aren't looked into.
+        """
+        seen: set[Type] = set()
+        work = [t]
+        while work:
+            part = work.pop()
+            if part in seen:
+                continue
+            seen.add(part)
+            match part:
+                case ListTy(element):
+                    work.append(element)
+                case TupleTy(items):
+                    work += items
+                case EnumTy(name, args) if "text" in self.module.enums[name].methods:
+                    if part not in self.module.texts:
+                        self.module.texts[part] = self.specialize(f"{name}.text", args, span)
+                case EnumTy(name, args):
+                    info = self.module.enums[name]
+                    mapping = dict(zip(info.params, args))
+                    work += [substitute(f, mapping) for fields in info.variants.values() for f in fields]
 
     def method(self, t: Type, name: str, span: Span) -> Value:
         """A closure of the method `name` of a struct or enum type, specialized for its type arguments."""
@@ -2348,6 +2392,13 @@ def returned_names(body: Expr | tuple[Expr, ...]) -> set[str]:
     if isinstance(body, tuple):
         return set()
     return tails(body) | returns(body)
+
+
+def names_in(node: object) -> set[str]:
+    """Every name some code uses, anywhere in it."""
+    if isinstance(node, Name):
+        return {node.name}
+    return set().union(*(names_in(child) for child in children(node)))
 
 
 def children(node: object) -> list[object]:

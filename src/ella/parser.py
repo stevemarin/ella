@@ -65,6 +65,7 @@ from ella.syntax import (
     LiteralPattern,
     LiteralValue,
     Loop,
+    MapLit,
     Match,
     Member,
     Method,
@@ -79,6 +80,7 @@ from ella.syntax import (
     Quote,
     RangePattern,
     Return,
+    SetLit,
     Splice,
     StringLit,
     Try,
@@ -308,6 +310,32 @@ class Parser:
                 self.expect(close)
                 break
         return items, trailing_comma
+
+    def parse_braces(self) -> Expr:
+        """`{k: v, ...}` (a Map), `{x, ...}` (a Set), or `{}` (an empty Map)."""
+        span = self.expect("{").span
+        if self.accept("}"):
+            return MapLit((), span)
+        first = self.parse_expr()
+        if self.accept(":"):
+            entries = [(first, self.parse_expr())]
+            if self.accept(","):
+                entries += self.parse_comma_list(self.parse_entry, "}")[0]
+            else:
+                self.expect("}")
+            return MapLit(tuple(entries), span)
+        items = [first]
+        if self.accept(","):
+            items += self.parse_comma_list(self.parse_expr, "}")[0]
+        else:
+            self.expect("}")
+        return SetLit(tuple(items), span)
+
+    def parse_entry(self) -> tuple[Expr, Expr]:
+        """`key: value` in a map literal."""
+        key = self.parse_expr()
+        self.expect(":")
+        return key, self.parse_expr()
 
     # Program structure and blocks
 
@@ -573,6 +601,8 @@ class Parser:
                 self.advance()
                 items, _ = self.parse_comma_list(self.parse_expr, "]")
                 return ListLit(tuple(items), token.span)
+            case TokenKind.OP, "{":
+                return self.parse_braces()
             case TokenKind.KEYWORD, "let":
                 return self.parse_let()
             case TokenKind.KEYWORD, "if":

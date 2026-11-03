@@ -1,0 +1,74 @@
+# `m[k] op= x` as a line changes the item in place through the type's `update` method
+# (docs/grammar.md §9), and map and set literals.
+
+# A struct with get, set and update: update says how its items change.
+struct Tally
+    names: [str]
+    totals: [i64]
+    get = (t: Tally, name: str) -> i64 => t.totals[t._find(name)]
+    set = (mut t: Tally, name: str, total: i64) -> () =>
+        let i = t._find(name)
+        if i < 0 then
+            t.names += [name]
+            t.totals += [total]
+        else
+            t.totals[i] = total
+    update = (mut t: Tally, name: str, change: (mut i64) -> ()) -> () =>
+        print("update", name)
+        change(mut t.totals[t._find(name)])
+    _find = (t: Tally, name: str) -> i64 =>
+        for i in 0..len(t.names)
+            if t.names[i] == name then return i
+        -1
+
+struct Person
+    name: str
+    age: i64
+
+let main = () -> () =>
+    let mut groups: Map[str, [i64]] = {"odd": [], "even": []}
+    for i in 0..10
+        groups[if i % 2 == 0 then "even" else "odd"] += [i]
+    print(groups["odd"], groups["even"])
+
+    # Any operator: the value is worked out first, then the key.
+    let mut scores = {"ann": 10, "bob": 3}
+    scores["ann"] -= 4
+    scores["bob"] *= scores["ann"]
+    scores["ann"] //= 4
+    print(scores["ann"], scores["bob"])
+
+    # Used as a value, an assignment gives the new item, through get and set.
+    let doubled = (scores["bob"] *= 2)
+    print(doubled, scores["bob"])
+
+    let mut tally = Tally([], [])
+    tally["x"] = 1
+    tally["x"] += 41
+    print(tally["x"])
+
+    # Parts of items: a map of maps, fields of structs in a map, items of lists in a map.
+    let mut nested = {"a": {1: "one"}}
+    nested["a"][1] += "!"
+    nested["a"][2] = "two"
+    print(nested["a"].items())
+    let mut people = {"al": Person("al", 25)}
+    people["al"].age += 1
+    people["al"].name = "Al"
+    print(people["al"])
+    let mut rows = {"r": [1, 2, 3]}
+    rows["r"][1] = 20
+    rows["r"][2] += 10
+    print(rows["r"])
+
+    # Map and set literals: `{k: v, ...}`, `{x, ...}`, and `{}` for an empty map.
+    let empty: Map[i64, str] = {}
+    let primes = {2, 3, 5, 7, 3}
+    print(len(empty), empty.is_empty(), primes.items(), 5 in primes, {1: 2}.items(), {"x"}.items())
+    print("in a string: {{ {1: [2, 3]}[1] }}", {
+        (0, 0): "origin",
+        (1, 0): "east",
+    }.items())
+
+    # A key that isn't there: update's precondition fails.
+    scores["cy"] += 1

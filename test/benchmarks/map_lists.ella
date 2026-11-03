@@ -1,0 +1,17 @@
+# Lists grown inside a Map, and fields of structs in one: `m[k] += [x]` changes the item in place,
+# through Map's `update`, rather than copying it out and back in.
+struct Stats
+    count: i64
+    total: i64
+
+let main = () -> () =>
+    let mut groups: Map[i64, [i64]] = {}
+    let mut stats: Map[str, Stats] = {}
+    for k in 0..10
+        groups[k] = []
+    stats["all"] = Stats(0, 0)
+    for i in 0..300000
+        groups[i % 10] += [i]
+        stats["all"].count += 1
+        stats["all"].total += i % 7
+    print(len(groups[3]), groups[3][29999], stats["all"])

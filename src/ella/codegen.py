@@ -234,20 +234,20 @@ class CodeGen:
             "    leave                       # back to the runtime's stack",
             "    ret",
             "",
-            "# Call an Ella closure with one argument, from the runtime: ella_call1(closure, argument).",
-            "# It runs finalizers, whose results are () and need no arena.",
-            "# It counts as a call, at the runtime's finalizer site, as in the interpreters.",
+            "# Call an Ella closure with one argument, from the runtime:",
+            "# ella_call1(closure, argument, result depth, site), giving its result.",
+            "# It runs finalizers and `text` methods, and counts as a call at the site given",
+            "# (ella_finalizer_site or ella_text_site), as in the interpreters.",
             "    .globl ella_call1",
             "ella_call1:",
             "    push rbp",
             "    mov rbp, rsp",
             "    mov rax, qword ptr [rip + ella_depth]",
-            "    lea rcx, [rip + ella_trace]",
-            "    lea rdx, [rip + ella_finalizer_site]",
-            "    mov qword ptr [rcx + 8*rax], rdx",
+            "    lea r8, [rip + ella_trace]",
+            "    mov qword ptr [r8 + 8*rax], rcx",
             "    inc qword ptr [rip + ella_depth]",
             "    push rsi                    # the argument",
-            "    push 0                      # where the result goes",
+            "    push rdx                    # where the result goes",
             "    push rdi                    # the closure",
             "    call qword ptr [rdi]",
             "    dec qword ptr [rip + ella_depth]",
@@ -618,6 +618,7 @@ class CodeGen:
                 mapping = dict(zip(enum.params, args))
                 kind, count = ENUM_KIND, len(enum.variants)
                 finalize = self.finalizer(name) if enum.finalize else "0"
+                text = self.static_closure(self.module.texts[t]) if t in self.module.texts else "0"
                 error = int(is_builtin_error(self.module.enums, name))
                 for variant, fields in enum.variants.items():
                     field_labels = [self.type_descriptor(substitute(f, mapping)) for f in fields]
@@ -625,7 +626,7 @@ class CodeGen:
                     self.rodata += [
                         "    .balign 8",
                         f"{variant_label}:",
-                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}, {error}"
+                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}, {error}, {text}"
                         + "".join(f", {f}" for f in field_labels),
                     ]
                     parts.append(variant_label)

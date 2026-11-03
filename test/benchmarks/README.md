@@ -25,6 +25,8 @@ time and the arena peak. `make bench` does the same for all of them.
 * `arith`: integer arithmetic in nested loops, calling small helpers.
 * `methods`: small methods and an operator on a struct of floats, in a loop.
 * `map_ops`: inserting, updating and looking up the keys of a `Map`.
+* `map_lists`: lists grown inside a `Map`, and fields of structs in one,
+  which change in place through `Map`'s `update` (`m[k] += [x]`).
 * `halves`: divide and conquer on list slices, which are views of the list
   (docs/memory-model.md §18); copying them would pass the `.peak` bound.
 * `fields`: `split`, `trim` and string slices, all views of the text.
