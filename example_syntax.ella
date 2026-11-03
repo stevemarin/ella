@@ -294,6 +294,14 @@ points[p].y += 1.0
 assert points[p].y == 2.0
 free(mut points, p)
 
+# an arena holds values of any types that are freed together, at once
+let mut level: Arena = arena_new()
+let start = alloc(mut level, Point(0.0, 0.0))
+let title = alloc(mut level, "level 1")
+level[title] += "!"
+assert len(level) == 2 and level[start].x == 0.0
+free(mut level)
+
 # multi-stage programming: quote makes code, $ splices it in, and a splice
 # outside any quote runs while compiling
 let power = (n: i64, x: Code[i64]) -> Code[i64] =>

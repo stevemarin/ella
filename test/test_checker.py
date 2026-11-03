@@ -156,7 +156,7 @@ def test_error_type() -> None:
         ("[1][true]", "an index must be an i64, not bool"),
         ("5[0]", "can't index a i64"),
         ("(1, 2).x", "a (i64, i64) has no fields"),
-        ("len(5)", "len() needs a list, str, range or Pool, not i64"),
+        ("len(5)", "len() needs a list, str, range, Pool or Arena, not i64"),
         ("len()", "len takes 1 argument but was given 0"),
         ("Some(1, 2)", "Some takes 1 argument but was given 2"),
         ("5(1)", "can't call a value of type i64"),
@@ -397,6 +397,11 @@ def test_struct_and_generic_types() -> None:
     assert type_of("let first[T] = (xs: [T]) -> T => xs[0]\nfirst([true])") == "bool"
     assert type_of("let mut p: Pool[str] = pool_new()\nlet h = alloc(mut p, 'x')\nh") == "Handle[str]"
     assert type_of("let mut p: Pool[str] = pool_new()\nlet h = alloc(mut p, 'x')\np[h]") == "str"
+    assert type_of("arena_new()") == "Arena"
+    assert type_of("let mut a = arena_new()\nlet r = alloc(mut a, 'x')\nr") == "Ref[str]"
+    assert type_of("let mut a = arena_new()\nlet r = alloc(mut a, [1])\na[r]") == "[i64]"
+    assert type_of("let mut a = arena_new()\nfree(mut a)") == "()"
+    assert type_of("let mut a = arena_new()\nlen(a)") == "i64"
     assert type_of("quote 1 + 2") == "Code[i64]"
     assert type_of("run(quote [1])") == "[i64]"
 
@@ -432,6 +437,21 @@ def test_struct_and_generic_types() -> None:
         (
             "let mut p: Pool[str] = pool_new()\nlet h = alloc(p, 'x')",
             "alloc() changes its pool, so mark it: 'alloc(mut pool, ...)'",
+        ),
+        ("let mut a = arena_new()\nlet b = a", "an Arena can't be copied, so it can't be used here"),
+        ("let mut a = arena_new()\nfree(a)", "free() changes its arena, so mark it: 'free(mut arena)'"),
+        ("let mut a = arena_new()\nfree(mut a, 1)", "free takes 1 argument but was given 2"),
+        ("let mut p: Pool[i64] = pool_new()\nfree(mut p)", "free takes 2 arguments but was given 1"),
+        ("let mut a = arena_new()\na[0]", "an arena's index should be Ref[?1], not i64"),
+        (
+            "let mut a = arena_new()\nlet r = alloc(mut a, 1)\nlet s: str = a[r]",
+            "the value of 's' should be str, not i64",
+        ),
+        ("let mut a = arena_new()\na == a", "Arena values can't be compared"),
+        ("let x: Arena[i64] = arena_new()", "Arena takes 0 type arguments, not 1"),
+        (
+            "let mut a = arena_new()\nlet r = alloc(mut a, 'x')\nlet f = (mut b: Arena, s: str) -> () => ()\nf(mut a, a[r])",
+            "'a' is passed as 'mut', so it can't also be used in another argument of the same call",
         ),
         (
             "let mut p: Pool[str] = pool_new()\nlet mut q: Pool[i64] = pool_new()\nlet h = alloc(mut p, 'x')\nq[h]",
@@ -1262,7 +1282,7 @@ def test_inferred_lambda_errors() -> None:
         prepare(parse("map(['a'], (s) => s..s)"))
     with pytest.raises(EllaError, match="argument 1 should be i64, not str"):
         prepare(parse("let f = () -> () =>\n    let g = (x) => x\n    g(1)\n    g('a')\n    ()"))
-    with pytest.raises(EllaError, match="len[(][)] needs a list, str, range or Pool, not i64"):
+    with pytest.raises(EllaError, match="len[(][)] needs a list, str, range, Pool or Arena, not i64"):
         prepare(parse("map([1], len)"))
 
 

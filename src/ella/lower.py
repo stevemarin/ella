@@ -513,15 +513,15 @@ class Lowerer:
     def needs_copy(self, t: Type, info: Info | None = None) -> bool:
         """Whether sharing a value of type `t` could ever be seen: it has parts that can change.
 
-        A value borrowed from a pool always needs copying to be kept: the
-        pool may free it.
+        A value borrowed from a pool or arena always needs copying to be kept: it
+        may be freed.
         """
         if info is not None and any(self.from_pool(b) for b in info.borrows):
             return is_boxed(t)
         return has_mutable(t, self.module.enums)
 
     def from_pool(self, borrowed: str) -> bool:
-        """Whether a borrowed variable holds a pool."""
+        """Whether a borrowed variable holds a pool or an arena."""
         if borrowed.startswith("global "):
             t = self.module.globals.get(borrowed.removeprefix("global "))
         else:
@@ -1190,10 +1190,11 @@ class Lowerer:
         return new
 
     def lower_assign_place(self, op: str, target: Index | Member, value_expr: Expr, span: Span) -> Value:
-        """`xs[i].y = v` and `xs[i].y op= v`: change the last list, struct or pool in place.
+        """`xs[i].y = v` and `xs[i].y op= v`: change the last list, struct, pool or arena in place.
 
-        A pool's values live in arenas of their own (one per slot), so a value
-        stored into one is copied there by the operation itself (`@slot`).
+        A pool's values live in arenas of their own (one per slot), and an
+        arena's values in its own slot arena, so a value stored into one is
+        copied there by the operation itself (`@slot`).
         """
         root, chain = place_steps(target)
         kind = self.checker.kinds[id(root)]
@@ -1273,7 +1274,10 @@ class Lowerer:
         return self.variant_field(struct, struct.type.name, index, t, span)
 
     def pool_get(self, pool: Value, handle: Value, t: Type, span: Span) -> Value:
-        """A pool's value, borrowed: it lives in the slot's own arena, until the slot is freed."""
+        """A pool's value, borrowed: it lives in the slot's own arena, until the slot is freed.
+
+        Or an arena's value, which lives in the arena until all of it is freed.
+        """
         result = self.emit("pool_get", t, [pool, handle], span)
         self.info[result.id] = self.info_of(pool)
         return result
@@ -1404,18 +1408,19 @@ class Lowerer:
         return result
 
     def lower_builtin(self, expr: Call, name: str, args: tuple[Expr, ...], span: Span, dest: str) -> Value:
-        """`print`, `len`, `run`, the pool functions, reflection, and the library."""
+        """`print`, `len`, `run`, the pool and arena functions, reflection, and the library."""
         if name in ("alloc", "free"):
-            pool_arg, value_expr = args
+            pool_arg, *rest = args
             assert isinstance(pool_arg, MutArg)
             _, pool = self.mut_place(pool_arg)
-            value = self.lower(value_expr)
+            values = [self.lower(value_expr) for value_expr in rest]  # none for `free(mut arena)`
             if name == "free":
-                self.emit_effect("free", [pool, value], span)
+                self.emit_effect("free", [pool, *values], span)
                 return self.const((), span)
-            # The pool copies the value into an arena of its own (a value that
-            # can't be copied is moved there, with its finalizers).
-            return self.emit("alloc", self.type_of(expr), [pool, value], span)
+            # The pool copies the value into an arena of its own, and an arena
+            # into itself (a value that can't be copied is moved there, with its
+            # finalizers).
+            return self.emit("alloc", self.type_of(expr), [pool, *values], span)
         if name in LIBRARY:
             # Its result is all new objects, made where they are wanted.
             values = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
@@ -1433,8 +1438,8 @@ class Lowerer:
             case "print" | "eprint":
                 self.emit_effect(name, [self.printed(operands, span)], span)
                 return self.const((), span)
-            case "pool_new":
-                return self.emit("pool_new", self.type_of(expr), [], span, region=dest)
+            case "pool_new" | "arena_new":
+                return self.emit(name, self.type_of(expr), [], span, region=dest)
             case "run":
                 return self.emit("run", self.type_of(expr), operands, span, region=dest)
             case _:  # reflection, which only the interpreters can do

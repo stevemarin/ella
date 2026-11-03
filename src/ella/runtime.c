@@ -66,7 +66,7 @@ typedef struct {
 
 // Type descriptors, emitted as static data by the code generator. Equality
 // and the text form of a list of enums of floats need to know all of that.
-enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE };
+enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE, K_ARENA, K_REF };
 
 struct Type {
     word kind;
@@ -150,7 +150,8 @@ _Noreturn static void out_of_memory(const char *what) {
 // that makes an object.
 //
 // A pool's values each live in an arena of their own, a *slot arena*,
-// numbered from SLOT_DEPTH up, which is freed when the value is.
+// numbered from SLOT_DEPTH up, which is freed when the value is. An Ella
+// `Arena` (a sub-arena) has one slot arena for all its values.
 //
 // All the arenas are parts of one range of address space, reserved when the
 // program starts: up to 1 GiB for each scope arena (there is room for two
@@ -168,16 +169,20 @@ _Noreturn static void out_of_memory(const char *what) {
 #define KEEP_SLOT ((size_t)64 << 10)
 
 // A value with a finalizer, in the arena it lives in: a nocopy struct with
-// its finalizer, or a pool (with no closure), which frees its values.
+// its finalizer, a pool (with no closure), which frees its values, or a
+// sub-arena (with SUB_ARENA), which frees its slot arena.
 typedef struct {
     word object;
     const Closure *finalize;
 } Final;
 
+#define SUB_ARENA ((const Closure *)1)
+
 typedef struct {
     char *top;
     Final *finals;
     word count, capacity;
+    word generation;  // goes up each time it is freed (only refs into sub-arenas use it)
 } Arena;
 
 static char *space;  // all the arenas' address space
@@ -275,6 +280,7 @@ static void unregister(word object) {
 
 extern void ella_call1(const Closure *closure, word argument);  // in the generated code
 static void free_pool(word pool);
+static void free_sub_arena(word arena);
 
 // Run the finalizers of the values in an arena, newest first.
 static void finalize_all(Arena *a) {
@@ -282,6 +288,8 @@ static void finalize_all(Arena *a) {
         Final final = a->finals[--a->count];
         if (final.finalize == NULL) {
             free_pool(final.object);
+        } else if (final.finalize == SUB_ARENA) {
+            free_sub_arena(final.object);
         } else {
             ella_call1(final.finalize, final.object);
         }
@@ -296,6 +304,7 @@ static void free_arena(word depth) {
     in_use -= used;
     if (poison) memset(start, 0xA5, used);
     a->top = start;
+    a->generation++;
     // Memory well beyond what the arena usually needs goes back to the OS.
     // It reads as zeros if it is used again.
     size_t keep = depth >= SLOT_DEPTH ? KEEP_SLOT : KEEP_SCOPE;
@@ -532,7 +541,8 @@ Closure *ella_closure_alloc(void *code, word count, const Type *types, word dept
 // arena that is freed sooner.
 
 static int is_boxed(const Type *t) {
-    return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL && t->kind != K_HANDLE;
+    return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL && t->kind != K_HANDLE &&
+           t->kind != K_REF;
 }
 
 word ella_copy(word v, const Type *t, word depth) {
@@ -578,7 +588,7 @@ word ella_copy(word v, const Type *t, word depth) {
         }
         return (word)copy;
     }
-    default:  // (), i64, f64, bool, handles; pools can't be copied
+    default:  // (), i64, f64, bool, handles, refs; pools and arenas can't be copied
         return v;
     }
 }
@@ -611,6 +621,14 @@ word ella_move(word v, const Type *t, word depth) {
         memcpy(moved, (const void *)v, 5 * sizeof(word));
         unregister(v);
         ella_register((word)moved, NULL, depth);
+        return (word)moved;
+    }
+    case K_ARENA: {
+        // An arena's header moves; its values stay in its slot arena.
+        word *moved = alloc(4 * sizeof(word), depth);
+        memcpy(moved, (const void *)v, 4 * sizeof(word));
+        unregister(v);
+        ella_register((word)moved, SUB_ARENA, depth);
         return (word)moved;
     }
     default:
@@ -731,6 +749,81 @@ static void free_pool(word object) {
     free(pool->slots);
     pool->slots = NULL;
     pool->len = pool->live = 0;
+}
+
+// Sub-arenas: an Ella `Arena`. All its values live in one slot arena, and
+// are freed together, which bumps the slot arena's generation. A ref is one
+// word: the slot arena's number (less SLOT_DEPTH) in the high 20 bits, its
+// generation (its low 24 bits) in the next 24, and which of the arena's
+// values in the low 20. So a ref is checked against the arena with one
+// comparison, which also catches a ref to another arena.
+
+#define REF_INDEXES ((word)1 << 20)
+#define REF_GENERATIONS ((word)1 << 24)
+
+typedef struct {
+    word depth;  // its slot arena
+    word len, capacity;
+    word *values;
+} SubArena;
+
+word ella_arena_new(word depth) {
+    SubArena *arena = alloc(sizeof(SubArena), depth);
+    *arena = (SubArena){new_slot_arena(), 0, 0, NULL};
+    ella_register((word)arena, SUB_ARENA, depth);  // when it dies, its slot arena is freed
+    return (word)arena;
+}
+
+static word ref_index(word ref) { return (word)((uint64_t)ref % REF_INDEXES); }
+
+static word ref_base(const SubArena *arena) {
+    word generation = slot_arenas[arena->depth - SLOT_DEPTH].generation % REF_GENERATIONS;
+    return (word)(((uint64_t)(arena->depth - SLOT_DEPTH) << 44) | ((uint64_t)generation << 20));
+}
+
+word ella_arena_alloc(SubArena *arena, word value, const Type *t) {
+    if (arena->len == REF_INDEXES) out_of_memory("an arena holds too many values");
+    if (arena->len == arena->capacity) {
+        arena->capacity = arena->capacity ? 2 * arena->capacity : 8;
+        arena->values = realloc(arena->values, (size_t)arena->capacity * sizeof(word));
+        if (arena->values == NULL) out_of_memory("can't grow an arena");
+    }
+    // A value that can't be copied is moved, with its finalizers.
+    arena->values[arena->len] = ella_move(value, t, arena->depth);
+    return ref_base(arena) | arena->len++;
+}
+
+static word *value_of(SubArena *arena, word ref, word line, word column) {
+    word index = ref_index(ref);
+    if (ref - index != ref_base(arena) || index >= arena->len) {
+        fail(line, column, "ref <ref %" PRId64 "> is stale: its arena was freed, or it is another arena's", index);
+    }
+    return &arena->values[index];
+}
+
+word ella_arena_get(SubArena *arena, word ref, word line, word column) { return *value_of(arena, ref, line, column); }
+
+// The new value is copied into the arena; the old one stays there until the arena is freed.
+void ella_arena_set(SubArena *arena, word ref, word value, const Type *t, word line, word column) {
+    word *place = value_of(arena, ref, line, column);
+    *place = is_boxed(t) ? ella_copy(value, t, arena->depth) : value;
+}
+
+// `free(mut arena)`: free all its values at once, keeping the slot arena for its next ones.
+void ella_arena_free(SubArena *arena) {
+    arena->len = 0;
+    free_arena(arena->depth);
+}
+
+word ella_arena_len(const SubArena *arena) { return arena->len; }
+
+// An arena dies: free its values, and give back its slot arena.
+static void free_sub_arena(word object) {
+    SubArena *arena = (SubArena *)object;
+    free_slot_arena(arena->depth);
+    free(arena->values);
+    arena->values = NULL;
+    arena->len = 0;
 }
 
 // `xs += ys`: add copies of ys's items to xs, which lives in the arena at
@@ -951,6 +1044,16 @@ static void put_value(Buffer *b, word v, const Type *t, int nested) {
     case K_POOL:
         put_ascii(b, "<pool of ");
         put_i128(b, ((const Pool *)v)->live);
+        put(b, '>');
+        break;
+    case K_ARENA:
+        put_ascii(b, "<arena of ");
+        put_i128(b, ((const SubArena *)v)->len);
+        put(b, '>');
+        break;
+    case K_REF:
+        put_ascii(b, "<ref ");
+        put_i128(b, ref_index(v));
         put(b, '>');
         break;
     case K_HANDLE:

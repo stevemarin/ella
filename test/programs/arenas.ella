@@ -1,0 +1,96 @@
+# Arenas hold values of any type that are freed together; refs find them.
+
+struct Room
+    name: str
+    exits: [Ref[Room]]
+
+struct Level
+    title: str
+    rooms: [Ref[Room]]
+
+# A level is built in an arena, with refs between its parts.
+let build = (mut arena: Arena, title: str, size: i64) -> Ref[Level] =>
+    let mut rooms = []
+    for i in 0..size
+        rooms += [alloc(mut arena, Room("{{title}}-{{i}}", []))]
+    for i in 1..size
+        arena[rooms[i - 1]].exits += [rooms[i]]
+        arena[rooms[i]].exits += [rooms[i - 1]]
+    alloc(mut arena, Level(title, rooms))
+
+let walk = (arena: Arena, level: Ref[Level]) -> [str] =>
+    let mut seen = []
+    let mut at = arena[level].rooms[0]
+    loop
+        seen += [arena[at].name]
+        let exits = arena[at].exits
+        if len(exits) == 0 or (len(seen) > 1 and len(exits) == 1) then break
+        at = exits[len(exits) - 1]
+    seen
+
+let arena_title = (arena: Arena, level: Ref[Level]) -> str => arena[level].title
+
+# One arena, freed after each level: the old level's values all go at once.
+let mut world: Arena = arena_new()
+let mut kept = []
+for n in 1..=3
+    let level = build(mut world, "L{{n}}", n + 1)
+    print(walk(world, level), len(world))
+    kept += [arena_title(world, level)]
+    free(mut world)
+    print(world)
+
+# A value copied out of an arena outlives it being freed.
+print(kept)
+
+# Values of different types, changed in place.
+let mut misc: Arena = arena_new()
+let s = alloc(mut misc, "text")
+let xs = alloc(mut misc, [1, 2])
+let pair = alloc(mut misc, (1.5, "half"))
+misc[s] = misc[s] + "!"
+misc[xs] += [3]
+misc[xs][0] = 10
+print(misc[s], misc[xs], misc[pair].1, len(misc))
+print(s, xs == xs, misc)
+
+# Finalizers run when the arena is freed, and when it dies, newest first.
+nocopy struct File
+    name: str
+    finalize = (h: File) -> () => print("closing {{h.name}}")
+
+let mut files: Arena = arena_new()
+let a = alloc(mut files, File("a"))
+let b = alloc(mut files, File("b"))
+print(files[a].name, files[b].name)
+free(mut files)
+let c = alloc(mut files, File("c"))
+print(files[c].name)
+
+let scratch = () -> () =>
+    let mut temp: Arena = arena_new()
+    let _ = alloc(mut temp, File("temp"))
+    print("scratch done")
+scratch()
+
+# An arena can be returned, and kept in a pool; a pool can be kept in an arena.
+let make = () -> Arena =>
+    let mut made: Arena = arena_new()
+    let _ = alloc(mut made, File("made"))
+    made
+let mut arenas: Pool[Arena] = pool_new()
+let h = alloc(mut arenas, make())
+let r = alloc(mut arenas[h], 42)
+print(arenas[h][r], len(arenas[h]))
+free(mut arenas, h)
+
+let mut outer: Arena = arena_new()
+let p = alloc(mut outer, pool_new())
+let item = alloc(mut outer[p], File("pooled"))
+print(outer[p][item].name)
+free(mut outer)
+
+# A ref is checked against its arena: a freed one, or another arena's, is stale.
+let other = alloc(mut misc, "other")
+print(files[c].name, misc[other])
+print(misc[c])

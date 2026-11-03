@@ -51,6 +51,7 @@ the same "stack overflow" error as in the interpreters.
 import struct
 
 from ella.checker import (
+    ARENA,
     F64,
     GENERIC_LIBRARY,
     I64,
@@ -86,6 +87,7 @@ from ella.values import MAX_CALL_DEPTH
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
 KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0}
 LIST_KIND, TUPLE_KIND, FUNCTION_KIND, ENUM_KIND, POOL_KIND, HANDLE_KIND, CODE_KIND = 6, 7, 8, 9, 10, 11, 12
+ARENA_KIND, REF_KIND = 13, 14
 
 # The registers for the first six arguments of a C call.
 C_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -379,6 +381,10 @@ class CodeGen:
                 kind, count = POOL_KIND, 0
             case BuiltinTy("Handle"):
                 kind, count = HANDLE_KIND, 0
+            case BuiltinTy("Arena"):
+                kind, count = ARENA_KIND, 0
+            case BuiltinTy("Ref"):
+                kind, count = REF_KIND, 0
             case BuiltinTy("Code" | "Type"):
                 kind, count = CODE_KIND, 0  # never made: native code can't build code at run time
             case EnumTy(name, args):
@@ -545,9 +551,20 @@ class CodeGen:
             case "move":
                 self.call_c("ella_move", args[0], self.type_descriptor(args[0].type), Region(instr.region))
                 self.store(dest)
-            case "pool_new":
-                self.call_c("ella_pool_new", Region(instr.region))
+            case "pool_new" | "arena_new":
+                self.call_c(f"ella_{op}", Region(instr.region))
                 self.store(dest)
+            case "alloc" if args[0].type == ARENA:
+                self.call_c("ella_arena_alloc", args[0], args[1], self.type_descriptor(args[1].type))
+                self.store(dest)
+            case "free" if args[0].type == ARENA:
+                self.call_c("ella_arena_free", args[0])
+            case "pool_get" if args[0].type == ARENA:
+                self.call_c("ella_arena_get", args[0], args[1], line, column)
+                self.store(dest)
+            case "pool_set" if args[0].type == ARENA:
+                t = self.type_descriptor(args[2].type)
+                self.call_c("ella_arena_set", args[0], args[1], args[2], t, line, column)
             case "alloc":
                 self.call_c("ella_alloc", args[0], args[1], self.type_descriptor(args[1].type))
                 self.store(dest)
@@ -599,7 +616,7 @@ class CodeGen:
                 self.call_c("ella_range_len", args[0])
                 self.store(dest)
             case "len" if isinstance(args[0].type, BuiltinTy):
-                self.call_c("ella_pool_len", args[0])
+                self.call_c("ella_arena_len" if args[0].type == ARENA else "ella_pool_len", args[0])
                 self.store(dest)
             case "len":
                 self.load("rax", args[0])
@@ -652,7 +669,7 @@ class CodeGen:
                 raise AssertionError(f"no code for IR operation {op}")
 
     def slot_value(self, instr: Instr, container: Value, value: Value) -> None:
-        """Put the value to store into `container` in rax: copied into its slot's arena if it is a pool's value."""
+        """Put the value to store into `container` in rax: copied into its slot arena if it is a pool's or arena's value."""
         if instr.region != "slot":
             self.load("rax", value)
             return

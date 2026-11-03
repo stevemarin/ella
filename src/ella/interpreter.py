@@ -95,12 +95,14 @@ from ella.syntax import (
 from ella.values import (
     MAX_CALL_DEPTH,
     UNIT,
+    ArenaValue,
     Builtin,
     Closure,
     CodeValue,
     Constructor,
     HandleValue,
     PoolValue,
+    RefValue,
     Scope,
     TypeValue,
     Value,
@@ -219,7 +221,8 @@ class Interpreter:
         for name, function in LIBRARY.items():
             self.globals.define(name, Builtin(name, len(function.params), self.builtin_library(name)))
         self.globals.define("pool_new", Builtin("pool_new", 0, lambda args, span: self.new_pool()))
-        # alloc and free change their pool, and are handled in `call_pool`.
+        self.globals.define("arena_new", Builtin("arena_new", 0, lambda args, span: self.new_arena()))
+        # alloc and free change their pool or arena, and are handled in `call_pool`.
         self.globals.define("alloc", Builtin("alloc", 2, lambda args, span: UNIT))
         self.globals.define("free", Builtin("free", 2, lambda args, span: UNIT))
         # Result, Optional and Error are ordinary enums and structs that happen to be predefined.
@@ -549,12 +552,15 @@ class Interpreter:
         return copy_value(value)
 
     def item(self, container: Value, index: Value, span: Span) -> Value:
-        """`container[index]`: an item of a list or string, a pool's value, or what a `get` method gives."""
+        """`container[index]`: an item of a list or string, a pool's or arena's value, or what a `get` method gives."""
         if (getter := self.find_method(container, "get")) is not None:
             return self.call(getter, [container, index], span)
         if isinstance(container, PoolValue):
             assert isinstance(index, HandleValue)
             return self.pool_slot(container, index, span)
+        if isinstance(container, ArenaValue):
+            assert isinstance(index, RefValue)
+            return self.arena_slot(container, index, span)
         return index_into(container, index, span)
 
     def set_item(self, container: Value, index: Value, value: Value, span: Span) -> None:
@@ -562,6 +568,11 @@ class Interpreter:
             assert isinstance(index, HandleValue)
             self.pool_slot(container, index, span)  # check the handle
             container.slots[index.slot] = value
+            return
+        if isinstance(container, ArenaValue):
+            assert isinstance(index, RefValue)
+            self.arena_slot(container, index, span)  # check the ref
+            container.values[index.index] = value
             return
         index_into(container, index, span)  # check that the index is in range
         if not isinstance(container, list):
@@ -818,7 +829,7 @@ class Interpreter:
             case VariantValue(enum, fields=fields):
                 inner = [v for item in fields for v in self.finalizable(item)]
                 return ([value] if enum in self.finalizers else []) + inner
-            case PoolValue():
+            case PoolValue() | ArenaValue():
                 return [value]
             case list() | tuple():
                 return [v for item in value for v in self.finalizable(item)]
@@ -840,11 +851,15 @@ class Interpreter:
             self.finalize(value)
 
     def finalize(self, value: Value) -> None:
-        """Run a value's finalizer; a pool finalizes its values, from the last slot to the first."""
+        """Run a value's finalizer; a pool finalizes its values, from the last slot to the first, and an arena
+        its values, newest first."""
         if isinstance(value, PoolValue):
             for slot in reversed(value.slots):
                 if slot is not None:
                     self.finalize_held(slot)
+        elif isinstance(value, ArenaValue):
+            for held in reversed(value.values):
+                self.finalize_held(held)
         elif isinstance(value, VariantValue) and value.enum in self.finalizers:
             self.call(self.finalizers[value.enum], [value], Span(0, 0))
 
@@ -859,7 +874,7 @@ class Interpreter:
                 self.finalize(value)
                 for item in reversed(fields):
                     self.finalize_held(item)
-            case PoolValue():
+            case PoolValue() | ArenaValue():
                 self.finalize(value)
             case list() | tuple():
                 for item in reversed(value):
@@ -880,19 +895,42 @@ class Interpreter:
         assert value is not None
         return value
 
+    def new_arena(self) -> Value:
+        arena = ArenaValue()
+        self.owners[-1].append(arena)
+        return arena
+
+    def arena_slot(self, arena: ArenaValue, ref: RefValue, span: Span) -> Value:
+        """The value a ref refers to, which must be in this arena and not freed."""
+        if ref.arena != arena.id or ref.generation != arena.generation:
+            raise EllaError(f"ref {to_text(ref)} is stale: its arena was freed, or it is another arena's", span)
+        return arena.values[ref.index]
+
     def call_pool(self, name: str, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
-        """`alloc(mut pool, value)` and `free(mut pool, handle)`, which change the pool in place."""
-        pool_arg, value_expr = args
+        """`alloc(mut pool, value)`, `free(mut pool, handle)`, `alloc(mut arena, value)` and `free(mut arena)`.
+
+        They change the pool or arena in place.
+        """
+        pool_arg, *rest = args
         assert isinstance(pool_arg, MutArg)
         root, indexes = self.evaluate_place(pool_arg.target, scope)
         pool = self.read_place(root, indexes, scope)
-        assert isinstance(pool, PoolValue)
-        value = self.eval(value_expr, scope)
+        if isinstance(pool, ArenaValue) and name == "free":
+            # Every value goes at once, newest first.
+            self.finalize(pool)
+            pool.values = []
+            pool.generation += 1
+            return UNIT
+        value = self.eval(rest[0], scope)
         if name == "alloc":
-            # The pool owns the value from now on, and finalizes it when it is freed.
+            # The pool or arena owns the value from now on, and finalizes it when it is freed.
             for owner in range(len(self.owners)):
                 moving = {id(v) for v in self.finalizable(value)}
                 self.owners[owner] = [v for v in self.owners[owner] if id(v) not in moving]
+            if isinstance(pool, ArenaValue):
+                pool.values.append(value)
+                return RefValue(pool.id, pool.generation, len(pool.values) - 1)
+            assert isinstance(pool, PoolValue)
             if pool.free:
                 slot = pool.free.pop()
                 pool.slots[slot] = value
@@ -901,7 +939,7 @@ class Interpreter:
                 pool.slots.append(value)
                 pool.generations.append(0)
             return HandleValue(slot, pool.generations[slot])
-        assert isinstance(value, HandleValue)
+        assert isinstance(pool, PoolValue) and isinstance(value, HandleValue)
         held = self.pool_slot(pool, value, span)
         self.finalize_held(held)
         pool.slots[value.slot] = None
@@ -1148,14 +1186,16 @@ class Interpreter:
         return UNIT
 
     def builtin_len(self, args: list[Value], span: Span) -> Value:
-        """`len(x)` is the length of a list, string or range, or how many values a pool holds."""
+        """`len(x)` is the length of a list, string or range, or how many values a pool or arena holds."""
         value = args[0]
         if (method := self.find_method(value, "len")) is not None:
             return self.call(method, [value], span)
         if isinstance(value, PoolValue):
             return value.live()
+        if isinstance(value, ArenaValue):
+            return len(value.values)
         if not isinstance(value, list | str | range):
-            raise EllaError(f"len() needs a list, str, range or Pool, not {type_name(value)}", span)
+            raise EllaError(f"len() needs a list, str, range, Pool or Arena, not {type_name(value)}", span)
         return len(value)
 
 

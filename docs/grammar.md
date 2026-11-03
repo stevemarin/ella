@@ -384,7 +384,7 @@ p.x = 1.5
 
 * `name = expr` assigns to an **existing** binding, which must be `mut`.
   Assigning to an immutable binding or an undefined name is a compile error.
-* Targets are names, index expressions (`a[i]`, `pool[h]`) and fields
+* Targets are names, index expressions (`a[i]`, `pool[h]`, `arena[r]`) and fields
   (`p.x`), in any combination: `world.players[i].score += 1`.
 * Assignment is right-associative and evaluates to the assigned value, so
   `a = b = 0` sets both. As a body, or the last line of a block, it has
@@ -707,7 +707,7 @@ returns `None`. The enclosing function's return type must be compatible.
   indexes are a run-time error **(provisional; no Python-style negative
   indexing)**. Indexing a string gives a one-character string; strings count
   Unicode code points, and can't be assigned into. Pools are indexed with
-  handles, and structs and enums with `get` and `set` methods with any key
+  handles, arenas with refs, and structs and enums with `get` and `set` methods with any key
   ([§9](#methods-provisional-syntax)).
 * `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
 * Indexing a list or string with a range gives a *slice*, a new list or
@@ -728,6 +728,7 @@ i64  f64  bool  str              built-in scalars
 Result[T, E]   Optional[T]       generic types use [ ]
 Point   Pair[T]                  structs and enums, by name
 Pool[T]   Handle[T]              a pool of values, and a handle to one
+Arena   Ref[T]                   an arena of values, and a ref to one
 Code[T]                          code that gives a T, for a later stage
 Type[T]                          the type T as a value: `type T`
 Type   Code                      a type, or code, whose type is only known later
@@ -1003,11 +1004,11 @@ let work = () -> () =>
 work()                 # prints: working, closing app
 ```
 
-* A value of a nocopy type (a nocopy struct, a pool, or anything holding
+* A value of a nocopy type (a nocopy struct, a pool, an arena, or anything holding
   one) is made where it stays. It can be bound with `let`, passed to
   functions (read-only, or as `mut`), read field by field, compared and
-  printed, held by another nocopy struct, and moved into a pool with
-  `alloc`. A function can return a new one, or one of its own local
+  printed, held by another nocopy struct, and moved into a pool or an
+  arena with `alloc`. A function can return a new one, or one of its own local
   variables declared outside loops (which moves it to the caller).
 * It can't be copied: not bound from another variable, assigned, put in a
   list, captured by a closure, returned from a parameter, or used with a
@@ -1022,7 +1023,7 @@ work()                 # prints: working, closing app
   the end of the program for top-level variables. A value that is
   returned, or given to `break`, belongs to the call or loop iteration it
   goes to; one moved into a pool dies when it is freed, or when the pool
-  dies. Values that die together are finalized newest first: a struct
+  dies, and one moved into an arena when the arena is freed or dies. Values that die together are finalized newest first: a struct
   before the fields it holds.
 * If the program stops with an error, finalizers don't run.
 
@@ -1060,7 +1061,7 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 
 | Constraint | Allows on `T` | Met by |
 | --- | --- | --- |
-| `Eq` | `==`, `!=`, `in` | every type except functions, pools and code |
+| `Eq` | `==`, `!=`, `in` | every type except functions, pools, arenas and code |
 | `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str`, types with a `compare` method |
 | `Add` | `+` | `i64`, `f64`, `str`, lists, types with an `add` method of type `(Self, Self) -> Self` |
 | `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `f64` |
@@ -1143,6 +1144,46 @@ print(nodes[kid])                         # error: the handle is stale
 * A pool can't be copied. A handle doesn't say which pool it is for, so
   using it with the wrong pool of the same type isn't caught.
 
+### Arenas **(provisional syntax)**
+
+An arena holds values of any types that are freed together, all at once,
+such as the parts of a game level or of a request. Each value is found with
+a ref:
+
+```ella
+struct Room
+    name: str
+    exits: [Ref[Room]]
+
+let mut level: Arena = arena_new()
+let hall = alloc(mut level, Room("hall", []))
+let den = alloc(mut level, Room("den", [hall]))
+level[hall].exits += [den]
+let title = alloc(mut level, "Level 1")
+print(level[title], level[level[den].exits[0]].name)    # Level 1 hall
+free(mut level)                                          # all of it, at once
+print(level[hall])                                       # error: the ref is stale
+```
+
+* `arena_new()` makes an empty `Arena`. `alloc(mut arena, value)` puts a
+  copy of the value in the arena (moving one that can't be copied), and
+  returns a `Ref[T]` for it, where `T` is the value's type. An arena can
+  hold values of different types.
+* `arena[r]` is the value, and `arena[r] = v`, `arena[r].f = v` and so on
+  change it in place. Replacing a value doesn't free the old one: it stays
+  in the arena until the arena is freed. `len(arena)` is how many values it
+  holds.
+* `free(mut arena)` frees all its values at once, finalizing them newest
+  first, and leaves the arena empty, to be used again. An arena that dies
+  frees its values too.
+* Refs are plain values: they can be copied, stored and compared. Each
+  remembers its arena and the arena's *generation*, which goes up when the
+  arena is freed, so using a ref after its arena was freed, or with
+  another arena, is a run-time error ("stale"). One check covers every
+  value of the arena.
+* An arena can't be copied. It can hold pools and other arenas, and pools
+  can hold arenas.
+
 ## 10. Built-ins
 
 Built-in functions (ordinary names, not keywords):
@@ -1153,9 +1194,11 @@ Built-in functions (ordinary names, not keywords):
 * `eprint(a, b, ...)` prints the same way to standard error, after
   everything printed so far.
 * `len(x)` returns the length of a list, string or range as `i64`, or how
-  many values a pool holds. On a struct or enum, it calls its `len` method.
+  many values a pool or arena holds. On a struct or enum, it calls its `len` method.
 * `pool_new()`, `alloc(mut pool, value)` and `free(mut pool, handle)` work on
-  pools ([§9](#pools-provisional-syntax)).
+  pools ([§9](#pools-provisional-syntax)); `arena_new()`,
+  `alloc(mut arena, value)` and `free(mut arena)` on arenas
+  ([§9](#arenas-provisional-syntax)).
 * `run(code)` runs code made with `quote` ([§11](#11-stages)).
 * The library functions below, and the prelude's ([below](#the-prelude)).
 * `fields(t)`, `field_type(t, name)`, `has_field(t, name)`, `type_name(t)`,
@@ -1232,7 +1275,8 @@ The text form of a value (used by `print` and interpolation) is how it would
 be written in Ella: `42`, `2.5`, `true`, `()`, `[1, 2]`, `(1, "a")`,
 `Some(3)`, `None`, `Point(1.0, 2.0)`. A string is its own text, but is
 quoted when it appears inside another value. A pool is `<pool of 3>`, a
-handle `<handle 0:1>` (its slot and generation), and code `<code ...>`,
+handle `<handle 0:1>` (its slot and generation), an arena `<arena of 3>`,
+a ref `<ref 2>` (which of the arena's values it is), and code `<code ...>`,
 with the code as an S-expression.
 
 Structs and enums can give themselves `len`, operators, indexing,

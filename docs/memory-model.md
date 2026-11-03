@@ -7,7 +7,8 @@
 IR interpreter checks, and real arenas in native code. Stage 7 built steps
 6 to 8: generics, pools with generation-checked handles, non-copyable types
 and finalizers, together with structs and multi-stage programming.
-Sub-arenas are not built yet. [What stage 6 built](#14-what-stage-6-built)
+Sub-arenas (the language's `Arena`) came after, built on pools' slot
+arenas. [What stage 6 built](#14-what-stage-6-built)
 and [what stage 7 built](#15-what-stage-7-built) describe the
 implementation, and where it settles or departs from this design, and
 [loops that carry values](#16-loops-that-carry-values) how region bloat
@@ -198,6 +199,9 @@ document). This is the same idea as Ada 2012 storage subpools.
   memory. With 128 TiB of user address space this is affordable.
 * Handles into a sub-arena are `(arena id, arena generation, offset)`, and
   there is one generation check per arena, not one per object.
+
+*(Built as the `Arena` type, on pools' slot arenas, which are reused, and
+with an index instead of an offset; see [§15](#sub-arenas-a-slot-arena-each).)*
 
 ## 6. Placement inference
 
@@ -625,6 +629,36 @@ with very many, each is smaller), and about a million slot arenas of 16
 MiB. A pool is itself a value that can't be
 copied, and when it dies, it frees its values.
 
+### Sub-arenas: a slot arena each
+
+Sub-arenas (§5) came after stage 7, as the type `Arena`
+([grammar.md §9](grammar.md#arenas-provisional-syntax)), and reuse the
+slot arenas of pools: an `Arena` takes one slot arena when it is made, and
+every value put in it (`alloc(mut arena, v)`) is copied there, whatever
+its type. `free(mut arena)` frees the slot arena, running its finalizers
+newest first, and keeps it for the arena's next values; when the `Arena`
+dies, its slot arena is given back, like a freed pool value's. So freeing
+a whole level or request is one step, however many values it holds. As
+with pools, replacing or changing a value leaves the old parts in the
+arena until it is freed.
+
+A ref is one word: which slot arena (20 bits), its generation (24 bits)
+and which value of the arena (20 bits; the arena keeps a table of its
+values, as a pool keeps its slots). Every slot arena's generation goes up
+when it is freed, so one comparison of the ref with the arena catches a
+ref whose arena was freed, a ref of another arena, and a ref of an arena
+that died, even after its slot arena is reused. This departs from §5 in
+two ways. Slot arenas are reused rather than never reused, since the
+checks don't depend on addresses; and a ref holds an index rather than
+an offset, so that it prints the same in every backend (`<ref 2>`). The
+limits are a slot arena's: 16 MiB, and about a million values, per arena.
+
+The checker and the lowering treat an arena like a pool: it can't be
+copied, and a value borrowed from one is copied before anything could free
+it. The IR reuses the pool operations (`alloc`, `pool_get`, `pool_set`,
+and `free` with no ref), and the IR interpreter checks that nothing
+borrowed from an arena is used after it is freed.
+
 ### Non-copyable values and finalizers
 
 `nocopy struct` (§3) marks a type that can't be copied. The checker
@@ -645,7 +679,6 @@ order. Nothing is finalized when a program stops with an error.
 
 ### Not built
 
-* Sub-arenas (§5) for groups of long-lived values that die together.
 * Owning, non-copyable handles, and an `adjust` hook (§11).
 * Running code built at run time in native code.
 * In the IR, a quote inside a function that is defined inside a splice

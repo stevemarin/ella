@@ -65,7 +65,8 @@ one names the arena, its *region*, written after an `@`:
     @mut0, ...     where the variable passed to `mut` parameter 0 lives
     @global        the program's global arena, freed when the program ends
     @slot          (for changing an object) the arena it is in: a pool's
-                   value, in its slot's own arena, which gets a copy
+                   value, in its slot's own arena, or an arena's value, in
+                   the arena's slot arena; the arena gets a copy
 
 `reset k` frees levels k and up when control leaves a loop iteration, and
 returning frees all of the function's levels.
@@ -83,7 +84,7 @@ rebuilds a value keeps at most two versions, not one per iteration. A value must
 after its arena is freed, and an object must never be stored where it would
 outlive its arena; the IR interpreter checks both at run time. Freeing an
 arena first runs the finalizers of the values in it that have them (nocopy
-structs with `finalize`, and pools), newest first.
+structs with `finalize`, pools and arenas), newest first.
 
 Operations
 ----------
@@ -120,6 +121,13 @@ Operations
     pool_get pool, h             the value a handle refers to (checking it isn't stale)
     pool_set pool, h, v          replace that value, with v in a new arena
     free pool, h                 free that value, with its arena
+    arena_new @r                 a new, empty Arena, with a slot arena of its own
+    alloc arena, v               put a copy of v in the arena; gives its ref
+    pool_get arena, r            the value a ref refers to (checking it isn't stale,
+                                 and is this arena's)
+    pool_set arena, r, v         replace that value, with a copy of v in the arena (the
+                                 old one stays there until the arena is freed)
+    free arena                   free all the arena's values at once
     quote_begin                  start building the code of quote n (in `index`),
                                  choosing fresh names for its variables
     quote begin, outer..., v...  the code of quote n: its splices' code and the
@@ -129,7 +137,7 @@ Operations
     type_value t...               type n (in `index`) of the module's types, as a value,
                                  with the types t... spliced into it (`type [$t]`)
     reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
-    len c                        length of a list, string or range, or a pool's count
+    len c                        length of a list, string or range, or a pool's or arena's count
     builtin a, ... @r            a library function (in `name`), such as split(a, b),
                                  whose result is all new objects (ella.library); abs,
                                  min and max take i64s or f64s
@@ -160,6 +168,7 @@ from dataclasses import dataclass, field
 from typing import Any, assert_never
 
 from ella.checker import (
+    ARENA,
     BOOL,
     F64,
     GENERIC_LIBRARY,
@@ -334,6 +343,7 @@ ALLOCATING = frozenset(
         "call",
         "append",
         "pool_new",
+        "arena_new",
         "run",
         "reflect",
         "slice",
@@ -360,9 +370,10 @@ def allocates(instr: Instr) -> bool:
 def is_boxed(t: Type) -> bool:
     """Whether values of type `t` are references to objects in an arena.
 
-    A pool's handle is just a number, a slot and a generation, in one word.
+    A pool's handle is just a number, a slot and a generation, in one word,
+    and so is an arena's ref.
     """
-    return t not in (I64, F64, BOOL, UNIT, NEVER) and not (isinstance(t, BuiltinTy) and t.name == "Handle")
+    return t not in (I64, F64, BOOL, UNIT, NEVER) and not (isinstance(t, BuiltinTy) and t.name in ("Handle", "Ref"))
 
 
 def region_level(region: str) -> int | None:
@@ -877,6 +888,18 @@ class Verifier:
                     need(instr.index < len(fields) and args[1] == fields[instr.index])
             case "pool_new":
                 need(not args and isinstance(dest, BuiltinTy) and dest.name == "Pool")
+            case "arena_new":
+                need(not args and dest == ARENA)
+            case "alloc" | "free" | "pool_get" | "pool_set" if args and args[0] == ARENA:
+                item = args[1] if instr.op == "alloc" else dest if instr.op == "pool_get" else args[-1]
+                ref = BuiltinTy("Ref", (item,)) if item is not None else None
+                expected = {
+                    "alloc": ([item], ref),
+                    "free": ([], None),
+                    "pool_get": ([ref], item),
+                    "pool_set": ([ref, item], None),
+                }[instr.op]
+                need(args[1:] == expected[0] and dest == expected[1])
             case "alloc" | "free" | "pool_get" | "pool_set":
                 need(len(args) >= 2 and isinstance(args[0], BuiltinTy) and args[0].name == "Pool")
                 if isinstance(args[0], BuiltinTy):
@@ -907,7 +930,7 @@ class Verifier:
             case "carry":
                 need(len(args) == 1 and dest == args[0] and instr.region == str(instr.index))
             case "len":
-                pool = len(args) == 1 and isinstance(args[0], BuiltinTy) and args[0].name == "Pool"
+                pool = len(args) == 1 and isinstance(args[0], BuiltinTy) and args[0].name in ("Pool", "Arena")
                 need(len(args) == 1 and (item_type(args[0]) is not None or pool) and dest == I64)
             case "to_text":
                 need(len(args) == 1 and dest == STR)
@@ -947,7 +970,7 @@ class Verifier:
                 raise self.fail(f"unknown operation {instr.op}", block)
 
     def valid_region(self, region: str, op: str = "") -> bool:
-        if region == "slot":  # the arena of the object being changed (or passed as mut), a pool's value
+        if region == "slot":  # the arena of the object being changed (or passed as mut), a pool's or arena's value
             return op in CHANGING or op == "call"
         level = region_level(region)
         if level is not None:

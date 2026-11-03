@@ -108,8 +108,8 @@ allocation is future work; currently every IR value has a stack slot.
 
 Done: explicit copies, in-place mutation, `mut` parameters, scope arenas,
 compiler-chosen placement, loops that carry values without piling them up,
-pools, non-copyable types, and finalization are implemented. Sub-arenas are
-not implemented. See
+pools, arenas whose values are freed together (sub-arenas), non-copyable
+types, and finalization are implemented. See
 [docs/memory-model.md](docs/memory-model.md) for the design and limitations.
 
 ### 7. Staged programming
@@ -165,7 +165,8 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   can look at a struct's fields and generate code for it, such as an
   equality test, and functions can compute new types while compiling
   (`$(Stack(type i64))`). The language also has structs, generic functions, pools of
-  long-lived values with handles that catch use after free, and `nocopy`
+  long-lived values with handles that catch use after free, arenas of values
+  freed together, and `nocopy`
   structs with finalizers. Generic functions can constrain their type
   parameters (`let largest[T: Ord]`) to use operators on them. See [docs/memory-model.md](docs/memory-model.md)
   §15.

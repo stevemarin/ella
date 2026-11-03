@@ -373,6 +373,28 @@ print(len(pool))
     assert peak < 10_000
 
 
+def test_arenas_free_their_values_at_once(tmp_path: Path) -> None:
+    # An arena's values all live in its slot arena, freed by `free(mut arena)`.
+    source = """\
+struct Item
+    name: str
+    tags: [str]
+let mut arena: Arena = arena_new()
+let mut total = 0
+for round in 0..200
+    for i in 0..100
+        let r = alloc(mut arena, Item("item {{i}}", ["a", "b", "c"]))
+        arena[r].tags += ["d"]
+        total += len(arena[r].tags)
+    free(mut arena)
+print(total)
+print(len(arena))
+"""
+    out, peak = arena_peak(source, tmp_path)
+    assert out == "80000\n0\n"
+    assert peak < 100_000
+
+
 def test_finalizers_run_natively(tmp_path: Path) -> None:
     source = """\
 nocopy struct Res

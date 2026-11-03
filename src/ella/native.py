@@ -25,7 +25,7 @@ from ella.passes import optimize
 from ella.values import MAX_CALL_DEPTH
 
 RUNTIME = Path(__file__).with_name("runtime.c")
-CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra", "-Wpedantic"]
+CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra"]
 
 
 def runtime_object() -> Path:

@@ -704,7 +704,7 @@ class Symbols:
     def type_name(self, name: str, span: Span) -> None:
         """A type's name in an annotation."""
         token = self.checked.token_at(span)
-        if name in PRIMITIVE_NAMES or name in ("Code", "Pool", "Handle", "Type"):
+        if name in PRIMITIVE_NAMES or name in ("Code", "Pool", "Handle", "Arena", "Ref", "Type"):
             self.add(token, f"{name}: built-in type", "type", ("defaultLibrary",))
         elif name in self.checker.enums:
             info = self.checker.enums[name]

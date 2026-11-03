@@ -165,14 +165,15 @@ class EnumTy:
 
 @dataclass(frozen=True, slots=True)
 class BuiltinTy:
-    """A built-in generic type: `Code[T]`, `Pool[T]` or `Handle[T]`."""
+    """A built-in type: `Code[T]`, `Pool[T]`, `Handle[T]`, `Arena`, `Ref[T]` or `Type[T]`."""
 
     name: str
     args: tuple[Type, ...]
 
 
-# The built-in generic types, and how many type arguments each takes.
-BUILTIN_TYPES = {"Code": 1, "Pool": 1, "Handle": 1, "Type": 1}
+# The built-in types, and how many type arguments each takes.
+BUILTIN_TYPES = {"Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Type": 1}
+ARENA = BuiltinTy("Arena", ())
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -496,7 +497,7 @@ LIBRARY: dict[str, FuncTy] = {
 GENERIC_LIBRARY = frozenset(name for name, t in LIBRARY.items() if NUM_T in t.params)
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
-BUILTINS = ("print", "eprint", "len", "run", "pool_new", "alloc", "free", *LIBRARY)
+BUILTINS = ("print", "eprint", "len", "run", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
 WRAPPED = frozenset({"print", "eprint", "len"})  # other built-ins that are values (taking one argument)
 
 
@@ -836,7 +837,10 @@ class Checker:
                 return inner
             case NamedType(name, args, span) if name in BUILTIN_TYPES:
                 if len(args) != BUILTIN_TYPES[name]:
-                    raise EllaError(f"{name} takes {BUILTIN_TYPES[name]} type argument, not {len(args)}", span)
+                    count = BUILTIN_TYPES[name]
+                    raise EllaError(
+                        f"{name} takes {count} type argument{'' if count == 1 else 's'}, not {len(args)}", span
+                    )
                 return BuiltinTy(name, tuple(self.annotation(arg, params) for arg in args))
             case NamedType(name, _, span):
                 raise EllaError(f"unknown type '{name}'", span)
@@ -1401,9 +1405,8 @@ class Checker:
                 if (getter := self.method_type(container, "get", span)) is not None:
                     self.expect(index_type, getter.params[1], index.span, "the index")
                     return getter.result
-                if isinstance(container, BuiltinTy) and container.name == "Pool":
-                    self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
-                    return container.args[0]
+                if isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
+                    return self.handle_item(container, index_type, index.span)
                 if resolve(index_type) == RANGE and (isinstance(container, ListTy) or container == STR):
                     return container  # a slice: `xs[1..3]`
                 if not self.unify(index_type, I64):
@@ -1702,7 +1705,7 @@ class Checker:
         if op not in ("==", "!=") and self.operator_method(a, "compare", span) is not None:
             return
         kind = describe_kind(self.known(a, span))
-        if kind in ("function", "Pool", "Code"):
+        if kind in ("function", "Pool", "Arena", "Code"):
             raise EllaError(
                 f"{'functions' if kind == 'function' else show_type(a) + ' values'} can't be compared", span
             )
@@ -1776,9 +1779,8 @@ class Checker:
                     self.expect(index_type, setter.params[1], index.span, "the index")
                     self.item_sets.add(id(target))
                     t = setter.params[2]
-                elif isinstance(container, BuiltinTy) and container.name == "Pool":
-                    self.expect(index_type, BuiltinTy("Handle", container.args), index.span, "a pool's index")
-                    t = container.args[0]
+                elif isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
+                    t = self.handle_item(container, index_type, index.span)
                 else:
                     if resolve(index_type) == RANGE:
                         raise EllaError(f"can't {verb} a slice; change the items one by one", span)
@@ -2091,8 +2093,8 @@ class Checker:
         """Whether an argument of type `other` could share storage that a `mut` argument of type `passed` changes.
 
         Changing a list in place leaves its old items alive, so only values
-        with parts that can change are at risk. A pool frees its values, so
-        anything boxed taken from one is.
+        with parts that can change are at risk. A pool or an arena frees its
+        values, so anything boxed taken from one is.
         """
         if has_pool(passed, self.enums):
             return other not in (I64, F64, BOOL, UNIT)
@@ -2155,8 +2157,21 @@ class Checker:
             self.at_stage(self.level - 1, code, env, -1)
         return self.types[id(code)]
 
+    def handle_item(self, container: BuiltinTy, index_type: Type, span: Span) -> Type:
+        """The type of `pool[h]` or `arena[r]`: a pool's item, or what the ref refers to."""
+        if container.name == "Pool":
+            self.expect(index_type, BuiltinTy("Handle", container.args), span, "a pool's index")
+            return container.args[0]
+        item: Type = self.fresh()
+        self.expect(index_type, BuiltinTy("Ref", (item,)), span, "an arena's index")
+        return item
+
     def check_builtin(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
-        """`print`, `len`, `run`, the pool functions `pool_new`, `alloc` and `free`, reflection, and the library."""
+        """`print`, `len`, `run`, the pool and arena functions, reflection, and the library.
+
+        The pool and arena functions are `pool_new`, `arena_new`, `alloc` and
+        `free`; `free(mut arena)` frees all of an arena's values at once.
+        """
         if name in LIBRARY:
             function = self.library_type(name, span)
             self.check_arity(name, len(function.params), args, span)
@@ -2180,25 +2195,17 @@ class Checker:
                     raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
                 self.check(arg, env)
             return UNIT
-        arity = {"len": 1, "run": 1, "pool_new": 0, "alloc": 2, "free": 2}[name]
-        self.check_arity(name, arity, args, span)
         if name in ("alloc", "free"):
-            # alloc(mut pool, value) -> handle, and free(mut pool, handle).
-            pool, value = args
-            if not isinstance(pool, MutArg):
-                raise EllaError(f"{name}() changes its pool, so mark it: '{name}(mut pool, ...)'", pool.span)
-            item: Type = self.fresh()
-            pool_type = self.check_place(pool.target, env, "pass")
-            self.types[id(pool)] = pool_type
-            self.expect(pool_type, BuiltinTy("Pool", (item,)), pool.span, f"the pool given to {name}()")
-            expected = item if name == "alloc" else BuiltinTy("Handle", (item,))
-            self.expect(self.check(value, env), expected, value.span, f"the value given to {name}()")
-            return BuiltinTy("Handle", (item,)) if name == "alloc" else UNIT
+            return self.check_alloc(name, args, env, span)
+        arity = {"len": 1, "run": 1, "pool_new": 0, "arena_new": 0}[name]
+        self.check_arity(name, arity, args, span)
         for arg in args:
             if isinstance(arg, MutArg):
                 raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
         if name == "pool_new":
             return BuiltinTy("Pool", (self.fresh(),))
+        if name == "arena_new":
+            return ARENA
         arg_type = self.check(args[0], env)
         if name == "run":
             result: Type = self.fresh()
@@ -2215,10 +2222,38 @@ class Checker:
             if method is not None:
                 self.expect(method, FuncTy((arg_type,), I64), args[0].span, "its len method")
                 return I64
-            if describe_kind(arg_type) not in ("list", "str", "range", "Pool", "?"):
-                raise EllaError(f"len() needs a list, str, range or Pool, not {show_type(arg_type)}", args[0].span)
+            if describe_kind(arg_type) not in ("list", "str", "range", "Pool", "Arena", "?"):
+                raise EllaError(
+                    f"len() needs a list, str, range, Pool or Arena, not {show_type(arg_type)}", args[0].span
+                )
             return I64
         return UNIT
+
+    def check_alloc(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
+        """`alloc(mut pool, value) -> Handle[T]`, `free(mut pool, handle)`, `alloc(mut arena, value) -> Ref[T]`
+        and `free(mut arena)`."""
+        if not args:
+            raise EllaError(f"{name}() needs a pool or an arena, marked 'mut'", span)
+        holder = args[0]
+        if not isinstance(holder, MutArg):
+            what = "arena" if resolve(self.check(holder, env)) == ARENA else "pool"
+            rest = "" if name == "free" and what == "arena" else ", ..."
+            raise EllaError(f"{name}() changes its {what}, so mark it: '{name}(mut {what}{rest})'", holder.span)
+        holder_type = self.known(self.check_place(holder.target, env, "pass"), holder.span)
+        self.types[id(holder)] = holder_type
+        if holder_type == ARENA:
+            self.check_arity(name, 2 if name == "alloc" else 1, args, span)
+            if name == "free":
+                return UNIT
+            value = args[1]
+            return BuiltinTy("Ref", (self.check(value, env),))
+        self.check_arity(name, 2, args, span)
+        item: Type = self.fresh()
+        self.expect(holder_type, BuiltinTy("Pool", (item,)), holder.span, f"the pool or arena given to {name}()")
+        value = args[1]
+        expected = item if name == "alloc" else BuiltinTy("Handle", (item,))
+        self.expect(self.check(value, env), expected, value.span, f"the value given to {name}()")
+        return BuiltinTy("Handle", (item,)) if name == "alloc" else UNIT
 
     def wrap(self, name: Name, arity: int, env: Env) -> Type:
         """`print`, `eprint`, `len` or a constructor used as a value: a lambda that calls it, like `(_1) => Some(_1)`.
@@ -2461,7 +2496,7 @@ def any_part(
 
 
 def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
-    """Whether values of type `t` hold anything Ella can change in place: a list, a struct with fields, or a pool.
+    """Whether values of type `t` hold anything Ella can change in place: a list, a struct with fields, a pool, an arena.
 
     Values without such parts can be shared freely: nothing can change them.
     `enums` gives the definitions of enum and struct types (the built-in
@@ -2471,7 +2506,7 @@ def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
 
     def changes(t: Type) -> bool:
         match t:
-            case ListTy() | BuiltinTy("Pool"):
+            case ListTy() | BuiltinTy("Pool" | "Arena"):
                 return True
             case EnumTy(name) if name in enums:
                 return enums[name].struct and bool(enums[name].field_names)
@@ -2481,11 +2516,11 @@ def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
 
 
 def is_nocopy(t: Type, enums: dict[str, EnumInfo]) -> bool:
-    """Whether values of type `t` can't be copied: they are, or hold, a nocopy struct or a pool."""
+    """Whether values of type `t` can't be copied: they are, or hold, a nocopy struct, a pool or an arena."""
 
     def nocopy(t: Type) -> bool:
         match t:
-            case BuiltinTy("Pool"):
+            case BuiltinTy("Pool" | "Arena"):
                 return True
             case EnumTy(name) if name in enums:
                 return enums[name].nocopy
@@ -2494,8 +2529,14 @@ def is_nocopy(t: Type, enums: dict[str, EnumInfo]) -> bool:
     return any_part(t, enums, nocopy)
 
 
+def a_or_an(word: str) -> str:
+    """The article for a word, by its first letter: "an Arena", "a Pool[str]"."""
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
 def has_pool(t: Type, enums: dict[str, EnumInfo]) -> bool:
-    return any_part(t, enums, lambda t: isinstance(t, BuiltinTy) and t.name == "Pool")
+    """Whether values of type `t` hold a pool or an arena, which free the values in them."""
+    return any_part(t, enums, lambda t: isinstance(t, BuiltinTy) and t.name in ("Pool", "Arena"))
 
 
 def persistable(t: Type, enums: dict[str, EnumInfo]) -> bool:
@@ -2507,7 +2548,7 @@ def persistable(t: Type, enums: dict[str, EnumInfo]) -> bool:
     return not is_nocopy(t, enums) and not any_part(
         t,
         enums,
-        lambda t: isinstance(t, FuncTy | DeferredTy) or (isinstance(t, BuiltinTy) and t.name == "Handle"),
+        lambda t: isinstance(t, FuncTy | DeferredTy) or (isinstance(t, BuiltinTy) and t.name in ("Handle", "Ref")),
     )
 
 
@@ -2545,7 +2586,7 @@ class CopyChecker:
 
     def error(self, expr: Expr, what: str) -> EllaError:
         t = show_type(finish(self.checker.types[id(expr)]))
-        return EllaError(f"a {t} can't be copied, so it can't be {what}", expr.span)
+        return EllaError(f"{a_or_an(t)} {t} can't be copied, so it can't be {what}", expr.span)
 
     def walk(self, node: object, context: str) -> None:
         """Check a node whose value is used in `context`: "copy", "borrow", or "return" (moved to the caller)."""
@@ -2580,9 +2621,9 @@ class CopyChecker:
                 self.function_binders.update(id(node) for node in pattern_names(pattern))
             case Assign(_, target, value):
                 if self.nocopy(target):
+                    t = show_type(finish(self.checker.types[id(target)]))
                     raise EllaError(
-                        f"a {show_type(finish(self.checker.types[id(target)]))} can't be copied, so it can't be "
-                        "assigned; change its fields instead",
+                        f"{a_or_an(t)} {t} can't be copied, so it can't be assigned; change its fields instead",
                         target.span,
                     )
                 self.walk_place(target)
@@ -2710,11 +2751,13 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
         return constraint in t.constraints
     match constraint:
         case "Eq":
-            # Anything but functions, pools and code, and type parameters that aren't Eq themselves.
+            # Anything but functions, pools, arenas and code, and type parameters that aren't Eq themselves.
             def unequal(part: Type) -> bool:
                 if isinstance(part, ParamTy):
                     return "Eq" not in part.constraints
-                return isinstance(part, FuncTy) or (isinstance(part, BuiltinTy) and part.name in ("Pool", "Code"))
+                return isinstance(part, FuncTy) or (
+                    isinstance(part, BuiltinTy) and part.name in ("Pool", "Arena", "Code")
+                )
 
             return not any_part(t, enums, unequal)
         case "Ord":

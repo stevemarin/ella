@@ -1,0 +1,9 @@
+# A ref to a value whose arena was freed is stale, even after the arena is used again.
+
+let mut arena: Arena = arena_new()
+let first = alloc(mut arena, "first")
+print(arena[first])
+free(mut arena)
+let second = alloc(mut arena, "second")
+print(arena[second], first == second)
+print(arena[first])

@@ -17,6 +17,7 @@ Ella values are represented by plain Python values where one fits:
     functions       Closure (written in Ella) or Builtin (written in Python)
                     in the AST interpreter; FunctionRef in the IR interpreter
     Pool[T]         PoolValue, and Handle[T] is HandleValue
+    Arena           ArenaValue, and Ref[T] is RefValue
     Code[T]         CodeValue, holding the code's syntax tree
 
 Python's `bool` is a subclass of `int`, so code that tells values apart must
@@ -31,6 +32,7 @@ program could tell (see ella.lower), and the IR interpreter runs its `copy`
 instructions with `copy_value` too.
 """
 
+import itertools
 import json
 import sys
 import threading
@@ -85,6 +87,33 @@ class HandleValue:
 
     slot: int
     generation: int
+
+
+# Numbers that tell arenas apart, for their refs.
+arena_ids = itertools.count()
+
+
+@dataclass(eq=False, slots=True)
+class ArenaValue:
+    """An `Arena`: values that are freed together, all at once.
+
+    Freeing them (`free(mut arena)`) bumps the arena's generation, so refs
+    to them are caught. `id` tells arenas apart, so a ref used with another
+    arena is caught too.
+    """
+
+    values: list[Value] = field(default_factory=list)
+    generation: int = 0
+    id: int = field(default_factory=lambda: next(arena_ids))
+
+
+@dataclass(frozen=True, slots=True)
+class RefValue:
+    """A `Ref[T]`: which value of an arena, the arena, and the arena's generation when it was put there."""
+
+    arena: int
+    generation: int
+    index: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +183,8 @@ type Value = (
     | FunctionRef
     | PoolValue
     | HandleValue
+    | ArenaValue
+    | RefValue
     | CodeValue
     | TypeValue
 )
@@ -241,6 +272,10 @@ def type_name(value: Value) -> str:
             return "Pool"
         case HandleValue():
             return "Handle"
+        case ArenaValue():
+            return "Arena"
+        case RefValue():
+            return "Ref"
         case CodeValue():
             return "Code"
         case TypeValue():
@@ -250,7 +285,7 @@ def type_name(value: Value) -> str:
 def copy_value(value: Value) -> Value:
     """A copy of `value` that shares no parts that can change with it (lists and structs).
 
-    Values that can't be copied (nocopy structs and pools) are returned as
+    Values that can't be copied (nocopy structs, pools and arenas) are returned as
     they are.
     """
     match value:
@@ -275,7 +310,7 @@ def equal(a: Value, b: Value) -> bool:
         return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
         return a.variant == b.variant and equal(a.fields, b.fields)
-    if isinstance(a, PoolValue | CodeValue):
+    if isinstance(a, PoolValue | ArenaValue | CodeValue):
         return a is b
     return a == b
 
@@ -311,6 +346,10 @@ def to_text(value: Value, nested: bool = False) -> str:
             return f"<pool of {value.live()}>"
         case HandleValue(slot, generation):
             return f"<handle {slot}:{generation}>"
+        case ArenaValue(values):
+            return f"<arena of {len(values)}>"
+        case RefValue(index=index):
+            return f"<ref {index}>"
         case CodeValue(expr):
             return f"<code {show(expr)}>"
         case TypeValue(t):

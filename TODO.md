@@ -26,7 +26,7 @@ passes (1044 tests, ruff, strict mypy).
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier; mem2reg, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas; byte-for-byte the same output and errors as the interpreters |
-| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, `nocopy` and finalizers |
+| Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `contains`, `len`) |
 | Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `sin`, `cos`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, and `Map[K, V]` |
@@ -46,7 +46,7 @@ programs hard to write today.
 
 ### Standard library and I/O
 
-The built-ins are `print`, `eprint`, `len`, `run`, the pool functions,
+The built-ins are `print`, `eprint`, `len`, `run`, the pool and arena functions,
 reflection, and the library (docs/grammar.md §10): number conversions and
 parsing, math, code points, string functions, `hash`, files, arguments,
 the environment and `exit`. The standard library's modules (src/ella/lib/,
@@ -120,7 +120,9 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 
 From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
-- Sub-arenas for groups of long-lived values that die together.
+- Arenas hold at most 16 MiB and about a million values each (a slot
+  arena's size), and a ref's generation is 24 bits, so a ref kept through
+  16 million frees of its slot arena could be taken for a live one.
 - Owning (non-copyable) handles, and handles that know their pool; a handle
   used with the wrong pool of the same type isn't caught.
 - Region bloat remains where loops don't carry values (memory-model.md

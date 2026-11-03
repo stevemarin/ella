@@ -49,6 +49,11 @@ from SLOT_DEPTH up, and aren't freed in any particular order, so they are
 only checked for use after they are freed. Operations that put a value in
 a pool copy it into the slot's arena.
 
+An `Arena` value has one slot arena of its own, which holds all its values.
+`free arena` frees that slot arena (bumping its generation, so values
+borrowed from it are caught) and keeps it for the arena's next values; the
+slot arena is given back when the arena dies.
+
 When an arena is freed, the finalizers of the values in it run first,
 newest first (docs/memory-model.md §7). The interpreter also adds up roughly how
 many bytes native code would use (`--profile` shows them): the high-water
@@ -88,10 +93,12 @@ from ella.syntax import Expr, Name
 from ella.values import (
     MAX_CALL_DEPTH,
     UNIT,
+    ArenaValue,
     CodeValue,
     FunctionRef,
     HandleValue,
     PoolValue,
+    RefValue,
     TypeValue,
     Value,
     VariantValue,
@@ -112,6 +119,7 @@ type Tag = tuple[int, int] | None
 
 SLOT_DEPTH = 1 << 20  # slot arenas are numbered from here
 POOL = "<pool>"  # the finalizer of a pool: free its values
+ARENA = "<arena>"  # the finalizer of an arena: free its slot arena
 
 
 def run_ir(source: str, out: TextIO | None = None, host: Host | None = None, path: Path | None = None) -> int:
@@ -171,6 +179,7 @@ class IRInterpreter:
         self.slot_arenas: dict[int, Arena] = {}
         self.free_slot_arenas: list[int] = []
         self.pool_arenas: dict[int, list[int]] = {}  # id of a pool -> the arena of each of its slots
+        self.arena_slots: dict[int, int] = {}  # id of an Arena -> its slot arena
         self.high_water: dict[tuple[str, int], int] = defaultdict(int)
         self.sites: dict[tuple[str, Span, str], Site] = defaultdict(Site)
 
@@ -270,6 +279,11 @@ class IRInterpreter:
         return max(present, key=lambda tag: self.key(tag[0])) if present else None
 
     def finalize(self, value: Value, finalizer: str) -> None:
+        if finalizer == ARENA:
+            assert isinstance(value, ArenaValue)
+            self.free_arena(self.arena_slots.pop(id(value)))
+            value.values = []
+            return
         if finalizer == POOL:
             assert isinstance(value, PoolValue)
             for slot in reversed(range(len(value.slots))):
@@ -482,6 +496,11 @@ class IRInterpreter:
             case "pool_new":
                 result = PoolValue()
                 self.pool_arenas[id(result)] = []
+            case "arena_new":
+                result = ArenaValue()
+                self.arena_slots[id(result)] = self.new_slot_arena()
+            case "alloc" | "pool_get" | "pool_set" | "free" if isinstance(args[0], ArenaValue):
+                result, tag = self.execute_arena(instr, args, frame)
             case "alloc" | "pool_get" | "pool_set" | "free":
                 result, tag = self.execute_pool(instr, args, tags, frame)
             case "quote_begin":
@@ -515,6 +534,8 @@ class IRInterpreter:
                 container = args[0]
                 if isinstance(container, PoolValue):
                     result = container.live()
+                elif isinstance(container, ArenaValue):
+                    result = len(container.values)
                 else:
                     assert isinstance(container, list | str | range)
                     result = len(container)
@@ -552,8 +573,8 @@ class IRInterpreter:
             case op:
                 raise AssertionError(f"unknown IR operation {op}")
         if instr.dest is not None:
-            if instr.op == "pool_new":
-                self.arena(depth).finals.append((result, POOL))
+            if instr.op in ("pool_new", "arena_new"):
+                self.arena(depth).finals.append((result, POOL if instr.op == "pool_new" else ARENA))
             if allocates(instr) and instr.op not in (
                 "append", "copy", "move", "call", "run", "slice", "builtin", "carry"
             ):  # fmt: skip
@@ -617,6 +638,38 @@ class IRInterpreter:
                 pool.slots[key.slot] = None
                 pool.generations[key.slot] += 1
                 pool.free.append(key.slot)
+        return UNIT, None
+
+    def execute_arena(self, instr: Instr, args: list[Value], frame: Frame) -> tuple[Value, Tag]:
+        """`alloc`, `free`, `pool_get` and `pool_set` on an arena, whose values all live in its slot arena."""
+        arena = args[0]
+        assert isinstance(arena, ArenaValue)
+        depth = self.arena_slots[id(arena)]
+        match instr.op:
+            case "alloc":
+                value = copy_value(args[1])  # a value that can't be copied is moved, finalizers and all
+                self.move_finals(value, depth)
+                self.allocate(depth, deep_size(value), instr, frame)
+                arena.values.append(value)
+                return RefValue(arena.id, arena.generation, len(arena.values) - 1), None
+            case "free":
+                # All at once: the slot arena is freed, and kept for the arena's next values.
+                self.finalize_all(depth)
+                self.arena(depth).generation += 1
+                self.arena(depth).used = 0
+                arena.values = []
+                arena.generation += 1
+                return UNIT, None
+        ref = args[1]
+        assert isinstance(ref, RefValue)
+        if ref.arena != arena.id or ref.generation != arena.generation:
+            raise EllaError(f"ref {to_text(ref)} is stale: its arena was freed, or it is another arena's", instr.span)
+        if instr.op == "pool_get":
+            return arena.values[ref.index], (depth, self.arena(depth).generation)
+        # pool_set: the new value is copied into the arena; the old one stays there until it is freed.
+        value = copy_value(args[2])
+        self.allocate(depth, deep_size(value), instr, frame)
+        arena.values[ref.index] = value
         return UNIT, None
 
     def build_code(self, instr: Instr, args: list[Value]) -> Value:
@@ -725,6 +778,6 @@ def held_values(value: Value) -> list[Value]:
             return [value, *(v for item in fields for v in held_values(item))]
         case list() | tuple():
             return [v for item in value for v in held_values(item)]
-        case PoolValue():
+        case PoolValue() | ArenaValue():
             return [value]
     return []

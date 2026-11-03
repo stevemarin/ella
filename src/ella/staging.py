@@ -390,7 +390,8 @@ def reflect(name: str, args: list[Value], enums: dict[str, EnumInfo], span: Span
     * `has_field(t, name)`
     * `type_name(t)`: the type as it is written, like `Pair[i64]`
     * `type_kind(t)`: "i64", "f64", "bool", "str", "()", "range", "list",
-      "tuple", "function", "struct", "enum", "pool", "handle", "code" or "type"
+      "tuple", "function", "struct", "enum", "pool", "handle", "arena", "ref",
+      "code" or "type"
     * `variants(t)`: an enum's variants, in order
     """
     if name == "new_struct":
