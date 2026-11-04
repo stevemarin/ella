@@ -1098,7 +1098,19 @@ class IRInterpreter:
 
     def format_profile(self) -> str:
         """The arena profile: high-water marks of each scope level, and the allocation sites."""
-        lines = ["Arena profile (bytes as native code would use them, roughly)", "", "High water by scope:"]
+        copied = [site for (_, _, op), site in self.sites.items() if op == "copy"]
+        copy_bytes = sum(site.bytes for site in copied)
+        copy_count = sum(site.count for site in copied)
+        allocated_bytes = sum(site.bytes for site in self.sites.values())
+        allocation_count = sum(site.count for site in self.sites.values())
+        lines = [
+            "Arena profile (bytes as native code would use them, roughly)",
+            "",
+            f"Total allocations: {allocation_count:,} ({allocated_bytes:,} bytes)",
+            f"Explicit deep copies: {copy_count:,} ({copy_bytes:,} bytes)",
+            "",
+            "High water by scope:",
+        ]
         for (function, level), size in sorted(self.high_water.items(), key=lambda item: -item[1]):
             scope = "global" if function == "global" else f"{function} level {level}"
             lines.append(f"  {size:>12,}  {scope}")

@@ -10,7 +10,10 @@ fails the tests. Speed isn't checked, since it depends on the machine:
     uv run python test/bench.py [NAME ...]
 
 compiles each one (optimized), runs it a few times, and prints the fastest
-time and the arena peak. `make bench` does the same for all of them.
+time, arena peak, and process maximum resident set size. The arena peak
+covers Ella's arenas; RSS also includes runtime and compiler data. RSS is
+measured with `/usr/bin/time`, which is available on the supported Linux
+target. `make bench` does the same for all of them.
 
 * `string_build`: a string rebuilt on every iteration of a loop in a function.
 * `tuple_replace`: a global tuple replaced now and then in a top-level loop.

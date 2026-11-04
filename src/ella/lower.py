@@ -307,6 +307,7 @@ class SlotInfo:
     kind: str
     region: str
     borrows: frozenset[str] = frozenset()
+    binding: int | None = None
 
 
 @dataclass(slots=True)
@@ -401,6 +402,7 @@ class Lowerer:
         self.slots: dict[str, SlotInfo] = {}
         self.info: dict[int, Info] = {}  # value id -> what is known about it
         self.changed: set[str] = set()  # names of variables changed in place in this function
+        self.changed_bindings: set[int] = set()
         self.carrying: set[int] = set()  # the levels of the loops being lowered that carry variables
         self.promoted: set[str] = set()  # globals that the loops being lowered carry, in local slots
         self.last_uses: dict[int, str] = {}  # id of an `x = y` -> y, if nothing reads y afterwards
@@ -422,6 +424,7 @@ class Lowerer:
         self.slots, self.info = {}, {}
         self.carrying, self.promoted, self.last_uses = set(), set(), {}
         self.changed = changed_in_place(body, self.checker, into_lambdas=False)
+        self.changed_bindings = changed_bindings(body, self.checker, into_lambdas=False)
         self.returned = returned_names(body) if name != "top" else set()
 
     def finish_function(self) -> None:
@@ -562,7 +565,11 @@ class Lowerer:
             name = borrowed.removeprefix("global ")
             return name in self.globals_changed and self.checker.globals.vars[name].mutable
         slot = self.slots.get(borrowed)
-        return slot is not None and slot.mutable and slot.name in self.changed
+        return (
+            slot is not None
+            and slot.mutable
+            and (slot.binding in self.changed_bindings if slot.binding is not None else slot.name in self.changed)
+        )
 
     def copy(self, value: Value, region: str, span: Span) -> Value:
         return self.emit("copy", value.type, [value], span, region=region)
@@ -622,16 +629,20 @@ class Lowerer:
         if not info.borrows:
             return value
         changed: set[str] = set()
+        changed_ids: set[int] = set()
         for expr in later:
             changed |= changed_in_place(expr, self.checker, into_lambdas=False)
+            changed_ids |= changed_bindings(expr, self.checker, into_lambdas=False)
         for borrowed in info.borrows:
             if not self.unstable(borrowed):
                 continue
             if borrowed.startswith("global "):
                 if calls or CALLS in changed or borrowed.removeprefix("global ") in changed:
                     return self.copy(value, self.here(), span)
-            elif self.slots[borrowed].name in changed:
-                return self.copy(value, self.here(), span)
+            else:
+                slot = self.slots[borrowed]
+                if slot.binding in changed_ids if slot.binding is not None else slot.name in changed:
+                    return self.copy(value, self.here(), span)
         return value
 
     def view_of(self, value: Value, region: str) -> Info:
@@ -699,7 +710,14 @@ class Lowerer:
         return self.here()
 
     def bind(
-        self, name: str, value: Value, span: Span, mutable: bool = False, region: str = "", kind: str = "local"
+        self,
+        name: str,
+        value: Value,
+        span: Span,
+        mutable: bool = False,
+        region: str = "",
+        kind: str = "local",
+        binding: int | None = None,
     ) -> Value:
         """Make `name` a variable in the innermost scope, holding `value`. Returns the value stored."""
         if not self.scopes:  # at top level, `let` makes a global
@@ -720,7 +738,8 @@ class Lowerer:
         borrows = frozenset() if mutable else self.info_of(value).borrows
         if old is not None:
             borrows |= old.borrows
-        self.slots[slot] = SlotInfo(name, mutable, kind, region, borrows)
+            binding = old.binding if old.binding is not None else binding
+        self.slots[slot] = SlotInfo(name, mutable, kind, region, borrows, binding)
         self.function.local_regions[slot] = region
         self.emit_effect("store", [value], span, slot)
         self.info[value.id] = Info(frozenset({slot}) | borrows, region)
@@ -931,11 +950,11 @@ class Lowerer:
             entry.params.append(param)
             if i in t.mutable:
                 self.info[param.id] = Info(frozenset(), f"mut{i}")
-                self.bind(declared.name, param, declared.span, True, f"mut{i}", "mut")
+                self.bind(declared.name, param, declared.span, True, f"mut{i}", "mut", id(declared))
                 mut_slots.append(self.scopes[0][declared.name])
             else:
                 self.info[param.id] = Info(frozenset(), "0")
-                self.bind(declared.name, param, declared.span, region="0", kind="param")
+                self.bind(declared.name, param, declared.span, region="0", kind="param", binding=id(declared))
 
         self.exit = self.new_block("exit")
         result = self.new_value(t.result)
@@ -1027,7 +1046,7 @@ class Lowerer:
             param = self.new_value(param_type)
             entry.params.append(param)
             self.info[param.id] = Info(frozenset(), "0")
-            self.bind(declared.name, param, declared.span, kind == "local", "0", kind)
+            self.bind(declared.name, param, declared.span, kind == "local", "0", kind, id(declared))
             values.append(param)
         return values
 
@@ -1105,7 +1124,7 @@ class Lowerer:
                     value = self.lower(value_expr, region)
                 for binding in bindings:
                     home = self.home(binding.name, t)
-                    value = self.bind(binding.name, value, binding.span, binding.mutable, home)
+                    value = self.bind(binding.name, value, binding.span, binding.mutable, home, binding=id(binding))
                 return value
             case LetPattern(pattern, value_expr, _, mutable):
                 value = self.lower(value_expr, self.here() if self.scopes else "global")
@@ -2018,7 +2037,8 @@ class Lowerer:
             slot = self.new_slot(name, value.type)
             region = f"carry{self.level}"
             self.function.local_regions[slot] = region
-            self.slots[slot] = SlotInfo(name, True, "local", region)
+            binding = self.slots[self.find_slot(name)].binding if kind == "local" else None
+            self.slots[slot] = SlotInfo(name, True, "local", region, binding=binding)
             self.emit_effect("store", [value], span, slot)
             scope[name] = slot
             carried.append(Carried(name, kind, slot))
@@ -2218,7 +2238,7 @@ class Lowerer:
                 if self.checker.kinds[id(pattern)] == "variant":
                     self.test(self.emit("is_variant", BOOL, [value], span, name), fail)
                 else:
-                    self.bind(name, value, span, mutable or mutable_name)
+                    self.bind(name, value, span, mutable or mutable_name, binding=id(pattern))
             case LiteralPattern(literal):
                 self.test(self.emit("eq", BOOL, [value, self.const(literal, span)], span), fail)
             case RangePattern(low, high, inclusive):
@@ -2378,6 +2398,30 @@ def changed_in_place(node: object, checker: Checker, into_lambdas: bool) -> set[
     if calls_method(node, checker):
         changed |= {CALLS}
     return changed.union(*(changed_in_place(child, checker, into_lambdas) for child in children(node)))
+
+
+def changed_bindings(node: object, checker: Checker, into_lambdas: bool) -> set[int]:
+    """The identities of local bindings whose mutable objects this code may change."""
+    root: Name | None
+    match node:
+        case Assign(_, Index() | Member() as target):
+            root, _ = place_steps(target)
+        case Assign(_, Name() as target) as assign if is_append(assign, checker):
+            root = target
+        case MutArg(Name() as root):
+            pass
+        case MutArg(Index() | Member() as target):
+            root, _ = place_steps(target)
+        case Lambda() if not into_lambdas:
+            return set()
+        case _:
+            root = None
+    changed: set[int] = set()
+    if root is not None:
+        info = checker.resolved.get(id(root))
+        if info is not None and info.kind == "local":
+            changed.add(id(info.binder))
+    return changed.union(*(changed_bindings(child, checker, into_lambdas) for child in children(node)))
 
 
 def calls_method(node: object, checker: Checker) -> bool:
