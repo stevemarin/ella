@@ -21,7 +21,8 @@ time and the arena peak. `make bench` does the same for all of them.
 * `words`: splitting, sorting and joining text, with a `Map` of counts.
 * `generators`: a pipeline of generators (the `iters` module, and one of
   its own that rebuilds a string for each item) over 200,000 items.
-* `fib`: about 30 million calls of a small recursive function.
+* `fib`: one million steps of tail-recursive Fibonacci with a modulus, which
+  checks that the native backend reuses its call frame.
 * `arith`: integer arithmetic in nested loops, calling small helpers.
 * `methods`: small methods and an operator on a struct of floats, in a loop.
 * `map_ops`: inserting, updating and looking up the keys of a `Map`.

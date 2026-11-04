@@ -557,6 +557,18 @@ alone returns `()`. Its own value has type "never" (it does not produce one).
 `f(a, b)` calls `f`. Trailing commas are allowed in argument and parameter
 lists. Named arguments are not supported (yet).
 
+### Tail recursion
+
+A direct self-call in tail position is guaranteed to reuse the current call
+frame when the function has no captures or `mut` parameters, has no `where`
+clauses, and all its parameters are scalar (not `str`). Tail position includes
+the final expression of a function or block, either arm of an `if`, a `match`
+case, and an explicit `return` expression. The tree interpreter, IR
+interpreter, and native backend all support this case; the native backend also
+resets the function's scope arenas between iterations, so temporary allocations do not
+accumulate. Other tail calls currently use ordinary calls and count toward
+the call-depth limit.
+
 ## 6. Control flow
 
 ### `if`

@@ -213,7 +213,6 @@ let later = 1
     "slice out of range": 'print("abc"[1..2])\nprint("abc"[2..1])',
     "to_i64 out of range": "print(to_i64(-1.5))\nprint(to_i64(1.0e19))",
     "split by nothing": 'print(split("a b", " "))\nprint(split("a", ""))',
-    "stack overflow": "let f = (n: i64) -> i64 => f(n + 1)\nf(0)",
     "division by zero": "print(1 // 0)",
     # Memory: copies, changing lists in place, and arenas (docs/memory-model.md).
     "shared until changed in place": """\
@@ -452,6 +451,21 @@ def test_interpreters_agree(source: str) -> None:
     assert outcome(optimized_output, source) == expected
     if shutil.which("gcc") is not None:
         assert outcome(native_output, source) == expected
+
+
+def test_non_tail_recursion_still_checks_the_depth_limit() -> None:
+    source = "let f = (n: i64) -> i64 => 1 + f(n + 1)\nf(0)"
+    expected = "stack overflow: more than 100 nested calls"
+
+    program, checker = prepare(parse(source))
+    with pytest.raises(EllaError, match=expected):
+        Interpreter(io.StringIO(), checker, max_depth=100).run(program)
+
+    with pytest.raises(EllaError, match=expected):
+        IRInterpreter(compile_program(source), io.StringIO(), max_depth=100).run()
+
+    with pytest.raises(EllaError, match=expected):
+        IRInterpreter(optimize(compile_program(source)), io.StringIO(), max_depth=100).run()
 
 
 @pytest.mark.parametrize("source", RUN_TIME_STAGING.values(), ids=RUN_TIME_STAGING.keys())

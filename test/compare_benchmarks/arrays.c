@@ -2,7 +2,7 @@
 #include <stdlib.h>
 
 int main(void) {
-    const int n = 2048, steps = 80;
+    const int n = 1024, steps = 40;
     const double dt = 0.01;
     double *target = malloc((size_t)n * sizeof(double));
     double *pos = calloc((size_t)n, sizeof(double));

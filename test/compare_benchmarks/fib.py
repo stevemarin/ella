@@ -1,7 +1,7 @@
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+def fib(n: int, a: int, b: int) -> int:
+    while n:
+        n, a, b = n - 1, b, (a + b) % 1_000_000_007
+    return a
 
 
-print(fib(27))
+print(fib(10_000, 0, 1))

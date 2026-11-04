@@ -471,9 +471,99 @@ class CodeGen:
                 self.emit(f"mov {layout.registers[param.id]}, {self.param_slot(i)}")
         for block in function.blocks:
             self.text.append(f"{self.block_label(block)}:")
+            tail = self.tail_call(block)
             for instr in block.instrs:
+                if instr is tail:
+                    continue
                 self.instr(instr)
             self.terminator(block)
+
+    def tail_call(self, block: Block) -> Instr | None:
+        """A scalar self-call in return position can reuse this native frame.
+
+        Scalar arguments can be moved into the reused frame before its scope
+        arenas are reset. Calls with captures, mutable parameters, generators,
+        or boxed parameters retain the ordinary call behavior.
+        """
+        term = block.terminator
+        if self.function.captures or self.function.mut_params or self.function.generator:
+            return None
+        if any(not isinstance(param.type, PrimTy) or param.type.name == "str" for param in self.function.params):
+            return None
+        if not block.instrs:
+            return None
+        instr = block.instrs[-1]
+        if instr.dest is None or instr.mutable:
+            return None
+        if isinstance(term, Return):
+            returns_call = instr.dest is term.value
+        elif isinstance(term, Jump):
+            returns_call = self.forwards_return_to(block, instr.dest)
+        else:
+            returns_call = False
+        if not returns_call:
+            return None
+        if instr.op == "call_direct":
+            if instr.name != self.function.name:
+                return None
+            args = instr.args
+        elif instr.op == "call":
+            closure = next(
+                (candidate for candidate in reversed(block.instrs[:-1]) if candidate.dest is instr.args[0]), None
+            )
+            if closure is None or closure.op != "closure" or closure.name != self.function.name or closure.args:
+                return None
+            args = instr.args[1:]
+        else:
+            return None
+        if len(args) != len(self.function.params):
+            return None
+        return instr
+
+    @staticmethod
+    def forwards_return_to(block: Block, value: Value) -> bool:
+        """Whether this block jumps through empty forwarding blocks to return `value`."""
+        term = block.terminator
+        if not isinstance(term, Jump):
+            return False
+        mapping = {param.id: arg for param, arg in zip(term.target.params, term.args)}
+        current = term.target
+        seen: set[str] = set()
+        while current.name not in seen and not current.instrs:
+            seen.add(current.name)
+            term = current.terminator
+            if isinstance(term, Return):
+                returned = mapping.get(term.value.id, term.value)
+                return returned is value
+            if not isinstance(term, Jump):
+                return False
+            mapping = {param.id: mapping.get(arg.id, arg) for param, arg in zip(term.target.params, term.args)}
+            current = term.target
+        return False
+
+    def emit_tail_call(self, instr: Instr) -> None:
+        """Transfer scalar arguments into the incoming slots and jump to entry."""
+        args = instr.args if instr.op == "call_direct" else instr.args[1:]
+        self.parallel_move([(self.param_slot(i), self.slots[arg.id]) for i, arg in enumerate(args)])
+        if self.base_slot:
+            self.emit(f"mov rdi, {self.base_slot}")
+            self.emit("call ella_leave            # end this logical invocation's arenas")
+            self.emit(f"mov rdi, {self.function.levels}")
+            self.emit("call ella_enter            # reuse the frame with fresh arenas")
+            self.emit(f"mov {self.base_slot}, rax")
+            for level in self.current_slots:
+                self.emit(f"lea rcx, [rax + {level}]")
+                self.emit(f"mov {self.current_slots[level]}, rcx")
+                self.emit(f"lea rcx, [rax + {level + 1}]")
+                self.emit(f"mov {self.carried_slots[level]}, rcx")
+        for i, param in enumerate(self.function.params):
+            if param.id in self.layout(self.function).registers:
+                self.emit(f"mov {self.slots[param.id]}, {self.param_slot(i)}")
+        self.emit("mov rax, qword ptr [rip + ella_depth]")
+        self.emit("lea rcx, [rip + ella_trace]")
+        self.emit(f"lea rdx, [rip + {self.site(instr.span, self.function.name)}]")
+        self.emit("mov qword ptr [rcx + 8*rax - 8], rdx   # latest tail-call site")
+        self.emit(f"jmp {self.block_label(self.function.blocks[0])}")
 
     def layout(self, function: Function) -> Layout:
         """Where a function's values are: a register (ella.regalloc), or else a stack slot (8 bytes); also a slot
@@ -2008,6 +2098,10 @@ class CodeGen:
     def terminator(self, block: Block) -> None:
         match block.terminator:
             case Jump(target, args):
+                tail = self.tail_call(block)
+                if tail is not None:
+                    self.emit_tail_call(tail)
+                    return
                 # Pass values to the target's parameters, all at once, since
                 # parameters can swap values, as loop variables can.
                 self.parallel_move([(self.slots[p.id], self.slots[a.id]) for p, a in zip(target.params, args)])
@@ -2019,6 +2113,10 @@ class CodeGen:
                 self.emit(f"jnz {self.block_label(then)}")
                 self.emit(f"jmp {self.block_label(else_)}")
             case Return(value, outs):
+                tail = self.tail_call(block)
+                if tail is not None:
+                    self.emit_tail_call(tail)
+                    return
                 if self.base_slot:
                     self.emit(f"mov rdi, {self.base_slot}")
                     self.emit("call ella_leave            # free the scope levels")

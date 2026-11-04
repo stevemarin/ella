@@ -77,7 +77,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from ella.checker import BuiltinTy, EnumTy, ListTy, TupleTy, Type, check_code, is_builtin_error, show_type, substitute
+from ella.checker import (
+    BuiltinTy,
+    EnumTy,
+    ListTy,
+    PrimTy,
+    TupleTy,
+    Type,
+    check_code,
+    is_builtin_error,
+    show_type,
+    substitute,
+)
 from ella.ir import (
     VIEWS,
     Block,
@@ -568,8 +579,24 @@ class IRInterpreter:
         """Run a function's blocks from `block` until it returns, or yields (giving the block to carry on at)."""
         function = frame.function
         while True:
+            tail = tail_call(block, function)
             for instr in block.instrs:
+                if instr is tail:
+                    continue
                 self.execute(instr, frame)
+            if tail is not None:
+                args = tail.args if tail.op == "call_direct" else tail.args[1:]
+                values = [frame.values[arg.id] for arg in args]
+                self.free_levels(frame, 0)
+                if not frame.levels:
+                    self.start_swaps(frame, [frame.base + level for level in range(function.levels)])
+                for param, param_value in zip(function.params, values):
+                    frame.values[param.id] = param_value
+                    frame.tags[param.id] = None
+                if self.calls and self.calls[-1] is not None:
+                    self.calls[-1] = site(tail)
+                block = function.blocks[0]
+                continue
             match block.terminator:
                 case Jump(target, jump_args):
                     values = [frame.values[a.id] for a in jump_args]
@@ -1084,6 +1111,51 @@ class IRInterpreter:
 def site(instr: Instr) -> CallSite | None:
     """Where a call is, for stack traces (None for the call of `main`)."""
     return CallSite(instr.span, instr.within) if instr.within is not None else None
+
+
+def tail_call(block: Block, function: Function) -> Instr | None:
+    """Find a scalar self-call whose result flows straight to the function return."""
+    if (
+        function.captures
+        or function.mut_params
+        or function.generator
+        or any(not isinstance(param.type, PrimTy) or param.type.name == "str" for param in function.params)
+    ):
+        return None
+    if not block.instrs:
+        return None
+    instr = block.instrs[-1]
+    if instr.dest is None or instr.mutable:
+        return None
+    if instr.op == "call_direct":
+        if instr.name != function.name:
+            return None
+    elif instr.op == "call":
+        closure = next((item for item in reversed(block.instrs[:-1]) if item.dest is instr.args[0]), None)
+        if closure is None or closure.op != "closure" or closure.name != function.name or closure.args:
+            return None
+    else:
+        return None
+    if len(instr.args if instr.op == "call_direct" else instr.args[1:]) != len(function.params):
+        return None
+    term = block.terminator
+    if isinstance(term, Return):
+        return instr if term.value is instr.dest else None
+    if not isinstance(term, Jump):
+        return None
+    mapping = {param.id: arg for param, arg in zip(term.target.params, term.args)}
+    current = term.target
+    seen: set[str] = set()
+    while current.name not in seen and not current.instrs:
+        seen.add(current.name)
+        term = current.terminator
+        if isinstance(term, Return):
+            return instr if mapping.get(term.value.id, term.value) is instr.dest else None
+        if not isinstance(term, Jump):
+            return None
+        mapping = {param.id: mapping.get(arg.id, arg) for param, arg in zip(term.target.params, term.args)}
+        current = term.target
+    return None
 
 
 def function_swaps(function: Function) -> set[int]:

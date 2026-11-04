@@ -13,15 +13,13 @@ from ella.native import compile_native
 
 BENCHMARKS = Path(__file__).parent
 MODES = ("tree max", "IR max", "Ella native", "Python", "C")
-INTERPRETER_TIMEOUT = 5.0
+INTERPRETER_TIMEOUT = 1.0
 
 
 def run(command: list[str], timeout: float | None = None) -> tuple[float, str | None]:
     start = time.perf_counter()
     try:
-        result = subprocess.run(
-            command, cwd=BENCHMARKS, capture_output=True, text=True, check=True, timeout=timeout
-        )
+        result = subprocess.run(command, cwd=BENCHMARKS, capture_output=True, text=True, check=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return time.perf_counter() - start, None
     return time.perf_counter() - start, result.stdout.strip()
@@ -84,7 +82,7 @@ def main(argv: list[str]) -> None:
             cells_list = []
             for index, (times, timed_out) in enumerate(results):
                 if timed_out:
-                    cells_list.append(f"{'>5.00':>10} s")
+                    cells_list.append(f"{'>1.00':>10} s")
                 else:
                     ms = (max(times) if index < 2 else min(times)) * 1000
                     cells_list.append(f"{ms:>10.2f} ms")

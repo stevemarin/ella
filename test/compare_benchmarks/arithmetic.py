@@ -8,9 +8,9 @@ def step(n: int) -> int:
     return n // 2 if n % 2 == 0 else 3 * n + 1
 
 
-total = sum(gcd(i, j) for i in range(1, 181) for j in range(1, 181))
+total = sum(gcd(i, j) for i in range(1, 11) for j in range(1, 11))
 longest = 0
-for start in range(1, 20001):
+for start in range(1, 101):
     n = start
     steps = 0
     while n != 1:

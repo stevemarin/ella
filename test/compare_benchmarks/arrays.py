@@ -1,5 +1,5 @@
-n = 2048
-steps = 80
+n = 1024
+steps = 40
 target = [(i % 97) * 0.02 - 1.0 for i in range(n)]
 pos = [0.0] * n
 vel = [0.0] * n

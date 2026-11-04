@@ -192,6 +192,15 @@ class ReturnSignal(Exception):
         self.span = span
 
 
+class TailCallSignal(Exception):
+    """A direct self-tail-call with scalar arguments, handled by the current frame."""
+
+    def __init__(self, closure: Closure, args: list[Value], span: Span) -> None:
+        self.closure = closure
+        self.call_args = args
+        self.span = span
+
+
 class GeneratorClosed(Exception):
     """Raised at a `yield` when its generator dies before its body finishes, to end the body's thread."""
 
@@ -371,7 +380,7 @@ class Interpreter:
 
     # Expressions
 
-    def eval(self, expr: Expr, scope: Scope) -> Value:
+    def eval(self, expr: Expr, scope: Scope, tail: bool = False) -> Value:
         """Evaluate an expression in `scope` and return its value."""
         match expr:
             # Literals
@@ -500,25 +509,33 @@ class Interpreter:
                     return self.call_next(args, scope, span)
                 if isinstance(function, Builtin) and function.name == "array" and len(args) == 1:
                     return self.make_array(expr, self.eval(args[0], scope), span)
+                if tail and isinstance(function, Closure) and all(not isinstance(arg, MutArg) for arg in args):
+                    values = [self.eval(arg, scope) for arg in args]
+                    if (
+                        len(values) == len(function.function.params)
+                        and all(not param.mutable for param in function.function.params)
+                        and all(isinstance(value, (int, float)) for value in values)
+                    ):
+                        raise TailCallSignal(function, values, span)
                 return self.call_with_args(function, args, scope, span)
             case MutArg(span=span):
                 raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
             case Return(returned, span):
-                raise ReturnSignal(UNIT if returned is None else self.eval(returned, scope), span)
+                raise ReturnSignal(UNIT if returned is None else self.eval(returned, scope, tail), span)
             case Yield(value_expr, span):
                 return self.yield_value(self.eval(value_expr, scope), span)
 
             # Control flow
             case Block(exprs):
-                return self.eval_block(exprs, scope)
+                return self.eval_block(exprs, scope, tail)
             case If(cond, then, else_):
                 if self.eval_bool(cond, scope, "an 'if' condition"):
-                    result = self.eval(then, scope)
+                    result = self.eval(then, scope, tail and else_ is not None)
                     # Without `else`, `if` has the value (), whatever the body gives.
                     return result if else_ is not None else UNIT
-                return self.eval(else_, scope) if else_ is not None else UNIT
+                return self.eval(else_, scope, tail) if else_ is not None else UNIT
             case Match(subject, cases, span):
-                return self.eval_match(subject, cases, scope, span)
+                return self.eval_match(subject, cases, scope, span, tail)
             case For(label, pattern, MutArg(target), body, span):
                 root, indexes = self.evaluate_place(target, scope)
                 place = (root, indexes, span)
@@ -561,12 +578,12 @@ class Interpreter:
             raise EllaError(f"{what} needs a bool, not {type_name(value)}", expr.span)
         return value
 
-    def eval_block(self, exprs: tuple[Expr, ...], scope: Scope) -> Value:
+    def eval_block(self, exprs: tuple[Expr, ...], scope: Scope, tail: bool = False) -> Value:
         """Run a block's lines in a new scope. Its value is the last line's value."""
         local = Scope(scope)
         value = UNIT
-        for expr in exprs:
-            value = self.eval(expr, local)
+        for index, expr in enumerate(exprs):
+            value = self.eval(expr, local, tail and index == len(exprs) - 1)
         # A block that ends with an assignment has the value () (docs/grammar.md §2).
         return UNIT if isinstance(exprs[-1], Assign) else value
 
@@ -985,9 +1002,26 @@ class Interpreter:
 
         self.depth += 1
         try:
-            result = self.eval(lambda_.body, local)
-        except ReturnSignal as signal:
-            result = signal.value
+            while True:
+                try:
+                    result = self.eval(lambda_.body, local, tail=not lambda_.where)
+                    break
+                except ReturnSignal as signal:
+                    result = signal.value
+                    break
+                except TailCallSignal as signal:
+                    if signal.closure.function is not lambda_ or signal.closure.scope is not captured:
+                        result = self.call(signal.closure, signal.call_args, signal.span)
+                        break
+                    self.close_owner()
+                    self.owners.append([])
+                    for param, param_value in zip(lambda_.params, signal.call_args):
+                        local.vars[param.name].value = param_value
+                    if self.calls and self.calls[-1] is not None:
+                        self.calls[-1] = CallSite(signal.span, self.running or "")
+                    for cond in lambda_.where:
+                        if cond not in postconditions:
+                            self.check_condition(cond, local, "precondition")
         # Loops can't be exited from inside a function called in their body.
         except BreakSignal as signal:
             raise EllaError("'break' outside of a loop", signal.span) from None
@@ -1410,7 +1444,9 @@ class Interpreter:
             bindings |= matched
         return bindings
 
-    def eval_match(self, subject_expr: Expr, cases: tuple[Case, ...], scope: Scope, span: Span) -> Value:
+    def eval_match(
+        self, subject_expr: Expr, cases: tuple[Case, ...], scope: Scope, span: Span, tail: bool = False
+    ) -> Value:
         """Try each case in order; the first whose pattern matches (and guard holds) wins."""
         subject = self.eval(subject_expr, scope)
         for case in cases:
@@ -1422,7 +1458,7 @@ class Interpreter:
             define_all(case_scope, bindings, mutable_names(case.pattern))
             if case.guard is not None and not self.eval_bool(case.guard, case_scope, "a case guard"):
                 continue
-            return self.eval(case.body, case_scope)
+            return self.eval(case.body, case_scope, tail)
         raise EllaError(f"no case matches {to_text(subject, nested=True)}", span)
 
     # Loops

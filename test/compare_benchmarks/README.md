@@ -17,17 +17,19 @@ The runner compiles each native program once, checks that all implementations
 print identical results, then reports the maximum time for Ella's two
 interpreters and the minimum time for native Ella, Python, and C. Timing
 includes process startup and interpreter startup, but excludes native
-compilation. Each Ella interpreter invocation has a five-second timeout; a
-timed-out mode is reported as `>5.00 s`. This makes short workloads sensitive
-to startup overhead; increase
-the work factors in all three implementations together for longer measurements.
+compilation. Each Ella interpreter invocation has a one-second timeout; a
+timed-out mode is reported as `>1.00 s`. Workloads are sized to finish within
+that limit so the full comparison remains usable from the interpreters. This
+makes short workloads sensitive to startup overhead; increase the work factors
+in all three implementations together for longer measurements.
 The numbers are for orientation, not a language ranking: Python integers are
 arbitrary precision, and the array workload deliberately compares Ella's
 multidimensional-array kernel with explicit Python and C loops.
 
 Workloads:
 
-* `fib`: recursive Fibonacci, exercising calls and branches.
+* `fib`: tail-recursive Fibonacci, exercising frame reuse in Ella and loops
+  in Python and C.
 * `arithmetic`: repeated GCDs plus a Collatz walk, exercising integer loops
   and helper calls.
 * `arrays`: repeated spring-particle updates and checksums, exercising flat

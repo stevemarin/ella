@@ -1,5 +1,5 @@
-# Calls: about 30 million of them, each doing a comparison and two subtractions.
-let fib = (n: i64) -> i64 =>
-    if n < 2 then n else fib(n - 1) + fib(n - 2)
+# Tail-recursive Fibonacci: each step returns the recursive call directly.
+let fib = (n: i64, a: i64, b: i64) -> i64 =>
+    if n == 0 then a else fib(n - 1, b, (a + b) % 1000000007)
 
-print(fib(35))
+print(fib(1000000, 0, 1))

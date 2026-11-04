@@ -325,11 +325,14 @@ def test_runtime_errors_with_values() -> None:
     assert_same_as_interpreter("assert 1 + 1 == 3")
 
 
-def test_deep_recursion_and_stack_overflow() -> None:
+def test_deep_recursion_and_tail_recursion() -> None:
     assert_same_as_interpreter(
         "let count = (n: i64) -> i64 => if n == 0 then 0 else 1 + count(n - 1)\nprint(count(998))"
     )
-    assert_same_as_interpreter("let f = (n: i64) -> i64 => f(n + 1)\nf(0)")
+    assert_same_as_interpreter(
+        "let count = (n: i64, total: i64) -> i64 => if n == 0 then total else count(n - 1, total + 1)\n"
+        "print(count(100000, 0))"
+    )
 
 
 def test_many_arguments_and_captures() -> None:

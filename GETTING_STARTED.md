@@ -61,6 +61,8 @@ Conditions must be `bool`; there is no truthiness. `match` must cover every poss
 
 Functions have explicit parameter and result types at top level. Lambda parameter types can often be inferred from context. A function type looks like `(i64, str) -> bool`. `mut` parameters opt into changing a caller's variable, and the call site marks the argument too: `push(mut items, x)`. Functions and closures capture values by copy. The pipe operator puts its left operand first: `items |> map(f)` means `map(items, f)`.
 
+Direct self-recursion in tail position reuses the current frame when the function has no captures or `mut` parameters and takes scalar parameters. For example, accumulator-style Fibonacci can recurse for far more than the normal call-depth limit. The current guarantee does not yet cover mutual recursion, calls through function values, or functions with boxed parameters.
+
 Structs, enums, tuples, patterns, methods, operator methods, protocols, modules, imports, and generators are available. A file is a module; names starting with `_` are private. See the reference and syntax tour for the full surface area.
 
 ## Types, numbers, and arrays

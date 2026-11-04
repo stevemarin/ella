@@ -3,8 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from ella.interpreter import run
+from ella.interpreter import Interpreter, run
 from ella.lexer import EllaError, Span
+from ella.parser import parse
 from ella.values import I64_MAX, I64_MIN, VariantValue, equal, fits_i64, to_text
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
@@ -268,7 +269,9 @@ def test_untyped_lambdas_run() -> None:
 
 
 def test_stack_overflow() -> None:
-    assert "stack overflow" in error("let f = (n: i64) -> i64 => f(n + 1)\nf(0)").message
+    source = "let f = (n: i64) -> i64 => 1 + f(n + 1)\nf(0)"
+    with pytest.raises(EllaError, match="stack overflow: more than 100 nested calls"):
+        Interpreter(io.StringIO(), max_depth=100).run(parse(source))
 
 
 def test_main_runs_after_top_level() -> None:
@@ -291,8 +294,6 @@ def test_tuple_items_and_slices() -> None:
     assert error("[1][0..2]").message == "slice 0..2 is out of range for a list of length 1"
 
 
-def test_deep_recursion() -> None:
-    # The interpreter runs on a big stack, so it reaches the call depth limit (10000) without trouble.
-    source = "let down = (n: i64) -> i64 => if n == 0 then 0 else 1 + down(n - 1)\n"
-    assert output(source + "print(down(9990))") == ["9990"]
-    assert error(source + "print(down(20000))").message == "stack overflow: more than 10000 nested calls"
+def test_deep_tail_recursion_reuses_the_interpreter_frame() -> None:
+    source = "let down = (n: i64, acc: i64) -> i64 => if n == 0 then acc else down(n - 1, acc + 1)\n"
+    assert output(source + "print(down(100000, 0))") == ["100000"]

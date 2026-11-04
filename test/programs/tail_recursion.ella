@@ -1,0 +1,14 @@
+# Tail-recursive Fibonacci stays within the fixed call depth even though it
+# takes more than the default limit of 10,000 steps.
+let fib = (n: i64, a: i64, b: i64) -> i64 =>
+    if n == 0 then a else fib(n - 1, b, (a + b) % 1000000007)
+
+print(fib(10000, 0, 1))
+
+# Tail calls also end one invocation's temporary scope before reusing it.
+let count = (n: i64, total: i64) -> i64 =>
+    if n == 0 then total else
+        let scratch = [total]
+        count(n - 1, scratch[0] + 1)
+
+print(count(10000, 0))

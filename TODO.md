@@ -35,7 +35,8 @@ stack traces, errors with causes and locations, and `main` giving a
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules; packages found on a package path (`--path`, `ELLA_PATH`) |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
-Rough speed, from `fib(35)` (about 30 million calls, test/benchmarks):
+Historical speed before tail-call support, from `fib(35)` (about 30 million
+calls, test/benchmarks):
 the native executable takes 0.09 s, about 2× slower than C at `gcc -O0`
 (it was 0.2 s before direct calls and register allocation). A `fib(24)` run takes
 1 s in the AST interpreter and 2 s in the IR interpreter; the IR one is

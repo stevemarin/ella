@@ -1,6 +1,6 @@
 let main = () -> () =>
-    let n = 2048
-    let steps = 80
+    let n = 1024
+    let steps = 40
     let mut target_items = []
     for i in 0..n
         target_items += [to_f64(i % 97) * 0.02 - 1.0]
