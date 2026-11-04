@@ -12,7 +12,19 @@ import math
 from collections.abc import Callable
 
 from ella.lexer import EllaError, Span
-from ella.values import ArrayValue, Value, VariantValue, equal, fits_i64, to_text, type_name
+from ella.values import (
+    F32,
+    I32,
+    ArrayValue,
+    Value,
+    VariantValue,
+    equal,
+    fits_i32,
+    fits_i64,
+    to_f32,
+    to_text,
+    type_name,
+)
 
 
 def float_div(a: float, b: float) -> float:
@@ -44,12 +56,18 @@ def unary(op: str, value: Value, span: Span) -> Value:
             return not value
         case _, bool():
             pass  # bools aren't numbers, though Python thinks they are
+        case "-", I32():
+            if not fits_i32(-value):
+                raise EllaError(f"i32 overflow: -({value}) doesn't fit in 32 bits", span)
+            return I32(-value)
         case "-", int():
             return check_i64(-value, f"-({value})", span)
+        case "-", F32():
+            return F32(-value)
         case "-", float():
             return -value
-        case "-", ArrayValue(shape, items, floats):
-            return ArrayValue(shape, [unary(op, item, span) for item in items], floats)
+        case "-", ArrayValue(shape, items, item):
+            return ArrayValue(shape, [unary(op, x, span) for x in items], item)
         case "~", int():
             return ~value
     raise EllaError(f"'{op}' doesn't work on {type_name(value)}", span)
@@ -67,8 +85,13 @@ def binary(op: str, a: Value, b: Value, span: Span) -> Value:
             pass
         case int(), int() if op in ("..", "..="):
             return range(a, b + 1 if op == "..=" else b)
+        case I32(), I32():
+            return i32_op(op, a, b, span)
         case int(), int():
             return int_op(op, a, b, span)
+        case F32(), F32():
+            # Exact in f64 (or, for `**`, as C's pow), then rounded to an f32.
+            return to_f32(float_op(op, a, b, span))  # type: ignore[arg-type]
         case float(), float():
             return float_op(op, a, b, span)
         case (str(), str()) | (list(), list()) if op == "+":
@@ -86,6 +109,27 @@ def check_i64(n: int, expr: str, span: Span) -> int:
     if not fits_i64(n):
         raise EllaError(f"i64 overflow: {expr} doesn't fit in 64 bits", span)
     return n
+
+
+def i32_op(op: str, a: int, b: int, span: Span) -> Value:
+    """i32 arithmetic: exact, then checked to fit in 32 bits (`/` gives an f64, as for i64)."""
+    match op:
+        case "/":
+            return float_div(float(a), float(b))
+        case "//" | "%" if b == 0:
+            raise EllaError("integer division by zero", span)
+        case "**" if b < 0:
+            raise EllaError("an i32 can't be raised to a negative power", span)
+        case "**" if abs(a) > 1 and b >= 32:
+            raise EllaError(f"i32 overflow: {a} ** {b} doesn't fit in 32 bits", span)
+        case "+" | "-" | "*" | "//" | "%" | "**":
+            exact = {"+": a + b, "-": a - b, "*": a * b}.get(op) if op in "+-*" else None
+            if exact is None:
+                exact = a // b if op == "//" else a % b if op == "%" else a**b
+            if not fits_i32(exact):
+                raise EllaError(f"i32 overflow: {a} {op} {b} doesn't fit in 32 bits", span)
+            return I32(exact)
+    raise EllaError(f"'{op}' doesn't work on i32", span)
 
 
 def int_op(op: str, a: int, b: int, span: Span) -> Value:
@@ -148,23 +192,55 @@ def float_op(op: str, a: float, b: float, span: Span) -> Value:
 
 
 def array_op(op: str, a: Value, b: Value, span: Span) -> ArrayValue:
-    """`+`, `-`, `*` or `/` on arrays, item by item: two arrays of the same shape, or an array and a number.
+    """`+`, `-`, `*` or `/` on arrays, item by item: two arrays whose shapes broadcast together, or an array and a
+    number.
 
-    An i64 overflow is reported for the first item (in row-major order) whose
-    result doesn't fit, with that item's operands.
+    Shapes *broadcast* (as NumPy's do) if, lined up from their last sizes,
+    each two sizes are the same or one of them is 1 (a missing size counts
+    as 1): the result has the larger, and an array of size 1 there gives the
+    same items all along it. `[2, 3] + [3]` adds the row to each row.
+
+    An i64 overflow is reported for the first item of the result (in
+    row-major order) whose operation doesn't fit, with its operands.
     """
     if isinstance(a, ArrayValue) and isinstance(b, ArrayValue):
-        if a.shape != b.shape:
+        if a.shape == b.shape:
+            return ArrayValue(a.shape, [binary(op, x, y, span) for x, y in zip(a.items, b.items)], a.item)
+        shape = broadcast(a.shape, b.shape)
+        if shape is None:
             raise EllaError(
-                f"'{op}' needs arrays of the same shape, not {shape_text(a.shape)} and {shape_text(b.shape)}", span
+                f"'{op}' needs arrays whose shapes broadcast together, not {shape_text(a.shape)} and "
+                f"{shape_text(b.shape)}",
+                span,
             )
-        array, pairs = a, list(zip(a.items, b.items))
-    elif isinstance(a, ArrayValue):
-        array, pairs = a, [(x, b) for x in a.items]
-    else:
-        assert isinstance(b, ArrayValue)
-        array, pairs = b, [(a, y) for y in b.items]
-    return ArrayValue(array.shape, [binary(op, x, y, span) for x, y in pairs], array.floats)
+        if math.prod(max(size, 1) for size in shape) >= 2**48:  # (ella.library.MAX_ITEMS)
+            raise EllaError(f"an array of shape {shape_text(shape)} is too big", span)
+        left, right = spread(a, shape), spread(b, shape)
+        return ArrayValue(shape, [binary(op, a.items[i], b.items[j], span) for i, j in zip(left, right)], a.item)
+    if isinstance(a, ArrayValue):
+        return ArrayValue(a.shape, [binary(op, x, b, span) for x in a.items], a.item)
+    assert isinstance(b, ArrayValue)
+    return ArrayValue(b.shape, [binary(op, a, y, span) for y in b.items], b.item)
+
+
+def broadcast(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...] | None:
+    """The shape two shapes broadcast to, or None if they don't."""
+    n = max(len(a), len(b))
+    shape = []
+    for x, y in zip((1,) * (n - len(a)) + a, (1,) * (n - len(b)) + b):
+        if x != y and 1 not in (x, y):
+            return None
+        shape.append(y if x == 1 else x)
+    return tuple(shape)
+
+
+def spread(array: ArrayValue, shape: tuple[int, ...]) -> list[int]:
+    """For each item of an array of the broadcast `shape`, in order, which of `array`'s items it is."""
+    sizes = (1,) * (len(shape) - len(array.shape)) + array.shape
+    offsets = [0]
+    for size, wanted in zip(sizes, shape):
+        offsets = [offset * size + (i if size != 1 else 0) for offset in offsets for i in range(wanted)]
+    return offsets
 
 
 def shape_text(shape: tuple[int, ...] | list[int]) -> str:
@@ -178,13 +254,7 @@ def array_offset(array: ArrayValue, index: Value, span: Span) -> int:
     `a[i, j]` of an array of shape `[n, m]` is item `i * m + j`.
     """
     indexes = index if isinstance(index, tuple) else (index,)
-    if len(indexes) != len(array.shape):
-        count = len(array.shape)
-        raise EllaError(
-            f"an array of shape {shape_text(array.shape)} needs {count} index{'' if count == 1 else 'es'}, "
-            f"not {len(indexes)}",
-            span,
-        )
+    check_count(array, indexes, span)
     offset = 0
     for i, size in zip(indexes, array.shape):
         assert isinstance(i, int)
@@ -193,6 +263,43 @@ def array_offset(array: ArrayValue, index: Value, span: Span) -> int:
             raise EllaError(f"index {shown} is out of range for an array of shape {shape_text(array.shape)}", span)
         offset = offset * size + i
     return offset
+
+
+def array_slice(array: ArrayValue, index: Value, span: Span) -> ArrayValue:
+    """`a[i, 1..3]`: the items of an array at the given indexes, an i64 or a range for each dimension, as a new
+    array. A range keeps its dimension (`stop - start` long), an i64 drops it: `m[0, 1..3]` is two items of row 0.
+    The last dimensions can be left out, and are whole: `m[1..3]` is rows 1 and 2.
+    """
+    given = index if isinstance(index, tuple) else (index,)
+    if len(given) > len(array.shape):
+        check_count(array, given, span)
+    shown = to_text(given[0] if len(given) == 1 else given)
+    indexes = given + tuple(range(size) for size in array.shape[len(given) :])
+    picks: list[range] = []
+    for i, size in zip(indexes, array.shape):
+        if isinstance(i, range):
+            part = i
+        else:
+            assert isinstance(i, int)
+            part = range(i, i + 1)
+        if not 0 <= part.start <= part.stop <= size:
+            raise EllaError(f"index {shown} is out of range for an array of shape {shape_text(array.shape)}", span)
+        picks.append(part)
+    offsets = [0]
+    for part, size in zip(picks, array.shape):
+        offsets = [offset * size + i for offset in offsets for i in part]
+    shape = tuple(len(part) for part, i in zip(picks, indexes) if isinstance(i, range))
+    return ArrayValue(shape, [array.items[offset] for offset in offsets], array.item)
+
+
+def check_count(array: ArrayValue, indexes: tuple[Value, ...], span: Span) -> None:
+    if len(indexes) != len(array.shape):
+        count = len(array.shape)
+        raise EllaError(
+            f"an array of shape {shape_text(array.shape)} needs {count} index{'' if count == 1 else 'es'}, "
+            f"not {len(indexes)}",
+            span,
+        )
 
 
 type Equal = Callable[[VariantValue, VariantValue], bool | None]
@@ -246,6 +353,9 @@ def index_into(container: Value, index: Value, span: Span) -> Value:
     if isinstance(index, range) and isinstance(container, list | str):
         return slice_of(container, index, span)
     if isinstance(container, ArrayValue):
+        parts = index if isinstance(index, tuple) else (index,)
+        if any(isinstance(part, range) for part in parts):
+            return array_slice(container, index, span)
         return container.items[array_offset(container, index, span)]
     if not isinstance(index, int) or isinstance(index, bool):
         raise EllaError(f"an index must be an i64, not {type_name(index)}", span)

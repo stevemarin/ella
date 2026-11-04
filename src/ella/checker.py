@@ -130,6 +130,8 @@ class PrimTy:
 
 I64 = PrimTy("i64")
 F64 = PrimTy("f64")
+F32 = PrimTy("f32")
+I32 = PrimTy("i32")
 BOOL = PrimTy("bool")
 STR = PrimTy("str")
 UNIT = PrimTy("()")
@@ -228,13 +230,16 @@ class ParamTy:
     constraints: frozenset[str] = frozenset()
 
 
+# The number types: what `Num` stands for, and an Array's items can be.
+NUMBERS = (I64, I32, F64, F32)
+
 # The constraints a generic function's type parameters can have
 # (docs/grammar.md §9), and the constraints each one implies, itself included.
 CONSTRAINTS = {
     "Eq": frozenset({"Eq"}),  # `==`, `!=`, `in`
     "Ord": frozenset({"Ord", "Eq"}),  # `<`, `<=`, `>`, `>=`
     "Add": frozenset({"Add"}),  # `+`: numbers, strings and lists
-    "Num": frozenset({"Num", "Add", "Ord", "Eq"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: i64 and f64
+    "Num": frozenset({"Num", "Add", "Ord", "Eq"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: i64, f64 and f32
 }
 
 # The constraint each operator needs of a type parameter.
@@ -408,7 +413,7 @@ def is_builtin_error(enums: dict[str, EnumInfo], name: str) -> bool:
     return name == "Error" and enums.get(name) == BUILTIN_ENUMS["Error"]
 
 
-PRIMITIVE_NAMES = {"i64": I64, "f64": F64, "bool": BOOL, "str": STR}
+PRIMITIVE_NAMES = {"i64": I64, "i32": I32, "f64": F64, "f32": F32, "bool": BOOL, "str": STR}
 
 
 # Scopes
@@ -490,8 +495,10 @@ ERROR = EnumTy("Error")
 NUM_T = ParamTy("T", CONSTRAINTS["Num"])
 EQ_T = ParamTy("T", CONSTRAINTS["Eq"])
 LIBRARY: dict[str, FuncTy] = {
-    "to_f64": FuncTy((I64,), F64),
-    "to_i64": FuncTy((F64,), I64),
+    "to_f64": FuncTy((NUM_T,), F64),
+    "to_f32": FuncTy((NUM_T,), F32),
+    "to_i64": FuncTy((NUM_T,), I64),
+    "to_i32": FuncTy((NUM_T,), I32),
     "parse_i64": FuncTy((STR,), EnumTy("Result", (I64, ERROR))),
     "parse_f64": FuncTy((STR,), EnumTy("Result", (F64, ERROR))),
     "read_line": FuncTy((), EnumTy("Optional", (STR,))),
@@ -949,8 +956,8 @@ class Checker:
                     )
                 t = BuiltinTy(name, tuple(self.annotation(arg, params) for arg in args))
                 item = array_item(t)
-                if item is not None and not isinstance(item, ParamTy | TyVar | DeferredTy) and item not in (I64, F64):
-                    raise EllaError(f"an Array's items must be i64 or f64, not {show_type(item)}", span)
+                if item is not None and not isinstance(item, ParamTy | TyVar | DeferredTy) and item not in NUMBERS:
+                    raise EllaError(f"an Array's items must be i64, i32, f64 or f32, not {show_type(item)}", span)
                 return t
             case NamedType(name, _, span):
                 raise EllaError(f"unknown type '{name}'", span)
@@ -1587,7 +1594,9 @@ class Checker:
                     self.require_constraint(param, "Num" if op == "-" else None, op, span)
                     return t
                 kind = describe_kind(self.known(t, operand.span))
-                if (op == "-" and kind in ("i64", "f64", "Array", "?")) or (op == "~" and kind in ("i64", "?")):
+                if (op == "-" and kind in ("i64", "i32", "f64", "f32", "Array", "?")) or (
+                    op == "~" and kind in ("i64", "?")
+                ):
                     if isinstance(param := resolve(array_item(t) or I64), ParamTy):
                         self.require_constraint(param, "Num", op, span)
                     return t
@@ -1616,8 +1625,7 @@ class Checker:
                 if isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     return self.handle_item(container, index_type, index.span)
                 if (array_of := array_item(container)) is not None:
-                    self.array_index(index_type, index.span)
-                    return array_of
+                    return container if self.array_index(index_type, index.span) else array_of
                 if resolve(index_type) == RANGE and (isinstance(container, ListTy) or container == STR):
                     return container  # a slice: `xs[1..3]`
                 if not self.unify(index_type, I64):
@@ -1867,18 +1875,20 @@ class Checker:
         kind = describe_kind(self.known(a, span))
         # Which kinds of operands each operator accepts (docs/grammar.md §8).
         allowed = {
-            "+": ("i64", "f64", "str", "list"),
-            "-": ("i64", "f64"),
-            "*": ("i64", "f64"),
-            "/": ("i64", "f64"),
-            "**": ("i64", "f64"),
+            "+": ("i64", "i32", "f64", "f32", "str", "list"),
+            "-": ("i64", "i32", "f64", "f32"),
+            "*": ("i64", "i32", "f64", "f32"),
+            "/": ("i64", "i32", "f64", "f32"),
+            "//": ("i64", "i32"),
+            "%": ("i64", "i32"),
+            "**": ("i64", "i32", "f64", "f32"),
             "..": ("i64",),
             "..=": ("i64",),
         }.get(op, ("i64",))  # `//`, `%` and the bitwise operators
         if kind not in allowed:
             raise EllaError(f"'{op}' doesn't work on {show_type(a)}", span)
         if op == "/":
-            return F64
+            return F32 if kind == "f32" else F64
         if op in ("..", "..="):
             return RANGE
         return a
@@ -1908,24 +1918,28 @@ class Checker:
         if isinstance(param := resolve(item), ParamTy):
             self.require_constraint(param, "Num", op, span)
             if op == "/":
-                raise EllaError(f"'/' works on Array[f64] only, not {show_type(array)}", span)
-        elif op == "/" and not self.unify(item, F64):
-            raise EllaError(f"'/' works on Array[f64] only, not {show_type(array)}; use '*' or '//' on i64s", span)
+                raise EllaError(f"'/' works on arrays of f64 or f32 only, not {show_type(array)}", span)
+        elif op == "/" and resolve(item) != F32 and not self.unify(item, F64):
+            raise EllaError(f"'/' works on arrays of f64 or f32 only, not {show_type(array)}", span)
         return array
 
-    def array_index(self, index_type: Type, span: Span) -> None:
-        """An array's index: an i64 for each dimension, `a[i]` or `a[i, j]` (or a tuple of them, `a[t]`)."""
+    def array_index(self, index_type: Type, span: Span) -> bool:
+        """An array's index: an i64 or a range for each dimension, `a[i]`, `a[i, j]` or `a[1..3, j]` (or a tuple of
+        them, `a[t]`). Is it a slice (with a range)?"""
         t = resolve(index_type)
-        if isinstance(t, TupleTy) and t.items:
-            if len(t.items) > MAX_DIMS:
+        items = t.items if isinstance(t, TupleTy) and t.items else (t,)
+        if len(items) > MAX_DIMS:
+            raise EllaError(f"an array has at most {MAX_DIMS} dimensions, so it can't take {len(items)} indexes", span)
+        sliced = False
+        for item in items:
+            if resolve(item) == RANGE:
+                sliced = True
+            elif not self.unify(item, I64):
                 raise EllaError(
-                    f"an array has at most {MAX_DIMS} dimensions, so it can't take {len(t.items)} indexes", span
+                    f"an array's index must be an i64 or a range, or a tuple of them, not {show_type(index_type)}",
+                    span,
                 )
-            if all(self.unify(item, I64) for item in t.items):
-                return
-        elif self.unify(t, I64):
-            return
-        raise EllaError(f"an array's index must be an i64, or a tuple of them, not {show_type(index_type)}", span)
+        return sliced
 
     def compare_type(self, op: str, a: Type, b: Type, span: Span) -> None:
         """Check one comparison of a chain. Comparisons always give a bool."""
@@ -1959,7 +1973,7 @@ class Checker:
             raise EllaError(
                 f"{'functions' if kind == 'function' else show_type(a) + ' values'} can't be compared", span
             )
-        if op not in ("==", "!=") and kind not in ("i64", "f64", "str"):
+        if op not in ("==", "!=") and kind not in ("i64", "i32", "f64", "f32", "str"):
             raise EllaError(f"'{op}' doesn't work on {show_type(a)}", span)
 
     def require_constraint(self, param: ParamTy, constraint: str | None, op: str, span: Span) -> None:
@@ -2032,7 +2046,8 @@ class Checker:
                 elif isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     t = self.handle_item(container, index_type, index.span)
                 elif (item := array_item(container)) is not None:
-                    self.array_index(index_type, index.span)
+                    if self.array_index(index_type, index.span):
+                        raise EllaError(f"can't {verb} a slice; change the items one by one", span)
                     t = item
                 else:
                     if resolve(index_type) == RANGE:
@@ -3171,14 +3186,14 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
             return not any_part(t, enums, unequal)
         case "Ord":
             # Structs and enums with a `compare` method too (its type is checked where it is defined).
-            return t in (I64, F64, STR) or (isinstance(t, EnumTy) and "compare" in enums[t.name].methods)
+            return t in (*NUMBERS, STR) or (isinstance(t, EnumTy) and "compare" in enums[t.name].methods)
         case "Add":
             # Structs and enums with an `add` method that gives one of the same type.
             if isinstance(t, EnumTy) and "add" in enums[t.name].methods:
                 info = enums[t.name]
                 return finish(substitute(info.methods["add"], dict(zip(info.params, t.args)))) == FuncTy((t, t), t)
-            return t in (I64, F64, STR) or isinstance(t, ListTy) or array_item(t) is not None
+            return t in (*NUMBERS, STR) or isinstance(t, ListTy) or array_item(t) is not None
         case "Num":
-            return t in (I64, F64)
+            return t in NUMBERS
         case _:  # user-defined constraints are checked by Checker.unmet
             return False

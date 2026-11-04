@@ -1,0 +1,1 @@
+6:13: '+' needs arrays whose shapes broadcast together, not [2, 3] and [2]

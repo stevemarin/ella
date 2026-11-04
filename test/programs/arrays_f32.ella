@@ -1,0 +1,34 @@
+# f32: numbers of single precision, made with to_f32, and arrays of them (eight to an AVX2
+# vector natively). Each operation rounds to an f32.
+
+let halves = (n: i64) -> Array[f32] =>
+    let mut xs: [f32] = []
+    for i in 0..n
+        xs += [to_f32(i) * to_f32(0.5) - to_f32(2.0)]
+    array(xs)
+
+let ratio[T: Num] = (a: T, b: T) -> f64 => a / b
+
+let main = () -> () =>
+    # Numbers
+    let tenth = to_f32(0.1)
+    let three = to_f32(3)
+    print(tenth, three, tenth + three, tenth * three, tenth / three, -tenth, three ** to_f32(0.5), to_f64(tenth))
+    print(tenth < three, to_f32(1.0e39), to_f32(16777217), abs(-tenth), min(tenth, three), ratio(tenth, three))
+    print(to_f32(0.1) + to_f32(0.2), to_f32(1.0) / to_f32(3.0), [tenth, three], hash(tenth) == hash(to_f32(0.1)))
+    let k = to_f32(1.5)
+    for n in [0, 1, 7, 8, 9, 15, 16, 17, 33]
+        let a = halves(n)
+        let b = a * to_f32(0.25) + to_f32(1.0)
+        print(n, a + b, a - b, a * b, a / b, -a, a * k, k - a, to_f32(1.0) / b)
+        print(total(a), dot(a, b), total(a * k + b), dot(a - b, a - b), total(-a))
+    let m = reshape(halves(12), [3, 4])
+    print(m, m[1, 2], shape(m), flat(m[0..2, 1..3]), transpose(m), matmul(m, transpose(m)))
+    let mut c = fill([2, 3], to_f32(0.1))
+    c[1, 1] = to_f32(7)
+    c[0, 2] += to_f32(0.2)
+    print(c, c + array([to_f32(1), to_f32(2), to_f32(3)]), c == c, hash(c) == hash(c * to_f32(1)))
+    for x in c[1, 0..3]
+        print(x)
+    let bits = array([to_f32(0.1), to_f32(1.0e30), to_f32(-0.0), to_f32(3.0e38)])
+    print(bits * to_f32(10), bits + bits, total(bits), -bits)

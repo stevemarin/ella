@@ -23,7 +23,21 @@ from typing import BinaryIO, TextIO
 from ella.lexer import EllaError, Span
 from ella.operators import binary, shape_text
 from ella.syntax import bare_name
-from ella.values import ArrayValue, HandleValue, RefValue, Value, VariantValue, fits_i64, make_error, to_text
+from ella.values import (
+    F32,
+    I32,
+    ArrayValue,
+    HandleValue,
+    RefValue,
+    Value,
+    VariantValue,
+    fits_i32,
+    fits_i64,
+    make_error,
+    to_f32,
+    to_text,
+    type_name,
+)
 
 MAX_CODE_POINT = 0x10FFFF
 SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and can't be written in UTF-8
@@ -91,12 +105,21 @@ def quoted(text: str) -> str:
 def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
     """Run the library function `name`. The checker has made sure the arguments have its types."""
     match name, args:
-        case "to_f64", [int() as n]:
-            return float(n)
+        case "to_f64", [int() | float() as n]:
+            return float(n)  # (an f32 as the f64 it is)
+        case "to_f32", [int() | float() as n]:
+            return to_f32(float(n))
+        case "to_i64", [int() as n]:
+            return int(n)  # (an i32 as the i64 it is)
         case "to_i64", [float() as x]:
             if math.isnan(x) or math.isinf(x) or not fits_i64(math.trunc(x)):
                 raise EllaError(f"to_i64() can't convert {to_text(x)} to an i64", span)
             return math.trunc(x)
+        case "to_i32", [int() | float() as x]:
+            # A float without its fraction (toward zero), as to_i64; either must then fit in 32 bits.
+            if isinstance(x, float) and (math.isnan(x) or math.isinf(x)) or not fits_i32(math.trunc(x)):
+                raise EllaError(f"to_i32() can't convert {to_text(x)} to an i32", span)
+            return I32(math.trunc(x))
         case "parse_i64", [str() as text]:
             if not I64_TEXT.fullmatch(text):
                 return err(f"{quoted(text)} isn't an i64", span)
@@ -210,10 +233,16 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             raise Exit(status, span)
         case "hash", [value]:
             return hash_value(value)
+        case "abs", [I32() as n]:
+            if not fits_i32(abs(n)):
+                raise EllaError(f"i32 overflow: abs({n}) doesn't fit in 32 bits", span)
+            return I32(abs(n))
         case "abs", [int() as n]:
             if not fits_i64(abs(n)):
                 raise EllaError(f"i64 overflow: abs({n}) doesn't fit in 64 bits", span)
             return abs(n)
+        case "abs", [F32() as x]:
+            return F32(abs(x))
         case "abs", [float() as x]:
             return abs(x)
         case "min", [int() | float() as a, int() | float() as b]:
@@ -222,10 +251,10 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             return max(a, b)
         case "array", [list() as items, str() as item]:
             # The interpreters pass the item type, which an empty list can't show.
-            return ArrayValue((len(items),), list(items), item == "f64")
+            return ArrayValue((len(items),), list(items), item)
         case "fill", [list() as shape, int() | float() as x]:
             size = check_shape(shape, span)
-            return ArrayValue(tuple(shape), [x] * size, isinstance(x, float))
+            return ArrayValue(tuple(shape), [x] * size, type_name(x))
         case "reshape", [ArrayValue() as a, list() as shape]:
             if check_shape(shape, span) != len(a.items):
                 raise EllaError(
@@ -233,19 +262,19 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
                     f"from one of shape {shape_text(a.shape)}",
                     span,
                 )
-            return ArrayValue(tuple(shape), a.items.copy(), a.floats)
+            return ArrayValue(tuple(shape), a.items.copy(), a.item)
         case "shape", [ArrayValue() as a]:
             return list(a.shape)
         case "flat", [ArrayValue() as a]:
             return list(a.items)
         case "total", [ArrayValue() as a]:
-            return lane_sum(a.items, a.floats, span)
+            return lane_sum(a.items, a.zero, span)
         case "dot", [ArrayValue() as a, ArrayValue() as b]:
             if a.shape != b.shape:
                 raise EllaError(
                     f"dot() needs arrays of the same shape, not {shape_text(a.shape)} and {shape_text(b.shape)}", span
                 )
-            return lane_sum([binary("*", x, y, span) for x, y in zip(a.items, b.items)], a.floats, span)
+            return lane_sum([binary("*", x, y, span) for x, y in zip(a.items, b.items)], a.zero, span)
         case "matmul", [ArrayValue() as a, ArrayValue() as b]:
             return matmul(a, b, span)
         case "transpose", [ArrayValue() as a]:
@@ -255,7 +284,7 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
                 )
             rows, columns = a.shape
             items = [a.items[i * columns + j] for j in range(columns) for i in range(rows)]
-            return ArrayValue((columns, rows), items, a.floats)
+            return ArrayValue((columns, rows), items, a.item)
     raise AssertionError(f"no library function {name} for {args}")
 
 
@@ -272,13 +301,12 @@ def check_shape(shape: list[int], span: Span) -> int:
     return math.prod(shape)
 
 
-def lane_sum(items: list[Value], floats: bool, span: Span) -> Value:
+def lane_sum(items: list[Value], zero: Value, span: Span) -> Value:
     """`total(a)`: the items added up in LANES sums starting at 0, item i into sum i % LANES, which are then added
     as `(s0 + s2) + (s1 + s3)`, as AVX2 code adds them. (`dot` gives it its products.)
 
     For i64, an overflow is reported at the first addition that doesn't fit.
     """
-    zero: Value = 0.0 if floats else 0
     sums = [zero] * LANES
     for i, item in enumerate(items):
         sums[i % LANES] = binary("+", sums[i % LANES], item, span)
@@ -297,7 +325,7 @@ def matmul(a: ArrayValue, b: ArrayValue, span: Span) -> ArrayValue:
         raise EllaError(
             f"matmul() can't multiply arrays of shapes {shape_text(a.shape)} and {shape_text(b.shape)}", span
         )
-    zero: Value = 0.0 if a.floats else 0
+    zero = a.zero
     items: list[Value] = []
     for i in range(n):
         for j in range(m):
@@ -305,7 +333,7 @@ def matmul(a: ArrayValue, b: ArrayValue, span: Span) -> ArrayValue:
             for p in range(k):
                 total = binary("+", total, binary("*", a.items[i * k + p], b.items[p * m + j], span), span)
             items.append(total)
-    return ArrayValue((n, m), items, a.floats)
+    return ArrayValue((n, m), items, a.item)
 
 
 # hash() is 64-bit FNV-1a, as a signed i64: over a string's code points, and

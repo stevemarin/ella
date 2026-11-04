@@ -46,7 +46,7 @@ Generator functions keep every value in their frame (docs/memory-model.md
 
 from dataclasses import dataclass, field
 
-from ella.checker import BOOL, F64, I64, RANGE, STR, UNIT, ListTy
+from ella.checker import BOOL, F32, F64, I32, I64, RANGE, STR, UNIT, ListTy
 from ella.ir import (
     Block,
     Branch,
@@ -88,16 +88,20 @@ def calls(instr: Instr) -> bool:
     """Whether an instruction's code calls a function (the runtime, or Ella code), which may change caller-saved
     registers. This must match what ella.codegen generates."""
     op, args = instr.op, instr.args
-    if op in ("add", "sub", "mul", "div", "neg", "fused") and instr.dest is not None and is_array(instr.dest.type):
+    if op == "fused" or (
+        op in ("add", "sub", "mul", "div", "neg") and instr.dest is not None and is_array(instr.dest.type)
+    ):
         return True  # the runtime makes the result
     if op in ("index", "set_index", "len") and is_array(args[0].type):
         return False
+    if op in ("floordiv", "mod") and args[0].type == I32:
+        return True  # done by the runtime
     if op in NO_CALLS:
         return False
     if op in ("add", "sub", "mul"):
-        return args[0].type not in (I64, F64)
+        return args[0].type not in (I64, I32, F64, F32)
     if op in COMPARISONS:
-        return args[0].type not in (I64, F64, BOOL, UNIT)
+        return args[0].type not in (I64, I32, F64, F32, BOOL, UNIT)
     if op == "len":
         return args[0].type != STR and not isinstance(args[0].type, ListTy)
     if op == "index":
@@ -114,7 +118,9 @@ def calls_partway(instr: Instr) -> bool:
     op = instr.op
     if op in ("tuple", "list", "variant", "gen_new") or (op == "closure" and instr.args):
         return True
-    if op in ("add", "sub", "mul", "div", "neg", "fused") and instr.dest is not None and is_array(instr.dest.type):
+    if op == "fused" or (
+        op in ("add", "sub", "mul", "div", "neg") and instr.dest is not None and is_array(instr.dest.type)
+    ):
         return True
     if op == "builtin" and instr.name in ("total", "dot"):
         return True

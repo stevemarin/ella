@@ -5,6 +5,8 @@ Ella values are represented by plain Python values where one fits:
     Ella            Python
     i64             int (checked to stay in the i64 range)
     f64             float
+    f32             F32, a float an f32 can hold
+    i32             I32, an int an i32 can hold
     bool            bool
     str             str
     ()              () (the empty tuple: unit is the tuple with no items)
@@ -36,6 +38,8 @@ instructions with `copy_value` too.
 
 import itertools
 import json
+import math
+import struct
 import sys
 import threading
 from collections.abc import Callable
@@ -100,17 +104,58 @@ def make_error(message: str, span: Span, cause: Value | None = None) -> VariantV
     return VariantValue("Error", "Error", [message, optional, str(span)], error=True)
 
 
+class I32(int):
+    """An `i32`: an int from -2**31 to 2**31 - 1. Arithmetic on two of them traps if the result doesn't fit."""
+
+    __slots__ = ()
+
+
+def fits_i32(n: int) -> bool:
+    return -(2**31) <= n < 2**31
+
+
+class F32(float):
+    """An `f32`: a float that an f32 holds exactly. Arithmetic on two of them is done exactly (in f64, which
+    has room for it) and then rounded to an f32 (`to_f32`), which gives what f32 hardware gives."""
+
+    __slots__ = ()
+
+
+def to_f32(x: float) -> F32:
+    """The f32 nearest x (rounding halfway cases to even), or an infinity if it is too big for one."""
+    try:
+        return F32(struct.unpack("<f", struct.pack("<f", x))[0])
+    except OverflowError:  # rounded, it is past the largest f32
+        return F32(math.copysign(math.inf, x))
+
+
+def f32_text(x: F32) -> str:
+    """The shortest decimal that is nearest to x of all f32s, written as `repr` writes an f64: `0.1`, `1e-05`."""
+    if not math.isfinite(x):
+        return repr(float(x))
+    for digits in range(1, 10):
+        text = f"{x:.{digits}g}"
+        if to_f32(float(text)) == x:
+            return repr(float(text))
+    raise AssertionError(x)
+
+
 @dataclass(eq=False, slots=True)
 class ArrayValue:
     """An `Array[T]`: a shape (the size of each dimension), and its items in row-major order.
 
     `items` has the product of the sizes, and can change in place (`a[i, j] = x`).
-    `floats` says T is f64, which an empty array's items can't show.
+    `item` is T's name, "i64", "f64" or "f32", which an empty array's items can't show.
     """
 
     shape: tuple[int, ...]
-    items: list[Value]  # all i64s, or all f64s
-    floats: bool
+    items: list[Value]  # all of type `item`
+    item: str
+
+    @property
+    def zero(self) -> Value:
+        """0 of the items' type."""
+        return {"i64": 0, "i32": I32(0), "f64": 0.0, "f32": F32(0.0)}[self.item]
 
 
 @dataclass(eq=False, slots=True)
@@ -318,8 +363,12 @@ def type_name(value: Value) -> str:
     match value:
         case bool():  # before int, since bool is a subclass of int
             return "bool"
+        case I32():
+            return "i32"
         case int():
             return "i64"
+        case F32():
+            return "f32"
         case float():
             return "f64"
         case str():
@@ -365,8 +414,8 @@ def copy_value(value: Value) -> Value:
             return [copy_value(item) for item in value]
         case tuple():
             return tuple(copy_value(item) for item in value)
-        case ArrayValue(shape, items, floats):
-            return ArrayValue(shape, items.copy(), floats)
+        case ArrayValue(shape, items, item):
+            return ArrayValue(shape, items.copy(), item)
         case VariantValue(enum, variant, fields, nocopy, error) if fields and not nocopy:
             return VariantValue(enum, variant, [copy_value(item) for item in fields], error=error)
         case _:
@@ -413,6 +462,8 @@ def to_text(value: Value, nested: bool = False, custom: Callable[[VariantValue],
     match value:
         case bool():
             return "true" if value else "false"
+        case F32():
+            return f32_text(value)
         case int() | float():
             return str(value)
         case str():

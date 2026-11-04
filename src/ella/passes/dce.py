@@ -30,7 +30,7 @@ Finally, scope levels that nothing allocates in any more are dropped, with
 the `reset`s that free them (ella.ir.trim_levels).
 """
 
-from ella.checker import F64, STR, EnumTy, ListTy
+from ella.checker import F32, F64, STR, EnumTy, ListTy
 from ella.ir import Function, Instr, Module, remove_param, trim_levels, used_values
 
 # Operations that never fail and have no effect.
@@ -77,7 +77,7 @@ def can_remove(instr: Instr, module: Module) -> bool:
     if instr.op in SAFE:
         return True
     t = instr.dest.type
-    if instr.op in ("add", "sub", "mul", "div", "pow", "neg") and t == F64:
+    if instr.op in ("add", "sub", "mul", "div", "pow", "neg") and t in (F64, F32):
         return True  # (`div` always gives an f64, unless it is an array's)
     return instr.op == "add" and (t == STR or isinstance(t, ListTy))
 

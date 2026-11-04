@@ -121,3 +121,25 @@ let main = () -> () =>
     print(cube, cube[at], shape(reshape(cube, [4, 6])))
     let big = reshape(floats(12), [3, 4])
     print(matmul(big, transpose(big)), matmul(transpose(big), big))
+
+    # Broadcasting: shapes that line up from the right, with sizes 1 spread along
+    let row = array([10, 20, 30])
+    let column = reshape(array([1, -1]), [2, 1])
+    let grid = reshape(array([1, 2, 3, 4, 5, 6]), [2, 3])
+    print(grid + row, grid * column, column + row, array([100]) - grid, fill([0, 3], 1) + row)
+    print(fill([2, 1, 2], 0.5) * reshape(floats(3), [3, 1]), total(grid * column + 1))
+
+    # Slices: a range keeps its dimension, an i64 drops it, and the last ones can be left out
+    print(grid[0..1], grid[1, 0..2], grid[0..2, 2], grid[1..2, 1..3], shape(grid[2..2]), cube[1, 1..3, 2])
+    let part = 1..3
+    print(floats(5)[part], total(floats(8)[2..6] * 2.0))
+
+    # Sums of whole expressions (one loop natively, adding as it goes)
+    let d = floats(9) - floats(9) * 0.5
+    print(total(floats(9) * 2.0 + 1.0), dot(d, d), dot(floats(7) + 1.0, floats(7)), total(-(ints(9) - 5)))
+
+    # An array used by the next step and by later code is written by the same loop (kept)
+    let base = floats(10)
+    let doubled = base * 2.0
+    let shifted = doubled + 1.0
+    print(shifted, doubled, total(doubled))

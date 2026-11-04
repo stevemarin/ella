@@ -712,7 +712,8 @@ Consequences worth knowing:
   (Arrays are the exception: `a * 2.0` works item by item, see
   [Arrays](#arrays-provisional-syntax).)
 * `+` also concatenates two `str`s or two lists.
-* `/` is true division and always returns `f64`, for `i64` or `f64` operands.
+* `/` is true division and returns `f64` for `i64` or `f64` operands (and
+  `f32` for `f32` ones).
 * `//` is integer division that **rounds toward negative infinity** (as in
   Python): `-7 // 2 == -4`. `%` matches it, so
   `a == (a // b) * b + a % b` always holds and `%` has the sign of `b`.
@@ -781,7 +782,7 @@ returns `None`. The enclosing function's return type must be compatible.
 ## 9. Types
 
 ```text
-i64  f64  bool  str              built-in scalars
+i64  i32  f64  f32  bool  str    built-in scalars
 ()                               unit
 [T]                              list of T
 Array[T]                         an array of T (i64 or f64), of any number of dimensions
@@ -799,7 +800,19 @@ Type   Code                      a type, or code, whose type is only known later
 $(t)                             a type computed while compiling (§11)
 ```
 
-* All integer types are signed. More widths (`i8`–`i32`, `f32`) come later.
+* All integer types are signed. `i32` is an integer of 32 bits, made with
+  `to_i32(x)`: its arithmetic (`+ - * // % **`, unary `-`) traps when a
+  result doesn't fit in 32 bits, as `i64`'s does for 64 (`i32 overflow:
+  ...`), and `/` gives an `f64`. The bitwise operators and indexes are
+  `i64` only; `to_i64` makes an `i32` an `i64`. `i8` and `i16` may come later.
+* `f32` is a float of single precision (IEEE 754 binary32), made with
+  `to_f32(x)` (there are no `f32` literals: `to_f32(0.5)`). Its arithmetic
+  works as `f64`'s does, but each result is rounded to an `f32`; `/` on two
+  `f32`s gives an `f32`, and `to_f64` makes one an `f64`. An `f32` prints
+  with the fewest digits that give it back: `to_f32(0.1)` prints `0.1`
+  (`to_f64(to_f32(0.1))` prints `0.10000000149011612`). In a generic
+  function, `/` on a type parameter gives an `f64` whatever its type, so
+  `f32`s are made `f64`s first, as `i64`s are.
   Arrays of numbers use SIMD instructions in native code
   ([Arrays](#arrays-provisional-syntax)).
 * A tuple's items are read with `.0`, `.1`, ...: `pair.0`, `t.1.0`. A
@@ -1097,11 +1110,11 @@ for n in Countdown(3)
 
 ### Arrays **(provisional syntax)**
 
-An `Array[T]` holds numbers, `i64`s or `f64`s, in any number of dimensions:
-a vector has one, a matrix two. Its *shape* is the size of each dimension,
-and its items are kept together, row by row (the last index changes
-fastest), so that native code works on them with SIMD instructions (AVX2,
-four numbers at a time).
+An `Array[T]` holds numbers, `i64`s, `i32`s, `f64`s or `f32`s, in any
+number of dimensions: a vector has one, a matrix two. Its *shape* is the
+size of each dimension, and its items are kept together, row by row (the
+last index changes fastest), so that native code works on them with SIMD
+instructions (AVX2, four numbers at a time, or eight `f32`s or `i32`s).
 
 ```ella
 let mut m = reshape(array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [2, 3])
@@ -1124,23 +1137,49 @@ print(matmul(m, transpose(m)))
   dimension (`a[i]` for one dimension, or a tuple of them, `a[t]`). Too many
   or too few indexes, or one out of range, is a run-time error. Items can be
   changed in place in a `mut` array: `m[0, 1] = 2.0`, `m[i, j] += x`.
-* `+`, `-` and `*` work item by item on two arrays of the same type and
-  shape, giving a new array; `/` too, on `Array[f64]` only. Either side can
-  be a number of the items' type instead, used for every item: `a * 2.0`,
-  `1.0 - a`. Unary `-` negates every item. Arrays of different shapes are a
-  run-time error. As for numbers, `i64` items trap on overflow: the error is
-  for the first item (by position) that overflows.
+* A *slice* takes a range for some dimensions: `m[1..3, 0]` is a new array
+  of items 0 of rows 1 and 2. A range keeps its dimension (as long as the
+  range), an `i64` drops it, and the last dimensions can be left out, which
+  takes them whole: `m[1..3]` is rows 1 and 2, `m[0, 1..3]` items 1 and 2 of
+  row 0. Each range must be in order and within its dimension. A slice is a
+  copy, and can't be assigned to.
+* `+`, `-` and `*` work item by item on two arrays of the same type, giving
+  a new array; `/` too, on arrays of `f64` or `f32`. Either side can be a
+  number of the items' type instead, used for every item: `a * 2.0`,
+  `1.0 - a`. Unary `-` negates every item. As for numbers, `i64` items trap
+  on overflow: the error is for the first item of the result (row by row)
+  that overflows.
+* Two arrays of different shapes *broadcast*, as in NumPy: lined up from
+  their last sizes, each two sizes must be the same, or one of them 1 (a
+  size that isn't there counts as 1). The result has the larger size in
+  each place, and an array of size 1 there gives the same items all along
+  it: `m + array([10, 20, 30])` adds the row to each row of an `[n, 3]`
+  array, and `m * reshape(array([1, -1]), [2, 1])` scales each row of a
+  `[2, n]` one. Shapes that don't broadcast are a run-time error.
 * `==` and `!=` compare the shapes and the items. Arrays can't be ordered.
 * `len(a)` is the number of items, and `for x in a` goes through them in
   order, row by row.
 * `total(a)` and `dot(a, b)` add up the items, or the products of two
-  arrays' items, in four sums at once, as AVX2 does: item i goes into sum
-  i % 4, and then the sums are added as `(s0 + s2) + (s1 + s3)`, each sum
-  starting at 0. Every backend adds in this order, so `f64` results are the
-  same everywhere, although they can differ in the last bits from adding
-  the items one by one; `i64` ones trap on the first addition (or product)
-  that overflows, in that order. `matmul` adds each item's products in
-  order, starting at 0.
+  arrays' items, in four sums at once: item i goes into sum i % 4, and
+  then the sums are added as `(s0 + s2) + (s1 + s3)`, each sum starting
+  at 0. `i64` ones trap on the first addition (or product) that
+  overflows, in that order. `matmul` adds each item's products in order,
+  starting at 0.
+* **Float results of arrays may differ in their last bits between
+  backends.** The interpreters do each operation as written, rounding after
+  each, in the order above. Native code may do a multiplication and an
+  addition as one *fused multiply-add*, which rounds once (`a * b + c` in
+  an expression of arrays, `dot`, `matmul`), and may add the items of
+  `total`, `dot` and `matmul` in other orders, more sums at once. So an
+  `f64` (or `f32`) result can be more exact, or less, by a few units in its
+  last place, and where that decides it, an infinity or NaN can come out
+  differently. Everything else is the same in every backend: `i64`
+  results, shapes, and every error (an `i64` overflow is the first in the
+  order above). Integer results and errors are the same for `i32`s, which
+  trap at 32 bits. Arithmetic on single numbers is always exactly the same.
+* Native code does arithmetic on arrays written as one expression, such as
+  `total(a * 2.0 + b - c)`, in one loop that makes no arrays in between
+  (that is an optimization, with `-O`; what it gives is the same, as above).
 * An array is a value like any other: `let b = a` copies, and so does
   passing one to a function, which changes a `mut` parameter's array in place.
 * An array prints as nested lists, one level per dimension:
@@ -1268,13 +1307,13 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 | Constraint | Allows on `T` | Met by |
 | --- | --- | --- |
 | `Eq` | `==`, `!=`, `in` | every type except functions, pools, arenas, generators and code |
-| `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `f64`, `str`, types with a `compare` method |
-| `Add` | `+` | `i64`, `f64`, `str`, lists, types with an `add` method of type `(Self, Self) -> Self` |
-| `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `f64` |
+| `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `i32`, `f64`, `f32`, `str`, types with a `compare` method |
+| `Add` | `+` | `i64`, `i32`, `f64`, `f32`, `str`, lists, arrays, types with an `add` method of type `(Self, Self) -> Self` |
+| `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` allows) | `i64`, `i32`, `f64`, `f32` |
 
 * The body is checked once, against the constraints: `(a: T, b: T) -> T =>
   a + b` needs `[T: Add]`. `/` on a `Num` gives an `f64`, as it does on
-  `i64` and `f64`.
+  `i64` and `f64` (an `f32` is made an `f64` first).
 * Each use is checked against them: `largest([true])` is an error, as
   `bool` isn't `Ord`. A type parameter meets the constraints it has, so a
   generic function can call another one with its own `T`.
@@ -1479,8 +1518,10 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 
 | Function | Type | Gives |
 | --- | --- | --- |
-| `to_f64(n)` | `(i64) -> f64` | `n` as the nearest `f64` |
-| `to_i64(x)` | `(f64) -> i64` | `x` without its fraction (toward zero); an error if that doesn't fit, or `x` is NaN |
+| `to_f64(n)` | `[T: Num] (T) -> f64` | `n` as the nearest `f64` |
+| `to_f32(n)` | `[T: Num] (T) -> f32` | `n` as the nearest `f32` (an infinity if it is too big for one) |
+| `to_i32(n)` | `[T: Num] (T) -> i32` | `n` (without a float's fraction) as an `i32`; an error if that doesn't fit |
+| `to_i64(x)` | `[T: Num] (T) -> i64` | `x` (without a float's fraction, toward zero) as an `i64`; an error if that doesn't fit, or `x` is NaN |
 | `parse_i64(s)` | `(str) -> Result[i64, Error]` | the number `s` writes: an optional sign and digits, nothing else |
 | `parse_f64(s)` | `(str) -> Result[f64, Error]` | the number `s` writes: `2.5`, `-1e3`, `.5`, `inf`, `nan`, ... |
 | `read_line()` | `() -> Optional[str]` | the next line of standard input, without its `\n` (or `\r\n`); `None` at the end |

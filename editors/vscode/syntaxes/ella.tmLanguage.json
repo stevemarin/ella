@@ -162,7 +162,7 @@
     "call": {
       "patterns": [
         {
-          "match": "\\b(?:print|len|run|pool_new|arena_new|alloc|free|next|fields|field_type|has_field|type_name|type_kind|variants|new_struct|to_f64|to_i64|parse_i64|parse_f64|read_line|read_file|args|split|join|find|replace|trim|chars|ord|chr|sqrt|floor|abs|min|max|eprint|ceil|round|exp|ln|sin|cos|tan|asin|acos|atan|atan2|log10|log2|upper|lower|starts_with|ends_with|pad_left|pad_right|format_f64|env|write_file|exit|reverse|sort|map|filter|hash|sum|any|all|zip|enumerate|sort_by|range|new_map|fold|flatten|flat_map|position|new_set|set_of|first|last|index_of|unique|chunks|min_of|max_of|repeat|lines|words|trim_start|trim_end|strip_prefix|strip_suffix|split_once|count_of|is_digit|is_alpha|is_space|min_by|max_by|partition|map_of|group_by|counts|array|fill|reshape|shape|flat|total|dot|matmul|transpose)(?=\\s*\\()",
+          "match": "\\b(?:print|len|run|pool_new|arena_new|alloc|free|next|fields|field_type|has_field|type_name|type_kind|variants|new_struct|to_f64|to_f32|to_i64|to_i32|parse_i64|parse_f64|read_line|read_file|args|split|join|find|replace|trim|chars|ord|chr|sqrt|floor|abs|min|max|eprint|ceil|round|exp|ln|sin|cos|tan|asin|acos|atan|atan2|log10|log2|upper|lower|starts_with|ends_with|pad_left|pad_right|format_f64|env|write_file|exit|reverse|sort|map|filter|hash|sum|any|all|zip|enumerate|sort_by|range|new_map|fold|flatten|flat_map|position|new_set|set_of|first|last|index_of|unique|chunks|min_of|max_of|repeat|lines|words|trim_start|trim_end|strip_prefix|strip_suffix|split_once|count_of|is_digit|is_alpha|is_space|min_by|max_by|partition|map_of|group_by|counts|array|fill|reshape|shape|flat|total|dot|matmul|transpose)(?=\\s*\\()",
           "name": "support.function.builtin.ella"
         },
         {
@@ -174,7 +174,7 @@
     "type": {
       "patterns": [
         {
-          "match": "\\b(?:i64|f64|bool|str)\\b",
+          "match": "\\b(?:i64|i32|f64|f32|bool|str)\\b",
           "name": "support.type.primitive.ella"
         },
         {

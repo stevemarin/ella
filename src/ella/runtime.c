@@ -49,14 +49,19 @@ typedef struct {
 // An array (docs/grammar.md §10, "Arrays"): its number of items, its number
 // of dimensions, and where its items are, in the places a list has its length
 // and items, so that the code generator's code for a list's length and items
-// works on an array's too; then the size of each dimension. Its items follow,
-// in row-major order, at a 32-byte boundary, as AVX2 likes them.
+// works on an array's too; then the kind of its items (I64_ITEMS, F64_ITEMS,
+// F32_ITEMS or I32_ITEMS: an f32 or i32 takes 4 bytes, the others 8), and the size of each
+// dimension. Its items follow, in row-major order, at a 32-byte boundary, as
+// AVX2 likes them.
 typedef struct {
     word len;
     word ndim;
-    word *items;
+    void *items;
+    word kind;
     word dims[];
 } Array;
+
+enum { I64_ITEMS, F64_ITEMS, F32_ITEMS, I32_ITEMS };
 
 // A tuple: a length and that many words, in the object. (`cap` is its length.)
 typedef struct {
@@ -106,7 +111,7 @@ static size_t gen_size(const Gen *g) { return sizeof(Gen) + (size_t)g->levels * 
 
 // Type descriptors, emitted as static data by the code generator. Equality
 // and the text form of a list of enums of floats need to know all of that.
-enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE, K_ARENA, K_REF, K_GEN, K_ARRAY };
+enum Kind { K_UNIT, K_I64, K_F64, K_BOOL, K_STR, K_RANGE, K_LIST, K_TUPLE, K_FUNCTION, K_ENUM, K_POOL, K_HANDLE, K_CODE, K_ARENA, K_REF, K_GEN, K_ARRAY, K_F32, K_I32 };
 
 struct Type {
     word kind;
@@ -250,6 +255,15 @@ _Noreturn void ella_error(word line, word column, const char *message) { fail(li
 
 _Noreturn void ella_overflow(word a, word b, const char *op, word line, word column) {
     fail(line, column, "i64 overflow: %" PRId64 " %s %" PRId64 " doesn't fit in 64 bits", a, op, b);
+}
+
+// i32 arithmetic that doesn't fit in 32 bits. (An i32 is kept sign-extended in its word.)
+_Noreturn void ella_overflow32(word a, word b, const char *op, word line, word column) {
+    fail(line, column, "i32 overflow: %" PRId64 " %s %" PRId64 " doesn't fit in 32 bits", a, op, b);
+}
+
+_Noreturn void ella_overflow32_neg(word a, word line, word column) {
+    fail(line, column, "i32 overflow: -(%" PRId64 ") doesn't fit in 32 bits", a);
 }
 
 _Noreturn void ella_overflow_neg(word a, word line, word column) {
@@ -543,6 +557,30 @@ word ella_mod(word a, word b, word line, word column) {
     return r;
 }
 
+word ella_floordiv(word a, word b, word line, word column);
+word ella_mod(word a, word b, word line, word column);
+
+static int fits_i32(word n) { return n >= INT32_MIN && n <= INT32_MAX; }
+
+// `//`, `%` and `**` on i32s: as on i64s (on the sign-extended words), then checked to fit in 32 bits.
+word ella_floordiv_i32(word a, word b, word line, word column) {
+    word q = ella_floordiv(a, b, line, column);
+    if (!fits_i32(q)) ella_overflow32(a, b, "//", line, column);
+    return q;
+}
+
+word ella_mod_i32(word a, word b, word line, word column) { return ella_mod(a, b, line, column); }
+
+word ella_pow_i32(word a, word b, word line, word column) {
+    if (b < 0) fail(line, column, "an i32 can't be raised to a negative power");
+    if ((a > 1 || a < -1) && b >= 32) ella_overflow32(a, b, "**", line, column);
+    word result = 1;
+    for (word i = 0; i < b; i++) {
+        if (__builtin_mul_overflow(result, a, &result) || !fits_i32(result)) ella_overflow32(a, b, "**", line, column);
+    }
+    return result;
+}
+
 word ella_pow(word a, word b, word line, word column) {
     if (b < 0) fail(line, column, "an i64 can't be raised to a negative power");
     if (a == 0) return b == 0 ? 1 : 0;
@@ -585,6 +623,27 @@ static word f64_bits(double x) {
     word bits;
     memcpy(&bits, &x, sizeof bits);
     return bits;
+}
+
+// An f32 is the low 32 bits of its word (the rest are 0).
+static float as_f32(word bits) {
+    uint32_t low = (uint32_t)bits;
+    float x;
+    memcpy(&x, &low, sizeof x);
+    return x;
+}
+
+static word f32_bits(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    return (word)bits;
+}
+
+word ella_pow_f64(word a_bits, word b_bits);
+
+// `**` on f32s: as f64s, rounded to an f32 (as ella.operators does it).
+word ella_pow_f32(word a_bits, word b_bits) {
+    return f32_bits((float)as_f64(ella_pow_f64(f64_bits(as_f32(a_bits)), f64_bits(as_f32(b_bits)))));
 }
 
 word ella_pow_f64(word a_bits, word b_bits) {
@@ -686,17 +745,37 @@ void ella_list_set(List *xs, word i, word value, word line, word column) {
 enum { MAX_DIMS = 32 };  // ella.checker.MAX_DIMS
 #define MAX_ITEMS ((__int128)1 << 48)  // an array's sizes (those that aren't 0) multiply to less than this
 
-static Array *array_alloc(word ndim, const word *dims, word len, word depth) {
+static size_t item_size(word kind) { return kind == F32_ITEMS || kind == I32_ITEMS ? 4 : 8; }
+
+static Array *array_alloc(word ndim, const word *dims, word len, word kind, word depth) {
     size_t header = sizeof(Array) + (size_t)ndim * sizeof(word);
-    Array *a = alloc(header + 24 + (size_t)len * sizeof(word), depth);  // objects are 16-byte aligned
+    Array *a = alloc(header + 24 + (size_t)len * item_size(kind), depth);  // objects are 16-byte aligned
     a->len = len;
     a->ndim = ndim;
+    a->kind = kind;
     memcpy(a->dims, dims, (size_t)ndim * sizeof(word));
-    a->items = (word *)(((uintptr_t)a + header + 31) & ~(uintptr_t)31);
+    a->items = (void *)(((uintptr_t)a + header + 31) & ~(uintptr_t)31);
     return a;
 }
 
-static Array *array_like(const Array *a, word depth) { return array_alloc(a->ndim, a->dims, a->len, depth); }
+static Array *array_like(const Array *a, word depth) { return array_alloc(a->ndim, a->dims, a->len, a->kind, depth); }
+
+// Item i, as a word (an f32 in its low 32 bits, an i32 sign-extended, as everywhere).
+static word get_item(const Array *a, word i) {
+    if (a->kind == F32_ITEMS) return (word)((const uint32_t *)a->items)[i];
+    if (a->kind == I32_ITEMS) return (word)((const int32_t *)a->items)[i];
+    return ((const word *)a->items)[i];
+}
+
+static void set_item(Array *a, word i, word v) {
+    if (item_size(a->kind) == 4) {
+        ((uint32_t *)a->items)[i] = (uint32_t)v;
+    } else {
+        ((word *)a->items)[i] = v;
+    }
+}
+
+static size_t items_bytes(const Array *a) { return (size_t)a->len * item_size(a->kind); }
 
 
 static int same_shape(const Array *a, const Array *b) {
@@ -753,33 +832,182 @@ _Noreturn void ella_array_index_error(const Array *a, word count, word line, wor
     fail(line, column, "index %s is out of range for an array of shape %s", index.text, shape_text(a).text);
 }
 
+// `p op q` for one item, with an i64 overflow's error.
+static word item_op(word op, word p, word q, word kind, word line, word column) {
+    word v;
+    if (kind == F64_ITEMS) {
+        double f = as_f64(p), g = as_f64(q);
+        return f64_bits(op == '+' ? f + g : op == '-' ? f - g : op == '*' ? f * g : f / g);
+    }
+    if (kind == F32_ITEMS) {  // (single precision, rounded once, as ella.operators does it through f64)
+        float f = as_f32(p), g = as_f32(q);
+        return f32_bits(op == '+' ? f + g : op == '-' ? f - g : op == '*' ? f * g : f / g);
+    }
+    if (op == '+' ? __builtin_add_overflow(p, q, &v) : op == '-' ? __builtin_sub_overflow(p, q, &v)
+                                                     : __builtin_mul_overflow(p, q, &v)) {
+        char symbol[2] = {(char)op, 0};
+        ella_overflow(p, q, symbol, line, column);  // (i32s can't overflow 64 bits)
+    }
+    if (kind == I32_ITEMS && !fits_i32(v)) {
+        char symbol[2] = {(char)op, 0};
+        ella_overflow32(p, q, symbol, line, column);
+    }
+    return v;
+}
+
+// -p for one item.
+static word item_neg(word p, word kind, word line, word column) {
+    if (kind == F64_ITEMS) return f64_bits(-as_f64(p));
+    if (kind == F32_ITEMS) return f32_bits(-as_f32(p));
+    if (kind == I64_ITEMS && p == INT64_MIN) ella_overflow_neg(p, line, column);
+    if (kind == I32_ITEMS && p == INT32_MIN) ella_overflow32_neg(p, line, column);
+    return -p;
+}
+
+// The shape arrays of shapes x and y broadcast to (ella.operators.broadcast),
+// in `dims`, giving its number of dimensions, or -1 if they don't.
+static word broadcast_shape(const Array *x, const Array *y, word *dims) {
+    word n = x->ndim > y->ndim ? x->ndim : y->ndim;
+    for (word d = 0; d < n; d++) {
+        word i = d - (n - x->ndim), j = d - (n - y->ndim);
+        word p = i >= 0 ? x->dims[i] : 1, q = j >= 0 ? y->dims[j] : 1;
+        if (p != q && p != 1 && q != 1) return -1;
+        dims[d] = p == 1 ? q : p;
+    }
+    return n;
+}
+
+// For each dimension of r, how far apart x's items are along it: 0 where x has size 1 (or no such dimension).
+static void spread_strides(const Array *x, const Array *r, word *strides) {
+    word stride = 1;
+    for (word d = r->ndim - 1; d >= 0; d--) {
+        word i = d - (r->ndim - x->ndim);
+        word size = i >= 0 ? x->dims[i] : 1;
+        strides[d] = size == 1 ? 0 : stride;
+        stride *= size;
+    }
+}
+
+// `x op y` on arrays of different shapes that broadcast together, into r, item by item in row-major order.
+static void broadcast_items(Array *r, const Array *x, const Array *y, word op, word line, word column) {
+    word sx[MAX_DIMS], sy[MAX_DIMS], counters[MAX_DIMS] = {0};
+    spread_strides(x, r, sx);
+    spread_strides(y, r, sy);
+    word i = 0, j = 0;
+    for (word k = 0; k < r->len; k++) {
+        set_item(r, k, item_op(op, get_item(x, i), get_item(y, j), r->kind, line, column));
+        for (word d = r->ndim - 1; d >= 0; d--) {  // the next item: like an odometer
+            i += sx[d], j += sy[d];
+            if (++counters[d] < r->dims[d]) break;
+            i -= sx[d] * r->dims[d], j -= sy[d] * r->dims[d];
+            counters[d] = 0;
+        }
+    }
+}
+
+// Whether ella_array_like made the whole result itself (for arrays of different shapes).
+word ella_array_done;
+
+// `a[i, 1..3, ...]`: a new array of the items at those indexes, from ella_indexes,
+// where bit k of `ranges` says index k is a range (ella.operators.array_slice).
+Array *ella_array_slice(const Array *a, word count, word ranges, word line, word column, word depth) {
+    if (count > a->ndim) ella_array_index_error(a, count, line, column);
+    word starts[MAX_DIMS], sizes[MAX_DIMS], dims[MAX_DIMS], ndim = 0, len = 1;
+    int bad = 0;
+    for (word k = 0; k < count; k++) {
+        __int128 start = ella_indexes[k], stop = start + 1;
+        if (ranges >> k & 1) {
+            const Range *r = (const Range *)ella_indexes[k];
+            start = r->start, stop = r->stop;
+        }
+        if (!(0 <= start && start <= stop && stop <= a->dims[k])) bad = 1;
+        starts[k] = (word)start, sizes[k] = (word)(stop - start);
+        if (ranges >> k & 1) dims[ndim++] = sizes[k];
+        len *= sizes[k];
+    }
+    for (word k = count; k < a->ndim; k++) {  // the dimensions left out are whole
+        starts[k] = 0, sizes[k] = dims[ndim++] = a->dims[k];
+        len *= sizes[k];
+    }
+    if (bad) {  // "index (0, 1..5)": each index as ella.values.to_text shows it
+        char text[64 * MAX_DIMS + 4], *p = text;
+        if (count > 1) *p++ = '(';
+        for (word k = 0; k < count; k++) {
+            if (k) p += sprintf(p, ", ");
+            if (ranges >> k & 1) {
+                const Range *r = (const Range *)ella_indexes[k];  // its stop is at most 2**63 (`..=` the largest i64)
+                if (r->stop > INT64_MAX) {
+                    p += sprintf(p, "%" PRId64 "..9223372036854775808", r->start);
+                } else {
+                    p += sprintf(p, "%" PRId64 "..%" PRId64, r->start, (word)r->stop);
+                }
+            } else {
+                p += sprintf(p, "%" PRId64, ella_indexes[k]);
+            }
+        }
+        if (count > 1) *p++ = ')';
+        *p = 0;
+        fail(line, column, "index %s is out of range for an array of shape %s", text, shape_text(a).text);
+    }
+    if (ndim == 0) dims[ndim++] = 1;  // (never: a slice has a range)
+    Array *r = array_alloc(ndim, dims, len, a->kind, depth);
+    word counters[MAX_DIMS] = {0}, strides[MAX_DIMS], stride = 1, from = 0;
+    count = a->ndim;
+    for (word k = count - 1; k >= 0; k--) {
+        strides[k] = stride;
+        stride *= a->dims[k];
+        from += starts[k] * strides[k];
+    }
+    for (word i = 0; i < len; i++) {
+        set_item(r, i, get_item(a, from));
+        for (word k = count - 1; k >= 0; k--) {  // the next item: like an odometer
+            from += strides[k];
+            if (++counters[k] < sizes[k]) break;
+            from -= strides[k] * sizes[k];
+            counters[k] = 0;
+        }
+    }
+    return r;
+}
+
 // The new array for arithmetic on `a` and `b`, either of which may be a number
 // instead of an array: bit 0 of `flags` says a is an array, bit 1 b; its bits
-// from 8 up are the operator, for the error if both are and their shapes differ.
+// from 8 up are the operator. Two arrays of
+// different shapes that broadcast together are worked out here, item by item
+// (ella_array_done is then 1); ones that don't are an error.
 Array *ella_array_like(word a, word b, word flags, word line, word column, word depth) {
     const Array *x = flags & 1 ? (const Array *)a : NULL, *y = flags & 2 ? (const Array *)b : NULL;
+    ella_array_done = 0;
     if (x && y && !same_shape(x, y)) {
-        fail(line, column, "'%c' needs arrays of the same shape, not %s and %s", (int)(flags >> 8), shape_text(x).text,
-             shape_text(y).text);
+        word dims[MAX_DIMS], n = broadcast_shape(x, y, dims);
+        if (n < 0) {
+            fail(line, column, "'%c' needs arrays whose shapes broadcast together, not %s and %s", (int)(flags >> 8),
+                 shape_text(x).text, shape_text(y).text);
+        }
+        word len = 1;
+        __int128 bound = 1;
+        for (word d = 0; d < n; d++) len *= dims[d], bound *= dims[d] > 0 ? dims[d] : 1;
+        if (bound >= MAX_ITEMS) fail(line, column, "an array of shape %s is too big", sizes_text(dims, n, "[", "]").text);
+        Array *r = array_alloc(n, dims, len, x->kind, depth);
+        broadcast_items(r, x, y, flags >> 8, line, column);
+        ella_array_done = 1;
+        return r;
     }
     return array_like(x ? x : y, depth);
 }
 
-// i64 arithmetic on arrays found an overflow: report the first, in order, as
-// ella.operators.array_op does. `op` is "+", "-", "*", or "neg" for `-b`.
+// i64 (or i32) arithmetic on arrays found an overflow: report the first, in
+// order, as ella.operators.array_op does. `op` is "+", "-", "*", or "neg" for `-b`.
 _Noreturn void ella_array_overflow(word a, word b, word flags, const char *op, word line, word column) {
     const Array *x = flags & 1 ? (const Array *)a : NULL, *y = flags & 2 ? (const Array *)b : NULL;
-    word len = x ? x->len : y->len;
+    word len = x ? x->len : y->len, kind = x ? x->kind : y->kind;
     for (word i = 0; i < len; i++) {
-        word p = x ? x->items[i] : a, q = y ? y->items[i] : b, r;
+        word p = x ? get_item(x, i) : a, q = y ? get_item(y, i) : b;
         if (op[0] == 'n') {
-            if (q == INT64_MIN) ella_overflow_neg(q, line, column);
-            continue;
+            item_neg(q, kind, line, column);
+        } else {
+            item_op(op[0], p, q, kind, line, column);
         }
-        int over = op[0] == '+' ? __builtin_add_overflow(p, q, &r)
-                   : op[0] == '-' ? __builtin_sub_overflow(p, q, &r)
-                                  : __builtin_mul_overflow(p, q, &r);
-        if (over) ella_overflow(p, q, op, line, column);
     }
     fail(line, column, "an overflow went missing");  // never: the vector code found one
 }
@@ -797,10 +1025,16 @@ static word lane_sum_i64(const word *sums, word line, word column) {
     return add_checked(low, high, line, column);
 }
 
+static word lane_sum_i32(const word *sums, word line, word column) {
+    word low = item_op('+', sums[0], sums[2], I32_ITEMS, line, column);
+    word high = item_op('+', sums[1], sums[3], I32_ITEMS, line, column);
+    return item_op('+', low, high, I32_ITEMS, line, column);
+}
+
 // total() of an Array[i64] overflowed: report where, as ella.library.lane_sum.
 _Noreturn void ella_total_overflow(const Array *a, word line, word column) {
     word sums[4] = {0, 0, 0, 0};
-    for (word i = 0; i < a->len; i++) sums[i % 4] = add_checked(sums[i % 4], a->items[i], line, column);
+    for (word i = 0; i < a->len; i++) sums[i % 4] = add_checked(sums[i % 4], get_item(a, i), line, column);
     lane_sum_i64(sums, line, column);
     fail(line, column, "an overflow went missing");
 }
@@ -816,15 +1050,18 @@ void ella_check_same_shape(const Array *a, const Array *b, const char *name, wor
 
 // Fused arithmetic (ella.passes.fuse): several steps on arrays, which the code
 // generator does in one AVX2 loop. It describes them in a plan, and puts their
-// operands in ella_fused_operands first. A step's op is '+', '-', '*', '/', or
-// 'n' for `-left`; an operand n >= 0 is the instruction's operand n, -1 - k
-// the result of step k.
+// operands in ella_fused_operands first. A step's op is '+', '-', '*', '/', 'n'
+// for `-left`, and as the last step 't' for `total(left)` or 'd' for
+// `dot(left, right)`; an operand n >= 0 is the instruction's operand n, -1 - k
+// the result of step k. A step whose array code after it needs too keeps it:
+// output `kept` (else -1), made in the arena at ella_fused_depths[kept], and
+// given in ella_fused_outs[kept].
 typedef struct {
-    word op, left, right, line, column;
+    word op, left, right, line, column, kept;
 } FusedStep;
 
 typedef struct {
-    word floats;  // whether the items are f64s
+    word kind;  // of the items: I64_ITEMS, F64_ITEMS or F32_ITEMS
     word operands;
     word arrays;  // bit n: operand n is an array
     word count;
@@ -832,84 +1069,115 @@ typedef struct {
 } FusedPlan;
 
 word ella_fused_operands[8];
+word ella_fused_done;  // whether ella_fused_start did the steps itself, one by one
+word ella_fused_depths[4], ella_fused_outs[4];
 
-// One step on whole arrays, with its errors, as ella.operators.array_op does it.
-static Array *fused_step(const FusedStep *s, word a, int a_array, word b, int b_array, int floats) {
-    if (s->op == 'n') {
-        const Array *x = (const Array *)a;
-        Array *r = array_like(x, 0);
-        for (word i = 0; i < x->len; i++) {
-            word v = x->items[i];
-            if (!floats && v == INT64_MIN) ella_overflow_neg(v, s->line, s->column);
-            r->items[i] = floats ? f64_bits(-as_f64(v)) : -v;
-        }
-        return r;
+// total() of the items, in four sums (see lane_sum_i64): floats may be added in any order (docs/grammar.md §9).
+static word sum_items(const Array *a, word line, word column) {
+    if (a->kind == F64_ITEMS) {
+        double sums[4] = {0.0, 0.0, 0.0, 0.0};
+        for (word i = 0; i < a->len; i++) sums[i % 4] += as_f64(get_item(a, i));
+        return f64_bits((sums[0] + sums[2]) + (sums[1] + sums[3]));
     }
-    Array *r = ella_array_like(a, b, a_array | b_array << 1 | s->op << 8, s->line, s->column, 0);
-    const Array *x = (const Array *)a, *y = (const Array *)b;
-    char symbol[2] = {(char)s->op, 0};
-    for (word i = 0; i < r->len; i++) {
-        word p = a_array ? x->items[i] : a, q = b_array ? y->items[i] : b, v;
-        if (floats) {
-            double f = as_f64(p), g = as_f64(q);
-            v = f64_bits(s->op == '+' ? f + g : s->op == '-' ? f - g : s->op == '*' ? f * g : f / g);
-        } else if (s->op == '+' ? __builtin_add_overflow(p, q, &v)
-                   : s->op == '-' ? __builtin_sub_overflow(p, q, &v)
-                                  : __builtin_mul_overflow(p, q, &v)) {
-            ella_overflow(p, q, symbol, s->line, s->column);
-        }
-        r->items[i] = v;
+    if (a->kind == F32_ITEMS) {
+        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (word i = 0; i < a->len; i++) sums[i % 4] += as_f32(get_item(a, i));
+        return f32_bits((sums[0] + sums[2]) + (sums[1] + sums[3]));
     }
-    return r;
+    word sums[4] = {0, 0, 0, 0};
+    for (word i = 0; i < a->len; i++) sums[i % 4] = item_op('+', sums[i % 4], get_item(a, i), a->kind, line, column);
+    return a->kind == I32_ITEMS ? lane_sum_i32(sums, line, column) : lane_sum_i64(sums, line, column);
 }
 
-// The fused loop found an error (an i64 overflow), or its arrays' shapes
-// differ: do the steps one by one, which stops at the error they make.
-_Noreturn void ella_fused_fail(const FusedPlan *plan) {
+// One step on whole arrays, with its errors, as ella.operators.array_op does it (and ella.library's total and
+// dot): an array in the arena at `depth`, or for total and dot a number.
+static word fused_step(const FusedStep *s, word a, int a_array, word b, int b_array, word depth) {
+    const Array *x = (const Array *)a, *y = (const Array *)b;
+    if (s->op == 't') return sum_items(x, s->line, s->column);
+    if (s->op == 'd') {
+        check_same_shape("dot", x, y, s->line, s->column);
+        Array *products = array_like(x, depth);
+        for (word i = 0; i < x->len; i++) set_item(products, i, item_op('*', get_item(x, i), get_item(y, i), x->kind, s->line, s->column));
+        return sum_items(products, s->line, s->column);
+    }
+    if (s->op == 'n') {
+        Array *r = array_like(x, depth);
+        for (word i = 0; i < x->len; i++) set_item(r, i, item_neg(get_item(x, i), x->kind, s->line, s->column));
+        return (word)r;
+    }
+    Array *r = ella_array_like(a, b, a_array | b_array << 1 | s->op << 8, s->line, s->column, depth);
+    if (ella_array_done) return (word)r;  // broadcast
+    for (word i = 0; i < r->len; i++) {
+        word p = a_array ? get_item(x, i) : a, q = b_array ? get_item(y, i) : b;
+        set_item(r, i, item_op(s->op, p, q, r->kind, s->line, s->column));
+    }
+    return (word)r;
+}
+
+// The steps one by one, in the arena at `depth`: the last one's result. This
+// stops at the first error they make, as the steps before fusion would.
+static word fused_steps(const FusedPlan *plan, word depth) {
     word results[16];
     for (word k = 0; k < plan->count; k++) {
         const FusedStep *s = &plan->steps[k];
         word refs[2] = {s->left, s->right}, values[2] = {0, 0};
         int arrays[2] = {0, 0};
-        for (int j = 0; j < (s->op == 'n' ? 1 : 2); j++) {
+        for (int j = 0; j < (s->op == 'n' || s->op == 't' ? 1 : 2); j++) {
             word n = refs[j];
             values[j] = n >= 0 ? ella_fused_operands[n] : results[-1 - n];
             arrays[j] = n < 0 || (plan->arrays >> n & 1);
         }
-        results[k] = (word)fused_step(s, values[0], arrays[0], values[1], arrays[1], (int)plan->floats);
+        results[k] = fused_step(s, values[0], arrays[0], values[1], arrays[1],
+                                s->kept >= 0 ? ella_fused_depths[s->kept] : depth);
+        if (s->kept >= 0) ella_fused_outs[s->kept] = results[k];
     }
+    return results[plan->count - 1];
+}
+
+// The fused loop found an i64 overflow: do the steps one by one, which stops at the first.
+_Noreturn void ella_fused_fail(const FusedPlan *plan) {
+    fused_steps(plan, 0);
     const FusedStep *last = &plan->steps[plan->count - 1];
     fail(last->line, last->column, "an error went missing");  // never: the fused loop found one
 }
 
-// The array the fused steps make, if their arrays all have the same shape.
-Array *ella_fused_start(const FusedPlan *plan, word depth) {
+// The array the fused steps make (none if they end in a sum), if their arrays
+// all have the same shape. Otherwise the steps are done one by one here, in
+// the arena at `depth`, and ella_fused_done says so: this gives their result.
+word ella_fused_start(const FusedPlan *plan, word depth) {
     const Array *first = NULL;
+    ella_fused_done = 0;
     for (word n = 0; n < plan->operands; n++) {
         if (!(plan->arrays >> n & 1)) continue;
         const Array *a = (const Array *)ella_fused_operands[n];
         if (first == NULL) {
             first = a;
         } else if (!same_shape(first, a)) {
-            ella_fused_fail(plan);
+            ella_fused_done = 1;
+            return fused_steps(plan, depth);
         }
     }
-    return array_like(first, depth);
+    for (word k = 0; k < plan->count; k++) {  // the arrays steps keep
+        word kept = plan->steps[k].kept;
+        if (kept >= 0) ella_fused_outs[kept] = (word)array_like(first, ella_fused_depths[kept]);
+    }
+    word last = plan->steps[plan->count - 1].op;
+    return last == 't' || last == 'd' ? 0 : (word)array_like(first, depth);
 }
 
 // The library's array functions. Most work on the words of the items, whatever
 // their type, and have one name for each item type, as the code generator calls them.
 
-static Array *array_of(const List *xs, word depth) {
-    Array *a = array_alloc(1, &xs->len, xs->len, depth);
-    memcpy(a->items, xs->items, (size_t)xs->len * sizeof(word));
+static Array *array_of(const List *xs, word kind, word depth) {
+    Array *a = array_alloc(1, &xs->len, xs->len, kind, depth);
+    for (word i = 0; i < xs->len; i++) set_item(a, i, xs->items[i]);
     return a;
 }
 
-static Array *fill(const List *shape, word x, word line, word column, word depth) {
+static Array *fill(const List *shape, word x, word kind, word line, word column, word depth) {
     word len = check_shape(shape, line, column);
-    Array *a = array_alloc(shape->len, shape->items, len, depth);
-    for (word i = 0; i < len; i++) a->items[i] = x;
+    Array *a = array_alloc(shape->len, shape->items, len, kind, depth);
+    for (word i = 0; i < len; i++) set_item(a, i, x);
     return a;
 }
 
@@ -918,8 +1186,8 @@ static Array *reshape(const Array *a, const List *shape, word line, word column,
         fail(line, column, "reshape() can't make an array of shape %s from one of shape %s",
              sizes_text(shape->items, shape->len, "[", "]").text, shape_text(a).text);
     }
-    Array *result = array_alloc(shape->len, shape->items, a->len, depth);
-    memcpy(result->items, a->items, (size_t)a->len * sizeof(word));
+    Array *result = array_alloc(shape->len, shape->items, a->len, a->kind, depth);
+    memcpy(result->items, a->items, items_bytes(a));
     return result;
 }
 
@@ -931,16 +1199,16 @@ static List *shape(const Array *a, word depth) {
 
 static List *flat(const Array *a, word depth) {
     List *xs = ella_list_alloc(a->len, depth);
-    memcpy(xs->items, a->items, (size_t)a->len * sizeof(word));
+    for (word i = 0; i < a->len; i++) xs->items[i] = get_item(a, i);
     return xs;
 }
 
 static Array *transpose(const Array *a, word line, word column, word depth) {
     if (a->ndim != 2) fail(line, column, "transpose() needs a 2-dimensional array, not one of shape %s", shape_text(a).text);
     word rows = a->dims[0], columns = a->dims[1], dims[2] = {columns, rows};
-    Array *result = array_alloc(2, dims, a->len, depth);
+    Array *result = array_alloc(2, dims, a->len, a->kind, depth);
     for (word i = 0; i < rows; i++) {
-        for (word j = 0; j < columns; j++) result->items[j * rows + i] = a->items[i * columns + j];
+        for (word j = 0; j < columns; j++) set_item(result, j * rows + i, get_item(a, i * columns + j));
     }
     return result;
 }
@@ -954,31 +1222,52 @@ static Array *matmul_result(const Array *a, const Array *b, word line, word colu
     if (a->dims[1] != b->dims[0])
         fail(line, column, "matmul() can't multiply arrays of shapes %s and %s", shape_text(a).text, shape_text(b).text);
     word dims[2] = {a->dims[0], b->dims[1]};
-    return array_alloc(2, dims, a->dims[0] * b->dims[1], depth);
+    return array_alloc(2, dims, a->dims[0] * b->dims[1], a->kind, depth);
 }
 
 typedef double __attribute__((may_alias)) f64_word;  // an item of an Array[f64], read as the number it is
 
-// Item (i, j) is the sum of a[i, p] * b[p, j], from p = 0 up, starting at 0.0
-// (ella.library.matmul). Each row of the result adds a row of b times a[i, p]
-// for each p in turn: four items of the row at once, each still added in the
-// same order. (Multiplying and adding separately: a fused multiply-add would
-// round differently.)
-__attribute__((target("avx2"))) static void matmul_rows(const f64_word *a, const f64_word *b, f64_word *c, word n,
-                                                         word k, word m) {
-    for (word i = 0; i < n; i++) {
-        f64_word *row = c + i * m;
-        for (word j = 0; j < m; j++) row[j] = 0.0;
-        for (word p = 0; p < k; p++) {
-            double x = a[i * k + p];
-            __m256d xs = _mm256_set1_pd(x);
-            const f64_word *from = b + p * m;
-            word j = 0;
-            for (; j + 4 <= m; j += 4) {
-                __m256d product = _mm256_mul_pd(xs, _mm256_loadu_pd((const double *)(from + j)));
-                _mm256_storeu_pd((double *)(row + j), _mm256_add_pd(_mm256_loadu_pd((const double *)(row + j)), product));
+// Item (i, j) is the sum of a[i, p] * b[p, j], from p = 0 up (ella.library.matmul
+// does them in that order; native code may round differently: docs/grammar.md §9).
+// A block of 4 rows by 8 columns of the result stays in eight AVX2 registers
+// while p goes up, each row of b's 8 items loaded once for the 4 rows, and
+// each product added with one rounding (a fused multiply-add). The rows and
+// columns left over go one item at a time.
+__attribute__((target("avx2,fma"))) static void matmul_rows(const f64_word *a, const f64_word *b, f64_word *c,
+                                                             word n, word k, word m) {
+    word i = 0;
+    for (; i + 4 <= n; i += 4) {
+        word j = 0;
+        for (; j + 8 <= m; j += 8) {
+            __m256d sums[4][2];
+            for (int r = 0; r < 4; r++) sums[r][0] = sums[r][1] = _mm256_setzero_pd();
+            for (word p = 0; p < k; p++) {
+                __m256d low = _mm256_loadu_pd((const double *)(b + p * m + j));
+                __m256d high = _mm256_loadu_pd((const double *)(b + p * m + j + 4));
+                for (int r = 0; r < 4; r++) {
+                    __m256d x = _mm256_set1_pd(a[(i + r) * k + p]);
+                    sums[r][0] = _mm256_fmadd_pd(x, low, sums[r][0]);
+                    sums[r][1] = _mm256_fmadd_pd(x, high, sums[r][1]);
+                }
             }
-            for (; j < m; j++) row[j] = row[j] + x * from[j];
+            for (int r = 0; r < 4; r++) {
+                _mm256_storeu_pd((double *)(c + (i + r) * m + j), sums[r][0]);
+                _mm256_storeu_pd((double *)(c + (i + r) * m + j + 4), sums[r][1]);
+            }
+        }
+        for (; j < m; j++) {
+            for (word r = i; r < i + 4; r++) {
+                double sum = 0.0;
+                for (word p = 0; p < k; p++) sum = __builtin_fma(a[r * k + p], b[p * m + j], sum);
+                c[r * m + j] = sum;
+            }
+        }
+    }
+    for (; i < n; i++) {
+        for (word j = 0; j < m; j++) {
+            double sum = 0.0;
+            for (word p = 0; p < k; p++) sum = __builtin_fma(a[i * k + p], b[p * m + j], sum);
+            c[i * m + j] = sum;
         }
     }
 }
@@ -990,50 +1279,115 @@ Array *ella_lib_matmul_f64(const Array *a, const Array *b, word line, word colum
     return c;
 }
 
-// i64 has no AVX2 multiply, and must check each operation for overflow, in the
-// order ella.library.matmul does them.
-Array *ella_lib_matmul_i64(const Array *a, const Array *b, word line, word column, word depth) {
+// Integers have no AVX2 multiply that notices overflow, and must check each
+// operation, in the order ella.library.matmul does them.
+static Array *matmul_ints(const Array *a, const Array *b, word line, word column, word depth) {
     Array *c = matmul_result(a, b, line, column, depth);
     word n = a->dims[0], k = a->dims[1], m = b->dims[1];
     for (word i = 0; i < n; i++) {
         for (word j = 0; j < m; j++) {
             word total = 0;
             for (word p = 0; p < k; p++) {
-                word x = a->items[i * k + p], y = b->items[p * m + j], product;
-                if (__builtin_mul_overflow(x, y, &product)) ella_overflow(x, y, "*", line, column);
-                total = add_checked(total, product, line, column);
+                word product = item_op('*', get_item(a, i * k + p), get_item(b, p * m + j), a->kind, line, column);
+                total = item_op('+', total, product, a->kind, line, column);
             }
-            c->items[i * m + j] = total;
+            set_item(c, i * m + j, total);
         }
     }
     return c;
 }
 
-// dot() of two Array[i64]s, in four sums like total().
-word ella_lib_dot_i64(const Array *a, const Array *b, word line, word column, word depth) {
-    UNUSED(depth);
+Array *ella_lib_matmul_i64(const Array *a, const Array *b, word line, word column, word depth) {
+    return matmul_ints(a, b, line, column, depth);
+}
+
+Array *ella_lib_matmul_i32(const Array *a, const Array *b, word line, word column, word depth) {
+    return matmul_ints(a, b, line, column, depth);
+}
+
+// dot() of two arrays of integers, in four sums like total().
+static word dot_ints(const Array *a, const Array *b, word line, word column) {
     check_same_shape("dot", a, b, line, column);
     word sums[4] = {0, 0, 0, 0};
     for (word i = 0; i < a->len; i++) {
-        word x = a->items[i], y = b->items[i], product;
-        if (__builtin_mul_overflow(x, y, &product)) ella_overflow(x, y, "*", line, column);
-        sums[i % 4] = add_checked(sums[i % 4], product, line, column);
+        word product = item_op('*', get_item(a, i), get_item(b, i), a->kind, line, column);
+        sums[i % 4] = item_op('+', sums[i % 4], product, a->kind, line, column);
     }
-    return lane_sum_i64(sums, line, column);
+    return a->kind == I32_ITEMS ? lane_sum_i32(sums, line, column) : lane_sum_i64(sums, line, column);
 }
 
-// For the AVX2 code of total() and dot(): masks for loading the last n % 4
-// items, for each n % 4 (the other lanes are 0).
+word ella_lib_dot_i64(const Array *a, const Array *b, word line, word column, word depth) {
+    UNUSED(depth);
+    return dot_ints(a, b, line, column);
+}
+
+word ella_lib_dot_i32(const Array *a, const Array *b, word line, word column, word depth) {
+    UNUSED(depth);
+    return dot_ints(a, b, line, column);
+}
+
+word ella_lib_total_i32(const Array *a, word line, word column, word depth) {
+    UNUSED(depth);
+    return sum_items(a, line, column);
+}
+
+// matmul of Array[f32]s, as matmul_rows: blocks of 4 rows by 8 columns, each a
+// vector of 8 f32s, the products added with fused multiply-adds.
+typedef float __attribute__((may_alias)) f32_item;
+
+__attribute__((target("avx2,fma"))) static void matmul_rows_f32(const f32_item *a, const f32_item *b, f32_item *c,
+                                                                 word n, word k, word m) {
+    word i = 0;
+    for (; i + 4 <= n; i += 4) {
+        word j = 0;
+        for (; j + 8 <= m; j += 8) {
+            __m256 sums[4];
+            for (int r = 0; r < 4; r++) sums[r] = _mm256_setzero_ps();
+            for (word p = 0; p < k; p++) {
+                __m256 row = _mm256_loadu_ps((const float *)(b + p * m + j));
+                for (int r = 0; r < 4; r++) sums[r] = _mm256_fmadd_ps(_mm256_set1_ps(a[(i + r) * k + p]), row, sums[r]);
+            }
+            for (int r = 0; r < 4; r++) _mm256_storeu_ps((float *)(c + (i + r) * m + j), sums[r]);
+        }
+        for (; j < m; j++) {
+            for (word r = i; r < i + 4; r++) {
+                float sum = 0.0f;
+                for (word p = 0; p < k; p++) sum = __builtin_fmaf(a[r * k + p], b[p * m + j], sum);
+                c[r * m + j] = sum;
+            }
+        }
+    }
+    for (; i < n; i++) {
+        for (word j = 0; j < m; j++) {
+            float sum = 0.0f;
+            for (word p = 0; p < k; p++) sum = __builtin_fmaf(a[i * k + p], b[p * m + j], sum);
+            c[i * m + j] = sum;
+        }
+    }
+}
+
+Array *ella_lib_matmul_f32(const Array *a, const Array *b, word line, word column, word depth) {
+    Array *c = matmul_result(a, b, line, column, depth);
+    matmul_rows_f32((const f32_item *)a->items, (const f32_item *)b->items, (f32_item *)c->items, a->dims[0],
+                    a->dims[1], b->dims[1]);
+    return c;
+}
+
+// For the AVX2 code: masks for loading the last n % 4 items of 8 bytes (or n % 8 of 4 bytes), for each n % 4
+// (or n % 8): the other lanes are 0.
 __attribute__((aligned(32))) const uint64_t ella_tail_masks[4][4] = {
     {0, 0, 0, 0}, {~0ull, 0, 0, 0}, {~0ull, ~0ull, 0, 0}, {~0ull, ~0ull, ~0ull, 0}};
+__attribute__((aligned(32))) const uint32_t ella_tail_masks32[8][8] = {
+    {0}, {~0u}, {~0u, ~0u}, {~0u, ~0u, ~0u}, {~0u, ~0u, ~0u, ~0u}, {~0u, ~0u, ~0u, ~0u, ~0u},
+    {~0u, ~0u, ~0u, ~0u, ~0u, ~0u}, {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u}};
 
-#define ARRAY_FUNCTIONS(T)                                                                                    \
+#define ARRAY_FUNCTIONS(T, KIND)                                                                              \
     Array *ella_lib_array_##T(const List *xs, word line, word column, word depth) {                           \
         UNUSED(line), UNUSED(column);                                                                         \
-        return array_of(xs, depth);                                                                           \
+        return array_of(xs, KIND, depth);                                                                     \
     }                                                                                                         \
     Array *ella_lib_fill_##T(const List *s, word x, word line, word column, word depth) {                     \
-        return fill(s, x, line, column, depth);                                                               \
+        return fill(s, x, KIND, line, column, depth);                                                         \
     }                                                                                                         \
     Array *ella_lib_reshape_##T(const Array *a, const List *s, word line, word column, word depth) {          \
         return reshape(a, s, line, column, depth);                                                            \
@@ -1050,8 +1404,10 @@ __attribute__((aligned(32))) const uint64_t ella_tail_masks[4][4] = {
         return transpose(a, line, column, depth);                                                             \
     }
 
-ARRAY_FUNCTIONS(i64)
-ARRAY_FUNCTIONS(f64)
+ARRAY_FUNCTIONS(i64, I64_ITEMS)
+ARRAY_FUNCTIONS(f64, F64_ITEMS)
+ARRAY_FUNCTIONS(f32, F32_ITEMS)
+ARRAY_FUNCTIONS(i32, I32_ITEMS)
 
 // Ranges
 
@@ -1096,8 +1452,8 @@ Closure *ella_closure_alloc(void *code, word count, const Type *types, word dept
 // arena that is freed sooner.
 
 static int is_boxed(const Type *t) {
-    return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_F64 && t->kind != K_BOOL && t->kind != K_HANDLE &&
-           t->kind != K_REF;
+    return t->kind != K_UNIT && t->kind != K_I64 && t->kind != K_I32 && t->kind != K_F64 && t->kind != K_F32 &&
+           t->kind != K_BOOL && t->kind != K_HANDLE && t->kind != K_REF;
 }
 
 word ella_copy(word v, const Type *t, word depth) {
@@ -1135,7 +1491,7 @@ word ella_copy(word v, const Type *t, word depth) {
     case K_ARRAY: {
         const Array *a = (const Array *)v;
         Array *copy = array_like(a, depth);
-        memcpy(copy->items, a->items, (size_t)a->len * sizeof(word));
+        memcpy(copy->items, a->items, items_bytes(a));
         return (word)copy;
     }
     case K_ENUM: {
@@ -1491,6 +1847,8 @@ word ella_equal(word a, word b, const Type *t) {
         return 1;
     case K_F64:
         return as_f64(a) == as_f64(b);
+    case K_F32:
+        return as_f32(a) == as_f32(b);
     case K_STR:
         return ella_str_compare((const Str *)a, (const Str *)b) == 0;
     case K_RANGE: {
@@ -1518,7 +1876,7 @@ word ella_equal(word a, word b, const Type *t) {
         const Array *x = (const Array *)a, *y = (const Array *)b;
         if (!same_shape(x, y)) return 0;
         for (word i = 0; i < x->len; i++) {
-            if (!ella_equal(x->items[i], y->items[i], t->parts[0])) return 0;
+            if (!ella_equal(get_item(x, i), get_item(y, i), t->parts[0])) return 0;
         }
         return 1;
     }
@@ -1638,6 +1996,22 @@ static void put_f64(Buffer *b, double x) {
     }
 }
 
+// An f32's text, as ella.values.f32_text: the shortest decimal that is nearest
+// to it of all f32s (going through an f64, as Python does), written as an f64 is.
+static void put_f32(Buffer *b, float x) {
+    if (!isfinite(x)) {
+        put_f64(b, x);
+        return;
+    }
+    char text[32];
+    for (int digits = 1; digits <= 9; digits++) {
+        snprintf(text, sizeof text, "%.*g", digits, (double)x);
+        float back = (float)strtod(text, NULL);
+        if (memcmp(&back, &x, sizeof x) == 0) break;
+    }
+    put_f64(b, strtod(text, NULL));
+}
+
 // A string inside another value is quoted the way Python's json.dumps does it.
 static void put_quoted(Buffer *b, const Str *s) {
     put(b, '"');
@@ -1668,15 +2042,15 @@ static void put_value(Buffer *b, word v, const Type *t, int nested, int custom);
 
 // An array's items as nested lists, one level for each of its `ndim` dimensions:
 // `[[1.0, 2.0], [3.0, 4.0]]`, as ella.values.nested_text.
-static void put_nested(Buffer *b, const word *items, const word *dims, word ndim, word len, const Type *item) {
+static void put_nested(Buffer *b, const Array *a, word start, const word *dims, word ndim, word len, const Type *item) {
     put(b, '[');
     word step = dims[0] ? len / dims[0] : 0;
     for (word i = 0; i < dims[0]; i++) {
         if (i) put_ascii(b, ", ");
         if (ndim == 1) {
-            put_value(b, items[i], item, 1, 0);
+            put_value(b, get_item(a, start + i), item, 1, 0);
         } else {
-            put_nested(b, items + i * step, dims + 1, ndim - 1, step, item);
+            put_nested(b, a, start + i * step, dims + 1, ndim - 1, step, item);
         }
     }
     put(b, ']');
@@ -1687,8 +2061,10 @@ static void put_nested(Buffer *b, const word *items, const word *dims, word ndim
 static void put_value(Buffer *b, word v, const Type *t, int nested, int custom) {
     switch (t->kind) {
     case K_UNIT: put_ascii(b, "()"); break;
-    case K_I64: put_i128(b, v); break;
+    case K_I64:
+    case K_I32: put_i128(b, v); break;  // (an i32 is its word, sign-extended)
     case K_F64: put_f64(b, as_f64(v)); break;
+    case K_F32: put_f32(b, as_f32(v)); break;
     case K_BOOL: put_ascii(b, v ? "true" : "false"); break;
     case K_FUNCTION: put_ascii(b, "<function>"); break;
     case K_CODE: put_ascii(b, "<code>"); break;  // never made: native code can't build code at run time
@@ -1744,7 +2120,7 @@ static void put_value(Buffer *b, word v, const Type *t, int nested, int custom) 
     case K_ARRAY: {
         const Array *a = (const Array *)v;
         put_ascii(b, "array(");
-        put_nested(b, a->items, a->dims, a->ndim, a->len, t->parts[0]);
+        put_nested(b, a, 0, a->dims, a->ndim, a->len, t->parts[0]);
         put(b, ')');
         break;
     }
@@ -2052,24 +2428,110 @@ static int matches_at(const Str *s, word i, const Str *part) {
     return i + part->len <= s->len && memcmp(s->chars + i, part->chars, (size_t)part->len * sizeof(uint32_t)) == 0;
 }
 
-word ella_lib_to_f64(word n, word line, word column, word depth) {
+word ella_lib_to_f64_i64(word n, word line, word column, word depth) {
     UNUSED(line), UNUSED(column), UNUSED(depth);
     return f64_bits((double)n);
 }
 
-word ella_lib_to_i64(word bits, word line, word column, word depth) {
-    UNUSED(depth);
-    double x = as_f64(bits), whole = trunc(x);
-    if (!(whole >= -9223372036854775808.0 && whole < 9223372036854775808.0)) {  // also false for NaN
-        Buffer b = {0};
+word ella_lib_to_f64_f64(word x, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return x;
+}
+
+word ella_lib_to_f64_f32(word x, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits((double)as_f32(x));
+}
+
+// to_f32: the nearest f32 (an i64 by way of the nearest f64, as Python does it).
+word ella_lib_to_f32_i64(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f32_bits((float)(double)n);
+}
+
+word ella_lib_to_f32_f64(word x, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f32_bits((float)as_f64(x));
+}
+
+word ella_lib_to_f32_f32(word x, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return x;
+}
+
+// A float's text, as print writes it (an f32 as an f32), for error messages.
+static void float_text(char *text, double x, int f32) {
+    Buffer b = {0};
+    if (f32) {
+        put_f32(&b, (float)x);
+    } else {
         put_f64(&b, x);
+    }
+    for (word i = 0; i < b.len; i++) text[i] = (char)b.chars[i];
+    text[b.len] = 0;
+    free(b.chars);
+}
+
+// A float without its fraction, if that fits in `bits` bits (to_i64 and to_i32).
+static word truncated(double x, int f32, int bits, word line, word column) {
+    double whole = trunc(x), limit = bits == 64 ? 9223372036854775808.0 : 2147483648.0;
+    if (!(whole >= -limit && whole < limit)) {  // also false for NaN
         char text[40];
-        for (word i = 0; i < b.len; i++) text[i] = (char)b.chars[i];
-        text[b.len] = 0;
-        free(b.chars);
-        fail(line, column, "to_i64() can't convert %s to an i64", text);
+        float_text(text, x, f32);
+        fail(line, column, "to_i%d() can't convert %s to an i%d", bits, text, bits);
     }
     return (word)whole;
+}
+
+word ella_lib_to_i64_f64(word bits, word line, word column, word depth) {
+    UNUSED(depth);
+    return truncated(as_f64(bits), 0, 64, line, column);
+}
+
+word ella_lib_to_i64_f32(word bits, word line, word column, word depth) {
+    UNUSED(depth);
+    return truncated(as_f32(bits), 1, 64, line, column);
+}
+
+word ella_lib_to_i64_i64(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return n;
+}
+
+word ella_lib_to_i64_i32(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return n;
+}
+
+word ella_lib_to_i32_f64(word bits, word line, word column, word depth) {
+    UNUSED(depth);
+    return truncated(as_f64(bits), 0, 32, line, column);
+}
+
+word ella_lib_to_i32_f32(word bits, word line, word column, word depth) {
+    UNUSED(depth);
+    return truncated(as_f32(bits), 1, 32, line, column);
+}
+
+word ella_lib_to_i32_i64(word n, word line, word column, word depth) {
+    UNUSED(depth);
+    if (!fits_i32(n)) fail(line, column, "to_i32() can't convert %" PRId64 " to an i32", n);
+    return n;
+}
+
+word ella_lib_to_i32_i32(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return n;
+}
+
+word ella_lib_to_f64_i32(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f64_bits((double)n);
+}
+
+word ella_lib_to_f32_i32(word n, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f32_bits((float)n);
 }
 
 word ella_lib_parse_i64(const Str *s, word line, word column, word depth) {
@@ -2310,9 +2772,10 @@ static uint64_t hash_value(word v, const Type *t) {
     switch (t->kind) {
     case K_UNIT:
         return h;
-    case K_F64: {
-        // 0.0 and -0.0 are equal, so they hash the same; NaNs are never equal, but hash alike.
-        double x = as_f64(v) + 0.0;
+    case K_F64:
+    case K_F32: {
+        // 0.0 and -0.0 are equal, so they hash the same; NaNs are never equal, but hash alike. (An f32 as the f64 it is.)
+        double x = (t->kind == K_F32 ? (double)as_f32(v) : as_f64(v)) + 0.0;
         return fnv(h, isnan(x) ? 0x7FF8000000000000u : (uint64_t)f64_bits(x));
     }
     case K_STR: {
@@ -2342,7 +2805,7 @@ static uint64_t hash_value(word v, const Type *t) {
         const Array *a = (const Array *)v;
         uint64_t shape = FNV_OFFSET, items = FNV_OFFSET;
         for (word i = 0; i < a->ndim; i++) shape = fnv(shape, fnv(FNV_OFFSET, (uint64_t)a->dims[i]));
-        for (word i = 0; i < a->len; i++) items = fnv(items, hash_value(a->items[i], t->parts[0]));
+        for (word i = 0; i < a->len; i++) items = fnv(items, hash_value(get_item(a, i), t->parts[0]));
         return fnv(fnv(h, shape), items);
     }
     case K_ENUM: {
@@ -2615,6 +3078,22 @@ word ella_lib_abs_f64(word bits, word line, word column, word depth) {
 }
 
 // min(a, b) is a unless b is less, and max(a, b) a unless b is greater (so a NaN a is kept).
+word ella_lib_abs_i32(word n, word line, word column, word depth) {
+    UNUSED(depth);
+    if (n == INT32_MIN) fail(line, column, "i32 overflow: abs(%" PRId64 ") doesn't fit in 32 bits", n);
+    return n < 0 ? -n : n;
+}
+
+word ella_lib_min_i32(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return b < a ? b : a;
+}
+
+word ella_lib_max_i32(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return b > a ? b : a;
+}
+
 word ella_lib_min_i64(word a, word b, word line, word column, word depth) {
     UNUSED(line), UNUSED(column), UNUSED(depth);
     return b < a ? b : a;
@@ -2635,6 +3114,21 @@ word ella_lib_max_f64(word a, word b, word line, word column, word depth) {
     return as_f64(b) > as_f64(a) ? b : a;
 }
 
+word ella_lib_abs_f32(word bits, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return f32_bits(fabsf(as_f32(bits)));
+}
+
+word ella_lib_min_f32(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return as_f32(b) < as_f32(a) ? b : a;
+}
+
+word ella_lib_max_f32(word a, word b, word line, word column, word depth) {
+    UNUSED(line), UNUSED(column), UNUSED(depth);
+    return as_f32(b) > as_f32(a) ? b : a;
+}
+
 // The program starts here, and runs the top-level code (generated as
 // ella_main) on a stack of its own, big enough for ella_max_depth nested
 // calls. Only the parts it uses take memory. A page at its end that can't
@@ -2644,12 +3138,12 @@ word ella_lib_max_f64(word a, word b, word line, word column, word depth) {
 #define STACK_PER_CALL ((size_t)256 << 10)
 
 extern word ella_main(char *stack);  // gives the exit status
-extern const word ella_uses_avx2;  // in the generated code: whether it has AVX2 instructions (for arrays)
+extern const word ella_uses_avx2;  // in the generated code: whether it has AVX2 and FMA instructions (for arrays)
 
 int main(int argc, char **argv) {
     __builtin_cpu_init();
-    if (ella_uses_avx2 && !__builtin_cpu_supports("avx2")) {
-        fputs("this program uses AVX2 instructions, which this CPU doesn't have\n", stderr);
+    if (ella_uses_avx2 && !(__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))) {
+        fputs("this program uses AVX2 and FMA instructions, which this CPU doesn't have\n", stderr);
         return 1;
     }
     poison = getenv("ELLA_POISON") != NULL;

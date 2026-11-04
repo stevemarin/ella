@@ -1,0 +1,6 @@
+# Arrays combine item by item when their shapes broadcast together (lined up
+# from the right, each two sizes equal or one of them 1); otherwise it is an error.
+let main = () -> () =>
+    let m = reshape(array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [2, 3])
+    print(m / array([1.0, 2.0, 4.0]), m - reshape(array([1.0, 2.0]), [2, 1]))
+    print(m + array([1.0, 2.0]))

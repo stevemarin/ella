@@ -119,6 +119,8 @@ from typing import TextIO
 from ella.checker import (
     BOOL,
     ERROR,
+    F32,
+    F64,
     I64,
     LIBRARY,
     NEVER,
@@ -1142,7 +1144,10 @@ class Lowerer:
                 if self.has_method(container.type, "get"):
                     return self.call_method("get", [container, self.lower(index)], self.type_of(expr), span, dest)
                 if is_array(container.type):
-                    return self.array_item(container, self.array_indexes(index), self.type_of(expr), span)
+                    indexes = self.array_indexes(index)
+                    if any(i.type == RANGE for i in indexes):  # a slice: a new array
+                        return self.emit("array_slice", container.type, [container, *indexes], span, region=dest)
+                    return self.array_item(container, indexes, self.type_of(expr), span)
                 if isinstance(container.type, BuiltinTy):
                     return self.pool_get(container, self.lower(index), self.type_of(expr), span)
                 return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
@@ -1321,6 +1326,9 @@ class Lowerer:
         """A binary operator on two values, which may be a method of a struct or enum (`a + b` is `a.add(b)`)."""
         if op in OPERATOR_METHODS and self.has_method(a.type, OPERATOR_METHODS[op]):
             return self.call_method(OPERATOR_METHODS[op], [a, b], t, span, region)
+        if op == "/" and a.type == F32 and t == F64:
+            # `/` on a type parameter gives an f64 (docs/grammar.md §9): f32s are made f64s first, as i64s are.
+            a, b = (self.emit("builtin", F64, [v], span, "to_f64") for v in (a, b))
         return self.emit(BINARY_OPS[op], t, [a, b], span, region=region)
 
     def lower_index(self, container: Value, index: Value, t: Type, span: Span, dest: str) -> Value:
@@ -1342,7 +1350,7 @@ class Lowerer:
         value = self.lower(index)
         if not isinstance(value.type, TupleTy):
             return [value]
-        return [self.emit("tuple_get", I64, [value], index.span, index=i) for i in range(len(value.type.items))]
+        return [self.emit("tuple_get", t, [value], index.span, index=i) for i, t in enumerate(value.type.items)]
 
     def array_item(self, array: Value, indexes: list[Value], t: Type, span: Span) -> Value:
         """`a[i, j]`: a number, from where `array_offset` finds it in the items."""

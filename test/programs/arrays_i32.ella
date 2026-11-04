@@ -1,0 +1,26 @@
+# i32: integers of 32 bits, made with to_i32, which trap when a result doesn't fit in 32
+# bits, and arrays of them (eight to an AVX2 vector natively).
+
+let ints = (n: i64) -> Array[i32] =>
+    let mut xs: [i32] = []
+    for i in 0..n
+        xs += [to_i32(i * 7 - 20)]
+    array(xs)
+
+let main = () -> () =>
+    let a32 = to_i32(100000)
+    let b32 = to_i32(-7)
+    print(a32 + b32, a32 * b32, a32 // b32, a32 % b32, a32 / b32, -b32, b32 ** to_i32(3), a32 < b32, to_i64(a32) * 100000)
+    print(to_i32(-3.9), to_i32(to_f32(2.5)), abs(b32), min(a32, b32), [a32, b32], to_f64(b32))
+    let k = to_i32(3)
+    for n in [0, 1, 7, 8, 9, 15, 16, 17]
+        let a = ints(n)
+        let b = a * k + to_i32(1)
+        print(n, a + b, a - b, a * b, -a, a + k, k - a, a * to_i32(-2))
+        print(total(a), dot(a, b), total(a * k + b), total(-a), a == a)
+    let m = reshape(ints(12), [3, 4])
+    print(m, m[1, 2], m[0..2, 1..3], transpose(m), matmul(m, transpose(m)), m + array([to_i32(1), to_i32(2), to_i32(3), to_i32(4)]))
+    let mut c = fill([2, 2], to_i32(5))
+    c[1, 0] = to_i32(-9)
+    c[0, 1] += to_i32(100)
+    print(c, flat(c), to_i64(c[1, 0]) * 1000000000, hash(c) == hash(c + to_i32(0)))

@@ -170,9 +170,11 @@ def test_fuse_makes_one_loop_of_arithmetic_on_arrays() -> None:
     assert fused_steps(source) == ["mul(0, 1) add(s0, 2) neg(s1) div(s2, 0)"]
 
 
-def test_fuse_keeps_arrays_used_twice_and_i64_multiplication() -> None:
+def test_fuse_keeps_arrays_used_elsewhere_and_leaves_i64_multiplication() -> None:
     twice = "let f = (a: Array[f64]) -> Array[f64] =>\n    let t = a + 1.0\n    t * t"
-    assert fused_steps(twice) == []
+    assert fused_steps(twice) == ["add(0, 1) mul(s0, s0)"]  # both uses are in the loop
+    elsewhere = "let f = (a: Array[f64]) -> (Array[f64], Array[f64]) =>\n    let t = a + 1.0\n    (t * 2.0, t)"
+    assert fused_steps(elsewhere) == ["keep add(0, 1) mul(s0, 2)"]  # the loop writes t too, for the tuple
     ints = "let f = (a: Array[i64]) -> Array[i64] => (a + 1) * 2 - a"
     assert fused_steps(ints) == []  # neither step next to the `*` can join it
 
@@ -183,6 +185,13 @@ def test_fuse_doesnt_move_operations_past_others() -> None:
         "let f = (a: Array[f64], b: Array[f64]) -> Array[f64] =>\n    let t = a + b\n    let n = total(b)\n    t * n"
     )
     assert fused_steps(source) == []
+
+
+def test_fuse_ends_with_a_sum_and_takes_values_used_twice_inside() -> None:
+    source = "let f = (a: Array[f64], b: Array[f64]) -> f64 =>\n    let d = a - b\n    dot(d, d) + total(a * 2.0 + b)"
+    assert fused_steps(source) == ["sub(0, 1) dot(s0, s0)", "mul(0, 1) add(s0, 2) total(s1)"]
+    # An i64 dot needs a multiply AVX2 doesn't have.
+    assert fused_steps("let f = (a: Array[i64]) -> i64 => dot(a + 1, a)") == []
 
 
 def test_fuse_keeps_to_the_registers_there_are() -> None:

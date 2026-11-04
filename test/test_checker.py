@@ -213,6 +213,15 @@ def test_array_types() -> None:
     assert type_of("fill([2, 3], 0.0)") == "Array[f64]"
     assert type_of("array([1, 2])[0]") == "i64"
     assert type_of("fill([2, 2], 1)[1, 1]") == "i64"
+    assert type_of("fill([2, 2], 1)[0..1]") == "Array[i64]"
+    assert type_of("fill([2, 2], 1.5)[0, 0..2]") == "Array[f64]"
+    assert type_of("to_f32(1) / to_f32(3)") == "f32"
+    assert type_of("fill([2], to_f32(1.5)) / to_f32(2.0)") == "Array[f32]"
+    assert type_of("total(fill([2], to_f32(1.5)))") == "f32"
+    assert type_of("to_f64(to_f32(0.5)) + to_f64(2)") == "f64"
+    assert type_of("to_i32(7) // to_i32(2)") == "i32"
+    assert type_of("to_i32(7) / to_i32(2)") == "f64"
+    assert type_of("total(fill([2], to_i32(3)) * to_i32(2))") == "i32"
     assert type_of("let t = (0, 1)\nfill([2, 2], 1.5)[t]") == "f64"
     assert type_of("fill([2], 1.0) * 2.0") == "Array[f64]"
     assert type_of("2 - fill([2], 1)") == "Array[i64]"
@@ -230,10 +239,15 @@ def test_array_types() -> None:
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        ("let a: Array[str] = fill([1], 1)", "an Array's items must be i64 or f64, not str"),
-        ("let a: Array[[i64]] = fill([1], 1)", "an Array's items must be i64 or f64, not [i64]"),
+        ("let a: Array[str] = fill([1], 1)", "an Array's items must be i64, i32, f64 or f32, not str"),
+        ("let a: Array[[i64]] = fill([1], 1)", "an Array's items must be i64, i32, f64 or f32, not [i64]"),
+        ("to_i32(1) + 1", "'+' needs two values of the same type, not i32 and i64"),
+        ("to_i32(1) & to_i32(2)", "'&' doesn't work on i32"),
+        ("fill([1], to_i32(1)) / to_i32(2)", "'/' works on arrays of f64 or f32 only, not Array[i32]"),
+        ("to_f32(1.0) + 1.0", "'+' needs two values of the same type, not f32 and f64"),
+        ("to_f32(1.0) // to_f32(2.0)", "'//' doesn't work on f32"),
         ('fill([1], "a")', "fill needs T to be Num, and str isn't"),
-        ("fill([1], 1) / 2", "'/' works on Array[f64] only, not Array[i64]; use '*' or '//' on i64s"),
+        ("fill([1], 1) / 2", "'/' works on arrays of f64 or f32 only, not Array[i64]"),
         ("fill([1], 1) // 2", "'//' doesn't work on Array[i64]"),
         (
             "fill([1], 1) + 2.0",
@@ -241,9 +255,9 @@ def test_array_types() -> None:
         ),
         ("fill([1], 1) + fill([1], 1.0)", "'+' needs two arrays of the same type, not Array[i64] and Array[f64]"),
         ("fill([1], 1) < fill([1], 1)", "'<' doesn't work on Array[i64]"),
-        ("fill([1], 1)[1.0]", "an array's index must be an i64, or a tuple of them, not f64"),
-        ("fill([1], 1)[0, true]", "an array's index must be an i64, or a tuple of them, not (i64, bool)"),
-        ("fill([1], 1)[0..1]", "an array's index must be an i64, or a tuple of them, not range"),
+        ("fill([1], 1)[1.0]", "an array's index must be an i64 or a range, or a tuple of them, not f64"),
+        ("fill([1], 1)[0, true]", "an array's index must be an i64 or a range, or a tuple of them, not (i64, bool)"),
+        ("let mut a = fill([2], 1)\na[0..1] = a", "can't assign to a slice; change the items one by one"),
         ("1 in fill([1], 1)", "'in' needs a list, str or range on the right, not Array[i64]"),
         (
             "let f[T] = (a: Array[T]) -> Array[T] => a + a",
@@ -1064,7 +1078,7 @@ def test_library_types(source: str, t: str) -> None:
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        ("to_f64(1.5)", "argument 1 of to_f64() should be i64, not f64"),
+        ("to_i64(true)", "to_i64 needs T to be Num, and bool isn't"),
         ('split("a")', "split takes 2 arguments but was given 1"),
         ('let mut s = "a"\ntrim(mut s)', "trim() has no 'mut' parameter"),
         (

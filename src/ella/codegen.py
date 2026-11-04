@@ -98,12 +98,15 @@ since the runtime's code uses the older SSE instructions.
 """
 
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ella.checker import (
     ARENA,
+    F32,
     F64,
     GENERIC_LIBRARY,
+    I32,
     I64,
     STR,
     BuiltinTy,
@@ -122,6 +125,7 @@ from ella.ir import (
     Block,
     Branch,
     Function,
+    FusedStep,
     Instr,
     Jump,
     Module,
@@ -140,10 +144,11 @@ from ella.ir import (
 from ella.lexer import Span
 from ella.regalloc import allocate, uses_levels
 from ella.syntax import bare_name
+from ella.values import F32 as F32Value
 from ella.values import MAX_CALL_DEPTH
 
 # Type descriptor kinds; these must match `enum Kind` in runtime.c.
-KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0}
+KINDS = {"()": 0, "i64": 1, "f64": 2, "bool": 3, "str": 4, "range": 5, "never": 0, "f32": 17, "i32": 18}
 LIST_KIND, TUPLE_KIND, FUNCTION_KIND, ENUM_KIND, POOL_KIND, HANDLE_KIND, CODE_KIND = 6, 7, 8, 9, 10, 11, 12
 ARENA_KIND, REF_KIND, GEN_KIND, ARRAY_KIND = 13, 14, 15, 16
 
@@ -157,10 +162,79 @@ C_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 SETCC = {"eq": "sete", "ne": "setne", "lt": "setl", "le": "setle", "gt": "setg", "ge": "setge"}
 
 # The operator of each step of a `fused` instruction, for the runtime.
-FUSED_OPS = {"add": "+", "sub": "-", "mul": "*", "div": "/", "neg": "n"}
+FUSED_OPS = {"add": "+", "sub": "-", "mul": "*", "div": "/", "neg": "n", "total": "t", "dot": "d"}
 
 # The Ella operator of each arithmetic operation, for overflow messages.
 SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "floordiv": "//", "pow": "**", "shl": "<<"}
+
+
+@dataclass(frozen=True, slots=True)
+class Lanes:
+    """How AVX2 code works on an array's items: four i64s or f64s, or eight f32s or i32s, to a ymm register."""
+
+    kind: str  # "i64", "i32", "f64" or "f32"
+
+    @property
+    def size(self) -> int:
+        return 4 if self.kind in ("f32", "i32") else 8
+
+    @property
+    def count(self) -> int:
+        return 32 // self.size
+
+    @property
+    def floats(self) -> bool:
+        return self.kind in ("f64", "f32")
+
+    @property
+    def q(self) -> str:
+        """The suffix of packed integer instructions: `vpaddq`, `vpaddd`."""
+        return "d" if self.kind == "i32" else "q"
+
+    @property
+    def scalar(self) -> str:
+        """The scratch register for one integer item: rax, or eax for an i32."""
+        return "eax" if self.kind == "i32" else "rax"
+
+    @property
+    def p(self) -> str:
+        """The suffix of packed instructions: `vaddps`, `vaddpd`."""
+        return "ps" if self.kind == "f32" else "pd"
+
+    @property
+    def s(self) -> str:
+        """The suffix of instructions on one item: `vaddss`, `vaddsd`."""
+        return "ss" if self.kind == "f32" else "sd"
+
+    @property
+    def ptr(self) -> str:
+        return "dword ptr" if self.size == 4 else "qword ptr"
+
+    @property
+    def masks(self) -> str:
+        """The runtime's masks for the last n % count items."""
+        return "ella_tail_masks32" if self.size == 4 else "ella_tail_masks"
+
+    @property
+    def broadcast(self) -> str:
+        return {"f32": "vbroadcastss", "i32": "vpbroadcastd"}.get(self.kind, "vpbroadcastq")
+
+    @property
+    def signs(self) -> str:
+        """The instruction that gathers the items' sign bits into a register: vmovmskpd, or vmovmskps."""
+        return "vmovmskps" if self.size == 4 else "vmovmskpd"
+
+    @property
+    def sign(self) -> int:
+        """The sign bit of an item, as a word."""
+        return 1 << 31 if self.kind == "f32" else -(1 << 63)
+
+
+def lanes(t: Type) -> Lanes:
+    """The lanes of an array type's items, or of a number type's (for `total` and `dot`)."""
+    item = item_type(t) if is_array(t) else t
+    assert isinstance(item, PrimTy)
+    return Lanes(item.name)
 
 
 class Label(str):
@@ -237,8 +311,9 @@ class CodeGen:
         self.text.append(f"    {line}")
 
     def label(self, hint: str) -> str:
+        """A new label: `.Lloop16_7`. (The `_` keeps `loop1` and `loop16` labels apart.)"""
         self.labels += 1
-        return f".L{hint}{self.labels}"
+        return f".L{hint}_{self.labels}"
 
     # The program
 
@@ -749,6 +824,9 @@ class CodeGen:
                 self.array_arithmetic(instr)
             case "add" | "sub" | "mul" | "div" | "pow":
                 self.arithmetic(instr)
+            case "floordiv" | "mod" if args[0].type == I32:
+                self.call_c(f"ella_{'floordiv' if op == 'floordiv' else 'mod'}_i32", args[0], args[1], line, column)
+                self.store(dest)
             case "floordiv" | "mod":
                 self.divide(instr)
             case "shl" | "shr":
@@ -761,6 +839,19 @@ class CodeGen:
             case "neg" if args[0].type == F64:
                 self.load("rax", args[0])
                 self.emit("btc rax, 63               # flip the sign bit")
+                self.store(dest)
+            case "neg" if args[0].type == I32:
+                ok = self.label("ok")
+                self.load("rax", args[0])
+                self.emit("neg eax")
+                self.emit(f"jno {ok}")
+                self.call_c("ella_overflow32_neg", args[0], line, column)
+                self.text.append(f"{ok}:")
+                self.emit("movsxd rax, eax   # an i32 is kept sign-extended")
+                self.store(dest)
+            case "neg" if args[0].type == F32:
+                self.load("rax", args[0])
+                self.emit("btc rax, 31               # flip the sign bit (an f32 is the low 32 bits)")
                 self.store(dest)
             case "neg":
                 ok = self.label("ok")
@@ -806,14 +897,28 @@ class CodeGen:
                 self.emit(f"mov rax, qword ptr [rax + {16 + 8 * instr.index}]")
                 self.store(dest)
             case "index" if is_array(args[0].type):
-                # array_offset (or a loop over the array) has checked the index.
+                # array_offset (or a loop over the array) has checked the index. (An f32 takes 4 bytes.)
                 self.load("rax", args[0])
                 self.load("rcx", args[1])
                 self.emit("mov rax, qword ptr [rax + 16]   # where its items are")
-                self.emit("mov rax, qword ptr [rax + 8 * rcx]")
+                if lanes(args[0].type).kind == "f32":
+                    self.emit("mov eax, dword ptr [rax + 4 * rcx]")
+                elif lanes(args[0].type).kind == "i32":
+                    self.emit("movsxd rax, dword ptr [rax + 4 * rcx]   # an i32 is kept sign-extended")
+                else:
+                    self.emit("mov rax, qword ptr [rax + 8 * rcx]")
                 self.store(dest)
             case "array_offset":
                 self.array_offset(instr)
+            case "array_slice":
+                # The indexes go in ella_indexes (a range as its pointer), which bits of the mask say are ranges.
+                array, *indexes = args
+                for k, index in enumerate(indexes):
+                    self.load("rax", index)
+                    self.emit(f"mov qword ptr [rip + ella_indexes + {8 * k}], rax")
+                ranges = sum(1 << k for k, index in enumerate(indexes) if index.type == PrimTy("range"))
+                self.call_c("ella_array_slice", array, len(indexes), ranges, line, column, Region(instr.region))
+                self.store(dest)
             case "fused":
                 self.fused(instr)
             case "index":
@@ -843,8 +948,8 @@ class CodeGen:
             case "slice":
                 self.call_c("ella_list_slice", args[0], args[1], line, column, Region(instr.region))
                 self.store(dest)
-            case "builtin" if instr.name == "total" or (
-                instr.name == "dot" and args[0].type == BuiltinTy("Array", (F64,))
+            case "builtin" if (instr.name == "total" and lanes(args[0].type).kind != "i32") or (
+                instr.name == "dot" and lanes(args[0].type).floats
             ):
                 self.reduction(instr)
             case "builtin":
@@ -866,7 +971,10 @@ class CodeGen:
                 self.load("rcx", args[1])
                 self.load("rdx", args[2])
                 self.emit("mov rax, qword ptr [rax + 16]   # where its items are")
-                self.emit("mov qword ptr [rax + 8 * rcx], rdx")
+                if lanes(args[0].type).size == 4:
+                    self.emit("mov dword ptr [rax + 4 * rcx], edx")
+                else:
+                    self.emit("mov qword ptr [rax + 8 * rcx], rdx")
             case "set_index":
                 self.slot_value(instr, args[0], args[2])
                 self.call_c("ella_list_set", args[0], args[1], Register("rax"), line, column)
@@ -1062,6 +1170,9 @@ class CodeGen:
                 self.emit(f"mov {register}, {int(value)}")
             case int():
                 self.emit(f"mov {register}, {value}")
+            case F32Value():
+                [bits] = struct.unpack("<I", struct.pack("<f", value))
+                self.emit(f"mov {register}, {bits}              # f32 {value!r}")
             case float():
                 [bits] = struct.unpack("<q", struct.pack("<d", value))
                 self.emit(f"mov {register}, {bits}              # {value!r}")
@@ -1076,6 +1187,34 @@ class CodeGen:
         op, (a, b), dest = instr.op, instr.args, instr.dest
         line, column = self.span_args(instr.span)
         match a.type:
+            case PrimTy("i32") if op != "div":
+                # 32-bit arithmetic, which sets the overflow flag if the result doesn't fit in an i32.
+                if op == "pow":
+                    self.call_c("ella_pow_i32", a, b, line, column)
+                    self.store(dest)
+                    return
+                ok = self.label("ok")
+                self.load("rax", a)
+                self.load("rcx", b)
+                self.emit(f"{'imul' if op == 'mul' else op} eax, ecx")
+                self.emit(f"jno {ok}")
+                self.call_c("ella_overflow32", a, b, self.c_string(SYMBOLS[op]), line, column)
+                self.text.append(f"{ok}:")
+                self.emit("movsxd rax, eax   # an i32 is kept sign-extended")
+                self.store(dest)
+            case PrimTy("f32"):
+                # In the low 32 bits of a word; `movd eax, xmm0` clears the high ones.
+                if op == "pow":
+                    self.call_c("ella_pow_f32", a, b)
+                    self.store(dest)
+                    return
+                self.load("rax", a)
+                self.load("rcx", b)
+                self.emit("movd xmm0, eax")
+                self.emit("movd xmm1, ecx")
+                self.emit(f"{op}ss xmm0, xmm1")
+                self.emit("movd eax, xmm0")
+                self.store(dest)
             case PrimTy("f64"):
                 if op == "pow":
                     self.call_c("ella_pow_f64", a, b)
@@ -1126,7 +1265,7 @@ class CodeGen:
         self.emit(f"cmp qword ptr [rax + 8], {len(indexes)}   # its number of dimensions")
         self.emit(f"jne {fail}")
         for k, index in enumerate(indexes):
-            size = f"qword ptr [rax + {24 + 8 * k}]"
+            size = f"qword ptr [rax + {32 + 8 * k}]"
             self.load("rcx", index)
             self.emit(f"cmp rcx, {size}   # the size of dimension {k}")
             self.emit(f"jae {fail}")
@@ -1145,34 +1284,39 @@ class CodeGen:
         self.store(instr.dest, "rdx")
 
     def array_arithmetic(self, instr: Instr) -> None:
-        """`+`, `-`, `*`, `/` and unary `-` on arrays, item by item, as an AVX2 loop over four items at a time.
+        """`+`, `-`, `*`, `/` and unary `-` on arrays, item by item, as an AVX2 loop over four items at a time (eight
+        f32s).
 
         Either operand may be a number instead of an array, used for every
         item: a vector of four of it. The runtime makes the result (checking
-        the shapes); the operands live through that call (ella.regalloc's
-        `calls_partway`), and nothing else is in a caller-saved register, so
-        the loop has those as well as the scratch registers:
+        the shapes; for two arrays of different shapes, it broadcasts them and
+        works out the whole result itself, `ella_array_done`); the operands
+        live through that call (ella.regalloc's `calls_partway`), and nothing
+        else is in a caller-saved register, so the loop has those as well as
+        the scratch registers:
 
             rsi, rdi    the operands' items (or the numbers), ymm2 and ymm3 the numbers' vectors
             rdx, rcx    the result's items, and how many
-            r9, r10     the item reached, and the last multiple of 4
+            r9, r10     the item reached, and the last multiple of the vector's count
             r8          the result
 
-        `-a` is `0 - a` for i64s, and flips the sign bits of f64s. f64
-        arithmetic never fails. i64 `+` and `-` work out each item's overflow
-        as a sign bit and gather them in ymm7; AVX2 has no 64-bit multiply, so
-        i64 `*` has no vector part. If an i64 overflowed, the runtime finds
-        the first and reports it.
+        `-a` is `0 - a` for integers, and flips the sign bits of floats. Float
+        arithmetic never fails. Integer `+` and `-` work out each item's
+        overflow as a sign bit and gather them in ymm7; AVX2 has no 64-bit
+        multiply, and none that notices a 32-bit one overflow, so integer `*`
+        has no vector part. If an integer overflowed, the runtime finds the
+        first and reports it.
         """
         assert instr.dest is not None
         self.uses_avx2 = True
-        floats = item_type(instr.dest.type) == F64
+        lane = lanes(instr.dest.type)
+        floats, size = lane.floats, lane.size
         line, column = self.span_args(instr.span)
         op = instr.op
         left: Value | int
         right: Value | int
         if op == "neg" and floats:
-            op, left, right = "xor", instr.args[0], -(1 << 63)  # flip the sign bits
+            op, left, right = "xor", instr.args[0], lane.sign  # flip the sign bits
         elif op == "neg":
             op, left, right = "sub", 0, instr.args[0]
         else:
@@ -1184,6 +1328,9 @@ class CodeGen:
         symbol = "neg" if instr.op == "neg" else SYMBOLS.get(op, "/")
         operator = {"add": "+", "sub": "-", "mul": "*", "div": "/"}.get(instr.op, "-")
         self.call_c("ella_array_like", left, right, flags | ord(operator) << 8, line, column, Region(instr.region))
+        broadcast = self.label("broadcast")
+        self.emit("cmp qword ptr [rip + ella_array_done], 0")
+        self.emit(f"jne {broadcast}   # the shapes differ: the runtime did it all")
         self.emit("mov r8, rax")
         self.emit("mov rcx, qword ptr [rax]   # how many items")
         self.emit("mov rdx, qword ptr [rax + 16]   # where they are")
@@ -1195,56 +1342,58 @@ class CodeGen:
                 self.emit(f"mov {register}, {side}")
             if flags & (1 if is_left else 2):
                 self.emit(f"mov {register}, qword ptr [{register} + 16]")
-                sides.append((f"ymmword ptr [{register} + 8 * r9]", f"qword ptr [{register} + 8 * r9]"))
+                sides.append((f"ymmword ptr [{register} + {size} * r9]", f"{lane.ptr} [{register} + {size} * r9]"))
             else:
                 self.emit(f"vmovq xmm{vector[-1]}, {register}")
-                self.emit(f"vpbroadcastq {vector}, xmm{vector[-1]}")
-                sides.append((vector, register if not floats else f"xmm{vector[-1]}"))
+                self.emit(f"{lane.broadcast} {vector}, xmm{vector[-1]}")
+                low = {"rsi": "esi", "rdi": "edi"}[register] if lane.kind == "i32" else register
+                sides.append((vector, low if not floats else f"xmm{vector[-1]}"))
         (a_vector, a_scalar), (b_vector, b_scalar) = sides
         overflow, done = self.label("overflow"), self.label("done")
         vector_loop = floats or op != "mul"
         self.emit("xor r9d, r9d")
         self.emit("mov r10, rcx")
-        self.emit("and r10, -4")
+        self.emit(f"and r10, {-lane.count}")
         loop4, test4, loop1, test1 = (self.label(hint) for hint in ("loop4", "test4", "loop1", "test1"))
         if vector_loop:
             if not floats:
                 self.emit("vpxor ymm7, ymm7, ymm7   # the overflows seen")
             self.emit(f"jmp {test4}")
             self.text.append(f"{loop4}:")
-            self.emit(f"{'vmovupd' if '[' in a_vector else 'vmovapd'} ymm0, {a_vector}")
+            self.emit(f"{'vmovu' if '[' in a_vector else 'vmova'}{lane.p} ymm0, {a_vector}")
             if floats:
-                self.emit(f"v{op}pd ymm0, ymm0, {b_vector}")
-                self.emit("vmovupd ymmword ptr [rdx + 8 * r9], ymm0")
+                self.emit(f"v{op}{lane.p} ymm0, ymm0, {b_vector}")
+                self.emit(f"vmovu{lane.p} ymmword ptr [rdx + {size} * r9], ymm0")
             else:
                 self.emit(f"{'vmovdqu' if '[' in b_vector else 'vmovdqa'} ymm1, {b_vector}")
-                self.emit(f"vp{op}q ymm4, ymm0, ymm1")
+                self.emit(f"vp{op}{lane.q} ymm4, ymm0, ymm1")
                 # Overflow sets the sign bit of (a ^ r) & (b ^ r) for +, of (a ^ b) & (a ^ r) for -.
                 self.emit(f"vpxor ymm5, ymm0, {'ymm4' if op == 'add' else 'ymm1'}")
                 self.emit(f"vpxor ymm6, {'ymm1' if op == 'add' else 'ymm0'}, ymm4")
                 self.emit("vpand ymm5, ymm5, ymm6")
                 self.emit("vpor ymm7, ymm7, ymm5")
-                self.emit("vmovdqu ymmword ptr [rdx + 8 * r9], ymm4")
-            self.emit("add r9, 4")
+                self.emit(f"vmovdqu ymmword ptr [rdx + {size} * r9], ymm4")
+            self.emit(f"add r9, {lane.count}")
             self.text.append(f"{test4}:")
             self.emit("cmp r9, r10")
             self.emit(f"jb {loop4}")
             if not floats:
-                self.emit("vmovmskpd eax, ymm7")
+                self.emit(f"{lane.signs} eax, ymm7")
                 self.emit("test eax, eax")
                 self.emit(f"jnz {overflow}")
-        # The rest one at a time (all of them for i64 `*`).
+        # The rest one at a time (all of them for an integer `*`).
         self.emit(f"jmp {test1}")
         self.text.append(f"{loop1}:")
         if floats:
-            self.emit(f"{'vmovsd' if '[' in a_scalar else 'vmovapd'} xmm0, {a_scalar}")
-            self.emit(f"v{op}pd xmm0, xmm0, {b_scalar}" if op == "xor" else f"v{op}sd xmm0, xmm0, {b_scalar}")
-            self.emit("vmovsd qword ptr [rdx + 8 * r9], xmm0")
+            self.emit(f"{'vmov' + lane.s if '[' in a_scalar else 'vmova' + lane.p} xmm0, {a_scalar}")
+            self.emit(f"v{op}{lane.p if op == 'xor' else lane.s} xmm0, xmm0, {b_scalar}")
+            self.emit(f"vmov{lane.s} {lane.ptr} [rdx + {size} * r9], xmm0")
         else:
-            self.emit(f"mov rax, {a_scalar}")
-            self.emit(f"{'imul' if op == 'mul' else op} rax, {b_scalar}")
+            work = lane.scalar
+            self.emit(f"mov {work}, {a_scalar}")
+            self.emit(f"{'imul' if op == 'mul' else op} {work}, {b_scalar}")
             self.emit(f"jo {overflow}")
-            self.emit("mov qword ptr [rdx + 8 * r9], rax")
+            self.emit(f"mov {lane.ptr} [rdx + {size} * r9], {work}")
         self.emit("inc r9")
         self.text.append(f"{test1}:")
         self.emit("cmp r9, rcx")
@@ -1257,60 +1406,82 @@ class CodeGen:
             self.emit("vzeroupper")
             self.call_c("ella_array_overflow", left, right, flags, self.c_string(symbol), line, column)
             self.text.append(f"{done}:")
+        self.text.append(f"{broadcast}:")
         self.store(instr.dest)
 
-    def fused_plan(self, instr: Instr, floats: bool) -> Label:
+    def fused_plan(self, instr: Instr, lane: Lanes) -> Label:
         """A `fused` instruction's steps, for the runtime (FusedPlan in runtime.c)."""
         label = Label(self.label("plan"))
         arrays = sum(1 << n for n, arg in enumerate(instr.args) if is_array(arg.type))
-        words = [int(floats), len(instr.args), arrays, len(instr.steps)]
+        words = [("i64", "f64", "f32").index(lane.kind), len(instr.args), arrays, len(instr.steps)]
+        kept = iter(range(len(instr.outs)))
         for step in instr.steps:
             line, column = self.span_args(step.span)
             right = step.right if step.right is not None else 0
-            words += [ord(FUSED_OPS[step.op]), step.left, right, line, column]
+            words += [ord(FUSED_OPS[step.op]), step.left, right, line, column, next(kept) if step.kept else -1]
         self.rodata += ["    .balign 8", f"{label}:", "    .quad " + ", ".join(map(str, words))]
         return label
 
     def fused(self, instr: Instr) -> None:
-        """Several steps of arithmetic on arrays (ella.passes.fuse) in one AVX2 loop, four items at a time.
+        """Several steps of arithmetic on arrays (ella.passes.fuse) in one AVX2 loop, four items at a time (eight
+        f32s).
 
         The runtime checks the arrays' shapes and makes the result
         (`ella_fused_start`), from the operands, which go in
-        `ella_fused_operands` first. In the loop, step k's four items are in
+        `ella_fused_operands` first; if the shapes differ, it does the steps
+        itself (`ella_fused_done`). In the loop, step k's items are in
         ymm k, the numbers among the operands in ymm8 and up, and the
         arrays' items are read where they are, at r9 (rsi, rdi, r11, rax
-        point to them). The last n % 4 items go through the same code, with
+        point to them). The last few items go through the same code, with
         loads and stores masked by ymm7 (`ella_tail_masks`). For `-x`, ymm6
-        holds the sign bits (f64) or 0 (i64, `0 - x`). As in
+        holds the sign bits (floats) or 0 (i64, `0 - x`). A `*` whose product is
+        only added or subtracted becomes part of that step, a fused
+        multiply-add (`fma_steps`). A last step `total` or `dot` adds into
+        its own register instead, and the loop stores nothing. As in
         `array_arithmetic`, i64 overflows gather in ymm11 (ymm14 and ymm15
         work them out); if any, the runtime does the steps one by one, which
         finds the first.
         """
         assert instr.dest is not None
         self.uses_avx2 = True
-        floats = item_type(instr.dest.type) == F64
-        plan = self.fused_plan(instr, floats)
+        summed = instr.steps[-1].op in ("total", "dot")
+        lane = lanes(instr.dest.type)
+        floats = lane.floats
+        plan = self.fused_plan(instr, lane)
         for n, arg in enumerate(instr.args):
             self.load("rax", arg)
             self.emit(f"mov qword ptr [rip + ella_fused_operands + {8 * n}], rax")
+        for j, region in enumerate(instr.out_regions):  # where the arrays steps keep go
+            self.region_to("rax", region)
+            self.emit(f"mov qword ptr [rip + ella_fused_depths + {8 * j}], rax")
         self.call_c("ella_fused_start", plan, Region(instr.region))
+        finished = self.label("fused_done")
+        self.emit("cmp qword ptr [rip + ella_fused_done], 0")
+        self.emit(f"jne {finished}   # the shapes differ: the runtime did the steps one by one")
         self.emit("mov r8, rax")
-        self.emit("mov rcx, qword ptr [rax]   # how many items")
-        self.emit("mov rdx, qword ptr [rax + 16]   # where they go")
+        if summed:
+            self.emit(f"mov rcx, qword ptr [rip + ella_fused_operands + {8 * self.first_array(instr)}]")
+            self.emit("mov rcx, qword ptr [rcx]   # how many items")
+        else:
+            self.emit("mov rcx, qword ptr [rax]   # how many items")
+            self.emit("mov rdx, qword ptr [rax + 16]   # where they go")
         self.emit("mov r10, rcx")
-        self.emit("and r10, -4")
+        self.emit(f"and r10, {-lane.count}")
         self.emit("mov rax, rcx")
         self.emit("sub rax, r10")
         self.emit("shl rax, 5")
-        self.emit("lea r9, [rip + ella_tail_masks]")
-        self.emit("vmovdqa ymm7, ymmword ptr [r9 + rax]   # the mask for the last n % 4 items")
+        self.emit(f"lea r9, [rip + {lane.masks}]")
+        self.emit("vmovdqa ymm7, ymmword ptr [r9 + rax]   # the mask for the last few items")
         if floats:
-            self.emit(f"mov rax, {-(1 << 63)}")
+            self.emit(f"mov rax, {lane.sign}")
             self.emit("vmovq xmm6, rax")
-            self.emit("vpbroadcastq ymm6, xmm6   # sign bits")
+            self.emit(f"{lane.broadcast} ymm6, xmm6   # sign bits")
         else:
             self.emit("vpxor ymm6, ymm6, ymm6")
             self.emit("vpxor ymm11, ymm11, ymm11   # the overflows seen")
+        if summed:
+            last = len(instr.steps) - 1
+            self.emit(f"vpxor ymm{last}, ymm{last}, ymm{last}   # the sums")
         places: list[str] = []  # each operand: its register, or its array's base register
         pointers, numbers = iter(["rsi", "rdi", "r11", "rax"]), iter(range(8, 11))
         for arg in instr.args:
@@ -1323,66 +1494,159 @@ class CodeGen:
                 vector = next(numbers)
                 self.load("r9", arg)
                 self.emit(f"vmovq xmm{vector}, r9")
-                self.emit(f"vpbroadcastq ymm{vector}, xmm{vector}")
+                self.emit(f"{lane.broadcast} ymm{vector}, xmm{vector}")
                 places.append(f"ymm{vector}")
+        keeps: list[str] = []  # where each kept step's items go
+        for j in range(len(instr.outs)):
+            register = next(pointers)
+            self.emit(f"mov {register}, qword ptr [rip + ella_fused_outs + {8 * j}]")
+            self.emit(f"mov {register}, qword ptr [{register} + 16]   # where kept array {j}'s items go")
+            keeps.append(register)
+        folded = self.fma_steps(instr) if floats else {}
         loop, test = self.label("loop4"), self.label("test4")
         self.emit("xor r9d, r9d")
         self.emit(f"jmp {test}")
         self.text.append(f"{loop}:")
-        self.fused_steps(instr, places, floats, tail=False)
-        self.emit("add r9, 4")
+        self.fused_steps(instr, places, lane, folded, keeps, tail=False)
+        self.emit(f"add r9, {lane.count}")
         self.text.append(f"{test}:")
         self.emit("cmp r9, r10")
         self.emit(f"jb {loop}")
-        self.fused_steps(instr, places, floats, tail=True)
+        self.fused_steps(instr, places, lane, folded, keeps, tail=True)
+        failed = self.label("fused_failed")
         if not floats:
-            failed = self.label("fused_failed")
             self.emit("vmovmskpd eax, ymm11")
             self.emit("test eax, eax")
             self.emit(f"jnz {failed}")
-        self.emit("vzeroupper   # (the runtime's code uses SSE)")
-        self.emit("mov rax, r8")
+        if summed and floats:
+            self.sum_vector(lane, f"ymm{len(instr.steps) - 1}")
+        elif summed:  # (s0 + s2) + (s1 + s3), checked, as ella.library.lane_sum
+            last = len(instr.steps) - 1
+            self.emit(f"vextracti128 xmm12, ymm{last}, 1")
+            self.emit(f"vmovq rax, xmm{last}")
+            self.emit(f"vpextrq rcx, xmm{last}, 1")
+            self.emit("vmovq rdx, xmm12")
+            self.emit("vpextrq r11, xmm12, 1")
+            self.emit("vzeroupper   # (the runtime's code uses SSE)")
+            self.emit("add rax, rdx")
+            self.emit(f"jo {failed}")
+            self.emit("add rcx, r11")
+            self.emit(f"jo {failed}")
+            self.emit("add rax, rcx")
+            self.emit(f"jo {failed}")
+        else:
+            self.emit("vzeroupper   # (the runtime's code uses SSE)")
+            self.emit("mov rax, r8")
         if not floats:
-            done = self.label("done")
-            self.emit(f"jmp {done}")
+            self.emit(f"jmp {finished}")
             self.text.append(f"{failed}:")
             self.emit("vzeroupper")
             self.call_c("ella_fused_fail", plan)
-            self.text.append(f"{done}:")
+        self.text.append(f"{finished}:")
         self.store(instr.dest)
+        for j, out in enumerate(instr.outs):
+            self.emit(f"mov rax, qword ptr [rip + ella_fused_outs + {8 * j}]")
+            self.store(out)
 
-    def fused_steps(self, instr: Instr, places: list[str], floats: bool, tail: bool) -> None:
-        """The steps of a fused instruction on four items at r9 (the last few, masked, if `tail`)."""
-        last = len(instr.steps) - 1
+    def sum_vector(self, lane: Lanes, vector: str) -> None:
+        """Add up the floats in a ymm register into rax (an f32 in its low 32 bits). (Clobbers ymm12, ymm13.)"""
+        number = vector.replace("ymm", "xmm")
+        self.emit(f"vextractf128 xmm12, {vector}, 1")
+        self.emit(f"vadd{lane.p} xmm12, {number}, xmm12")
+        self.emit("vunpckhpd xmm13, xmm12, xmm12   # the high 64 bits")
+        self.emit(f"vadd{lane.p} xmm12, xmm12, xmm13")
+        if lane.kind == "f32":
+            self.emit("vmovshdup xmm13, xmm12   # the second f32")
+            self.emit("vaddss xmm12, xmm12, xmm13")
+            self.emit("vmovd eax, xmm12")
+        else:
+            self.emit("vmovq rax, xmm12")
+        self.emit("vzeroupper   # (the runtime's code uses SSE)")
+
+    @staticmethod
+    def first_array(instr: Instr) -> int:
+        return next(n for n, arg in enumerate(instr.args) if is_array(arg.type))
+
+    @staticmethod
+    def fma_steps(instr: Instr) -> dict[int, int]:
+        """The float `+` and `-` steps that can do a `*` step's work too, as one fused multiply-add: step -> the `*`.
+
+        The product must be used by that step alone (natively floats may round once there: docs/grammar.md §9).
+        """
+        refs = [ref for step in instr.steps for ref in (step.left, step.right) if ref is not None]
+        folded: dict[int, int] = {}
         for k, step in enumerate(instr.steps):
+            if step.op not in ("add", "sub") or step.right is None:
+                continue
+            for ref in (step.left, step.right):
+                j = -1 - ref
+                product = instr.steps[j] if ref < 0 else None
+                if (
+                    product
+                    and product.op == "mul"
+                    and not product.kept
+                    and refs.count(ref) == 1
+                    and j not in folded.values()
+                ):
+                    folded[k] = j
+                    break
+        return folded
+
+    def fused_steps(
+        self, instr: Instr, places: list[str], lane: Lanes, folded: dict[int, int], keeps: list[str], tail: bool
+    ) -> None:
+        """The steps of a fused instruction on the items at r9 (the last few, masked, if `tail`). A kept step's items
+        are stored where `keeps` points, in order."""
+        last = len(instr.steps) - 1
+        kept = iter(keeps)
+        p, size = lane.p, lane.size
+        temps = iter(["ymm12", "ymm13", "ymm14"])
+
+        def operand(ref: int, register: bool = False) -> str:
+            """Where an operand's items are: a register, or (if not `register`, and not in the tail) memory."""
+            if ref < 0:
+                return f"ymm{-1 - ref}"
+            if places[ref].startswith("ymm"):
+                return places[ref]
+            memory = f"ymmword ptr [{places[ref]} + {size} * r9]"
+            if tail or register:
+                temp = next(temps)
+                self.emit(f"vmaskmov{p} {temp}, ymm7, {memory}" if tail else f"vmovu{p} {temp}, {memory}")
+                return temp
+            return memory
+
+        products = set(folded.values())
+        for k, step in enumerate(instr.steps):
+            temps = iter(["ymm12", "ymm13", "ymm14"])
             dest = f"ymm{k}"
-            operands: list[str] = []
-            for j, ref in enumerate((step.left, step.right)):
-                if ref is None:
-                    continue
-                if ref < 0:
-                    operands.append(f"ymm{-1 - ref}")
-                elif places[ref].startswith("ymm"):
-                    operands.append(places[ref])
-                elif tail:  # masked: the other lanes are 0
-                    temp = f"ymm{12 + j}"
-                    self.emit(f"vmaskmovpd {temp}, ymm7, ymmword ptr [{places[ref]} + 8 * r9]")
-                    operands.append(temp)
+            if k in products:
+                continue  # done by the step that adds it
+            if k in folded:
+                product = instr.steps[folded[k]]
+                assert product.right is not None and step.right is not None
+                other = step.right if step.left == -1 - folded[k] else step.left
+                x, y = operand(product.left, register=True), operand(product.right)
+                z = operand(other)
+                self.emit(f"{'vmovu' if '[' in z else 'vmova'}{p} {dest}, {z}")
+                if step.op == "add":
+                    self.emit(f"vfmadd231{p} {dest}, {x}, {y}   # x * y + z, rounded once")
+                elif step.left == -1 - folded[k]:
+                    self.emit(f"vfmsub231{p} {dest}, {x}, {y}   # x * y - z, rounded once")
                 else:
-                    operands.append(f"ymmword ptr [{places[ref]} + 8 * r9]")
-            if step.op == "neg" and floats:
-                self.emit(f"vxorpd {dest}, ymm6, {operands[0]}")
-            elif floats:
-                a, b = operands
-                if "[" in a:
-                    self.emit(f"vmovupd {dest}, {a}")
-                    a = dest
-                self.emit(f"v{step.op}pd {dest}, {a}, {b}")
+                    self.emit(f"vfnmadd231{p} {dest}, {x}, {y}   # z - x * y, rounded once")
+            elif step.op == "total" or step.op == "dot":
+                self.fused_sum(step, dest, operand, lane, tail)
+                continue
+            elif step.op == "neg" and lane.floats:
+                self.emit(f"vxor{p} {dest}, ymm6, {operand(step.left)}")
+            elif lane.floats:
+                assert step.right is not None
+                a, b = operand(step.left, register=True), operand(step.right)
+                self.emit(f"v{step.op}{p} {dest}, {a}, {b}")
             else:
-                a, b = ("ymm6", operands[0]) if step.op == "neg" else operands
-                if "[" in a:
-                    self.emit(f"vmovdqu {dest}, {a}")
-                    a = dest
+                assert step.op == "neg" or step.right is not None
+                a = "ymm6" if step.op == "neg" else operand(step.left, register=True)
+                b = operand(step.left if step.op == "neg" else step.right)  # type: ignore[arg-type]
                 if step.op == "add":  # overflow: the sign bit of (a ^ r) & (b ^ r)
                     self.emit(f"vpaddq ymm15, {a}, {b}")
                     self.emit(f"vpxor ymm14, {a}, ymm15")
@@ -1396,25 +1660,60 @@ class CodeGen:
                     self.emit("vpand ymm14, ymm14, ymm7   # only the items there are")
                 self.emit("vpor ymm11, ymm11, ymm14")
                 self.emit(f"vmovdqa {dest}, ymm15")
-            if k == last:
+            if k == last or step.kept:
+                base = next(kept) if step.kept else "rdx"
                 if tail:
-                    self.emit(f"vmaskmovpd ymmword ptr [rdx + 8 * r9], ymm7, {dest}")
+                    self.emit(f"vmaskmov{p} ymmword ptr [{base} + {size} * r9], ymm7, {dest}")
                 else:
-                    self.emit(f"vmovupd ymmword ptr [rdx + 8 * r9], {dest}")
+                    self.emit(f"vmovu{p} ymmword ptr [{base} + {size} * r9], {dest}")
+
+    def fused_sum(self, step: FusedStep, sums: str, operand: Callable[..., str], lane: Lanes, tail: bool) -> None:
+        """A last step `total(x)` or `dot(x, y)`: add more items (or products) to the sums in `sums`.
+
+        In the tail, the lanes past the end are 0 (a step's register there holds
+        nothing that counts, so it is masked first)."""
+        p = lane.p
+        x = operand(step.left, register=True)
+        if tail and x.startswith("ymm") and x not in ("ymm12", "ymm13", "ymm14"):
+            # (ymm14 is free in float code, where dot's operands use at most ymm12 and ymm13; an i64 total has one.)
+            masked = "ymm14" if lane.floats else "ymm12"
+            self.emit(f"vpand {masked}, {x}, ymm7   # only the items there are")
+            x = masked
+        if step.op == "dot":
+            assert step.right is not None
+            y = operand(step.right)
+            if tail:  # a product of what is past the end could be NaN, so mask the products
+                self.emit(f"vmul{p} ymm15, {x}, {y}")
+                self.emit(f"vand{p} ymm15, ymm15, ymm7")
+                self.emit(f"vadd{p} {sums}, {sums}, ymm15")
+            else:
+                self.emit(f"vfmadd231{p} {sums}, {x}, {y}")
+        elif lane.floats:
+            self.emit(f"vadd{p} {sums}, {sums}, {x}")
+        else:  # i64: the overflows gather in ymm11, as for `+`
+            self.emit(f"vpaddq ymm15, {sums}, {x}")
+            self.emit(f"vpxor ymm14, {sums}, ymm15")
+            self.emit(f"vpxor ymm13, {x}, ymm15")
+            self.emit("vpand ymm14, ymm14, ymm13")
+            self.emit("vpor ymm11, ymm11, ymm14")
+            self.emit(f"vmovdqa {sums}, ymm15")
 
     def reduction(self, instr: Instr) -> None:
-        """`total(a)`, and `dot(a, b)` of Array[f64]s: four sums at once in ymm0, item i going into sum i % 4.
+        """`total(a)` of an Array[i64]: four sums at once in ymm0, item i going into sum i % 4.
 
-        The last `n % 4` items are loaded with a mask (`ella_tail_masks`),
-        which gives 0 for the other lanes: adding 0 changes no sum (a sum
-        starts at 0.0 and so is never -0.0). Then the sums are added as
-        `(s0 + s2) + (s1 + s3)`, as ella.library.lane_sum does. An i64 sum's
+        (`total` and `dot` of Array[f64]s are `f64_reduction`'s.) The last
+        `n % 4` items are loaded with a mask (`ella_tail_masks`), which gives
+        0 for the other lanes: adding 0 changes no sum. Then the sums are
+        added as `(s0 + s2) + (s1 + s3)`, as ella.library.lane_sum does. The
         overflows are gathered as in `array_arithmetic`, and the runtime
-        reports the first. `dot` calls the runtime to check the shapes first.
+        reports the first.
         """
         assert instr.dest is not None
         self.uses_avx2 = True
-        floats = instr.dest.type == F64
+        floats = instr.dest.type in (F64, F32)
+        if floats:
+            self.float_reduction(instr)
+            return
         line, column = self.span_args(instr.span)
         dot = instr.name == "dot"
         if dot:
@@ -1490,6 +1789,75 @@ class CodeGen:
             self.text.append(f"{done}:")
         self.store(instr.dest)
 
+    def float_reduction(self, instr: Instr) -> None:
+        """`total(a)` or `dot(a, b)` of arrays of floats, in four vectors of sums at once (ymm0 to ymm3), so that
+        the additions don't wait for each other. `dot` multiplies and adds with one rounding (`vfmadd231`), and
+        calls the runtime to check the shapes first. (Native code may add floats in its own order:
+        docs/grammar.md §9.) The last few items are loaded with a mask, which gives 0 for the other lanes."""
+        assert instr.dest is not None
+        lane = lanes(instr.dest.type)
+        p, size = lane.p, lane.size
+        line, column = self.span_args(instr.span)
+        dot = instr.name == "dot"
+        if dot:
+            self.call_c("ella_check_same_shape", instr.args[0], instr.args[1], self.c_string("dot"), line, column)
+            self.load("rdi", instr.args[1])
+            self.emit("mov rdi, qword ptr [rdi + 16]")
+        self.load("rsi", instr.args[0])
+        self.emit("mov rcx, qword ptr [rsi]   # how many items")
+        self.emit("mov rsi, qword ptr [rsi + 16]   # where they are")
+        for q in range(4):
+            self.emit(f"vxor{p} ymm{q}, ymm{q}, ymm{q}")
+        self.emit("xor r9d, r9d")
+
+        def add(sums: int, load: str, offset: int = 0) -> None:
+            """Add the items (or products) at r9 + offset bytes to ymm `sums`, loaded by `load` into ymm4."""
+            items = f"ymmword ptr [rsi + {size} * r9 + {offset}]"
+            others = f"ymmword ptr [rdi + {size} * r9 + {offset}]"
+            if load == "masked":
+                self.emit(f"vmaskmov{p} ymm4, ymm6, {items}")
+                if dot:
+                    self.emit(f"vmaskmov{p} ymm5, ymm6, {others}")
+                    self.emit(f"vfmadd231{p} ymm{sums}, ymm4, ymm5")
+                else:
+                    self.emit(f"vadd{p} ymm{sums}, ymm{sums}, ymm4")
+            elif dot:
+                self.emit(f"vmovu{p} ymm4, {items}")
+                self.emit(f"vfmadd231{p} ymm{sums}, ymm4, {others}")
+            else:
+                self.emit(f"vadd{p} ymm{sums}, ymm{sums}, {items}")
+
+        loop16, test16, loop4, test4 = (self.label(hint) for hint in ("loop16", "test16", "loop4", "test4"))
+        self.emit("mov r10, rcx")
+        self.emit(f"and r10, {-4 * lane.count}")
+        self.emit(f"jmp {test16}")
+        self.text.append(f"{loop16}:")
+        for q in range(4):
+            add(q, "plain", 32 * q)
+        self.emit(f"add r9, {4 * lane.count}")
+        self.text.append(f"{test16}:")
+        self.emit("cmp r9, r10")
+        self.emit(f"jb {loop16}")
+        self.emit("mov r10, rcx")
+        self.emit(f"and r10, {-lane.count}")
+        self.emit(f"jmp {test4}")
+        self.text.append(f"{loop4}:")
+        add(0, "plain")
+        self.emit(f"add r9, {lane.count}")
+        self.text.append(f"{test4}:")
+        self.emit("cmp r9, r10")
+        self.emit(f"jb {loop4}")
+        self.emit("sub rcx, r10   # the last few items")
+        self.emit("shl rcx, 5")
+        self.emit(f"lea rax, [rip + {lane.masks}]")
+        self.emit("vmovdqa ymm6, ymmword ptr [rax + rcx]")
+        add(1, "masked")
+        self.emit(f"vadd{p} ymm0, ymm0, ymm1")
+        self.emit(f"vadd{p} ymm2, ymm2, ymm3")
+        self.emit(f"vadd{p} ymm0, ymm0, ymm2")
+        self.sum_vector(lane, "ymm0")
+        self.store(instr.dest)
+
     def divide(self, instr: Instr) -> None:
         """`//` and `%` on i64s, rounding toward negative infinity (so a remainder has the sign of the divisor).
 
@@ -1530,18 +1898,25 @@ class CodeGen:
     def comparison(self, instr: Instr) -> None:
         op, (a, b), dest = instr.op, instr.args, instr.dest
         match a.type:
-            case PrimTy("i64" | "bool" | "()"):
+            case PrimTy("i64" | "i32" | "bool" | "()"):
                 self.load("rax", a)
                 self.emit(f"cmp rax, {self.slots[b.id]}")
                 self.emit(f"{SETCC[op]} al")
-            case PrimTy("f64"):
+            case PrimTy("f64" | "f32"):
                 # `ucomisd` compares floats. It reports NaN as "unordered",
                 # which the `seta`/`setae` used here treat as false. For `<`
                 # and `<=`, compare the other way round.
                 if op in ("lt", "le"):
                     a, b = b, a
-                self.load_xmm("xmm0", a)
-                self.emit(f"ucomisd xmm0, {self.xmm_operand(b)}")
+                if a.type == F32:  # an f32 is in the low 32 bits of its word
+                    self.load("rax", a)
+                    self.load("rcx", b)
+                    self.emit("movd xmm0, eax")
+                    self.emit("movd xmm1, ecx")
+                    self.emit("ucomiss xmm0, xmm1")
+                else:
+                    self.load_xmm("xmm0", a)
+                    self.emit(f"ucomisd xmm0, {self.xmm_operand(b)}")
                 match op:
                     case "eq":
                         self.emit("sete al")

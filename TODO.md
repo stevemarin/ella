@@ -19,7 +19,7 @@ and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
 and iterators, then direct calls, inlining and register allocation, then
 stack traces, errors with causes and locations, and `main` giving a
-`Result`, then sets and more of the standard library, then packages, then arrays with SIMD). `make check` passes (1340 tests, ruff, strict mypy).
+`Result`, then sets and more of the standard library, then packages, then arrays with SIMD, then f32, i32, broadcasting, slices and more fusion). `make check` passes (1375 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -89,8 +89,8 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   use; only top-level generic functions can be used at several.
 - `print` and `eprint` as values take one argument, not any number.
 - Generic functions must be top-level; there are no generic lambdas.
-- Only `i64`, `f64`, `bool` and `str` (and `Array[T]` of the numbers).
-  Narrower integers, `f32` and fixed-size SIMD vectors aren't designed yet.
+- The numbers are `i64`, `i32`, `f64` and `f32` (and `Array[T]` of them);
+  no `i8`, `i16` or fixed-size SIMD vector types, and no f32 literals.
 - No negative indexing (deliberate for now).
 - The warning for cases that never match doesn't compare ranges with
   literals or each other (`case 1` after `case 0..5` isn't reported), and
@@ -328,7 +328,33 @@ Small steps that build on the above:
 1. Take a top-level function's missing types from its `let`'s declared
    type: `let inc: (i64) -> i64 = (x) => x + 1`.
 2. A way for generic code to make the zero of a `Num` type, so that
-   `sum(xs)` needs no start value.
+   `sum(xs)` needs no start value. The plan:
+   - Put it in `Num`, not `Add`. `Add` is met by arrays, whose zero
+     depends on a shape the type doesn't know, and by any type with an
+     `add` method, which would all have to give a zero too (and those
+     that meet `Add` today would stop). Only the four number types meet
+     `Num`, so each has an obvious zero and no code changes.
+   - A library function `zero[T: Num]() -> T`, with `T` from where the
+     result goes (`let mut total: T = zero()`): the checker already infers
+     a type argument from the result alone. Nothing deciding it
+     (`print(zero())`) is an error. Each use is specialized, so the
+     lowering and backends need nothing new.
+   - `sum` can't be both: there is no overloading, and `sum(xs, start)` is
+     used on strings, lists, arrays and structs with `add` (prelude,
+     constraints and methods test programs). Either `sum(xs)` takes only
+     numbers (strings use `join`, lists `flatten`, the rest `fold`), the
+     cleaner way, or the version without a start value gets another name.
+   - Not a new `Zero` constraint yet: for user types to meet it they'd need
+     a method called on the type, not on a value (`zero: () -> Self`),
+     which constraints can't have. With that (and constraints requiring
+     others, an open question in docs/grammar.md), `Num` could require
+     `Zero`.
+   - One function for lists and arrays (and ranges, generators, `iter`
+     types) needs a constraint with an item type:
+     `let sum[C: Iter[T], T: Num] = (xs: C) -> T`. Only the checker would
+     change (working out `T` from `C`); `for` already compiles for each
+     concrete type. `map`, `any`, `all` and `fold` could then take any of
+     them. Arrays keep `total`, which fuses and runs as AVX2 loops.
 3. Warnings for unused methods, enum variants and top-level variables.
 
 ### Done (2026-11-03): arrays and SIMD
@@ -355,7 +381,7 @@ Small steps that build on the above:
    On 1,000-item arrays, `c = a * 2.0 + b - c` with `dot` runs 26× faster
    than the same loop over lists; on 1,000,000 items, where memory is the
    limit, 5.7×.
-5. A `fuse` pass (last in the pipeline) makes arithmetic on arrays in a row
+4. A `fuse` pass (last in the pipeline) makes arithmetic on arrays in a row
    one `fused` instruction: `a * 2.0 + b - c` is one loop that reads a, b
    and c once and makes no arrays in between, with masked loads and stores
    for the last n % 4 items. Up to 6 steps, 4 arrays and 3 numbers (the
@@ -363,16 +389,54 @@ Small steps that build on the above:
    between it and the next, so errors still come in order, and the runtime
    finds the error by doing the steps one by one. The 1,000,000-item loop
    went from 0.47 s to 0.20 s, the `arrays` benchmark from 18 ms to 7 ms.
-4. DCE no longer removes an unused `div` of arrays, which can fail, and
+5. DCE no longer removes an unused `div` of arrays, which can fail, and
    a top-level definition that fails still hides a library function of the
    same name from later lines (only the error collection for editors saw
    the difference).
 
-Still open: fusing `total` and `dot` with the arithmetic before them, and
-across statements (`let t = a * 2.0` then `t + b`, if t isn't used again,
-already fuses; through a variable that is, it doesn't), no broadcasting
-between shapes, no slices of arrays, no `f32` or narrower items, and i64
-`*` has no vector code (AVX2 lacks a 64-bit multiply).
+### Done (2026-11-03, second round): faster, wider arrays
+
+1. Float results of arrays may now differ in their last bits between
+   backends (docs/grammar.md §9, "Arrays"): native code uses fused
+   multiply-adds (FMA) in fused loops (`a * b + c` is one `vfmadd231pd`),
+   `dot` and `matmul`, and adds `total` and `dot` in sixteen sums at once
+   (four vectors, so additions don't wait for each other). The interpreters
+   stay the reference; i64 results and every error are still exactly the
+   same everywhere. Programs that need agreement in every bit avoid
+   inexact values in tests; the native fuzz tests compare floats with a
+   tolerance.
+2. `matmul` keeps a 4×8 block of the result in registers (FMA, each row of
+   b loaded once for four rows): 20 products of 300×300 matrices take 0.07 s.
+3. Fusion goes further: `total(...)` and (on floats) `dot(...)` end a fused
+   loop, which adds as it goes and makes no array; a value used twice
+   inside a group (`dot(d, d)`) joins it; and a value that later code also
+   needs is *kept*: the loop writes it too, as an extra result of the
+   `fused` instruction (`outs`), in its own region. Groups are formed
+   without keeping first, then take in operations that would be left on
+   their own: keeping greedily split a simulation's loop in two, with an
+   array in between, and made it 1.7× slower.
+4. Broadcasting, as in NumPy: arrays whose shapes line up from the right
+   with sizes equal or 1 combine (`m + row`, `m * column`); natively a
+   strided loop in the runtime (`ella_array_done`), and fused groups fall
+   back to doing their steps one by one.
+5. Slices: `a[1..3]`, `m[0, 1..3]`, `m[1..3]` (the last dimensions left
+   out are whole); a new array (`array_slice`).
+6. `f32` and `i32`: numbers of 32 bits (`to_f32`, `to_i32`; `to_f64` and
+   `to_i64` take any number), with arithmetic rounded to f32 or trapping at
+   32 bits, and `Array[f32]` and `Array[i32]`, whose items take 4 bytes (an
+   array records its item kind): eight to an AVX2 vector, so f32 array
+   arithmetic runs about twice as fast as f64's. f32 prints with the fewest
+   digits that give it back (`0.1`). i32 arrays use AVX2 for `+` and `-`
+   (overflow checked in 32-bit lanes); their `*`, `total`, `dot` and
+   `matmul` are checked scalar code, and they aren't fused.
+7. The 1,000,000-item loop is now 5.5× faster than over lists (0.22 s);
+   the 1,000-item one about 18× (0.06 s).
+
+Still open: `i8` and `i16`; fusing `i32` arithmetic and i64 `*` (AVX2 has
+no multiply that notices overflow); broadcasting inside the fused loop
+itself (shapes that differ take the step-by-step path); slices that are
+views rather than copies, and assigning to slices; f32 literals (`to_f32`
+is the only way to write one).
 
 ### Done (2026-11-02, tenth round): a bigger standard library
 
@@ -578,9 +642,9 @@ out of range, which wins back the extra load.
 
 ### 6. SIMD and narrower number types
 
-`Array[T]` is done (see "arrays and SIMD" above). Next: `i8`–`i32` and
-`f32` (and arrays of them, eight `f32`s per AVX2 vector), fixed-size vector
-types (`f32x4`, ...), and fusing reductions into the loops before them.
+`Array[T]`, `f32` and `i32` are done (see "arrays and SIMD" above). Next:
+`i8` and `i16`, fixed-size vector types (`f32x4`, ...), and AVX-512 where
+the CPU has it.
 
 ### 7. Native staging
 

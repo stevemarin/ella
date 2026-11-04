@@ -138,8 +138,11 @@ plain:
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly. Arrays
   (`ArrayValue` in values.py; `Array[T]` in the checker, `array_item`) work
-  item by item here, and their library functions are in library.py;
-  `total` and `dot` add in four sums (`lane_sum`), the order AVX2 code uses.
+  item by item here (broadcasting shapes, and slices), and their library
+  functions are in library.py; `total` and `dot` add in four sums
+  (`lane_sum`). Float results of arrays may differ in their last bits
+  natively (FMA, other orders: docs/grammar.md §9); i64 and i32 ones and
+  errors may not. `f32` and `i32` values are `F32` and `I32` (values.py).
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
   the reference for the language's behavior. It copies eagerly, passes
   `mut` arguments in and out (value-result), and finalizes values through
@@ -185,9 +188,10 @@ plain:
   functions into `call_direct`; `inline` copies small non-recursive
   functions into their callers (bottom up), their levels going above the
   caller's, with `enter`/`leave` so the call still counts toward the depth
-  limit. `fuse` (last) makes arithmetic on arrays in a row one `fused`
-  instruction, one AVX2 loop natively, whose errors the runtime finds by
-  doing its steps one by one.
+  limit. `fuse` (last) makes arithmetic on arrays in a row (maybe ending in
+  `total` or `dot`) one `fused` instruction, one AVX2 loop natively (with
+  FMA), whose errors the runtime finds by doing its steps one by one; a
+  step whose array later code needs is kept (an extra result, `outs`).
 * `src/ella/regalloc.py`: register allocation for codegen: liveness, then
   greedy coloring in dominator-tree order (the IR is SSA); a value with no
   free register spills to a stack slot. Values live across a call (`calls`,

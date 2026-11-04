@@ -41,6 +41,26 @@ def assert_same_as_interpreter(source: str) -> None:
     assert outcome(run_native, source) == outcome(run_ir, source)
 
 
+FLOAT = re.compile(r"-?(?:\d+\.\d*(?:e[+-]?\d+)?|\d+e[+-]?\d+|inf|nan)")
+
+
+def assert_close_to_interpreter(source: str, tolerance: float = 1e-9) -> None:
+    """Native f64 results of arrays may differ in their last bits (fused multiply-adds, other orders of adding:
+    docs/grammar.md §9). Everything else must be the same: the text around the floats, i64s, errors, and
+    infinities and NaNs; finite floats must agree to `tolerance` of the largest in the output (f32s are only good to
+    about 1e-7)."""
+    (native, native_error), (expected, error) = outcome(run_native, source), outcome(run_ir, source)
+    assert native_error == error
+    assert FLOAT.split(native) == FLOAT.split(expected), native
+    found, wanted = [float(x) for x in FLOAT.findall(native)], [float(x) for x in FLOAT.findall(expected)]
+    scale = max((abs(x) for x in wanted if math.isfinite(x)), default=1.0)
+    for x, y in zip(found, wanted, strict=True):
+        if math.isfinite(y):
+            assert math.isclose(x, y, rel_tol=tolerance, abs_tol=tolerance * scale), (x, y, native)
+        else:
+            assert repr(x) == repr(y), (x, y, native)
+
+
 def native_lines(source: str) -> list[str]:
     out = io.StringIO()
     run_native(source, out)
@@ -118,7 +138,7 @@ def test_array_arithmetic_on_floats_matches_the_interpreter() -> None:
     big = ", ".join(ella_float(rng.uniform(-1, 1)) for _ in range(5 * 7))
     lines.append(f"let m = reshape(array([{big}]), [5, 7])")
     lines.append("print(matmul(m, transpose(m)), matmul(transpose(m), m))")
-    assert_same_as_interpreter("\n".join(lines))
+    assert_close_to_interpreter("\n".join(lines))
 
 
 def test_array_arithmetic_on_integers_matches_the_interpreter() -> None:
@@ -165,9 +185,23 @@ def test_fused_array_arithmetic_matches_the_interpreter() -> None:
                 expr = random_chain(rng, floats)
                 source = (
                     f"let a = array([{values[0]}])\nlet b = array([{values[1]}])\nlet c = array([{values[2]}])\n"
-                    f"print(a + 0{'.0' if floats else ''} - a, {expr})"
+                    f"print(a + 0{'.0' if floats else ''} - a, {expr}, total({expr}), dot({expr}, a))"
                 )
-                assert_same_as_interpreter(source)
+                (assert_close_to_interpreter if floats else assert_same_as_interpreter)(source)
+
+
+def test_f32_arrays_match_the_interpreter() -> None:
+    # Eight f32s to an AVX2 vector: lengths around 8 and 16 put items in the loops and in the masked rest.
+    rng = random.Random(10)
+    for n in (1, 7, 8, 9, 23):
+        values = [", ".join(f"to_f32({x})" for x in random_floats(rng, n)) for _ in range(3)]
+        for _ in range(3):
+            expr = random_chain(rng, floats=True).replace("2.5", "to_f32(2.5)").replace("(-0.5)", "to_f32(-0.5)")
+            source = (
+                f"let a = array([{values[0]}])\nlet b = array([{values[1]}])\nlet c = array([{values[2]}])\n"
+                f"print({expr}, total({expr}), dot({expr}, a), total(a), dot(b, c), a / b, -c, matmul(reshape(a, [n_rows(a), 1]), reshape(b, [1, len(b)])))"
+            ).replace("n_rows(a)", str(n))
+            assert_close_to_interpreter(source, tolerance=1e-5)
 
 
 def test_avx2_code_is_only_in_programs_with_arrays() -> None:

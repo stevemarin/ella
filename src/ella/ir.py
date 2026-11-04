@@ -128,14 +128,20 @@ Operations
                                  over the array gives i
     array_offset a, i, j, ...    where item (i, j, ...) is in array a's items, checking
                                  that there is an index for each dimension, in range
+    array_slice a, i, r, ... @r  a new array of a's items at the indexes, an i64 or a range
+                                 for each dimension (a range keeps its dimension)
     fused a, b, ... [steps] @r   several of `add`, `sub`, `mul`, `div` and `neg` on arrays
-                                 (and numbers) in a row, as one (made by ella.passes.fuse):
+                                 (and numbers) in a row, as one (made by ella.passes.fuse),
+                                 maybe ending with `total` or `dot` (then giving a number,
+                                 and @r is for arrays the steps one by one would make):
                                  each step works on the operands (a, b, ...: 0, 1, ...)
                                  and the results of earlier steps (s0, s1, ...), and has
                                  the span of the operation it was; the last step's array
                                  is the result. Natively one loop goes over all the items,
                                  with no arrays in between; it gives what the steps one by
-                                 one would give, errors and all
+                                 one would give, errors and all. A step marked `keep`
+                                 gives its array too, as an extra result (`outs`, in its
+                                 region of `out_regions`), for code after it
     slice c, r @r                a view of items r.start up to r.stop of a list or string:
                                  a new header in @r that shares c's items (or characters)
     set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
@@ -184,7 +190,7 @@ Operations
     builtin a, ... @r            a library function (in `name`), such as split(a, b),
                                  whose result is new objects in @r (ella.library), or
                                  for those in VIEWS views of a's characters; abs, min,
-                                 max and the array functions take i64s or f64s (or
+                                 max and the array functions take i64s, f64s or f32s (or
                                  arrays of them), and `array` its result's item type
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
@@ -230,8 +236,10 @@ from typing import Any, assert_never
 from ella.checker import (
     ARENA,
     BOOL,
+    F32,
     F64,
     GENERIC_LIBRARY,
+    I32,
     I64,
     LIBRARY,
     NEVER,
@@ -252,8 +260,10 @@ from ella.checker import (
 )
 from ella.lexer import Span
 from ella.syntax import show_literal
+from ella.values import F32 as F32Value
+from ella.values import I32 as I32Value
 
-# The literal values `const` can hold. Unit is the empty tuple, as at run time.
+# The literal values `const` can hold (an F32Value for an f32). Unit is the empty tuple, as at run time.
 type Constant = int | float | bool | str | tuple[()]
 
 
@@ -270,20 +280,22 @@ class Value:
 
 @dataclass(frozen=True, slots=True)
 class FusedStep:
-    """One step of a `fused` instruction: `op` ("add", "sub", "mul", "div" or "neg") on `left` and `right` (None
-    for `neg`). An operand n >= 0 is the instruction's operand n; -1 - k is the result of step k."""
+    """One step of a `fused` instruction: `op` ("add", "sub", "mul", "div", "neg", or as the last step "total" or
+    "dot") on `left` and `right` (None for `neg` and `total`). An operand n >= 0 is the instruction's operand n;
+    -1 - k is the result of step k."""
 
     op: str
     left: int
     right: int | None
     span: Span
+    kept: bool = False  # its array is also one of the instruction's extra results (`outs`), in order
 
     def __str__(self) -> str:
         def ref(n: int) -> str:
             return str(n) if n >= 0 else f"s{-1 - n}"
 
         operands = ref(self.left) + (f", {ref(self.right)}" if self.right is not None else "")
-        return f"{self.op}({operands})"
+        return ("keep " if self.kept else "") + f"{self.op}({operands})"
 
 
 @dataclass(slots=True)
@@ -455,6 +467,7 @@ ALLOCATING = frozenset(
         "div",
         "neg",
         "fused",
+        "array_slice",
         "index",
         "to_text",
         "copy",
@@ -479,12 +492,15 @@ CHANGING = frozenset({"set_index", "set_field", "append"})
 
 
 def allocates(instr: Instr) -> bool:
-    """Whether an instruction makes a new object, and so names the region to put it in.
+    """Whether an instruction makes a new object, and so names the region to put it in. (A `fused` one always
+    names one: even one that gives a number may make arrays.)
 
     Indexing a list gives an item that is already in the list; indexing a
     string makes a new one-character string. A closure that captures nothing
     is static data, like a string constant.
     """
+    if instr.op == "fused":
+        return True
     if instr.op not in ALLOCATING or instr.dest is None or not is_boxed(instr.dest.type):
         return False
     if instr.op == "closure" and not instr.args:
@@ -502,7 +518,9 @@ def is_boxed(t: Type) -> bool:
     A pool's handle is just a number, a slot and a generation, in one word,
     and so is an arena's ref.
     """
-    return t not in (I64, F64, BOOL, UNIT, NEVER) and not (isinstance(t, BuiltinTy) and t.name in ("Handle", "Ref"))
+    return t not in (I64, I32, F64, F32, BOOL, UNIT, NEVER) and not (
+        isinstance(t, BuiltinTy) and t.name in ("Handle", "Ref")
+    )
 
 
 def region_level(region: str) -> int | None:
@@ -970,7 +988,7 @@ class Verifier:
             "pool_set", "enter", "leave",
         )  # fmt: skip
         self.require((dest is None) == (instr.op in effects), f"{instr.op} has the wrong kind of result", block)
-        calls = ("call", "call_direct")
+        calls = ("call", "call_direct", "fused")
         self.require(not instr.outs or instr.op in calls, f"{instr.op} can't have extra results", block)
         self.check_region(instr, block)
 
@@ -999,19 +1017,25 @@ class Verifier:
                     and is_array(dest)
                     and all(a in (dest, item_type(dest)) for a in args)
                 )
-                need(instr.op != "div" or dest == BuiltinTy("Array", (F64,)))
+                need(instr.op != "div" or dest in (BuiltinTy("Array", (F64,)), BuiltinTy("Array", (F32,))))
             case "add":
                 need(
-                    len(args) == 2 and args[0] == args[1] == dest and kind(args[0]) in ("i64", "f64", "str", "ListTy")
+                    len(args) == 2
+                    and args[0] == args[1] == dest
+                    and kind(args[0]) in ("i64", "i32", "f64", "f32", "str", "ListTy")
                 )
             case "sub" | "mul" | "pow":
-                need(len(args) == 2 and args[0] == args[1] == dest and dest in (I64, F64))
+                need(len(args) == 2 and args[0] == args[1] == dest and dest in (I64, I32, F64, F32))
             case "div":
-                need(len(args) == 2 and args[0] == args[1] and args[0] in (I64, F64) and dest == F64)
-            case "floordiv" | "mod" | "bitand" | "bitor" | "bitxor" | "shl" | "shr":
+                # i64s divide as f64s; f32s give an f32.
+                need(len(args) == 2 and args[0] == args[1] and dest == (F32 if args[0] == F32 else F64))
+                need(args[0] in (I64, I32, F64, F32))
+            case "floordiv" | "mod":
+                need(len(args) == 2 and args[0] == args[1] == dest and dest in (I64, I32))
+            case "bitand" | "bitor" | "bitxor" | "shl" | "shr":
                 need(args == [I64, I64] and dest == I64)
             case "neg":
-                need(dest is not None and args == [dest] and (dest in (I64, F64) or is_array(dest)))
+                need(dest is not None and args == [dest] and (dest in (I64, I32, F64, F32) or is_array(dest)))
             case "bitnot":
                 need(args == [I64] and dest == I64)
             case "not":
@@ -1021,7 +1045,7 @@ class Verifier:
                 types = all(isinstance(a, BuiltinTy) and a.name == "Type" for a in args)
                 need(len(args) == 2 and (args[0] == args[1] or types) and dest == BOOL)
             case "lt" | "le" | "gt" | "ge":
-                need(len(args) == 2 and args[0] == args[1] and args[0] in (I64, F64, STR) and dest == BOOL)
+                need(len(args) == 2 and args[0] == args[1] and args[0] in (I64, I32, F64, F32, STR) and dest == BOOL)
             case "contains":
                 need(len(args) == 2 and dest == BOOL and args[0] == item_type(args[1]))
             case "range" | "range_incl":
@@ -1036,15 +1060,30 @@ class Verifier:
                 need(len(args) == 2 and args[1] == I64 and dest == item_type(args[0]))
             case "array_offset":
                 need(len(args) >= 2 and is_array(args[0]) and all(a == I64 for a in args[1:]) and dest == I64)
+            case "array_slice":
+                need(
+                    len(args) >= 2
+                    and is_array(args[0])
+                    and dest == args[0]
+                    and all(a in (I64, RANGE) for a in args[1:])
+                )
             case "fused":
-                need(dest is not None and is_array(dest) and bool(instr.steps))
-                if dest is not None and is_array(dest):
-                    need(all(a in (dest, item_type(dest)) for a in args) and dest in args)
+                summed = bool(instr.steps) and instr.steps[-1].op in ("total", "dot")
+                array = BuiltinTy("Array", (dest,)) if summed and dest is not None else dest
+                need(array is not None and is_array(array) and bool(instr.steps))
+                if array is not None and is_array(array):
+                    need(all(a in (array, item_type(array)) for a in args) and array in args)
+                kept = [step for step in instr.steps if step.kept]
+                need(len(kept) == len(instr.outs) == len(instr.out_regions) and not instr.steps[-1].kept)
+                need(all(out.type == array for out in instr.outs))
+                for region in instr.out_regions:
+                    self.require(self.valid_region(region, "fused"), f"unknown region @{region}", block)
                 for k, step in enumerate(instr.steps):
                     refs = [step.left] if step.right is None else [step.left, step.right]
-                    need(step.op in ("add", "sub", "mul", "div", "neg") and (step.right is None) == (step.op == "neg"))
+                    ops = ("add", "sub", "mul", "div", "neg") + (("total", "dot") if k == len(instr.steps) - 1 else ())
+                    need(step.op in ops and (step.right is None) == (step.op in ("neg", "total")))
                     need(all(-k <= ref < len(args) for ref in refs))
-                    need(step.op != "div" or dest == BuiltinTy("Array", (F64,)))
+                    need(step.op != "div" or array in (BuiltinTy("Array", (F64,)), BuiltinTy("Array", (F32,))))
             case "slice":
                 need(
                     len(args) == 2
@@ -1206,8 +1245,12 @@ def constant_type(const: Constant) -> Type:
     match const:
         case bool():  # before int, since bool is a subclass of int
             return BOOL
+        case I32Value():
+            return I32
         case int():
             return I64
+        case F32Value():
+            return F32
         case float():
             return F64
         case str():

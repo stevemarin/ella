@@ -43,6 +43,7 @@ from ella.checker import (
     check_code,
     finish,
     pattern_names,
+    show_type,
 )
 from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.library import Exit, Host, hash_value
@@ -117,6 +118,7 @@ from ella.syntax import (
     mentions_return,
 )
 from ella.values import (
+    F32,
     MAX_CALL_DEPTH,
     UNIT,
     ArenaValue,
@@ -449,7 +451,11 @@ class Interpreter:
             case Binary("or", left, right):
                 return self.eval_bool(left, scope, "'or'") or self.eval_bool(right, scope, "'or'")
             case Binary(op, left, right, span):
-                return self.binary(op, self.eval(left, scope), self.eval(right, scope), span)
+                a, b = self.eval(left, scope), self.eval(right, scope)
+                if op == "/" and isinstance(a, F32) and self.checker and finish(self.checker.types[id(expr)]) == F64:
+                    assert isinstance(b, F32)
+                    a, b = float(a), float(b)  # `/` on a type parameter gives an f64 (as ella.lower does it)
+                return self.binary(op, a, b, span)
             case Compare(first, rest, span):
                 # `a < b <= c` evaluates each operand once, stopping at the
                 # first comparison that is false.
@@ -1556,12 +1562,12 @@ class Interpreter:
     def make_array(self, call: Call, items: Value, span: Span) -> Value:
         """`array(xs)`, whose item type the checker knows (an empty list can't show it)."""
         t = self.checker.types.get(id(call)) if self.checker is not None else None
-        floats = (
-            array_item(finish(t)) == F64
-            if t is not None
-            else isinstance(items, list) and any(isinstance(item, float) for item in items)
-        )
-        return call_library("array", [items, "f64" if floats else "i64"], span, self.host)
+        item = array_item(finish(t)) if t is not None else None
+        if item is not None:
+            name = show_type(item)
+        else:
+            name = type_name(items[0]) if isinstance(items, list) and items else "i64"
+        return call_library("array", [items, name], span, self.host)
 
     def builtin_len(self, args: list[Value], span: Span) -> Value:
         """`len(x)` is the length of a list, string or range, or how many values a pool or arena holds."""

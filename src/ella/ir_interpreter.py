@@ -100,7 +100,7 @@ from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, 
 from ella.library import FNV_OFFSET, Exit, Host, fnv, hash_bits
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
-from ella.operators import array_offset, binary, compare, contains, index_into, slice_of, unary
+from ella.operators import array_offset, array_slice, binary, compare, contains, index_into, slice_of, unary
 from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
 from ella.syntax import Expr, Name, bare_name
 from ella.values import (
@@ -741,12 +741,30 @@ class IRInterpreter:
                 results: list[Value] = []
                 for step in instr.steps:
                     left = args[step.left] if step.left >= 0 else results[-1 - step.left]
-                    if step.right is None:
+                    right = (
+                        None
+                        if step.right is None
+                        else args[step.right]
+                        if step.right >= 0
+                        else results[-1 - step.right]
+                    )
+                    if step.op in ("total", "dot"):
+                        results.append(
+                            call_library(step.op, [left] if right is None else [left, right], step.span, self.host)
+                        )
+                    elif right is None:
                         results.append(unary("-", left, step.span))
                     else:
-                        right = args[step.right] if step.right >= 0 else results[-1 - step.right]
                         results.append(binary(OPERATORS[step.op], left, right, step.span))
                 result = results[-1]
+                kept = [value for step, value in zip(instr.steps, results) if step.kept]
+                for out, region, value in zip(instr.outs, instr.out_regions, kept):  # the arrays code after it needs
+                    frame.values[out.id] = value
+                    frame.tags[out.id] = self.allocate(self.depth_of(region, frame), shallow_size(value), instr, frame)
+            case "array_slice":
+                container = args[0]
+                assert isinstance(container, ArrayValue)
+                result = array_slice(container, tuple(args[1:]) if len(args) > 2 else args[1], span)
             case "array_offset":
                 container = args[0]
                 assert isinstance(container, ArrayValue)
@@ -1094,9 +1112,10 @@ def shallow_size(value: Value) -> int:
             return round16(16 + 8 * len(value))
         case range():
             return 32
-        case ArrayValue(shape, items):
-            # Its length, dimensions and where its items are, its sizes, then its items, at a 32-byte boundary.
-            return round16(24 + 8 * len(shape) + 24 + 8 * len(items))
+        case ArrayValue(shape, items, item):
+            # Its length, dimensions, where its items are and their kind, its sizes, then its items, at a 32-byte
+            # boundary (an f32 takes 4 bytes).
+            return round16(32 + 8 * len(shape) + 24 + (4 if item == "f32" else 8) * len(items))
         case VariantValue(fields=fields):
             return round16(16 + 8 * len(fields))
         case FunctionRef(captured=captured):

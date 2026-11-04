@@ -1,0 +1,8 @@
+# An i32 traps when a result doesn't fit in 32 bits, even where an i64 would hold it,
+# in arrays too: the first item (by position) that overflows.
+let main = () -> () =>
+    let mut a = fill([10], to_i32(1))
+    a[3] = to_i32(2000000000)
+    a[8] = to_i32(2147483647)
+    print(a - a[0], a * to_i32(1))
+    print(a + to_i32(200000000))
