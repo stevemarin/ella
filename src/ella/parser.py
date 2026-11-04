@@ -549,7 +549,14 @@ class Parser:
                 args, _ = self.parse_comma_list(self.parse_arg, ")")
                 return Call(left, tuple(args), token.span)
             case "[":
+                # `a[i, j]` indexes with the tuple `(i, j)`: an array's item, or a key of a type with `get`.
                 index = self.parse_expr()
+                if self.at(","):
+                    indexes = [index]
+                    while self.at(","):
+                        self.advance()
+                        indexes.append(self.parse_expr())
+                    index = TupleLit(tuple(indexes), index.span)
                 self.expect("]")
                 return Index(left, index, token.span)
             case ".":

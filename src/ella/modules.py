@@ -1,9 +1,13 @@
 """Modules and imports: a program's files, linked into one program (docs/grammar.md §3).
 
 A file is a module, named by its path from the *root*, the entry file's
-directory: `geo/poly.ella` is the module `geo.poly`. The standard library's
-modules are files in src/ella/lib, found after the root's; their public
-names are the *prelude*, which every module sees without importing them.
+directory: `geo/poly.ella` is the module `geo.poly`. Imports not found
+from the root are found from each directory of the *package path* in turn
+(`--path` and the ELLA_PATH environment variable, `package_path`), as if
+it were the root: a *package* is a module found there, with the modules
+below it. The standard library's modules are files in src/ella/lib, found
+last; their public names are the *prelude*, which every module sees
+without importing them.
 
 Linking (`link`) loads the modules the entry file uses, directly or not:
 the ones it imports, and the library modules whose prelude names it uses.
@@ -21,7 +25,8 @@ that, every top-level name in the program is made different:
   prelude (`lists.map`). The linker keeps track of local variables, which
   hide top-level names, as the checker does.
 
-Each module's spans have its file (`geo/poly.ella`, `<std>/maps.ella`), so
+Each module's spans have its file (`geo/poly.ella`, `<std>/maps.ella`, and
+a package's module by its path from the root, `../libs/json.ella`), so
 that errors say where they are. A bare name left in a module other than
 the entry file is a built-in (the linker reports any other name it doesn't
 know), so the checker and the interpreter give such code the built-ins
@@ -31,7 +36,8 @@ read-only imported variables are checked; private fields and methods are
 checked by the checker, which knows the types of values.
 """
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cache, partial
 from pathlib import Path
@@ -87,6 +93,9 @@ UNPRELUDED = frozenset({"iters"})
 BUILTIN_NAMES = frozenset({*BUILTINS, *REFLECTION}) | {v for e in BUILTIN_ENUMS.values() for v in e.variants}
 BUILTIN_TYPE_NAMES = frozenset({*PRIMITIVE_NAMES, *BUILTIN_TYPES, *BUILTIN_ENUMS})
 
+# The environment variable with the package path: directories separated by os.pathsep (':').
+PACKAGE_PATH = "ELLA_PATH"
+
 # Reads a module's file: its text, or None if there is no such file.
 type Reader = Callable[[Path], str | None]
 
@@ -95,14 +104,23 @@ def read_file(path: Path) -> str | None:
     return path.read_text(encoding="utf-8") if path.is_file() else None
 
 
-def find_root(path: Path, imports: tuple[Import, ...], top: Path, read: Reader = read_file) -> Path:
+def package_path(given: Sequence[Path] = ()) -> tuple[Path, ...]:
+    """The directories packages are found in: those given (by `--path`), then those of ELLA_PATH."""
+    found = os.environ.get(PACKAGE_PATH, "").split(os.pathsep)
+    return (*given, *(Path(directory) for directory in found if directory))
+
+
+def find_root(
+    path: Path, imports: tuple[Import, ...], top: Path, read: Reader = read_file, packages: Sequence[Path] = ()
+) -> Path:
     """The root of the program a file is part of, for editors, which only know the workspace folder (`top`): of
     the directories from the file's up to `top`, the one its imports are found from (the most of them, the
-    nearest if they tie). An import is found if its module is, or the module its item is from."""
+    nearest if they tie). An import is found if its module is, or the module its item is from, there or in
+    a package."""
 
     def found(root: Path, line: Import) -> bool:
         paths = [line.path, line.path[:-1]] if len(line.path) > 1 else [line.path]
-        files = (root.joinpath(*p).with_suffix(".ella") for p in paths)
+        files = (place.joinpath(*p).with_suffix(".ella") for place in (root, *packages) for p in paths)
         return any(read(file) is not None for file in files) or library_module(line.path[0]) is not None
 
     places = [path.parent, *path.parent.parents]
@@ -151,14 +169,15 @@ class Module:
     body: tuple[Expr, ...] = ()  # its code, linked
 
 
-def link(program: Program, path: Path | None = None) -> Program:
+def link(program: Program, path: Path | None = None, packages: Sequence[Path] | None = None) -> Program:
     """A program (the entry file, at `path` if it has one) linked with the modules it uses. Raises EllaError.
 
-    Its imports are found from the file's directory. Linking a linked program changes nothing.
+    Its imports are found from the file's directory, then from the package path (`packages`, by default
+    `package_path()`). Linking a linked program changes nothing.
     """
     if program.modules:
         return program
-    return Linker(path).link(program)
+    return Linker(path, packages=packages).link(program)
 
 
 def module_name(file: str) -> str:
@@ -236,7 +255,8 @@ class Linker:
     named as the module it is from there. `read` reads files (an editor
     has some open). With `every`, the whole prelude is linked in, used or
     not, to offer its names. With `errors` a list, errors are recorded
-    there rather than raised, and a line with one is left out.
+    there rather than raised, and a line with one is left out. `packages`
+    is the package path (by default `package_path()`).
     """
 
     def __init__(
@@ -246,8 +266,10 @@ class Linker:
         root: Path | None = None,
         every: bool = False,
         errors: list[EllaError] | None = None,
+        packages: Sequence[Path] | None = None,
     ) -> None:
         self.root = root if root is not None else path.parent if path is not None else None
+        self.packages = tuple(packages) if packages is not None else package_path()
         self.entry_name = "main"
         if path is not None:
             inside = self.root is not None and path.is_relative_to(self.root)
@@ -348,7 +370,17 @@ class Linker:
         if name in self.modules:
             self.check_cycle(self.modules[name], span)
             return self.modules[name]
-        text = self.read(self.root.joinpath(*path).with_suffix(".ella")) if self.root is not None else None
+        file = "/".join(path) + ".ella"
+        text = self.read(self.root / file) if self.root is not None else None
+        for package in self.packages if text is None else ():
+            text = self.read(package / file)
+            if text is not None:
+                # Named by its path from the root, as other modules are, so that it can be found from its span.
+                found = package / file
+                file = (
+                    Path(os.path.relpath(found, self.root)).as_posix() if self.root is not None else found.as_posix()
+                )
+                break
         if text is None:
             return self.library(name, span) if len(path) == 1 else None
         shadows = library_module(path[0]) is not None
@@ -356,7 +388,6 @@ class Linker:
             self.warnings.append(
                 EllaError(f"'{name}.ella' has the name of a standard library module, and is used instead of it", span)
             )
-        file = "/".join(path) + ".ella"
         module = Module(name, file, parse(text, file), ("./" if shadows else "") + name + ".")
         self.modules[name] = self.files[file] = module
         self.load(module)

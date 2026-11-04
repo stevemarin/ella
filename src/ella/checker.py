@@ -39,7 +39,7 @@ a function body, ...) then records its error and the check goes on. See
 """
 
 import dataclasses
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
@@ -170,15 +170,25 @@ class EnumTy:
 
 @dataclass(frozen=True, slots=True)
 class BuiltinTy:
-    """A built-in type: `Code[T]`, `Pool[T]`, `Handle[T]`, `Arena`, `Ref[T]`, `Gen[T]` or `Type[T]`."""
+    """A built-in type: `Array[T]`, `Code[T]`, `Pool[T]`, `Handle[T]`, `Arena`, `Ref[T]`, `Gen[T]` or `Type[T]`."""
 
     name: str
     args: tuple[Type, ...]
 
 
 # The built-in types, and how many type arguments each takes.
-BUILTIN_TYPES = {"Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Gen": 1, "Type": 1}
+BUILTIN_TYPES = {"Array": 1, "Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Gen": 1, "Type": 1}
 ARENA = BuiltinTy("Arena", ())
+# An array has at most this many dimensions (MAX_DIMS in runtime.c).
+MAX_DIMS = 32
+
+
+def array_item(t: Type) -> Type | None:
+    """The item type of an `Array[T]`, or None for other types."""
+    match resolve(t):
+        case BuiltinTy("Array", (item,)):
+            return item
+    return None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -524,11 +534,63 @@ LIBRARY: dict[str, FuncTy] = {
     "abs": FuncTy((NUM_T,), NUM_T),
     "min": FuncTy((NUM_T, NUM_T), NUM_T),
     "max": FuncTy((NUM_T, NUM_T), NUM_T),
+    # Arrays (docs/grammar.md §10, "Arrays").
+    "array": FuncTy((ListTy(NUM_T),), BuiltinTy("Array", (NUM_T,))),
+    "fill": FuncTy((ListTy(I64), NUM_T), BuiltinTy("Array", (NUM_T,))),
+    "reshape": FuncTy((BuiltinTy("Array", (NUM_T,)), ListTy(I64)), BuiltinTy("Array", (NUM_T,))),
+    "shape": FuncTy((BuiltinTy("Array", (NUM_T,)),), ListTy(I64)),
+    "flat": FuncTy((BuiltinTy("Array", (NUM_T,)),), ListTy(NUM_T)),
+    "total": FuncTy((BuiltinTy("Array", (NUM_T,)),), NUM_T),
+    "dot": FuncTy((BuiltinTy("Array", (NUM_T,)), BuiltinTy("Array", (NUM_T,))), NUM_T),
+    "matmul": FuncTy((BuiltinTy("Array", (NUM_T,)), BuiltinTy("Array", (NUM_T,))), BuiltinTy("Array", (NUM_T,))),
+    "transpose": FuncTy((BuiltinTy("Array", (NUM_T,)),), BuiltinTy("Array", (NUM_T,))),
 }
+
+
+def mentions(t: Type, part: Type) -> bool:
+    """Whether a type is, or holds, `part`: `Array[T]` mentions T."""
+    match t:
+        case ListTy(element):
+            return mentions(element, part)
+        case TupleTy(items) | BuiltinTy(args=items) | EnumTy(args=items):
+            return any(mentions(item, part) for item in items)
+        case FuncTy(params, result):
+            return any(mentions(p, part) for p in params) or mentions(result, part)
+    return t == part
+
+
 # The generic library functions, with the constraint on their T.
 GENERIC_LIBRARY = {
-    name: "Num" if NUM_T in t.params else "Eq" for name, t in LIBRARY.items() if NUM_T in t.params or EQ_T in t.params
+    name: "Num" if mentions(t, NUM_T) else "Eq"
+    for name, t in LIBRARY.items()
+    if mentions(t, NUM_T) or mentions(t, EQ_T)
 }
+
+
+def library_param(name: str, args: Sequence[Type]) -> Type:
+    """The type a generic library function's T stands for, from the types of its arguments.
+
+    T is wherever it first appears in the parameters: `total(a)` with `a` an
+    `Array[f64]` has T = f64, `fill(shape, x)` has the type of x.
+    """
+
+    def find(pattern: Type, actual: Type) -> Type | None:
+        actual = resolve(actual)
+        match pattern, actual:
+            case ParamTy("T"), _:
+                return actual
+            case ListTy(p), ListTy(a):
+                return find(p, a)
+            case BuiltinTy(_, ps), BuiltinTy(_, items):
+                return next((found for p, a in zip(ps, items) if (found := find(p, a)) is not None), None)
+        return None
+
+    for pattern, actual in zip(LIBRARY[name].params, args):
+        if (found := find(pattern, actual)) is not None:
+            return found
+    raise AssertionError(f"no T for {name}{tuple(args)}")
+
+
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
 BUILTINS = ("print", "eprint", "len", "run", "next", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
@@ -885,7 +947,11 @@ class Checker:
                     raise EllaError(
                         f"{name} takes {count} type argument{'' if count == 1 else 's'}, not {len(args)}", span
                     )
-                return BuiltinTy(name, tuple(self.annotation(arg, params) for arg in args))
+                t = BuiltinTy(name, tuple(self.annotation(arg, params) for arg in args))
+                item = array_item(t)
+                if item is not None and not isinstance(item, ParamTy | TyVar | DeferredTy) and item not in (I64, F64):
+                    raise EllaError(f"an Array's items must be i64 or f64, not {show_type(item)}", span)
+                return t
             case NamedType(name, _, span):
                 raise EllaError(f"unknown type '{name}'", span)
             case ListType(element):
@@ -1224,17 +1290,18 @@ class Checker:
             return self.fresh()
 
     def bind_unknown(self, line: Expr, env: Env) -> None:
-        """After an error in a `let`, give the names it binds unknown types (at the top level, unless bound already)."""
+        """After an error in a `let`, give the names it binds unknown types (at the top level, unless the program
+        bound them already: a built-in's name still means the program's)."""
         top = env is self.globals
         match line:
             case Let(bindings):
                 for binding in bindings:
-                    if not (top and binding.name in env.vars):
+                    if not (top and binding.name in env.vars and env.vars[binding.name].kind != "builtin"):
                         self.bind_name(env, binding.name, self.fresh(), binding.mutable, binding.span, binding)
             case LetPattern(pattern, mutable=mutable):
                 for node in pattern_names(pattern):
                     info = env.lookup(node.name)
-                    if not (info is not None and (top or info.kind == "variant")):
+                    if not (info is not None and info.kind != "builtin" and (top or info.kind == "variant")):
                         self.bind_name(env, node.name, self.fresh(), mutable or node.mutable, node.span, node)
 
     def finish_checks(self) -> None:
@@ -1408,6 +1475,9 @@ class Checker:
                 self.kinds[id(expr)] = info.kind
                 self.resolved[id(expr)] = info
                 match info.kind:
+                    case "builtin" if name == "array":
+                        # The interpreter needs the item type of each call (ella.library), so a call of a lambda.
+                        return self.wrap(expr, 1, env)
                     case "builtin" if name in LIBRARY and name not in NOT_VALUES:
                         return self.library_type(name, span)
                     case "builtin" if name in WRAPPED:
@@ -1517,7 +1587,9 @@ class Checker:
                     self.require_constraint(param, "Num" if op == "-" else None, op, span)
                     return t
                 kind = describe_kind(self.known(t, operand.span))
-                if (op == "-" and kind in ("i64", "f64", "?")) or (op == "~" and kind in ("i64", "?")):
+                if (op == "-" and kind in ("i64", "f64", "Array", "?")) or (op == "~" and kind in ("i64", "?")):
+                    if isinstance(param := resolve(array_item(t) or I64), ParamTy):
+                        self.require_constraint(param, "Num", op, span)
                     return t
                 raise EllaError(f"'{op}' doesn't work on {show_type(t)}", span)
             case Binary(("and" | "or") as op, left, right):
@@ -1543,6 +1615,9 @@ class Checker:
                     return getter.result
                 if isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     return self.handle_item(container, index_type, index.span)
+                if (array_of := array_item(container)) is not None:
+                    self.array_index(index_type, index.span)
+                    return array_of
                 if resolve(index_type) == RANGE and (isinstance(container, ListTy) or container == STR):
                     return container  # a slice: `xs[1..3]`
                 if not self.unify(index_type, I64):
@@ -1780,6 +1855,8 @@ class Checker:
         if op in OPERATOR_METHODS and (method := self.operator_method(a, OPERATOR_METHODS[op], span)) is not None:
             self.expect(b, method.params[1], span, f"the right side of '{op}'")
             return method.result
+        if array_item(a) is not None or array_item(b) is not None:
+            return self.array_operation(op, a, b, span)
         if not self.unify(a, b):
             raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
         if isinstance(resolve(a), DeferredTy) or isinstance(resolve(b), DeferredTy):
@@ -1805,6 +1882,50 @@ class Checker:
         if op in ("..", "..="):
             return RANGE
         return a
+
+    def array_operation(self, op: str, a: Type, b: Type, span: Span) -> Type:
+        """An operator on arrays, item by item: two arrays of the same type, or an array and a number of its items' type.
+
+        `+`, `-` and `*` work on both kinds of arrays, `/` on `Array[f64]` only.
+        """
+        array = resolve(a) if array_item(a) is not None else resolve(b)
+        item = array_item(array)
+        assert item is not None
+        if op not in ("+", "-", "*", "/"):
+            raise EllaError(f"'{op}' doesn't work on {show_type(array)}", span)
+        other = b if array is resolve(a) else a
+        if array_item(other) is not None:
+            if not self.unify(a, b):
+                raise EllaError(
+                    f"'{op}' needs two arrays of the same type, not {show_type(a)} and {show_type(b)}", span
+                )
+        elif not self.unify(other, item):
+            raise EllaError(
+                f"'{op}' on an array needs another array or a number of its items' type, "
+                f"not {show_type(a)} and {show_type(b)}",
+                span,
+            )
+        if isinstance(param := resolve(item), ParamTy):
+            self.require_constraint(param, "Num", op, span)
+            if op == "/":
+                raise EllaError(f"'/' works on Array[f64] only, not {show_type(array)}", span)
+        elif op == "/" and not self.unify(item, F64):
+            raise EllaError(f"'/' works on Array[f64] only, not {show_type(array)}; use '*' or '//' on i64s", span)
+        return array
+
+    def array_index(self, index_type: Type, span: Span) -> None:
+        """An array's index: an i64 for each dimension, `a[i]` or `a[i, j]` (or a tuple of them, `a[t]`)."""
+        t = resolve(index_type)
+        if isinstance(t, TupleTy) and t.items:
+            if len(t.items) > MAX_DIMS:
+                raise EllaError(
+                    f"an array has at most {MAX_DIMS} dimensions, so it can't take {len(t.items)} indexes", span
+                )
+            if all(self.unify(item, I64) for item in t.items):
+                return
+        elif self.unify(t, I64):
+            return
+        raise EllaError(f"an array's index must be an i64, or a tuple of them, not {show_type(index_type)}", span)
 
     def compare_type(self, op: str, a: Type, b: Type, span: Span) -> None:
         """Check one comparison of a chain. Comparisons always give a bool."""
@@ -1910,6 +2031,9 @@ class Checker:
                     t = setter.params[2]
                 elif isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     t = self.handle_item(container, index_type, index.span)
+                elif (item := array_item(container)) is not None:
+                    self.array_index(index_type, index.span)
+                    t = item
                 else:
                     if resolve(index_type) == RANGE:
                         raise EllaError(f"can't {verb} a slice; change the items one by one", span)
@@ -2398,9 +2522,9 @@ class Checker:
             if method is not None:
                 self.expect(method, FuncTy((arg_type,), I64), args[0].span, "its len method")
                 return I64
-            if describe_kind(arg_type) not in ("list", "str", "range", "Pool", "Arena", "?"):
+            if describe_kind(arg_type) not in ("list", "str", "range", "Array", "Pool", "Arena", "?"):
                 raise EllaError(
-                    f"len() needs a list, str, range, Pool or Arena, not {show_type(arg_type)}", args[0].span
+                    f"len() needs a list, str, range, Array, Pool or Arena, not {show_type(arg_type)}", args[0].span
                 )
             return I64
         return UNIT
@@ -2508,7 +2632,7 @@ class Checker:
         match t:
             case DeferredTy():
                 return DEFERRED
-            case ListTy(element):
+            case ListTy(element) | BuiltinTy("Array", (element,)):
                 return element
             case PrimTy("str"):
                 return STR
@@ -2738,7 +2862,8 @@ def any_part(
 
 
 def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
-    """Whether values of type `t` hold anything Ella can change in place: a list, a struct with fields, a pool, an arena.
+    """Whether values of type `t` hold anything Ella can change in place: a list, an array, a struct with fields, a pool,
+    an arena.
 
     Values without such parts can be shared freely: nothing can change them.
     `enums` gives the definitions of enum and struct types (the built-in
@@ -2748,7 +2873,7 @@ def has_mutable(t: Type, enums: dict[str, EnumInfo] | None = None) -> bool:
 
     def changes(t: Type) -> bool:
         match t:
-            case ListTy() | BuiltinTy("Pool" | "Arena" | "Gen"):
+            case ListTy() | BuiltinTy("Array" | "Pool" | "Arena" | "Gen"):
                 return True
             case EnumTy(name) if name in enums:
                 return enums[name].struct and bool(enums[name].field_names)
@@ -3052,7 +3177,7 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
             if isinstance(t, EnumTy) and "add" in enums[t.name].methods:
                 info = enums[t.name]
                 return finish(substitute(info.methods["add"], dict(zip(info.params, t.args)))) == FuncTy((t, t), t)
-            return t in (I64, F64, STR) or isinstance(t, ListTy)
+            return t in (I64, F64, STR) or isinstance(t, ListTy) or array_item(t) is not None
         case "Num":
             return t in (I64, F64)
         case _:  # user-defined constraints are checked by Checker.unmet

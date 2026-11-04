@@ -21,8 +21,9 @@ from dataclasses import dataclass, field
 from typing import BinaryIO, TextIO
 
 from ella.lexer import EllaError, Span
+from ella.operators import binary, shape_text
 from ella.syntax import bare_name
-from ella.values import HandleValue, RefValue, Value, VariantValue, fits_i64, make_error, to_text
+from ella.values import ArrayValue, HandleValue, RefValue, Value, VariantValue, fits_i64, make_error, to_text
 
 MAX_CODE_POINT = 0x10FFFF
 SURROGATES = range(0xD800, 0xE000)  # code points that aren't characters, and can't be written in UTF-8
@@ -41,6 +42,9 @@ F64_FUNCTIONS: dict[str, Callable[[float], float]] = {
     "log2": math.log2,
 }
 MAX_DIGITS = 100  # how many decimals format_f64 can write
+MAX_DIMS = 32  # how many dimensions an array can have (ella.checker.MAX_DIMS)
+MAX_ITEMS = 2**48  # an array's sizes (those that aren't 0) multiply to less than this
+LANES = 4  # how many sums total() and dot() keep, one per item of an AVX2 vector (docs/grammar.md §10)
 
 
 class Exit(Exception):
@@ -216,7 +220,92 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             return min(a, b)
         case "max", [int() | float() as a, int() | float() as b]:
             return max(a, b)
+        case "array", [list() as items, str() as item]:
+            # The interpreters pass the item type, which an empty list can't show.
+            return ArrayValue((len(items),), list(items), item == "f64")
+        case "fill", [list() as shape, int() | float() as x]:
+            size = check_shape(shape, span)
+            return ArrayValue(tuple(shape), [x] * size, isinstance(x, float))
+        case "reshape", [ArrayValue() as a, list() as shape]:
+            if check_shape(shape, span) != len(a.items):
+                raise EllaError(
+                    f"reshape() can't make an array of shape {shape_text(shape)} "
+                    f"from one of shape {shape_text(a.shape)}",
+                    span,
+                )
+            return ArrayValue(tuple(shape), a.items.copy(), a.floats)
+        case "shape", [ArrayValue() as a]:
+            return list(a.shape)
+        case "flat", [ArrayValue() as a]:
+            return list(a.items)
+        case "total", [ArrayValue() as a]:
+            return lane_sum(a.items, a.floats, span)
+        case "dot", [ArrayValue() as a, ArrayValue() as b]:
+            if a.shape != b.shape:
+                raise EllaError(
+                    f"dot() needs arrays of the same shape, not {shape_text(a.shape)} and {shape_text(b.shape)}", span
+                )
+            return lane_sum([binary("*", x, y, span) for x, y in zip(a.items, b.items)], a.floats, span)
+        case "matmul", [ArrayValue() as a, ArrayValue() as b]:
+            return matmul(a, b, span)
+        case "transpose", [ArrayValue() as a]:
+            if len(a.shape) != 2:
+                raise EllaError(
+                    f"transpose() needs a 2-dimensional array, not one of shape {shape_text(a.shape)}", span
+                )
+            rows, columns = a.shape
+            items = [a.items[i * columns + j] for j in range(columns) for i in range(rows)]
+            return ArrayValue((columns, rows), items, a.floats)
     raise AssertionError(f"no library function {name} for {args}")
+
+
+def check_shape(shape: list[int], span: Span) -> int:
+    """The number of items an array of this shape has, if it can have that shape."""
+    if not shape:
+        raise EllaError("an array's shape needs at least one size, not []", span)
+    if len(shape) > MAX_DIMS:
+        raise EllaError(f"an array has at most {MAX_DIMS} dimensions, not {len(shape)}", span)
+    if any(size < 0 for size in shape):
+        raise EllaError(f"an array's sizes can't be negative: {shape_text(shape)}", span)
+    if math.prod(max(size, 1) for size in shape) >= MAX_ITEMS:
+        raise EllaError(f"an array of shape {shape_text(shape)} is too big", span)
+    return math.prod(shape)
+
+
+def lane_sum(items: list[Value], floats: bool, span: Span) -> Value:
+    """`total(a)`: the items added up in LANES sums starting at 0, item i into sum i % LANES, which are then added
+    as `(s0 + s2) + (s1 + s3)`, as AVX2 code adds them. (`dot` gives it its products.)
+
+    For i64, an overflow is reported at the first addition that doesn't fit.
+    """
+    zero: Value = 0.0 if floats else 0
+    sums = [zero] * LANES
+    for i, item in enumerate(items):
+        sums[i % LANES] = binary("+", sums[i % LANES], item, span)
+    return binary("+", binary("+", sums[0], sums[2], span), binary("+", sums[1], sums[3], span), span)
+
+
+def matmul(a: ArrayValue, b: ArrayValue, span: Span) -> ArrayValue:
+    """`matmul(a, b)`: the matrix product. Item (i, j) is the sum of `a[i, k] * b[k, j]`, from k = 0 up, starting at 0."""
+    if len(a.shape) != 2 or len(b.shape) != 2:
+        raise EllaError(
+            f"matmul() needs two 2-dimensional arrays, not shapes {shape_text(a.shape)} and {shape_text(b.shape)}",
+            span,
+        )
+    (n, k), (k2, m) = a.shape, b.shape
+    if k != k2:
+        raise EllaError(
+            f"matmul() can't multiply arrays of shapes {shape_text(a.shape)} and {shape_text(b.shape)}", span
+        )
+    zero: Value = 0.0 if a.floats else 0
+    items: list[Value] = []
+    for i in range(n):
+        for j in range(m):
+            total = zero
+            for p in range(k):
+                total = binary("+", total, binary("*", a.items[i * k + p], b.items[p * m + j], span), span)
+            items.append(total)
+    return ArrayValue((n, m), items, a.floats)
 
 
 # hash() is 64-bit FNV-1a, as a signed i64: over a string's code points, and
@@ -248,6 +337,8 @@ def hash_bits(value: Value, custom: Callable[[VariantValue], int | None] | None 
             return fnv(FNV_OFFSET, [bits])
         case tuple() | list():  # () too
             return fnv(FNV_OFFSET, (hash_bits(item, custom) for item in value))
+        case ArrayValue(shape, items):  # as the tuple of its shape and its items, (shape(a), flat(a))
+            return fnv(FNV_OFFSET, [hash_bits(list(shape)), hash_bits(items)])
         case range():
             # Ranges are equal when they hold the same numbers.
             size = max(0, value.stop - value.start) % 2**64

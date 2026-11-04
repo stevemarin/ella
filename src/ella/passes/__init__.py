@@ -11,6 +11,7 @@ Each keeps the program's behavior exactly the same, including its errors:
 * `simplify`: simplify the control-flow graph (ella.passes.simplify)
 * `dce`: dead-code elimination (ella.passes.dce)
 * `inline`: put small functions' bodies where they are called (ella.passes.inline)
+* `fuse`: make arithmetic on arrays in a row one loop (ella.passes.fuse)
 
 `optimize` runs passes over a whole module, verifying the IR before and after
 every pass, so a pass that breaks the IR's rules is caught right where it
@@ -24,6 +25,7 @@ from ella.ir import Function, IRError, Module, verify
 from ella.passes.dce import eliminate_dead_code
 from ella.passes.direct import make_calls_direct
 from ella.passes.fold import fold_constants
+from ella.passes.fuse import fuse_arithmetic
 from ella.passes.inline import bottom_up, inline_calls, unused_functions
 from ella.passes.mem2reg import promote_slots
 from ella.passes.moves import move_copies
@@ -39,6 +41,7 @@ PASSES: dict[str, Pass] = {
     "simplify": simplify_cfg,
     "dce": eliminate_dead_code,
     "inline": inline_calls,
+    "fuse": fuse_arithmetic,
 }
 
 # The passes that clean up after each other. Each can make work for the
@@ -66,7 +69,8 @@ def optimize(module: Module, passes: list[str] | None = None) -> Module:
 
     With `passes`, run exactly those passes once each, in order. Without, run
     the default pipeline: mem2reg and direct, then the cleanup passes until
-    nothing changes, then inlining and the cleanup passes again. Functions
+    nothing changes, then inlining and the cleanup passes again, and last
+    fusion, once every operation is where it will stay. Functions
     that inlining leaves unused are dropped, unless the program builds code
     at run time, which may call them.
     """
@@ -80,6 +84,7 @@ def optimize(module: Module, passes: list[str] | None = None) -> Module:
     clean_up(module)
     if run_pass(module, "inline"):
         clean_up(module)
+    run_pass(module, "fuse")
     if not module.templates:
         for name in unused_functions(module):
             del module.functions[name]

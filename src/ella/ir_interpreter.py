@@ -77,7 +77,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from ella.checker import EnumTy, ListTy, TupleTy, Type, check_code, is_builtin_error, substitute
+from ella.checker import BuiltinTy, EnumTy, ListTy, TupleTy, Type, check_code, is_builtin_error, show_type, substitute
 from ella.ir import (
     VIEWS,
     Block,
@@ -100,13 +100,14 @@ from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, 
 from ella.library import FNV_OFFSET, Exit, Host, fnv, hash_bits
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
-from ella.operators import binary, compare, contains, index_into, slice_of, unary
+from ella.operators import array_offset, binary, compare, contains, index_into, slice_of, unary
 from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
 from ella.syntax import Expr, Name, bare_name
 from ella.values import (
     MAX_CALL_DEPTH,
     UNIT,
     ArenaValue,
+    ArrayValue,
     CodeValue,
     FunctionRef,
     GenValue,
@@ -716,6 +717,9 @@ class IRInterpreter:
                 if isinstance(container, range):
                     assert isinstance(i, int)
                     result = container[i]
+                elif isinstance(container, ArrayValue):
+                    assert isinstance(i, int) and 0 <= i < len(container.items)  # array_offset checked it
+                    result = container.items[i]
                 else:
                     result = index_into(container, i, span)
                     if isinstance(container, list):
@@ -732,7 +736,25 @@ class IRInterpreter:
             case "builtin" if instr.name == "hash":  # through `hash` methods
                 h = self.hash(args[0], instr.args[0].type, span)
                 result = h - 2**64 if h >= 2**63 else h
+            case "fused":
+                # The steps one by one, as they were before fusion (native code does them in one loop).
+                results: list[Value] = []
+                for step in instr.steps:
+                    left = args[step.left] if step.left >= 0 else results[-1 - step.left]
+                    if step.right is None:
+                        results.append(unary("-", left, step.span))
+                    else:
+                        right = args[step.right] if step.right >= 0 else results[-1 - step.right]
+                        results.append(binary(OPERATORS[step.op], left, right, step.span))
+                result = results[-1]
+            case "array_offset":
+                container = args[0]
+                assert isinstance(container, ArrayValue)
+                result = array_offset(container, tuple(args[1:]) if len(args) > 2 else args[1], span)
             case "builtin":
+                if instr.name == "array":  # it needs the item type, which an empty list can't show
+                    assert instr.dest is not None and isinstance(instr.dest.type, BuiltinTy)
+                    args = [*args, show_type(instr.dest.type.args[0])]
                 try:
                     result = call_library(instr.name, args, self.place(span), self.host)
                 except EllaError as error:
@@ -743,6 +765,12 @@ class IRInterpreter:
                     tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
                 elif allocates(instr):
                     tag = self.allocate(depth, deep_size(result), instr, frame)
+            case "set_index" if isinstance(args[0], ArrayValue):
+                container, i, item = args
+                assert isinstance(container, ArrayValue) and isinstance(i, int)
+                assert 0 <= i < len(container.items)  # array_offset checked it
+                self.check_fits(tags[0], depth, f"the object {instr.args[0]}", span)
+                container.items[i] = item
             case "set_index":
                 container, i, item = args
                 index_into(container, i, span)  # check that the index is in range
@@ -819,6 +847,8 @@ class IRInterpreter:
                     result = container.live()
                 elif isinstance(container, ArenaValue):
                     result = len(container.values)
+                elif isinstance(container, ArrayValue):
+                    result = len(container.items)
                 else:
                     assert isinstance(container, list | str | range)
                     result = len(container)
@@ -1064,6 +1094,9 @@ def shallow_size(value: Value) -> int:
             return round16(16 + 8 * len(value))
         case range():
             return 32
+        case ArrayValue(shape, items):
+            # Its length, dimensions and where its items are, its sizes, then its items, at a 32-byte boundary.
+            return round16(24 + 8 * len(shape) + 24 + 8 * len(items))
         case VariantValue(fields=fields):
             return round16(16 + 8 * len(fields))
         case FunctionRef(captured=captured):

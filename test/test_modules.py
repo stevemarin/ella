@@ -10,7 +10,7 @@ from ella.analysis import Place, analyze, complete
 from ella.interpreter import Interpreter
 from ella.lexer import EllaError
 from ella.lower import compile_program
-from ella.modules import LIBRARY_DIR, link
+from ella.modules import LIBRARY_DIR, link, package_path
 from ella.parser import parse
 from ella.staging import prepare
 from ella.syntax import Import, Lambda, Let, Match, NamedType, NamePattern, VariantPattern
@@ -427,6 +427,78 @@ def test_cli_shows_each_module_with_splices(tmp_path: Path, capsys: pytest.Captu
     assert capsys.readouterr().out.startswith("(import gen)\n(import plain)\n")
 
 
+def test_cli_finds_packages_in_the_given_directories(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path / "libs", JSON)
+    write(tmp_path / "more", {"extra.ella": "let f = () -> i64 => 1 // 0\n"})
+    path = write(tmp_path / "app", {"main.ella": "import json\nimport extra\nprint(json.count('a,b'), extra.f())\n"})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ELLA_PATH", "more")
+    assert main(["--path", "libs", "app/main.ella"]) == 1
+    assert capsys.readouterr() == (
+        "",
+        "more/extra.ella:1:24: integer division by zero\n  called at app/main.ella:3:33\n",
+    )
+    assert main(["--native", "--path", str(tmp_path / "libs"), str(path)]) == 1
+    assert capsys.readouterr().err.startswith(f"{tmp_path}/more/extra.ella:1:24: integer division by zero\n")
+
+
+# Packages
+
+JSON = {
+    "json.ella": "import json.lex\nlet count = (s: str) -> i64 => len(json.lex.tokens(s))\n",
+    "json/lex.ella": "let tokens = (s: str) -> [str] => split(s, _sep)\nlet _sep = ','\n",
+}
+
+
+def test_packages_are_found_after_the_programs_modules(tmp_path: Path) -> None:
+    write(tmp_path / "libs", JSON)
+    write(tmp_path / "other", {"json.ella": "let count = (s: str) -> i64 => 0\n", "tool.ella": "let n = 7\n"})
+    path = write(tmp_path / "app", {"main.ella": "import json\nimport tool\nprint(json.count('a,b,c'), tool.n)\n"})
+    out = io.StringIO()
+    program, checker = prepare(parse(path.read_text()), out, path, [tmp_path / "libs", tmp_path / "other"])
+    Interpreter(out, checker).run(program)
+    assert out.getvalue() == "3 7\n"
+    assert ("../libs/json/lex.ella", "json.lex") in program.modules
+    module = compile_program(path.read_text(), path=path, packages=[tmp_path / "libs", tmp_path / "other"])
+    assert "json.count" in module.functions
+    write(tmp_path / "app", {"json.ella": "let count = (s: str) -> i64 => 9\n"})  # the program's own comes first
+    out = io.StringIO()
+    Interpreter(out).run(link(parse(path.read_text()), path, [tmp_path / "libs", tmp_path / "other"]))
+    assert out.getvalue() == "9 7\n"
+
+
+def test_the_package_path_comes_from_ella_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write(tmp_path / "libs", JSON)
+    write(tmp_path / "other", {"lists.ella": "let three = 3\n"})
+    monkeypatch.setenv("ELLA_PATH", f"{tmp_path / 'nothing'}:{tmp_path / 'libs'}::{tmp_path / 'other'}")
+    assert package_path([Path("first")]) == (
+        Path("first"),
+        tmp_path / "nothing",
+        tmp_path / "libs",
+        tmp_path / "other",
+    )
+    path = write(tmp_path / "app", {"main.ella": "import json\nimport lists\nprint(json.count('a'), lists.three)\n"})
+    out = io.StringIO()
+    program, checker = prepare(parse(path.read_text()), out, path)
+    Interpreter(out, checker).run(program)
+    assert out.getvalue() == "1 3\n"
+    assert [str(w) for w in checker.warnings] == [
+        "2:1: 'lists.ella' has the name of a standard library module, and is used instead of it"
+    ]
+
+
+def test_a_packages_private_names_stay_in_it(tmp_path: Path) -> None:
+    write(tmp_path / "libs", JSON)
+    path = write(tmp_path / "app", {"main.ella": "import json.lex\nprint(json.lex._sep)\n"})
+    with pytest.raises(EllaError, match="2:16: '_sep' is private to module 'json.lex'"):
+        prepare(parse(path.read_text()), io.StringIO(), path, [tmp_path / "libs"])
+    path = write(tmp_path / "app", {"main.ella": "import yaml\n"})
+    with pytest.raises(EllaError, match="1:1: there is no module 'yaml'"):
+        prepare(parse(path.read_text()), io.StringIO(), path, [tmp_path / "libs"])
+
+
 # Editors
 
 
@@ -492,3 +564,20 @@ def test_analysis_finds_the_root_between_the_file_and_the_workspace_folder(tmp_p
     )
     for file in [path, path.parent / "geo.ella", path.parent / "geo" / "poly.ella"]:
         assert analyze(file.read_text(), Place(str(file), str(tmp_path))).problems == []
+
+
+def test_analysis_finds_packages_on_ella_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write(tmp_path / "libs", {**JSON, "bad.ella": "let f = () -> i64 => 'x'\n"})
+    monkeypatch.setenv("ELLA_PATH", str(tmp_path / "libs"))
+    path = write(tmp_path / "app", {"main.ella": ""})
+    found = {
+        (s.where.line, s.where.column): s
+        for s in analyze("import json\nprint(json.count('a'))\n", Place(str(path), str(tmp_path / "app"))).symbols
+        or []
+    }
+    assert found[(2, 12)].definition is not None
+    assert Path(found[(2, 12)].definition.file).resolve() == tmp_path / "libs" / "json.ella"
+    problems = analyze("import bad\nprint(bad.f())\n", Place(str(path), str(tmp_path / "app"))).problems
+    assert [(p.message, p.line) for p in problems] == [
+        ("../libs/bad.ella:1:22: the function's result should be i64, not str", 1)
+    ]

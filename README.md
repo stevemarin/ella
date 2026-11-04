@@ -19,7 +19,7 @@ native code generator.
 * Everything is an expression; only booleans are truthy.
 * No implicit type conversions.
 * Pass-by-value semantics; bindings are immutable unless marked `mut`.
-* Future goals include built-in vector types and SIMD.
+* Built-in arrays of numbers, which native code works on with SIMD (AVX2).
 
 The language itself is described in [docs/grammar.md](docs/grammar.md), and
 [example_syntax.ella](example_syntax.ella) is a tour of the syntax.

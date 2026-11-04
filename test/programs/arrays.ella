@@ -1,0 +1,123 @@
+# Arrays: making them, indexing, arithmetic item by item (AVX2 loops natively, four
+# items at a time, then the rest one by one), total, dot, matmul, and arrays as values.
+
+struct Grid
+    cells: Array[f64]
+    name: str
+    at = (g: Grid, i: i64, j: i64) -> f64 => g.cells[i, j]
+    bump = (mut g: Grid, i: i64, j: i64) -> () =>
+        g.cells[i, j] += 1.0
+
+let floats = (n: i64) -> Array[f64] =>
+    let mut xs = []
+    for i in 0..n
+        xs += [to_f64(i) * 1.5 - 3.25]
+    array(xs)
+
+let ints = (n: i64) -> Array[i64] =>
+    let mut xs = []
+    for i in 0..n
+        xs += [i * 7 - 20]
+    array(xs)
+
+let clear = (mut a: Array[i64], i: i64) -> () =>
+    a[i, i] = 0
+
+let scale[T: Num] = (a: Array[T], k: T) -> Array[T] => a * k + a - a
+
+let step = (pos: Array[f64], vel: Array[f64], dt: f64) -> Array[f64] => pos + vel * dt
+
+let main = () -> () =>
+    # Making and reading
+    let mut m = reshape(array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [2, 3])
+    print(m, shape(m), len(m), m[1, 2], m[0, 0])
+    m[1, 1] = 10.0
+    m[0, 2] += 0.5
+    print(m, flat(m), transpose(m))
+    print(fill([2, 0], 1), fill([0], 1.0), fill([1, 1, 1], 7), array([]) == fill([0], 0))
+
+    # Every operation at each length up to 10, so the vector loops and the rest both run
+    for n in 0..11
+        let a = floats(n)
+        let b = floats(n) * 0.5 + 1.0
+        print(n, a + b, a - b, a * b, a / b, -a)
+        print(a + 2.0, 2.0 + a, a - 2.0, 2.0 - a, a * 3.0, 3.0 * a, a / 4.0, 4.0 / b)
+        print(total(a), total(b), dot(a, b), total(-a))
+        let i = ints(n)
+        let j = ints(n) * 3 + 1
+        print(n, i + j, i - j, i * j, -i, i + 5, 5 - i, i * -2, -2 * i)
+        print(total(i), total(j), dot(i, j))
+
+    # Zeros, infinities and NaN
+    let z = fill([3], 0.0)
+    print(-z, z * -1.0, 0.0 - z, total(-z), dot(-z, z), z == -z)
+    let odd = array([0.0 / 0.0, 1.0 / 0.0, -1.0 / 0.0, 1.0, -0.0])
+    print(odd + 1.0, odd * 0.0, odd / 0.0, total(odd), -odd, 1.0 / odd, odd == odd)
+
+    # total adds in four sums, so these cancel before they could overflow
+    print(total(array([9223372036854775807, 9223372036854775807, -9223372036854775807, -1])))
+
+    # Copies: changing one doesn't change the other
+    let mut a = fill([2, 2], 1)
+    let b = a
+    a[0, 0] = 5
+    let mut c = a
+    c[1, 1] = 9
+    print(a, b, c)
+    clear(mut c, 0)
+    print(c)
+
+    # In lists, structs, maps, sets and pools
+    let mut grids = [fill([2], 0.0), fill([3], 1.0)]
+    grids[1][2] = 7.0
+    grids[0] += fill([2], 0.5)
+    print(grids)
+    let mut g = Grid(reshape(array([1.0, 2.0, 3.0, 4.0]), [2, 2]), "g")
+    mut g.bump(0, 1)
+    g.cells[1, 0] = -1.0
+    print(g, g.at(0, 1))
+    let mut counts = {"x": fill([3], 0)}
+    counts["x"][1] += 4
+    counts["x"][2] = 2
+    print(counts, counts["x"] == array([0, 4, 2]))
+    let s = {array([1, 2]), array([1, 2]), fill([2], 1)}
+    print(len(s), array([1, 2]) in s, hash(array([1.0])) == hash(array([1.0])))
+    let mut p = pool_new()
+    let h = alloc(mut p, fill([2], 1.0))
+    p[h][1] = 3.0
+    print(p[h], total(p[h]))
+
+    # Loops that carry arrays from one iteration to the next
+    let mut pos = fill([4], 0.0)
+    let vel = array([1.0, -1.0, 0.5, 2.0])
+    for _ in 0..1000
+        pos = step(pos, vel, 0.01)
+    print(pos)
+    let mut acc = fill([3, 3], 0)
+    for i in 0..3
+        for j in 0..3
+            acc[i, j] = i * 3 + j
+        acc = acc + 1
+    let mut seen = 0
+    for x in acc
+        seen += x
+    print(acc, matmul(acc, acc), seen, total(acc))
+
+    # Generic code, functions as values, and the Add constraint
+    print(scale(array([1, 2, 3]), 3), scale(array([0.5]), 2.0))
+    let k = 2.0
+    let twice = (v: Array[f64]) => v * k
+    print(twice(vel), map([vel, -vel], twice))
+    print(sum([array([1, 2]), array([3, 4]), array([5, 6])], fill([2], 0)))
+    print(map([[1.0], [2.0, 3.0]], array), map([fill([2], 1)], total))
+
+    # Three dimensions, and an index from a tuple
+    let mut cube = fill([2, 3, 4], 0)
+    for i in 0..2
+        for j in 0..3
+            for l in 0..4
+                cube[i, j, l] = 100 * i + 10 * j + l
+    let at = (1, 2, 3)
+    print(cube, cube[at], shape(reshape(cube, [4, 6])))
+    let big = reshape(floats(12), [3, 4])
+    print(matmul(big, transpose(big)), matmul(transpose(big), big))

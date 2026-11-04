@@ -18,6 +18,8 @@ error. Only instructions that can never fail are removed:
 * floating point arithmetic, which never fails (IEEE 754 gives infinities
   and NaNs instead), and joining strings and lists with `add`
 
+Arithmetic on arrays can fail (their shapes may differ), so it stays.
+
 `i64` arithmetic can overflow, so unused `i64` arithmetic stays.
 
 Unused block parameters are removed too, along with the values jumps pass
@@ -58,7 +60,6 @@ SAFE = frozenset(
         "bitand",
         "bitor",
         "bitxor",
-        "div",  # always f64, so it never fails
         "copy",
         "carry",
         "quote",
@@ -76,8 +77,8 @@ def can_remove(instr: Instr, module: Module) -> bool:
     if instr.op in SAFE:
         return True
     t = instr.dest.type
-    if instr.op in ("add", "sub", "mul", "pow", "neg") and t == F64:
-        return True
+    if instr.op in ("add", "sub", "mul", "div", "pow", "neg") and t == F64:
+        return True  # (`div` always gives an f64, unless it is an array's)
     return instr.op == "add" and (t == STR or isinstance(t, ListTy))
 
 

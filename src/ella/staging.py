@@ -470,16 +470,19 @@ def type_kind(t: Type, enums: dict[str, EnumInfo]) -> str:
 # Expanding splices outside quotes
 
 
-def prepare(program: Program, out: TextIO | None = None, path: Path | None = None) -> tuple[Program, Checker]:
+def prepare(
+    program: Program, out: TextIO | None = None, path: Path | None = None, packages: Sequence[Path] | None = None
+) -> tuple[Program, Checker]:
     """Check a program, and expand its splices outside quotes. Returns the program to run, and its checker.
 
     A splice in a type runs while the program is being checked, since the
     checker needs the type; other splices run after checking. What the
     compile-time code prints goes to `out`. The program is first linked
     with the modules it uses (see ella.modules); `path` is its file, which
-    its imports are found from. Raises EllaError.
+    its imports are found from, and then from the package path, `packages`
+    (by default ELLA_PATH's). Raises EllaError.
     """
-    program = link(program, path)
+    program = link(program, path, packages)
     if not uses_staging(program):
         return program, check(program)
     checker = Checker()

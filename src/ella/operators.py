@@ -12,7 +12,7 @@ import math
 from collections.abc import Callable
 
 from ella.lexer import EllaError, Span
-from ella.values import Value, VariantValue, equal, fits_i64, to_text, type_name
+from ella.values import ArrayValue, Value, VariantValue, equal, fits_i64, to_text, type_name
 
 
 def float_div(a: float, b: float) -> float:
@@ -48,6 +48,8 @@ def unary(op: str, value: Value, span: Span) -> Value:
             return check_i64(-value, f"-({value})", span)
         case "-", float():
             return -value
+        case "-", ArrayValue(shape, items, floats):
+            return ArrayValue(shape, [unary(op, item, span) for item in items], floats)
         case "~", int():
             return ~value
     raise EllaError(f"'{op}' doesn't work on {type_name(value)}", span)
@@ -55,6 +57,8 @@ def unary(op: str, value: Value, span: Span) -> Value:
 
 def binary(op: str, a: Value, b: Value, span: Span) -> Value:
     """Apply an arithmetic, bitwise or range operator to two values."""
+    if isinstance(a, ArrayValue) or isinstance(b, ArrayValue):
+        return array_op(op, a, b, span)
     # There are no implicit conversions, so both sides must have the same type.
     if type_name(a) != type_name(b):
         raise EllaError(f"'{op}' needs two values of the same type, not {type_name(a)} and {type_name(b)}", span)
@@ -143,6 +147,54 @@ def float_op(op: str, a: float, b: float, span: Span) -> Value:
     raise EllaError(f"'{op}' doesn't work on f64", span)
 
 
+def array_op(op: str, a: Value, b: Value, span: Span) -> ArrayValue:
+    """`+`, `-`, `*` or `/` on arrays, item by item: two arrays of the same shape, or an array and a number.
+
+    An i64 overflow is reported for the first item (in row-major order) whose
+    result doesn't fit, with that item's operands.
+    """
+    if isinstance(a, ArrayValue) and isinstance(b, ArrayValue):
+        if a.shape != b.shape:
+            raise EllaError(
+                f"'{op}' needs arrays of the same shape, not {shape_text(a.shape)} and {shape_text(b.shape)}", span
+            )
+        array, pairs = a, list(zip(a.items, b.items))
+    elif isinstance(a, ArrayValue):
+        array, pairs = a, [(x, b) for x in a.items]
+    else:
+        assert isinstance(b, ArrayValue)
+        array, pairs = b, [(a, y) for y in b.items]
+    return ArrayValue(array.shape, [binary(op, x, y, span) for x, y in pairs], array.floats)
+
+
+def shape_text(shape: tuple[int, ...] | list[int]) -> str:
+    """An array's shape as error messages show it, like the list `shape(a)` gives: `[2, 3]`."""
+    return "[" + ", ".join(map(str, shape)) + "]"
+
+
+def array_offset(array: ArrayValue, index: Value, span: Span) -> int:
+    """Where `array[index]` is in its items: `index` is an i64, or a tuple of one i64 for each dimension.
+
+    `a[i, j]` of an array of shape `[n, m]` is item `i * m + j`.
+    """
+    indexes = index if isinstance(index, tuple) else (index,)
+    if len(indexes) != len(array.shape):
+        count = len(array.shape)
+        raise EllaError(
+            f"an array of shape {shape_text(array.shape)} needs {count} index{'' if count == 1 else 'es'}, "
+            f"not {len(indexes)}",
+            span,
+        )
+    offset = 0
+    for i, size in zip(indexes, array.shape):
+        assert isinstance(i, int)
+        if not 0 <= i < size:
+            shown = to_text(indexes[0] if len(indexes) == 1 else indexes)  # `a[t]` for a 1-tuple t shows its i64
+            raise EllaError(f"index {shown} is out of range for an array of shape {shape_text(array.shape)}", span)
+        offset = offset * size + i
+    return offset
+
+
 type Equal = Callable[[VariantValue, VariantValue], bool | None]
 
 
@@ -193,6 +245,8 @@ def index_into(container: Value, index: Value, span: Span) -> Value:
     """`container[index]` for a list, or a string (giving a one-character string), or a slice of either."""
     if isinstance(index, range) and isinstance(container, list | str):
         return slice_of(container, index, span)
+    if isinstance(container, ArrayValue):
+        return container.items[array_offset(container, index, span)]
     if not isinstance(index, int) or isinstance(index, bool):
         raise EllaError(f"an index must be an i64, not {type_name(index)}", span)
     if not isinstance(container, list | str):

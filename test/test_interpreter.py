@@ -135,7 +135,7 @@ def test_and_or_short_circuit() -> None:
         ("[1][true]", "an index must be an i64, not bool"),
         ("5[0]", "can't index a i64"),
         ("(1, 2).x", "a tuple has no field 'x'"),
-        ("len(5)", "len() needs a list, str, range, Pool or Arena"),
+        ("len(5)", "len() needs a list, str, range, Array, Pool or Arena"),
         ("len()", "len takes 1 argument but was given 0"),
         ("Some(1, 2)", "Some takes 1 argument but was given 2"),
         ("5(1)", "can't call a value of type i64"),

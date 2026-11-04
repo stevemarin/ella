@@ -34,6 +34,8 @@ arithmetic and comparisons on numbers, reading fields and the like. Some
 call it partway through, using their operands or result after the call
 (`calls_partway`): making a list calls the runtime for the space, then
 stores the items. Their operands and results must survive the call too.
+Arithmetic on arrays, `total` and `dot` do too, and their AVX2 loops use the
+caller-saved registers, which hold nothing then.
 A function that takes arenas for its scope levels frees them at `return`
 before it reads the values it returns, which then must survive that call.
 The prologue takes the arenas before it loads the parameters.
@@ -45,7 +47,20 @@ Generator functions keep every value in their frame (docs/memory-model.md
 from dataclasses import dataclass, field
 
 from ella.checker import BOOL, F64, I64, RANGE, STR, UNIT, ListTy
-from ella.ir import Block, Branch, Function, Instr, Jump, Return, Trap, Yield, defined_by, region_level, successors
+from ella.ir import (
+    Block,
+    Branch,
+    Function,
+    Instr,
+    Jump,
+    Return,
+    Trap,
+    Yield,
+    defined_by,
+    is_array,
+    region_level,
+    successors,
+)
 
 CALLEE_SAVED = ["rbx", "r12", "r13", "r14", "r15"]
 CALLER_SAVED = ["rsi", "rdi", "r8", "r9", "r10"]
@@ -55,6 +70,7 @@ NO_CALLS = frozenset(
     {
         "const", "load", "store", "global_get", "global_set", "div", "floordiv", "mod", "bitand", "bitor", "bitxor",
         "neg", "not", "bitnot", "tuple_get", "is_variant", "variant_field", "quote_begin", "enter", "leave", "assert",
+        "array_offset",
     }
 )  # fmt: skip
 COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
@@ -72,6 +88,10 @@ def calls(instr: Instr) -> bool:
     """Whether an instruction's code calls a function (the runtime, or Ella code), which may change caller-saved
     registers. This must match what ella.codegen generates."""
     op, args = instr.op, instr.args
+    if op in ("add", "sub", "mul", "div", "neg", "fused") and instr.dest is not None and is_array(instr.dest.type):
+        return True  # the runtime makes the result
+    if op in ("index", "set_index", "len") and is_array(args[0].type):
+        return False
     if op in NO_CALLS:
         return False
     if op in ("add", "sub", "mul"):
@@ -93,6 +113,10 @@ def calls_partway(instr: Instr) -> bool:
     """Whether an instruction uses its operands or results after calling a function in its own code."""
     op = instr.op
     if op in ("tuple", "list", "variant", "gen_new") or (op == "closure" and instr.args):
+        return True
+    if op in ("add", "sub", "mul", "div", "neg", "fused") and instr.dest is not None and is_array(instr.dest.type):
+        return True
+    if op == "builtin" and instr.name in ("total", "dot"):
         return True
     if op in ("set_index", "set_field"):
         return instr.region == "slot"

@@ -44,6 +44,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from ella.checker import (
+    BUILTIN_TYPES,
     LIBRARY,
     PRIMITIVE_NAMES,
     Checker,
@@ -60,7 +61,7 @@ from ella.checker import (
     substitute,
 )
 from ella.lexer import KEYWORDS, STD, EllaError, Span, Token, TokenKind, tokenize
-from ella.modules import LIBRARY_DIR, Linker, Module, find_root, module_name, prelude, read_file
+from ella.modules import LIBRARY_DIR, Linker, Module, find_root, package_path, prelude, read_file
 from ella.parser import parse_partial
 from ella.staging import Expander, has_splices, uses_staging
 from ella.syntax import (
@@ -321,11 +322,12 @@ class Checked:
         def read(file: Path) -> str | None:
             return files[str(file)] if str(file) in files else read_file(file)
 
+        packages = package_path()
         if path is not None and root is not None:
-            root = find_root(path, parsed.imports, root, read)
+            root = find_root(path, parsed.imports, root, read, packages)
         # Every prelude module is linked in, so that completions offer its names.
         link_errors: list[EllaError] = []
-        self.linker = Linker(path, read, root, every=True, errors=link_errors)
+        self.linker = Linker(path, read, root, every=True, errors=link_errors, packages=packages)
         self.root = self.linker.root
         self.linked = self.linker.link(parsed)
         # This file's code is last in the linked program; the checker's tables are about it.
@@ -360,7 +362,7 @@ class Checked:
             return problem(error)
         if error.span.file.startswith(STD):
             return None  # the standard library's own code (it has no errors)
-        line = self.import_line(module_name(error.span.file))
+        line = self.import_line(self.linker.files[error.span.file].name)
         return Problem(f"{error.span}: {error.message}", line.line, line.column)
 
     def import_line(self, name: str) -> Span:
@@ -704,7 +706,7 @@ class Symbols:
     def type_name(self, name: str, span: Span) -> None:
         """A type's name in an annotation."""
         token = self.checked.token_at(span)
-        if name in PRIMITIVE_NAMES or name in ("Code", "Pool", "Handle", "Arena", "Ref", "Type"):
+        if name in PRIMITIVE_NAMES or name in BUILTIN_TYPES:
             self.add(token, f"{name}: built-in type", "type", ("defaultLibrary",))
         elif name in self.checker.enums:
             info = self.checker.enums[name]

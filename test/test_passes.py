@@ -150,6 +150,49 @@ def test_dce_keeps_instructions_that_can_fail() -> None:
     assert "add" in ops(function)  # might overflow
 
 
+def test_dce_keeps_arithmetic_on_arrays() -> None:
+    # Even f64 arrays: their shapes may differ, which is an error.
+    source = (
+        "let f = (a: Array[f64], b: Array[f64]) -> () =>\n    let c = a / b\n    let d = -a\n    let e = a[0]\n    ()"
+    )
+    function = compiled(source, ["mem2reg", "dce"]).functions["f"]
+    assert {"div", "neg", "array_offset"} <= set(ops(function))
+
+
+def fused_steps(source: str) -> list[str]:
+    """The steps of each fused instruction of f, after the whole pipeline."""
+    function = compiled(source).functions["f"]
+    return [" ".join(map(str, i.steps)) for b in function.blocks for i in b.instrs if i.op == "fused"]
+
+
+def test_fuse_makes_one_loop_of_arithmetic_on_arrays() -> None:
+    source = "let f = (a: Array[f64], b: Array[f64]) -> Array[f64] => -(a * 2.0 + b) / a"
+    assert fused_steps(source) == ["mul(0, 1) add(s0, 2) neg(s1) div(s2, 0)"]
+
+
+def test_fuse_keeps_arrays_used_twice_and_i64_multiplication() -> None:
+    twice = "let f = (a: Array[f64]) -> Array[f64] =>\n    let t = a + 1.0\n    t * t"
+    assert fused_steps(twice) == []
+    ints = "let f = (a: Array[i64]) -> Array[i64] => (a + 1) * 2 - a"
+    assert fused_steps(ints) == []  # neither step next to the `*` can join it
+
+
+def test_fuse_doesnt_move_operations_past_others() -> None:
+    # The total between them reads b, which must happen after the first operation (its error comes first).
+    source = (
+        "let f = (a: Array[f64], b: Array[f64]) -> Array[f64] =>\n    let t = a + b\n    let n = total(b)\n    t * n"
+    )
+    assert fused_steps(source) == []
+
+
+def test_fuse_keeps_to_the_registers_there_are() -> None:
+    chain = " + ".join(["a"] * 9)  # 8 additions: 6 in one loop, then 2
+    assert fused_steps(f"let f = (a: Array[f64]) -> Array[f64] => {chain}") == [
+        "add(0, 0) add(s0, 0)",
+        "add(0, 1) add(s0, 1) add(s1, 1) add(s2, 1) add(s3, 1) add(s4, 1)",
+    ]
+
+
 def test_dce_keeps_effects() -> None:
     function = compiled('print("hi")', ["dce"]).functions["top"]
     assert "print" in ops(function)

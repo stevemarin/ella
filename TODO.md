@@ -19,7 +19,7 @@ and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
 and iterators, then direct calls, inlining and register allocation, then
 stack traces, errors with causes and locations, and `main` giving a
-`Result`, then sets and more of the standard library). `make check` passes (1279 tests, ruff, strict mypy).
+`Result`, then sets and more of the standard library, then packages, then arrays with SIMD). `make check` passes (1340 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -32,7 +32,7 @@ stack traces, errors with causes and locations, and `main` giving a
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
 | Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `log10`, `log2`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `sets`, `strings`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `fold`, `flatten`, `flat_map`, `position`, `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`, `max_by`, `partition`, `chunks`, `unique`, `map_of`, `group_by`, `counts`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, `tau`, `e`, `inf`, `nan`, `Map[K, V]` and `Set[T]`, and strings (`repeat`, `lines`, `words`, `trim_start`, `trim_end`, `strip_prefix`, `strip_suffix`, `split_once`, `count_of`, `is_digit`, `is_alpha`, `is_space`); lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
-| Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules |
+| Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules; packages found on a package path (`--path`, `ELLA_PATH`) |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
 Rough speed, from `fib(35)` (about 30 million calls, test/benchmarks):
@@ -89,8 +89,8 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   use; only top-level generic functions can be used at several.
 - `print` and `eprint` as values take one argument, not any number.
 - Generic functions must be top-level; there are no generic lambdas.
-- Only `i64`, `f64`, `bool` and `str`. Narrower integers, `f32` and SIMD
-  vectors (a stated goal) aren't designed yet.
+- Only `i64`, `f64`, `bool` and `str` (and `Array[T]` of the numbers).
+  Narrower integers, `f32` and fixed-size SIMD vectors aren't designed yet.
 - No negative indexing (deliberate for now).
 - The warning for cases that never match doesn't compare ranges with
   literals or each other (`case 1` after `case 0..5` isn't reported), and
@@ -331,6 +331,49 @@ Small steps that build on the above:
    `sum(xs)` needs no start value.
 3. Warnings for unused methods, enum variants and top-level variables.
 
+### Done (2026-11-03): arrays and SIMD
+
+1. `Array[T]`, for `i64` and `f64` items, of up to 32 dimensions, kept
+   flat in row-major order: `array(xs)`, `fill(shape, x)`,
+   `reshape(a, shape)`, `shape(a)`, `flat(a)`, `transpose(a)`,
+   `matmul(a, b)`, `total(a)` and `dot(a, b)`; `a[i, j]` (the parser
+   reads `a[i, j]` as `a[(i, j)]`, which works for `get` keys too) and
+   `a[i, j] = x`; `+ - * /` and unary `-` item by item, with an array or a
+   number on either side; `len`, `for`, `==`, `hash` and printing as nested
+   lists. Arrays meet `Add`, so `sum` adds lists of them.
+2. Native code runs arithmetic on arrays, `total` and `dot` as AVX2 loops
+   that codegen writes (four items at a time, i64 overflow gathered as
+   sign bits); `matmul` uses AVX2 intrinsics in the runtime. `total` and
+   `dot` add in four sums, an order the language defines, so results are
+   bit for bit the same in every backend. Indexing is inline
+   (`array_offset`), allocating nothing. A program with AVX2 code checks
+   the CPU has it when it starts.
+3. Arenas now start at staggered offsets: two arenas a power of two apart
+   holding arrays at the same offsets made a loop carrying an array ten
+   times slower. A scope arena also keeps the pages it used the last time
+   it was freed, so a loop making big arrays doesn't fault them in again.
+   On 1,000-item arrays, `c = a * 2.0 + b - c` with `dot` runs 26× faster
+   than the same loop over lists; on 1,000,000 items, where memory is the
+   limit, 5.7×.
+5. A `fuse` pass (last in the pipeline) makes arithmetic on arrays in a row
+   one `fused` instruction: `a * 2.0 + b - c` is one loop that reads a, b
+   and c once and makes no arrays in between, with masked loads and stores
+   for the last n % 4 items. Up to 6 steps, 4 arrays and 3 numbers (the
+   ymm registers); an operation joins only if nothing but constants is
+   between it and the next, so errors still come in order, and the runtime
+   finds the error by doing the steps one by one. The 1,000,000-item loop
+   went from 0.47 s to 0.20 s, the `arrays` benchmark from 18 ms to 7 ms.
+4. DCE no longer removes an unused `div` of arrays, which can fail, and
+   a top-level definition that fails still hides a library function of the
+   same name from later lines (only the error collection for editors saw
+   the difference).
+
+Still open: fusing `total` and `dot` with the arithmetic before them, and
+across statements (`let t = a * 2.0` then `t + b`, if t isn't used again,
+already fuses; through a variable that is, it doesn't), no broadcasting
+between shapes, no slices of arrays, no `f32` or narrower items, and i64
+`*` has no vector code (AVX2 lacks a 64-bit multiply).
+
 ### Done (2026-11-02, tenth round): a bigger standard library
 
 1. A `sets` module in the prelude: `Set[T]`, a `Map[T, ()]` inside, made
@@ -501,9 +544,11 @@ made of modules, it grows by topic (`lists`, `maps`, `sets`, `strings`,
 
 Modules are done (see above): whole-program compilation, with generics and
 methods specialized across modules, and compile-time code calling imported
-functions. What's left is code from outside the program: a library path
-or packages, importing several names at once, re-exports, and perhaps
-separate compilation of modules that don't change.
+functions. Packages, code from outside the program, are found on a package path
+(`--path DIR`, `ELLA_PATH`; docs/grammar.md §3). What's left: importing
+several names at once, re-exports, a way for a project to name its
+packages (a manifest, rather than the environment), and perhaps separate
+compilation of modules that don't change.
 
 ### 3. A real back end: beyond register allocation and inlining
 
@@ -533,10 +578,9 @@ out of range, which wins back the extra load.
 
 ### 6. SIMD and narrower number types
 
-A stated goal. Add `i8`–`i32` and `f32`, then fixed-size vector types
-(`f32x4`, ...) with element-wise operators through the `Num`-style
-constraints, lowered to SSE/AVX in codegen. This is a natural place to use
-the protocol methods, and it exercises the back end.
+`Array[T]` is done (see "arrays and SIMD" above). Next: `i8`–`i32` and
+`f32` (and arrays of them, eight `f32`s per AVX2 vector), fixed-size vector
+types (`f32x4`, ...), and fusing reductions into the loops before them.
 
 ### 7. Native staging
 

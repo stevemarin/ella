@@ -50,11 +50,11 @@ global before it is set is a run-time error.
 Memory
 ------
 
-Lists, strings, tuples, ranges, enum values and closures are *boxed*: a
+Lists, arrays, strings, tuples, ranges, enum values and closures are *boxed*: a
 value is a reference to an object in memory. (i64, f64, bool and () are
 not.) Ella has value semantics, so no two variables may share an object
 that can change; the only objects that ever change are lists, through
-`set_index` and `append`. The lowering makes this safe with explicit `copy`
+`set_index` and `append`, arrays, through `set_index`, and structs, through `set_field`. The lowering makes this safe with explicit `copy`
 instructions wherever a value gets a second owner (docs/memory-model.md §3).
 
 Every boxed object lives in an *arena*, and every instruction that makes
@@ -110,7 +110,11 @@ Operations
     load slot, store slot, v     read or write a local variable
     global_get name, global_set name, v
     add sub mul div floordiv mod pow    arithmetic (`div` always gives f64;
-                                 `add` also joins strings and lists)
+                                 `add` also joins strings and lists). `add`, `sub`,
+                                 `mul`, `div` and `neg` also work on arrays item by item
+                                 (two of the same shape, or an array and a number on
+                                 either side), giving a new array in the instruction's
+                                 region; native code runs them as AVX2 loops
     bitand bitor bitxor shl shr  bitwise operations, on i64
     neg not bitnot               unary operations
     eq ne lt le gt ge            comparisons, giving bool
@@ -118,10 +122,24 @@ Operations
     range lo, hi                 `lo..hi`; `range_incl` for `lo..=hi`
     tuple a, b, ...              build a tuple; `tuple_get t, n` reads item n
     list a, b, ...               build a list
-    index c, i                   item i of a list,string (a 1-char string) or range
+    index c, i                   item i of a list, string (a 1-char string) or range, or
+                                 item i of an array's items (in row-major order),
+                                 which must be in range: `array_offset` or a loop
+                                 over the array gives i
+    array_offset a, i, j, ...    where item (i, j, ...) is in array a's items, checking
+                                 that there is an index for each dimension, in range
+    fused a, b, ... [steps] @r   several of `add`, `sub`, `mul`, `div` and `neg` on arrays
+                                 (and numbers) in a row, as one (made by ella.passes.fuse):
+                                 each step works on the operands (a, b, ...: 0, 1, ...)
+                                 and the results of earlier steps (s0, s1, ...), and has
+                                 the span of the operation it was; the last step's array
+                                 is the result. Natively one loop goes over all the items,
+                                 with no arrays in between; it gives what the steps one by
+                                 one would give, errors and all
     slice c, r @r                a view of items r.start up to r.stop of a list or string:
                                  a new header in @r that shares c's items (or characters)
     set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
+                                 (or of an array's items, i given by `array_offset`)
     append xs, ys @r             xs with copies of ys's items added, growing xs in place
                                  if it can; xs lives in region r and isn't used again
     copy v @r                    a deep copy of v in region r
@@ -161,11 +179,13 @@ Operations
     type_value t...               type n (in `index`) of the module's types, as a value,
                                  with the types t... spliced into it (`type [$t]`)
     reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
-    len c                        length of a list, string or range, or a pool's or arena's count
+    len c                        length of a list, string or range, an array's number of
+                                 items, or a pool's or arena's count
     builtin a, ... @r            a library function (in `name`), such as split(a, b),
                                  whose result is new objects in @r (ella.library), or
-                                 for those in VIEWS views of a's characters; abs, min
-                                 and max take i64s or f64s
+                                 for those in VIEWS views of a's characters; abs, min,
+                                 max and the array functions take i64s or f64s (or
+                                 arrays of them), and `array` its result's item type
     to_text v                    the text form of any value
     print v                      write the text form of v and a newline
     eprint v                     the same, to standard error
@@ -226,6 +246,7 @@ from ella.checker import (
     PrimTy,
     TupleTy,
     Type,
+    library_param,
     show_type,
     substitute,
 )
@@ -247,6 +268,24 @@ class Value:
         return f"%{self.id}"
 
 
+@dataclass(frozen=True, slots=True)
+class FusedStep:
+    """One step of a `fused` instruction: `op` ("add", "sub", "mul", "div" or "neg") on `left` and `right` (None
+    for `neg`). An operand n >= 0 is the instruction's operand n; -1 - k is the result of step k."""
+
+    op: str
+    left: int
+    right: int | None
+    span: Span
+
+    def __str__(self) -> str:
+        def ref(n: int) -> str:
+            return str(n) if n >= 0 else f"s{-1 - n}"
+
+        operands = ref(self.left) + (f", {ref(self.right)}" if self.right is not None else "")
+        return f"{self.op}({operands})"
+
+
 @dataclass(slots=True)
 class Instr:
     """One instruction. Which of the optional fields matter depends on `op`.
@@ -263,6 +302,7 @@ class Instr:
       an inlined one), the name of the function it is in, as stack traces
       show it ("" for the top-level code), even after inlining moves it to
       another; None for the call of `main`, which traces leave out.
+    * `steps`: the steps of a `fused` instruction.
     """
 
     op: str
@@ -277,6 +317,7 @@ class Instr:
     out_regions: list[str] = field(default_factory=list)
     mutable: tuple[int, ...] = ()
     within: str | None = None
+    steps: tuple[FusedStep, ...] = ()
 
 
 @dataclass(slots=True)
@@ -409,6 +450,11 @@ ALLOCATING = frozenset(
         "range",
         "range_incl",
         "add",
+        "sub",
+        "mul",
+        "div",
+        "neg",
+        "fused",
         "index",
         "to_text",
         "copy",
@@ -444,6 +490,10 @@ def allocates(instr: Instr) -> bool:
     if instr.op == "closure" and not instr.args:
         return False  # static: it holds nothing
     return instr.op != "index" or instr.args[0].type == STR
+
+
+def is_array(t: Type) -> bool:
+    return isinstance(t, BuiltinTy) and t.name == "Array"
 
 
 def is_boxed(t: Type) -> bool:
@@ -714,6 +764,8 @@ def format_instr(instr: Instr) -> str:
             operands = f"{args}, {show_literal(instr.name)}"
         case "reset" | "swap":
             operands = str(instr.index)
+        case "fused":
+            operands = f"{args} [" + " ".join(map(str, instr.steps)) + "]"
         case _:
             operands = args
     text = f"{instr.op} {operands}".rstrip()
@@ -939,6 +991,15 @@ class Verifier:
                 need(dest == self.module.globals.get(instr.name))
             case "global_set":
                 need(args == [self.module.globals.get(instr.name)])
+            case "add" | "sub" | "mul" | "div" if any(is_array(a) for a in args):
+                # Item by item: an array of the same type, or a number of its items' type, on the other side.
+                need(
+                    len(args) == 2
+                    and dest in args
+                    and is_array(dest)
+                    and all(a in (dest, item_type(dest)) for a in args)
+                )
+                need(instr.op != "div" or dest == BuiltinTy("Array", (F64,)))
             case "add":
                 need(
                     len(args) == 2 and args[0] == args[1] == dest and kind(args[0]) in ("i64", "f64", "str", "ListTy")
@@ -950,7 +1011,7 @@ class Verifier:
             case "floordiv" | "mod" | "bitand" | "bitor" | "bitxor" | "shl" | "shr":
                 need(args == [I64, I64] and dest == I64)
             case "neg":
-                need(args == [dest] and dest in (I64, F64))
+                need(dest is not None and args == [dest] and (dest in (I64, F64) or is_array(dest)))
             case "bitnot":
                 need(args == [I64] and dest == I64)
             case "not":
@@ -973,6 +1034,17 @@ class Verifier:
                 need(isinstance(dest, ListTy) and all(a == dest.element for a in args))
             case "index":
                 need(len(args) == 2 and args[1] == I64 and dest == item_type(args[0]))
+            case "array_offset":
+                need(len(args) >= 2 and is_array(args[0]) and all(a == I64 for a in args[1:]) and dest == I64)
+            case "fused":
+                need(dest is not None and is_array(dest) and bool(instr.steps))
+                if dest is not None and is_array(dest):
+                    need(all(a in (dest, item_type(dest)) for a in args) and dest in args)
+                for k, step in enumerate(instr.steps):
+                    refs = [step.left] if step.right is None else [step.left, step.right]
+                    need(step.op in ("add", "sub", "mul", "div", "neg") and (step.right is None) == (step.op == "neg"))
+                    need(all(-k <= ref < len(args) for ref in refs))
+                    need(step.op != "div" or dest == BuiltinTy("Array", (F64,)))
             case "slice":
                 need(
                     len(args) == 2
@@ -983,10 +1055,11 @@ class Verifier:
             case "builtin":
                 library: Type | None = LIBRARY.get(instr.name)
                 if library is not None and instr.name in GENERIC_LIBRARY and args:
-                    library = substitute(library, {"T": args[0]})
+                    library = substitute(library, {"T": library_param(instr.name, args)})
                 need(library is not None and dest is not None and FuncTy(tuple(args), dest) == library)
             case "set_index":
-                need(len(args) == 3 and isinstance(args[0], ListTy) and args[1:] == [I64, args[0].element])
+                need(len(args) == 3 and item_type(args[0]) is not None and args[0] != STR and args[0] != RANGE)
+                need(args[1:] == [I64, item_type(args[0])])
             case "append" | "copy" | "move":
                 need(len(args) == (2 if instr.op == "append" else 1) and dest == args[0])
                 need(instr.op != "append" or (isinstance(dest, ListTy) and args[1] == dest))
@@ -1144,9 +1217,9 @@ def constant_type(const: Constant) -> Type:
 
 
 def item_type(t: Type) -> Type | None:
-    """The type of the items of a list, string or range (as `index` and `for` see them)."""
+    """The type of the items of a list, string, range or array (as `index` and `for` see them)."""
     match t:
-        case ListTy(element):
+        case ListTy(element) | BuiltinTy("Array", (element,)):
             return element
         case PrimTy("str"):
             return STR

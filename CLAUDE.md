@@ -112,7 +112,9 @@ plain:
   (`trim(str)`) made by the lowering.
 * `src/ella/modules.py`: modules and imports (docs/grammar.md §3).
   `link` loads the modules a program's entry file imports (found from its
-  directory) and the library modules whose prelude names it uses, and
+  directory, then from the package path: `--path` and `ELLA_PATH`,
+  `package_path`; a package's module's file in spans is its path from the
+  root, `../libs/json.ella`) and the library modules whose prelude names it uses, and
   makes one program of them, in the order their code runs: each module's
   top-level names get its name in front (`geo.area`; the entry file's stay
   bare), and every use of a top-level name becomes that name, tracking
@@ -134,7 +136,10 @@ plain:
   without importing them, except those of `iters` (`UNPRELUDED` in
   ella.modules), which share names with `lists`'; they can be imported too.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
-  both interpreters so results and error messages match exactly.
+  both interpreters so results and error messages match exactly. Arrays
+  (`ArrayValue` in values.py; `Array[T]` in the checker, `array_item`) work
+  item by item here, and their library functions are in library.py;
+  `total` and `dot` add in four sums (`lane_sum`), the order AVX2 code uses.
 * `src/ella/interpreter.py`: tree-walking interpreter over the AST (stage 2),
   the reference for the language's behavior. It copies eagerly, passes
   `mut` arguments in and out (value-result), and finalizes values through
@@ -164,12 +169,14 @@ plain:
   types it may hold (`Module.texts`), and `==`, `in` and `hash` their `eq`
   and `hash` methods (`Module.eqs`, `hashes`), which the IR interpreter and
   the runtime (through type descriptors, `ella_call1` and `ella_call2`) call.
+  `a[i, j]` on an array becomes `array_offset` (checking the indexes) and
+  `index`/`set_index` at that offset.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
   ("memory check failed" means a compiler bug; a list's view, `View`, checks
   its list's items haven't changed), and keeps the `--profile` numbers. It builds run-time code and lowers it into the module for `run`.
 * `src/ella/passes/`: optimization passes, one module each (`mem2reg`,
-  `direct`, `moves`, `fold`, `simplify`, `dce`, `inline`), each
+  `direct`, `moves`, `fold`, `simplify`, `dce`, `inline`, `fuse`), each
   `pass(function, module) -> bool` (changed?).
   `optimize()` in `__init__.py` runs them, verifying the IR after every pass,
   then drops functions inlining left unused (unless the program has quotes).
@@ -178,13 +185,17 @@ plain:
   functions into `call_direct`; `inline` copies small non-recursive
   functions into their callers (bottom up), their levels going above the
   caller's, with `enter`/`leave` so the call still counts toward the depth
-  limit.
+  limit. `fuse` (last) makes arithmetic on arrays in a row one `fused`
+  instruction, one AVX2 loop natively, whose errors the runtime finds by
+  doing its steps one by one.
 * `src/ella/regalloc.py`: register allocation for codegen: liveness, then
   greedy coloring in dominator-tree order (the IR is SSA); a value with no
   free register spills to a stack slot. Values live across a call (`calls`,
   `calls_partway`, which must match codegen) get callee-saved registers
   (rbx, r12-r15), others caller-saved ones (rsi, rdi, r8-r10); rax, rcx,
-  rdx, r11 are codegen's scratch. Generator functions get none.
+  rdx, r11 are codegen's scratch. Generator functions get none. Arithmetic
+  on arrays, `total` and `dot` call partway, and their AVX2 loops use the
+  caller-saved registers (and ymm registers, which no value is ever in).
 * `src/ella/codegen.py`: IR to x64 GNU assembly (Intel syntax). Each value
   in its register or a stack slot, Ella's own calling convention (arguments
   pushed; see the module docstring), C calling convention for runtime calls

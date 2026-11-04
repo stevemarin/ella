@@ -1,6 +1,7 @@
 """Ella: a statically typed language for learning and fun."""
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from ella.ir_interpreter import IRInterpreter
 from ella.lexer import STD, EllaError, Span, tokenize
 from ella.library import Host
 from ella.lower import compile_program
-from ella.modules import link
+from ella.modules import link, package_path
 from ella.native import build, finish_run
 from ella.parser import parse
 from ella.passes import PASSES, optimize
@@ -44,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--tree", action="store_true", help="run with the tree-walking interpreter instead of the IR")
     mode.add_argument("--native", action="store_true", help="compile to a native executable and run it")
     mode.add_argument("-o", "--output", type=Path, help="compile to a native executable with this name")
+    args.add_argument(
+        "--path",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="find packages in this directory too (before those of ELLA_PATH; may be given more than once)",
+    )
     args.add_argument("-O", "--optimize", action="store_true", help="optimize the IR before running or printing it")
     args.add_argument(
         "--max-depth",
@@ -70,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             args.error(f"unknown pass {unknown[0]!r}; the passes are {', '.join(PASSES)}")
 
     source = options.file.read_text(encoding="utf-8")
+    packages = package_path(options.path)
     status = 0
     try:
         if options.tokens:
@@ -82,14 +92,14 @@ def main(argv: list[str] | None = None) -> int:
             for expr in program.body:
                 print(show(expr))
         elif options.expanded:
-            linked = link(parse(source), options.file)
+            linked = link(parse(source), options.file, packages)
             show_expanded(options.file, linked, prepare(linked)[0])
         elif options.tree:
-            program, checker = prepare(parse(source), path=options.file)
+            program, checker = prepare(parse(source), path=options.file, packages=packages)
             warn(options.file, checker)
             status = Interpreter(checker=checker, host=host, max_depth=options.max_depth).run(program)
         else:
-            module = compile_program(source, path=options.file)
+            module = compile_program(source, path=options.file, packages=packages)
             warn(options.file, module.checker)
             if options.optimize or passes is not None:
                 optimize(module, passes)
@@ -128,12 +138,13 @@ def warn(file: Path, checker: Checker) -> None:
 
 def where(file: Path, span: Span) -> str:
     """Where an error is: `prog.ella:3:5`, `geo/poly.ella:3:5` in a module (from the entry file's
-    directory, as the entry file was given), or `<std>/maps.ella:12:5` in the standard library."""
+    directory, as the entry file was given, which a package's module is too), or `<std>/maps.ella:12:5`
+    in the standard library."""
     if not span.file:
         return f"{file}:{span}"
     if span.file.startswith(STD):
         return str(span)
-    return f"{(file.parent / span.file).as_posix()}:{span.line}:{span.column}"
+    return f"{Path(os.path.normpath(file.parent / span.file)).as_posix()}:{span.line}:{span.column}"
 
 
 def show_import(line: Import) -> str:

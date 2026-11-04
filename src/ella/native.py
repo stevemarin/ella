@@ -27,7 +27,8 @@ from ella.passes import optimize
 from ella.values import MAX_CALL_DEPTH
 
 RUNTIME = Path(__file__).with_name("runtime.c")
-CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra"]
+# No fused multiply-adds, which round differently from Python (the array code multiplies, then adds).
+CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra", "-ffp-contract=off"]
 
 
 def runtime_object() -> Path:

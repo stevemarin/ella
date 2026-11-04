@@ -1,0 +1,12 @@
+# Optimized, `(a + 1) - b + 5` is one loop (ella.passes.fuse), but its errors are
+# those of the operations one by one: the `+` overflows (at its last item) before
+# the `-` finds that b's shape is wrong.
+let step = (a: Array[i64], b: Array[i64]) -> Array[i64] => (a + 1) - b + 5
+
+let main = () -> () =>
+    let a = array([1, 2, 3, 4, 5, 6])
+    print(step(a, a * 2))
+    print(step(reshape(a, [2, 3]), fill([2, 3], 1)))
+    let mut big = a
+    big[5] = 9223372036854775807
+    print(step(big, fill([7], 0)))

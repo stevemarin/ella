@@ -176,7 +176,7 @@ def test_errors_have_a_cause_and_where_they_were_made() -> None:
         ("[1][true]", "an index must be an i64, not bool"),
         ("5[0]", "can't index a i64"),
         ("(1, 2).x", "a (i64, i64) has no fields"),
-        ("len(5)", "len() needs a list, str, range, Pool or Arena, not i64"),
+        ("len(5)", "len() needs a list, str, range, Array, Pool or Arena, not i64"),
         ("len()", "len takes 1 argument but was given 0"),
         ("Some(1, 2)", "Some takes 1 argument but was given 2"),
         ("5(1)", "can't call a value of type i64"),
@@ -207,6 +207,64 @@ def test_errors_have_a_cause_and_where_they_were_made() -> None:
 )
 def test_type_errors(source: str, message: str) -> None:
     assert error(source).message == message
+
+
+def test_array_types() -> None:
+    assert type_of("fill([2, 3], 0.0)") == "Array[f64]"
+    assert type_of("array([1, 2])[0]") == "i64"
+    assert type_of("fill([2, 2], 1)[1, 1]") == "i64"
+    assert type_of("let t = (0, 1)\nfill([2, 2], 1.5)[t]") == "f64"
+    assert type_of("fill([2], 1.0) * 2.0") == "Array[f64]"
+    assert type_of("2 - fill([2], 1)") == "Array[i64]"
+    assert type_of("-fill([2], 1)") == "Array[i64]"
+    assert type_of("total(fill([2], 1))") == "i64"
+    assert type_of("dot(fill([2], 1.0), fill([2], 2.0))") == "f64"
+    assert type_of("shape(fill([2], 1))") == "[i64]"
+    assert type_of("flat(fill([2], 1.0))") == "[f64]"
+    assert type_of("let mut a = array([])\na = a * 2.5\na") == "Array[f64]"  # decided by its use
+    assert type_of("for x in fill([2], 1.5) print(x)\nfill([1], 1)") == "Array[i64]"
+    assert binding_type("let f = (a: Array[i64]) -> i64 => len(a) + a[0, 0]", "f") == "(Array[i64]) -> i64"
+    assert binding_type("let f[T: Num] = (a: Array[T], k: T) -> Array[T] => a * k", "f") == "(Array[T], T) -> Array[T]"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("let a: Array[str] = fill([1], 1)", "an Array's items must be i64 or f64, not str"),
+        ("let a: Array[[i64]] = fill([1], 1)", "an Array's items must be i64 or f64, not [i64]"),
+        ('fill([1], "a")', "fill needs T to be Num, and str isn't"),
+        ("fill([1], 1) / 2", "'/' works on Array[f64] only, not Array[i64]; use '*' or '//' on i64s"),
+        ("fill([1], 1) // 2", "'//' doesn't work on Array[i64]"),
+        (
+            "fill([1], 1) + 2.0",
+            "'+' on an array needs another array or a number of its items' type, not Array[i64] and f64",
+        ),
+        ("fill([1], 1) + fill([1], 1.0)", "'+' needs two arrays of the same type, not Array[i64] and Array[f64]"),
+        ("fill([1], 1) < fill([1], 1)", "'<' doesn't work on Array[i64]"),
+        ("fill([1], 1)[1.0]", "an array's index must be an i64, or a tuple of them, not f64"),
+        ("fill([1], 1)[0, true]", "an array's index must be an i64, or a tuple of them, not (i64, bool)"),
+        ("fill([1], 1)[0..1]", "an array's index must be an i64, or a tuple of them, not range"),
+        ("1 in fill([1], 1)", "'in' needs a list, str or range on the right, not Array[i64]"),
+        (
+            "let f[T] = (a: Array[T]) -> Array[T] => a + a",
+            "'+' on T needs the constraint Num, like [T: Num]",
+        ),
+        (
+            "fill([1], 1)[" + ", ".join(["0"] * 33) + "]",
+            "an array has at most 32 dimensions, so it can't take 33 indexes",
+        ),
+        ("let a = fill([1], 1)\na[0] = 2", "can't assign to 'a' because it isn't mutable; declare it with 'let mut'"),
+    ],
+)
+def test_array_type_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+def test_a_failed_definition_hides_a_library_function_of_its_name() -> None:
+    # Uses of `total` are of the program's, which failed, not the library's.
+    assert all_errors("let total = 1 + true\nlet t = total + 1\n") == [
+        "1:15: '+' needs two values of the same type, not i64 and bool"
+    ]
 
 
 def test_type_error_span() -> None:
@@ -1372,7 +1430,7 @@ def test_inferred_lambda_errors() -> None:
         prepare(parse("map(['a'], (s) => s..s)"))
     with pytest.raises(EllaError, match="argument 1 should be i64, not str"):
         prepare(parse("let f = () -> () =>\n    let g = (x) => x\n    g(1)\n    g('a')\n    ()"))
-    with pytest.raises(EllaError, match="len[(][)] needs a list, str, range, Pool or Arena, not i64"):
+    with pytest.raises(EllaError, match="len[(][)] needs a list, str, range, Array, Pool or Arena, not i64"):
         prepare(parse("map([1], len)"))
 
 

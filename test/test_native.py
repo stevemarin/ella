@@ -93,6 +93,92 @@ print(1.5 < 2.5 <= 2.5 > 0.0 >= 0.0)
     )
 
 
+# Arrays: AVX2 code
+
+
+def random_floats(rng: random.Random, n: int) -> list[str]:
+    """Ella literals of n floats, some of them special: zeros of both signs, infinities and NaN."""
+    specials = ["0.0", "(-0.0)", "(1.0 / 0.0)", "(-1.0 / 0.0)", "(0.0 / 0.0)", "1.0e-310"]
+    return [rng.choice(specials) if rng.random() < 0.2 else ella_float(rng.uniform(-1e3, 1e3)) for _ in range(n)]
+
+
+def test_array_arithmetic_on_floats_matches_the_interpreter() -> None:
+    # Each length up to 13 puts items in both the vector loop and the rest; the sums of
+    # total and dot must come out the same, bit for bit, as the interpreter's four sums.
+    rng = random.Random(7)
+    lines = []
+    for n in range(14):
+        a, b = ", ".join(random_floats(rng, n)), ", ".join(random_floats(rng, n))
+        lines += [
+            f"let a{n} = array([{a}])",
+            f"let b{n} = array([{b}])",
+            f"print(a{n} + b{n}, a{n} - b{n}, a{n} * b{n}, a{n} / b{n}, -a{n}, a{n} * 0.5, 3.0 - a{n}, 1.0 / b{n})",
+            f"print(total(a{n}), dot(a{n}, b{n}), total(a{n} * 1.0e300), dot(a{n} * 1.0e-200, b{n}))",
+        ]
+    big = ", ".join(ella_float(rng.uniform(-1, 1)) for _ in range(5 * 7))
+    lines.append(f"let m = reshape(array([{big}]), [5, 7])")
+    lines.append("print(matmul(m, transpose(m)), matmul(transpose(m), m))")
+    assert_same_as_interpreter("\n".join(lines))
+
+
+def test_array_arithmetic_on_integers_matches_the_interpreter() -> None:
+    rng = random.Random(8)
+    edge = [2**62, -(2**62), 2**63 - 1, -(2**63) + 1, 3037000499, -3037000500]
+    for n in (3, 4, 7, 9):
+        for op in ("+", "-", "*"):
+            items = [rng.choice(edge) if rng.random() < 0.3 else rng.randrange(-1000, 1000) for _ in range(n)]
+            others = [rng.choice(edge) if rng.random() < 0.3 else rng.randrange(-1000, 1000) for _ in range(n)]
+            for expr in (f"a {op} b", f"a {op} 7", f"-3 {op} a", "-a", "total(a)", "dot(a, b)"):
+                source = f"let a = array({items})\nlet b = array({others})\nprint({expr})"
+                assert_same_as_interpreter(source)
+
+
+def random_chain(rng: random.Random, floats: bool, depth: int = 0) -> str:
+    """An expression of arrays a, b, c and numbers, which the fuse pass makes one loop of."""
+    leaves = ["a", "b", "c", ("2.5" if floats else "3"), ("(-0.5)" if floats else "(-7)")]
+    if depth >= 3 or rng.random() < 0.25:
+        return rng.choice(leaves[:3])
+    ops = ["+", "-", "*", "/"] if floats else ["+", "-"]
+    if rng.random() < 0.15:
+        return f"-({random_chain(rng, floats, depth + 1)})"
+    left, right = random_chain(rng, floats, depth + 1), random_chain(rng, floats, depth + 1)
+    if rng.random() < 0.3:
+        right = rng.choice(leaves[3:])
+    return f"({left} {rng.choice(ops)} {right})"
+
+
+def test_fused_array_arithmetic_matches_the_interpreter() -> None:
+    # Native code is optimized, so fused (ella.passes.fuse); the IR interpreter's isn't. Some i64 chains
+    # overflow, which must be reported as unfused code reports it.
+    rng = random.Random(9)
+    for floats in (True, False):
+        for n in (1, 4, 6, 11):
+            if floats:
+                values = [", ".join(random_floats(rng, n)) for _ in range(3)]
+            else:
+                big = [2**62, -(2**62), 2**63 - 1, -(2**63)]
+                values = [
+                    ", ".join(str(rng.choice(big) if rng.random() < 0.1 else rng.randrange(-99, 99)) for _ in range(n))
+                    for _ in range(3)
+                ]
+            for _ in range(4):
+                expr = random_chain(rng, floats)
+                source = (
+                    f"let a = array([{values[0]}])\nlet b = array([{values[1]}])\nlet c = array([{values[2]}])\n"
+                    f"print(a + 0{'.0' if floats else ''} - a, {expr})"
+                )
+                assert_same_as_interpreter(source)
+
+
+def test_avx2_code_is_only_in_programs_with_arrays() -> None:
+    plain = generate(compile_program("print([1.5] + [2.5])"))
+    assert "ella_uses_avx2:\n    .quad 0" in plain and "ymm" not in plain
+    text = generate(compile_program("let a = fill([8], 1.5)\nprint(total(a * a + a))"))
+    assert "ella_uses_avx2:\n    .quad 1" in text
+    assert "vmulpd ymm0, ymm0, ymmword ptr [rdi + 8 * r9]" in text  # four items at once
+    assert "vaddpd ymm0, ymm0, ymm1" in text  # the four sums of total
+
+
 # Integers
 
 

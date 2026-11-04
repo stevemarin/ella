@@ -1,0 +1,25 @@
+# Springs pulling 4,096 particles toward their targets, as arrays updated item by
+# item (AVX2 code), then a matrix product. The loop carries the arrays from one
+# step to the next, so its arenas hold two steps' arrays, not one per step.
+
+let spread = (n: i64, scale: f64) -> Array[f64] =>
+    let mut xs = []
+    for i in 0..n
+        xs += [to_f64(i % 97) * scale - 1.0]
+    array(xs)
+
+let main = () -> () =>
+    let n = 4096
+    let target = spread(n, 0.02)
+    let mut pos = fill([n], 0.0)
+    let mut vel = fill([n], 0.0)
+    let dt = 0.01
+    for step in 0..3000
+        let force = (target - pos) * 4.0 - vel * 0.5
+        vel = vel + force * dt
+        pos = pos + vel * dt
+        if step % 1000 == 999 then
+            print(step, total(pos), dot(vel, vel))
+    let m = reshape(spread(160 * 160, 0.001), [160, 160])
+    let p = matmul(m, matmul(m, transpose(m)))
+    print(total(p), p[3, 7])

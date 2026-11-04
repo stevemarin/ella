@@ -292,10 +292,11 @@ let main = () -> () =>
   imported name, as it can any top-level name.
 * A top-level variable of another module can be read but not changed:
   it can't be assigned or passed as `mut`, even if it is `let mut`.
-* Imports are found first from the root, then in the standard library
-  ([§10](#the-prelude)). A module of the program with the name of a
-  library module is used instead of it by imports, with a warning (the
-  prelude's names still come from the library).
+* Imports are found first from the root, then from each directory of
+  the package path ([below](#packages)), then in the standard library
+  ([§10](#the-prelude)). A module of the program or of a package with the
+  name of a library module is used instead of it by imports, with a
+  warning (the prelude's names still come from the library).
 * Imports can't form a cycle (`a` imports `b`, which imports `a`); the
   error names the modules in it.
 
@@ -325,7 +326,37 @@ functions that nothing in the program uses aren't compiled.
 **Locations.** Errors and warnings give `file:line:column`. The file is
 the entry file as given to `ella`, other modules by their path from its
 directory, joined to it (`geo/poly.ella:12:5` for `ella main.ella`), and
-`<std>/maps.ella:136:13` for a library module.
+`<std>/maps.ella:136:13` for a library module. A package's module
+([below](#packages)) is named the same way, by its path from the entry
+file's directory: `ella app/main.ella --path libs` gives
+`libs/json/lex.ella:3:9`.
+
+### Packages
+
+A *package* is code from outside the program: a module found in a
+directory of the *package path*, with the modules below it. The package
+path is the directories given to `ella` with `--path DIR` (which may be
+given more than once), then those of the `ELLA_PATH` environment
+variable, separated by `:`. Each directory is searched as if it were the
+root: with `ELLA_PATH=~/ella/libs`, `import json` finds
+`~/ella/libs/json.ella`, and `import json.lex` finds
+`~/ella/libs/json/lex.ella`.
+
+```sh
+ella --path ../libs main.ella
+ELLA_PATH=../libs:../vendor ella main.ella
+```
+
+* A package's modules are modules like any other, named by their paths
+  from the package's directory: the rules above for imports, private
+  names and running hold for them too. So a package's modules import each
+  other by their full names (`import json.lex` in `json.ella`), and its
+  private names are kept from its users.
+* An import is found in the first place that has its module: the root,
+  then each directory in order. A module of the program hides a package's
+  of the same name, and an earlier directory's a later one's.
+* Editors find packages from `ELLA_PATH`, as the editor's environment has
+  it.
 
 ## 4. Bindings and assignment
 
@@ -678,6 +709,8 @@ Consequences worth knowing:
 ### Arithmetic
 
 * Operands must have the same type; there are no implicit conversions.
+  (Arrays are the exception: `a * 2.0` works item by item, see
+  [Arrays](#arrays-provisional-syntax).)
 * `+` also concatenates two `str`s or two lists.
 * `/` is true division and always returns `f64`, for `i64` or `f64` operands.
 * `//` is integer division that **rounds toward negative infinity** (as in
@@ -733,6 +766,9 @@ returns `None`. The enclosing function's return type must be compatible.
   Unicode code points, and can't be assigned into. Pools are indexed with
   handles, arenas with refs, and structs and enums with `get` and `set` methods with any key
   ([§9](#methods-provisional-syntax)).
+* `a[i, j]` is `a[(i, j)]`: indexing with a tuple. An array takes one `i64`
+  for each of its dimensions ([§9](#arrays-provisional-syntax)), and a
+  type with `get` and `set` methods can take tuple keys this way: `grid[1, 2]`.
 * `a..b` is the half-open range `a <= i < b`; `a..=b` includes `b`.
 * Indexing a list or string with a range gives a *slice*, a new list or
   string of those items: `"hello"[1..3]` is `"el"`, `xs[0..=1]` the first
@@ -748,6 +784,7 @@ returns `None`. The enclosing function's return type must be compatible.
 i64  f64  bool  str              built-in scalars
 ()                               unit
 [T]                              list of T
+Array[T]                         an array of T (i64 or f64), of any number of dimensions
 (T, U)                           tuple
 (T, U) -> R                      function (parameters always parenthesized)
 (mut T, U) -> R                  function with a `mut` parameter
@@ -762,8 +799,9 @@ Type   Code                      a type, or code, whose type is only known later
 $(t)                             a type computed while compiling (§11)
 ```
 
-* All integer types are signed. More widths (`i8`–`i32`, `f32`) and SIMD
-  vector types come later.
+* All integer types are signed. More widths (`i8`–`i32`, `f32`) come later.
+  Arrays of numbers use SIMD instructions in native code
+  ([Arrays](#arrays-provisional-syntax)).
 * A tuple's items are read with `.0`, `.1`, ...: `pair.0`, `t.1.0`. A
   tuple can't be changed in place; build a new one.
 * Types appear after `:` in annotations, after `->` in lambdas, and inside
@@ -1056,6 +1094,57 @@ for n in Countdown(3)
   can index, loop over and search its values.
 * All these names (and the operators' above, and `finalize`) are kept for
   their meaning: a method with one of them must have its type.
+
+### Arrays **(provisional syntax)**
+
+An `Array[T]` holds numbers, `i64`s or `f64`s, in any number of dimensions:
+a vector has one, a matrix two. Its *shape* is the size of each dimension,
+and its items are kept together, row by row (the last index changes
+fastest), so that native code works on them with SIMD instructions (AVX2,
+four numbers at a time).
+
+```ella
+let mut m = reshape(array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [2, 3])
+print(m)                  # array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+print(shape(m), len(m))   # [2, 3] 6
+print(m[1, 2])            # 6.0
+m[0, 0] = 10.0
+let v = m * 0.5 + m       # item by item
+print(total(v), dot(m, m))
+print(matmul(m, transpose(m)))
+```
+
+* `array(xs)` makes a one-dimensional array of a list's numbers;
+  `fill(shape, x)` an array of the shape with every item `x`; and
+  `reshape(a, shape)` one with the same items in another shape. A shape is
+  a list of sizes: at least one, at most 32, none negative, and those that
+  aren't 0 must multiply to less than 2⁴⁸. See [§10](#10-built-ins) for the
+  other array functions.
+* `a[i, j]` is the item at row i, column j, with an `i64` for each
+  dimension (`a[i]` for one dimension, or a tuple of them, `a[t]`). Too many
+  or too few indexes, or one out of range, is a run-time error. Items can be
+  changed in place in a `mut` array: `m[0, 1] = 2.0`, `m[i, j] += x`.
+* `+`, `-` and `*` work item by item on two arrays of the same type and
+  shape, giving a new array; `/` too, on `Array[f64]` only. Either side can
+  be a number of the items' type instead, used for every item: `a * 2.0`,
+  `1.0 - a`. Unary `-` negates every item. Arrays of different shapes are a
+  run-time error. As for numbers, `i64` items trap on overflow: the error is
+  for the first item (by position) that overflows.
+* `==` and `!=` compare the shapes and the items. Arrays can't be ordered.
+* `len(a)` is the number of items, and `for x in a` goes through them in
+  order, row by row.
+* `total(a)` and `dot(a, b)` add up the items, or the products of two
+  arrays' items, in four sums at once, as AVX2 does: item i goes into sum
+  i % 4, and then the sums are added as `(s0 + s2) + (s1 + s3)`, each sum
+  starting at 0. Every backend adds in this order, so `f64` results are the
+  same everywhere, although they can differ in the last bits from adding
+  the items one by one; `i64` ones trap on the first addition (or product)
+  that overflows, in that order. `matmul` adds each item's products in
+  order, starting at 0.
+* An array is a value like any other: `let b = a` copies, and so does
+  passing one to a function, which changes a `mut` parameter's array in place.
+* An array prints as nested lists, one level per dimension:
+  `array([[1, 2], [3, 4]])`.
 
 ### Errors
 
@@ -1366,8 +1455,9 @@ Built-in functions (ordinary names, not keywords):
   line, and `print("x", 1)` prints `x 1`.
 * `eprint(a, b, ...)` prints the same way to standard error, after
   everything printed so far.
-* `len(x)` returns the length of a list, string or range as `i64`, or how
-  many values a pool or arena holds. On a struct or enum, it calls its `len` method.
+* `len(x)` returns the length of a list, string or range as `i64`, the
+  number of items of an array, or how many values a pool or arena holds. On a
+  struct or enum, it calls its `len` method.
 * `next(mut g)` gives the next item of a generator, or of an iterator
   (its `next` method), as an `Optional`
   ([§9](#generators-provisional-syntax)).
@@ -1424,13 +1514,23 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 | `abs(x)` | `[T: Num] (T) -> T` | `x` without its sign; an `i64` error for the smallest `i64` |
 | `min(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b < a`, otherwise `a` |
 | `max(a, b)` | `[T: Num] (T, T) -> T` | `b` if `b > a`, otherwise `a` |
+| `array(xs)` | `[T: Num] ([T]) -> Array[T]` | a one-dimensional array of the list's items |
+| `fill(shape, x)` | `[T: Num] ([i64], T) -> Array[T]` | an array of that shape, every item `x` |
+| `reshape(a, shape)` | `[T: Num] (Array[T], [i64]) -> Array[T]` | `a`'s items, in order, in another shape with as many items |
+| `shape(a)` | `[T: Num] (Array[T]) -> [i64]` | the size of each dimension |
+| `flat(a)` | `[T: Num] (Array[T]) -> [T]` | the items, as a list, row by row |
+| `total(a)` | `[T: Num] (Array[T]) -> T` | the sum of the items, in four sums ([§9](#arrays-provisional-syntax)) |
+| `dot(a, b)` | `[T: Num] (Array[T], Array[T]) -> T` | the sum of the products of the items of two arrays of the same shape, in four sums |
+| `matmul(a, b)` | `[T: Num] (Array[T], Array[T]) -> Array[T]` | the matrix product of a `[n, k]` and a `[k, m]` array: item (i, j) is the sum of `a[i, p] * b[p, j]` |
+| `transpose(a)` | `[T: Num] (Array[T]) -> Array[T]` | a two-dimensional array with its rows as columns |
 
 * `hash` is 64-bit FNV-1a: over the code points of a string, and over
   the hashes of the parts of other values (the items of a list or tuple;
   a variant's name, then its fields). Numbers, `bool`s and handles are
   one part each; `0.0` and `-0.0` hash the same, as do all NaNs; a range
   is its length and, unless empty, its start; a ref is its index; and an
-  `Error` leaves out where it was made, as `==` does. A struct or enum
+  `Error` leaves out where it was made, as `==` does; an array is the
+  tuple of its shape and its items. A struct or enum
   with a `hash` method ([§9](#methods-provisional-syntax)) hashes to what
   it gives, wherever it is.
 * Numbers are written in ASCII only, with no `_` and no spaces around them:
@@ -1829,7 +1929,7 @@ let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { bind
 type_param  = IDENT [ ":" path { "+" path } ] ;      (* built-in or user-defined constraints *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
-target      = IDENT | operator_expr "[" expr "]" | operator_expr "." IDENT ;
+target      = IDENT | operator_expr index | operator_expr "." IDENT ;
 
 lambda      = "(" [ param { "," param } [ "," ] ] ")" [ "->" type ] "=>" lambda_body
             | IDENT "=>" body ;                  (* one parameter, of an inferred type *)
@@ -1871,7 +1971,7 @@ operator_expr = prefix_op operator_expr
             | primary ;
 call        = "(" [ arg { "," arg } [ "," ] ] ")" ;
 arg         = [ "mut" ] expr ;                   (* `mut` only for a place, or before a method call *)
-index       = "[" expr "]" ;
+index       = "[" expr { "," expr } "]" ;           (* `a[i, j]` is `a[(i, j)]` *)
 member      = "." ( IDENT | INT | "$" ( IDENT | "(" expr ")" ) ) ;  (* `.0`: a tuple's item; `.$f`: a spliced field name *)
 
 primary     = INT | FLOAT | string | "true" | "false" | IDENT
@@ -1943,8 +2043,9 @@ Parsing notes:
 
 ## Open questions
 
-* How SIMD vector types are named and written (`f32x4`?), and how they relate
-  to `[T]`.
+* Fixed-size SIMD vector types (`f32x4`?) beside `Array[T]`, narrower
+  item types for arrays, broadcasting between arrays of different shapes,
+  and slices of arrays.
 * Whether iteration should use a stateful iterator (`next`) rather than
   making a list.
 * Methods for built-in types (`xs.len()`), and functions in a type's

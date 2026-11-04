@@ -32,7 +32,7 @@ later.
 """
 
 from ella.checker import ListTy
-from ella.ir import Function, Instr, Module, Value, count_uses, is_boxed, replace_values
+from ella.ir import Function, Instr, Module, Value, count_uses, is_array, is_boxed, replace_values
 
 # Operations whose results are entirely new objects.
 NEW = frozenset({"copy", "call", "call_direct", "to_text", "range", "range_incl", "append", "index"})
@@ -71,6 +71,8 @@ def movable(source: Instr, region: str, constants: set[int]) -> bool:
     if source.op in NEW:
         return True
     t = source.dest.type
+    if source.op in ("add", "sub", "mul", "div", "neg") and is_array(t):
+        return True  # a new array of numbers
     if source.op == "add":  # joining strings, or lists of numbers, makes all new objects
         return not isinstance(t, ListTy) or not is_boxed(t.element)
     # A new list, tuple or variant of numbers and constants.

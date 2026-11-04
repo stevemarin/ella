@@ -1,0 +1,7 @@
+# An index out of range for its dimension.
+let corner = (m: Array[f64], i: i64) -> f64 => m[i, i]
+
+let main = () -> () =>
+    let m = fill([2, 3], 0.5)
+    print(corner(m, 1))
+    print(corner(m, 2))

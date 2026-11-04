@@ -1,0 +1,2 @@
+2:49: index (2, 2) is out of range for an array of shape [2, 3]
+  called at 7:17 in main

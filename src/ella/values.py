@@ -10,6 +10,7 @@ Ella values are represented by plain Python values where one fits:
     ()              () (the empty tuple: unit is the tuple with no items)
     (T, U)          tuple
     [T]             list
+    Array[T]        ArrayValue: its shape and its items, in one flat list
     a..b, a..=b     range
     enum variants   VariantValue, or Constructor for a variant with fields
     structs         VariantValue too (a struct is an enum with one variant),
@@ -97,6 +98,19 @@ def make_error(message: str, span: Span, cause: Value | None = None) -> VariantV
     """A built-in Error, made at `span`."""
     optional = VariantValue("Optional", "Some", [cause]) if cause is not None else VariantValue("Optional", "None")
     return VariantValue("Error", "Error", [message, optional, str(span)], error=True)
+
+
+@dataclass(eq=False, slots=True)
+class ArrayValue:
+    """An `Array[T]`: a shape (the size of each dimension), and its items in row-major order.
+
+    `items` has the product of the sizes, and can change in place (`a[i, j] = x`).
+    `floats` says T is f64, which an empty array's items can't show.
+    """
+
+    shape: tuple[int, ...]
+    items: list[Value]  # all i64s, or all f64s
+    floats: bool
 
 
 @dataclass(eq=False, slots=True)
@@ -228,6 +242,7 @@ type Value = (
     | tuple[Value, ...]
     | list[Value]
     | range
+    | ArrayValue
     | VariantValue
     | Constructor
     | Closure
@@ -317,6 +332,8 @@ def type_name(value: Value) -> str:
             return "list"
         case range():
             return "range"
+        case ArrayValue():
+            return "Array"
         case VariantValue(enum=enum):
             return enum
         case Constructor() | Closure() | Builtin() | FunctionRef():
@@ -348,6 +365,8 @@ def copy_value(value: Value) -> Value:
             return [copy_value(item) for item in value]
         case tuple():
             return tuple(copy_value(item) for item in value)
+        case ArrayValue(shape, items, floats):
+            return ArrayValue(shape, items.copy(), floats)
         case VariantValue(enum, variant, fields, nocopy, error) if fields and not nocopy:
             return VariantValue(enum, variant, [copy_value(item) for item in fields], error=error)
         case _:
@@ -366,6 +385,8 @@ def equal(a: Value, b: Value, custom: Callable[[VariantValue, VariantValue], boo
         return False
     if isinstance(a, list | tuple) and isinstance(b, list | tuple):
         return len(a) == len(b) and all(equal(x, y, custom) for x, y in zip(a, b))
+    if isinstance(a, ArrayValue) and isinstance(b, ArrayValue):
+        return a.shape == b.shape and all(x == y for x, y in zip(a.items, b.items))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
         if custom is not None and (same := custom(a, b)) is not None:
             return same
@@ -404,6 +425,8 @@ def to_text(value: Value, nested: bool = False, custom: Callable[[VariantValue],
             return "[" + ", ".join(map(part, value)) + "]"
         case range():
             return f"{value.start}..{value.stop}"
+        case ArrayValue(shape, items):
+            return f"array({nested_text(shape, items)})"
         case VariantValue() if custom is not None and (text := custom(value)) is not None:
             return text
         case VariantValue(fields=[message, VariantValue(fields=cause), _], error=True):
@@ -428,6 +451,15 @@ def to_text(value: Value, nested: bool = False, custom: Callable[[VariantValue],
             return f"<code {show(expr)}>"
         case TypeValue(t):
             return f"<type {show_type(t)}>"
+
+
+def nested_text(shape: tuple[int, ...], items: list[Value]) -> str:
+    """An array's items as nested lists, one level per dimension: `[[1.0, 2.0], [3.0, 4.0]]`."""
+    if len(shape) == 1:
+        return "[" + ", ".join(map(to_text, items)) + "]"
+    step = len(items) // shape[0] if shape[0] else 0
+    rows = (nested_text(shape[1:], items[i * step : (i + 1) * step]) for i in range(shape[0]))
+    return "[" + ", ".join(rows) + "]"
 
 
 def run_deep[T](run: Callable[[], T], max_depth: int, frames_per_call: int) -> T:

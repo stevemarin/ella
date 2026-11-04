@@ -361,6 +361,15 @@ let Stack = (t: Type) -> Type => new_struct("Stack[{{type_name(t)}}]", ["items"]
 let numbers: $(Stack(type i64)) = $(Stack(type i64))([1, 2])
 assert len(numbers.items) == 2
 
+# arrays of numbers, of any number of dimensions; native code works on them
+# with AVX2, four items at a time. a[i, j] indexes, and + - * / go item by item
+let mut board = reshape(array([1.0, 2.0, 3.0, 4.0]), [2, 2])
+board[0, 1] = 5.0
+let scaled = board * 2.0 + board
+assert shape(scaled) == [2, 2] and scaled[0, 1] == 15.0
+assert flat(board) == [1.0, 5.0, 3.0, 4.0] and dot(board, board) == 51.0
+assert matmul(board, transpose(board))[1, 1] == 25.0
+
 # print takes any number of values; eprint writes to standard error
 print("low", low, "high", high)
 

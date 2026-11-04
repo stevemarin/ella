@@ -34,10 +34,12 @@ from typing import TextIO
 
 from ella.checker import (
     BUILTIN_ENUMS,
+    F64,
     LIBRARY,
     OPERATOR_METHODS,
     REFLECTION,
     Checker,
+    array_item,
     check_code,
     finish,
     pattern_names,
@@ -46,7 +48,7 @@ from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, 
 from ella.library import Exit, Host, hash_value
 from ella.library import call as call_library
 from ella.modules import link
-from ella.operators import binary, compare, index_into, unary
+from ella.operators import array_offset, binary, compare, index_into, unary
 from ella.parser import parse
 from ella.staging import (
     AnySplice,
@@ -118,6 +120,7 @@ from ella.values import (
     MAX_CALL_DEPTH,
     UNIT,
     ArenaValue,
+    ArrayValue,
     Builtin,
     Closure,
     CodeValue,
@@ -393,6 +396,13 @@ class Interpreter:
                     and id(expr) in self.checker.wrappers
                 ):
                     return replace(value, at=span)  # Error used as a value makes its Errors here
+                if (
+                    isinstance(value, Builtin)
+                    and value.name == "array"
+                    and self.checker
+                    and id(expr) in self.checker.wrappers
+                ):
+                    return self.eval(self.checker.wrappers[id(expr)], scope)  # whose call knows the item type
                 return value
             case Let(bindings, value_expr):
                 if isinstance(value_expr, Lambda):
@@ -482,6 +492,8 @@ class Interpreter:
                     return self.call_pool(function.name, args, scope, span)
                 if isinstance(function, Builtin) and function.name == "next":
                     return self.call_next(args, scope, span)
+                if isinstance(function, Builtin) and function.name == "array" and len(args) == 1:
+                    return self.make_array(expr, self.eval(args[0], scope), span)
                 return self.call_with_args(function, args, scope, span)
             case MutArg(span=span):
                 raise EllaError("'mut' marks an argument for a 'mut' parameter, and only works in a call", span)
@@ -672,6 +684,9 @@ class Interpreter:
             assert isinstance(index, RefValue)
             self.arena_slot(container, index, span)  # check the ref
             container.values[index.index] = value
+            return
+        if isinstance(container, ArrayValue):
+            container.items[array_offset(container, index, span)] = value
             return
         index_into(container, index, span)  # check that the index is in range
         if not isinstance(container, list):
@@ -1481,6 +1496,8 @@ class Interpreter:
         match iterable:
             case list() | range():
                 items = iterable
+            case ArrayValue():
+                items = list(iterable.items)  # in row-major order
             case str():
                 items = list(iterable)  # one-character strings
             case GenValue() | VariantValue() if isinstance(iterable, GenValue) or self.find_method(iterable, "next"):
@@ -1536,6 +1553,16 @@ class Interpreter:
         stderr.flush()
         return UNIT
 
+    def make_array(self, call: Call, items: Value, span: Span) -> Value:
+        """`array(xs)`, whose item type the checker knows (an empty list can't show it)."""
+        t = self.checker.types.get(id(call)) if self.checker is not None else None
+        floats = (
+            array_item(finish(t)) == F64
+            if t is not None
+            else isinstance(items, list) and any(isinstance(item, float) for item in items)
+        )
+        return call_library("array", [items, "f64" if floats else "i64"], span, self.host)
+
     def builtin_len(self, args: list[Value], span: Span) -> Value:
         """`len(x)` is the length of a list, string or range, or how many values a pool or arena holds."""
         value = args[0]
@@ -1545,8 +1572,10 @@ class Interpreter:
             return value.live()
         if isinstance(value, ArenaValue):
             return len(value.values)
+        if isinstance(value, ArrayValue):
+            return len(value.items)
         if not isinstance(value, list | str | range):
-            raise EllaError(f"len() needs a list, str, range, Pool or Arena, not {type_name(value)}", span)
+            raise EllaError(f"len() needs a list, str, range, Array, Pool or Arena, not {type_name(value)}", span)
         return len(value)
 
 

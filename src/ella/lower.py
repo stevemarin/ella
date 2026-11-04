@@ -59,8 +59,9 @@ for each boxed value, the lowering tracks two things (`Info`):
 A value is copied when it is stored (in a variable, a list, a returned
 value, ...) if either check fails:
 
-* Sharing would be visible. Only lists ever change, and only in place,
-  through `xs[i] = v` and `xs += ys`. A value with lists in it is copied
+* Sharing would be visible. Only lists (and arrays and structs, which
+  work alike) ever change, and only in place, through `xs[i] = v` and
+  `xs += ys`. A value with lists in it is copied
   if it borrows from a variable that is changed in place, or is stored into
   a `mut` variable, which may change it in place itself.
 * It would outlive its objects: it lives in a region that doesn't outlive
@@ -160,6 +161,7 @@ from ella.ir import (
     Yield,
     allocates,
     carry_level,
+    is_array,
     is_boxed,
     outlives,
     shortest,
@@ -262,14 +264,16 @@ SELF = "<self>"
 CALLS = "<calls>"
 
 
-def compile_program(source: str, out: TextIO | None = None, path: Path | None = None) -> Module:
+def compile_program(
+    source: str, out: TextIO | None = None, path: Path | None = None, packages: Sequence[Path] | None = None
+) -> Module:
     """Parse, type check and lower a program, and verify the IR. Raises EllaError.
 
     Splices outside quotes run first, while compiling (see ella.staging);
     what they print goes to `out`. `path` is the program's file, which its
-    imports are found from.
+    imports are found from, and then from the package path (`packages`).
     """
-    program, checker = prepare(parse(source), out, path)
+    program, checker = prepare(parse(source), out, path, packages)
     module = Lowerer(checker).lower_program(program)
     verify(module)
     return module
@@ -344,8 +348,9 @@ class SelfInfo:
     capture_slots: list[str] = field(default_factory=list)
 
 
-# One step into a place: an index (a list's or a pool's) with its value, or a field.
-type Step = tuple[Index | Member, Value | None]
+# One step into a place: an index (a list's or a pool's) with its value, an array's
+# indexes (one for each dimension), or a field.
+type Step = tuple[Index | Member, Value | list[Value] | None]
 
 
 @dataclass(slots=True)
@@ -1125,7 +1130,7 @@ class Lowerer:
                 value = self.lower(operand)
                 if op == "-" and self.has_method(value.type, "neg"):
                     return self.call_method("neg", [value], self.type_of(expr), span, dest)
-                return self.emit(UNARY_OPS[op], self.type_of(expr), [value], span)
+                return self.emit(UNARY_OPS[op], self.type_of(expr), [value], span, region=dest)  # (an array's)
             case Binary(("and" | "or") as op, left, right):
                 return self.lower_logic(op, left, right, span)
             case Binary(op, left, right):
@@ -1136,6 +1141,8 @@ class Lowerer:
                 container = self.lower(target)
                 if self.has_method(container.type, "get"):
                     return self.call_method("get", [container, self.lower(index)], self.type_of(expr), span, dest)
+                if is_array(container.type):
+                    return self.array_item(container, self.array_indexes(index), self.type_of(expr), span)
                 if isinstance(container.type, BuiltinTy):
                     return self.pool_get(container, self.lower(index), self.type_of(expr), span)
                 return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
@@ -1328,6 +1335,20 @@ class Lowerer:
             self.info[result.id] = self.info_of(container)
         return result
 
+    def array_indexes(self, index: Expr) -> list[Value]:
+        """An array's indexes, one for each dimension: `a[i, j]` gives i and j, without making a tuple."""
+        if isinstance(index, TupleLit):
+            return [self.lower(item) for item in index.items]
+        value = self.lower(index)
+        if not isinstance(value.type, TupleTy):
+            return [value]
+        return [self.emit("tuple_get", I64, [value], index.span, index=i) for i in range(len(value.type.items))]
+
+    def array_item(self, array: Value, indexes: list[Value], t: Type, span: Span) -> Value:
+        """`a[i, j]`: a number, from where `array_offset` finds it in the items."""
+        offset = self.emit("array_offset", I64, [array, *indexes], span)
+        return self.emit("index", t, [array, offset], span)
+
     def lower_assign_name(self, op: str, target: Name, value_expr: Expr, span: Span, moved: str = "") -> Value:
         """`x = v` and `x op= v`. `moved` is a variable v reads for the last time, whose value can move to x."""
         kind = self.checker.kinds[id(target)]
@@ -1388,10 +1409,15 @@ class Lowerer:
         return value
 
     def is_pool_step(self, node: Index | Member) -> bool:
-        return isinstance(node, Index) and isinstance(self.type_of(node.target), BuiltinTy)
+        if not isinstance(node, Index):
+            return False
+        t = self.type_of(node.target)
+        return isinstance(t, BuiltinTy) and not is_array(t)
 
-    def step_key(self, node: Index | Member) -> Value | None:
-        """Evaluate a step's index (fields need nothing)."""
+    def step_key(self, node: Index | Member) -> Value | list[Value] | None:
+        """Evaluate a step's index, or an array's indexes (fields need nothing)."""
+        if isinstance(node, Index) and is_array(self.type_of(node.target)):
+            return self.array_indexes(node.index)
         return self.lower(node.index) if isinstance(node, Index) else None
 
     def step_into(self, container: Value, step: Step, region: str, span: Span | None = None) -> tuple[Value, str]:
@@ -1405,6 +1431,8 @@ class Lowerer:
         if isinstance(node, Member):
             return self.field(container, self.checker.members[id(node)], t, where), region
         assert key is not None
+        if isinstance(key, list):
+            return self.array_item(container, key, t, where), region
         if isinstance(container.type, BuiltinTy):
             return self.pool_get(container, key, t, where), "slot"
         return self.lower_index(container, key, t, where, ""), region
@@ -1418,8 +1446,12 @@ class Lowerer:
         """
         node, key = step
         where = node.span if at_step else span
+        if isinstance(key, list):  # an array's item, a number
+            offset = self.emit("array_offset", I64, [container, *key], where)
+            self.emit_effect("set_index", [container, offset, value], where, region=region)
+            return
         if isinstance(container.type, BuiltinTy):
-            assert key is not None
+            assert key is not None and not isinstance(key, list)
             self.emit_effect("pool_set", [container, key, value], where)
             return
         if region != "slot":
@@ -1432,7 +1464,7 @@ class Lowerer:
                 Instr("set_field", None, [container, value], where, enum.name, index, region=region)
             )
         else:
-            assert key is not None
+            assert key is not None and not isinstance(key, list)
             self.emit_effect("set_index", [container, key, value], where, region=region)
 
     def field(self, struct: Value, index: int, t: Type, span: Span) -> Value:

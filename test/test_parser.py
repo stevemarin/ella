@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 145
+    assert len(program.body) == 151
 
 
 # Precedence (docs/grammar.md §8)
@@ -167,6 +167,13 @@ def test_assignment_as_a_body_is_a_block() -> None:
     assert one("match c\n    case _ => x = 1") == "(match c (case _ (block (= x 1))))"
     assert one("for i in xs x += i") == "(for i xs (block (+= x i)))"
     assert one("let y = (x = 1)") == "(let [y] (= x 1))"  # a value, not a body
+
+
+def test_index_with_several_items_is_a_tuple() -> None:
+    assert one("a[i, j]") == "(index a (tuple i j))"
+    assert one("a[1, 2, 3] += x") == "(+= (index a (tuple 1 2 3)) x)"
+    assert one("a[(i, j)]") == "(index a (tuple i j))"
+    assert one("a[i][j, k]") == "(index (index a i) (tuple j k))"
 
 
 def test_assignment() -> None:
