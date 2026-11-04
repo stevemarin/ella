@@ -1,0 +1,24 @@
+let gcd = (a: i64, b: i64) -> i64 =>
+    let mut x = a
+    let mut y = b
+    while y != 0
+        let t = x % y
+        x = y
+        y = t
+    x
+
+let step = (n: i64) -> i64 => if n % 2 == 0 then n // 2 else 3 * n + 1
+
+let mut total = 0
+for i in 1..181
+    for j in 1..181
+        total += gcd(i, j)
+let mut longest = 0
+for start in 1..20001
+    let mut n = start
+    let mut steps = 0
+    while n != 1
+        n = step(n)
+        steps += 1
+    longest = max(longest, steps)
+print(total, longest)

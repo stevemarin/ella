@@ -1,0 +1,15 @@
+let main = () -> () =>
+    let n = 2048
+    let steps = 80
+    let mut target_items = []
+    for i in 0..n
+        target_items += [to_f64(i % 97) * 0.02 - 1.0]
+    let target = array(target_items)
+    let mut pos = fill([n], 0.0)
+    let mut vel = fill([n], 0.0)
+    let dt = 0.01
+    for _ in 0..steps
+        let force = (target - pos) * 4.0 - vel * 0.5
+        vel = vel + force * dt
+        pos = pos + vel * dt
+    print(to_i64(total(pos) * 1000000000.0), to_i64(dot(vel, vel) * 1000000000.0))
