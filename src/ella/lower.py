@@ -406,7 +406,7 @@ class Lowerer:
         self.carrying: set[int] = set()  # the levels of the loops being lowered that carry variables
         self.promoted: set[str] = set()  # globals that the loops being lowered carry, in local slots
         self.last_uses: dict[int, str] = {}  # id of an `x = y` -> y, if nothing reads y afterwards
-        self.returned: set[str] = set()  # names of variables this function may return
+        self.returned: set[int] = set()  # local binding identities this function may return
 
     # Building blocks
 
@@ -425,7 +425,7 @@ class Lowerer:
         self.carrying, self.promoted, self.last_uses = set(), set(), {}
         self.changed = changed_in_place(body, self.checker, into_lambdas=False)
         self.changed_bindings = changed_bindings(body, self.checker, into_lambdas=False)
-        self.returned = returned_names(body) if name != "top" else set()
+        self.returned = returned_bindings(body, self.checker) if name != "top" else set()
 
     def finish_function(self) -> None:
         """Remove the blocks that can't be reached from the entry, such as dead blocks."""
@@ -697,7 +697,7 @@ class Lowerer:
         self.function.locals[slot] = t
         return slot
 
-    def home(self, name: str, t: Type | None = None) -> str:
+    def home(self, name: str, t: Type | None = None, binding: int | None = None) -> str:
         """The region for a new local variable: the current level, or the caller's if the function returns it.
 
         A value that can't be copied stays where it is made, and is moved
@@ -705,7 +705,12 @@ class Lowerer:
         """
         if not self.scopes:
             return "global"
-        if self.level == 0 and name in self.returned and not (t is not None and self.nocopy(t)):
+        if (
+            self.level == 0
+            and binding is not None
+            and binding in self.returned
+            and not (t is not None and self.nocopy(t))
+        ):
             return "result"
         return self.here()
 
@@ -1117,13 +1122,13 @@ class Lowerer:
                 return self.read_name(name, kind, span, dest)
             case Let(bindings, value_expr):
                 t = self.type_of(value_expr)
-                region = self.home(bindings[0].name, t)
+                region = self.home(bindings[0].name, t, id(bindings[0]))
                 if isinstance(value_expr, Lambda):
                     value = self.lower_lambda(value_expr, [b.name for b in bindings], span, region)
                 else:
                     value = self.lower(value_expr, region)
                 for binding in bindings:
-                    home = self.home(binding.name, t)
+                    home = self.home(binding.name, t, id(binding))
                     value = self.bind(binding.name, value, binding.span, binding.mutable, home, binding=id(binding))
                 return value
             case LetPattern(pattern, value_expr, _, mutable):
@@ -1998,24 +2003,47 @@ class Lowerer:
         labels = {loop.label} | {node.label for node in inside if isinstance(node, For | While | Loop)}
         if any(isinstance(node, Break | Continue) and node.label not in (None, *labels) for node in inside):
             return []
-        declared = {node.name for node in pattern_names(loop.pattern)} if isinstance(loop, For) else set()
+        declared: set[int] = set()
+        if isinstance(loop, For):
+            declared |= {id(node) for node in pattern_names(loop.pattern)}
         for node in inside:
             match node:
                 case Let(bindings):
-                    declared |= {binding.name for binding in bindings}
+                    declared |= {id(binding) for binding in bindings}
                 case LetPattern(pattern) | For(pattern=pattern) | Case(pattern=pattern):
-                    declared |= {name.name for name in pattern_names(pattern)}
+                    declared |= {id(name) for name in pattern_names(pattern)}
         changed = changed_in_place(tuple(parts), self.checker, into_lambdas=False)
+        changed_ids = changed_bindings(tuple(parts), self.checker, into_lambdas=False)
         if isinstance(loop, For) and isinstance(loop.iterable, MutArg):
             changed |= {place_root(loop.iterable.target), CALLS}  # it changes as the loop advances it
+            root = loop.iterable.target
+            if not isinstance(root, Name):
+                root, _ = place_steps(root)
+            info = self.checker.resolved.get(id(root))
+            if info is not None and info.kind == "local":
+                changed_ids.add(id(info.binder))
         closed = CALLS not in changed and not any(isinstance(node, Lambda | Quote) for node in inside)
         names: list[tuple[str, str]] = []
+        seen_bindings: set[int] = set()
         for node in inside:
             if not isinstance(node, Assign) or not isinstance(node.target, Name) or is_append(node, self.checker):
                 continue
             name = node.target.name
             kind = self.resolve(name, self.checker.kinds.get(id(node.target), ""))
-            if name in declared or name in changed or (name, kind) in names:
+            binding: int | None = None
+            if kind == "local":
+                info = self.checker.resolved.get(id(node.target))
+                if info is None:
+                    continue
+                binding = id(info.binder)
+                if binding in declared or binding in changed_ids or binding in seen_bindings:
+                    continue
+                slot = self.find_slot(name)
+                if slot == SELF:
+                    continue
+                if self.slots[slot].binding != binding:
+                    continue
+            elif name in changed or (name, kind) in names:
                 continue
             if kind == "local" and self.find_slot(name) != SELF:
                 t = self.function.locals[self.find_slot(name)]
@@ -2025,6 +2053,8 @@ class Lowerer:
                 continue
             if is_boxed(t) and not self.nocopy(t) and not has_pool(t, self.module.enums):
                 names.append((name, kind))
+                if binding is not None:
+                    seen_bindings.add(binding)
         return names
 
     def begin_carrying(self, names: list[tuple[str, str]], span: Span) -> list[Carried]:
@@ -2463,13 +2493,14 @@ def calls_method(node: object, checker: Checker) -> bool:
     return False
 
 
-def returned_names(body: Expr | tuple[Expr, ...]) -> set[str]:
-    """The names of variables a function body may return as they are: its last value, or a `return`'s."""
+def returned_bindings(body: Expr | tuple[Expr, ...], checker: Checker) -> set[int]:
+    """Local bindings a function may return directly, as its last value or from a `return`."""
 
-    def tails(expr: Expr | None) -> set[str]:
+    def tails(expr: Expr | None) -> set[int]:
         match expr:
-            case Name(name):
-                return {name}
+            case Name():
+                info = checker.resolved.get(id(expr))
+                return {id(info.binder)} if info is not None and info.kind == "local" else set()
             case BlockExpr(exprs):
                 return tails(exprs[-1])
             case If(_, then, else_):
@@ -2478,7 +2509,7 @@ def returned_names(body: Expr | tuple[Expr, ...]) -> set[str]:
                 return set().union(*(tails(case.body) for case in cases))
         return set()
 
-    def returns(node: object) -> set[str]:
+    def returns(node: object) -> set[int]:
         match node:
             case ReturnExpr(value):
                 return tails(value) | returns(value)

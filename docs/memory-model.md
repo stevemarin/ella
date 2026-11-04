@@ -487,10 +487,18 @@ the value at the time of reading, as in the AST interpreter.
 the list grows where it is if it is the last object in its arena, and
 otherwise moves to a new home with room for twice as many items.
 
-The `moves` pass removes a copy whose original has no other use, in the
-same block, when the original is made entirely of new objects; the
-original is then made in the copy's region. General last-use analysis
-(liveness) is not done yet.
+The `moves` pass removes a copy whose original has no other use and is made
+entirely of new objects. It can do this in the same block, or across blocks
+when dominance and postdominance prove the source and copy execute in order;
+cross-block cases that can pass through a loop stay conservative. The source
+is then made in the copy's region. General last-use analysis is not done: the
+separate `x = y` optimization still recognizes only same-block last uses.
+
+Borrow invalidation and return placement use checker-resolved local binding
+identities, so a shadowed local with the same spelling is tracked separately.
+Loop carrying uses those identities for local assignments and in-place
+changes too. Global loop carrying remains conservative around calls, closures
+and quoted code.
 
 ### `mut` parameters
 

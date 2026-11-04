@@ -157,8 +157,9 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - Moving at the last use (`x = y`) only sees `y`'s own block, not
   liveness in general.
 - Copies are deep, even where a shallow copy would be safe.
-- Exclusivity and in-place analysis go by name, so shadowing makes them
-  more conservative than needed.
+- Exclusivity and some global loop analysis still go by name. Borrow
+  invalidation, local return placement, and local loop carrying use resolved
+  binding identities.
 - No warnings or reports about costly copies or placement, beyond
   `--placement` and `--profile`.
 
