@@ -1,75 +1,4 @@
-"""IR interpreter: runs a module of IR (see ella.ir) directly.
-
-This gives the IR its meaning, and lets the tests check that lowering keeps
-the program's behavior: every program in test/programs must print the same
-thing (and fail with the same error) here as with the AST interpreter.
-
-Running a function is a simple loop: execute the current block's
-instructions in order, then follow its terminator to the next block, until
-a `return`. Each instruction's result is kept in a dictionary from value id
-to run-time value. Because IR values never change, there is nothing else to
-keep track of besides the function's local slots.
-
-The operators are the same functions the AST interpreter uses (ella.operators),
-so results and error messages match exactly.
-
-Arenas
-------
-
-The interpreter also simulates the arenas that native code allocates in
-(docs/memory-model.md §5), to check the compiler's decisions about where
-objects live. Arenas are numbered by *depth*: 0 is the global arena, and
-each call takes the next few depths for its scope levels, so deeper arenas
-are always freed first. Freeing an arena (`reset`, or returning) bumps its
-*generation*.
-
-Every boxed value carries a tag: the depth and generation of the
-shortest-lived arena it may have objects in. (A list made in arena 1 with
-strings from arena 3 is tagged with arena 3.) The interpreter checks that
-
-* no value is used after its arena has been freed: its tag's generation
-  must still be current, and
-* no value is stored where it would outlive its arena: a variable, a list
-  being changed, a returned value or a global must not live longer than
-  the value's tag says it can.
-
-A failed check is a bug in the compiler, reported as a run-time error that
-starts with "memory check failed".
-
-A slice is a view (docs/memory-model.md §18): natively, it shares its
-list's items or its string's characters, so it is tagged like them. Here
-it is a copy, but a list's view (`View`) remembers its list, and every use
-of it checks that the items it shares haven't changed since it was made,
-which natively would show.
-
-A loop that carries values (docs/memory-model.md §6) has two arenas that
-take turns, so which depth a level is at changes as it runs: each frame
-keeps the current depth of each such loop's level and of its carried
-values. Their order changes too: the carried arena is freed first, so it
-counts as deeper. `key` gives each arena's place in the order arenas are
-freed in, which is its depth except for those two.
-
-A pool's values each live in an arena of their own, a *slot arena*, which
-is freed when the value is (`free`) or replaced. Slot arenas are numbered
-from SLOT_DEPTH up, and aren't freed in any particular order, so they are
-only checked for use after they are freed. Operations that put a value in
-a pool copy it into the slot's arena.
-
-An `Arena` value has one slot arena of its own, which holds all its values.
-`free arena` frees that slot arena (bumping its generation, so values
-borrowed from it are caught) and keeps it for the arena's next values; the
-slot arena is given back when the arena dies.
-
-A generator function's frame (docs/memory-model.md §17) is kept in its
-Gen between resumes, along with its scope levels, which are slot arenas
-the Gen owns: `reset` there clears them, and they are given back when the
-Gen dies, after the values in them are finalized, deepest level first.
-
-When an arena is freed, the finalizers of the values in it run first,
-newest first (docs/memory-model.md §7). The interpreter also adds up roughly how
-many bytes native code would use (`--profile` shows them): the high-water
-mark of each scope level, and what each allocating instruction made.
-"""
+"""IR interpreter: runs a module of IR (see ella.ir) directly."""
 
 import sys
 from collections import defaultdict
@@ -703,6 +632,7 @@ class IRInterpreter:
         span = instr.span
         for arg, arg_tag, value in zip(instr.args, tags, args):
             self.check_alive(arg_tag, str(arg), span)
+            # Views share list storage, so check the source is unchanged before using it.
             if isinstance(value, View):
                 value.check(span)
         result: Value = UNIT

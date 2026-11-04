@@ -1,101 +1,4 @@
-"""x64 code generation: turns IR into GNU assembly (Intel syntax) for Linux.
-
-The generated code is linked with the C runtime (src/ella/runtime.c) into a
-native executable; see ella.native.
-
-The design favors being easy to follow over fast code:
-
-* **An IR value lives in a register or in its own 8-byte stack slot.**
-  ella.regalloc chooses which values get registers; the rest spill to
-  slots. An instruction reads its operands where they are (a register or
-  a slot work alike as most operands), computes in the scratch registers
-  rax, rcx, rdx, r11 and xmm0/xmm1, and puts the result where it goes.
-  Values live across a call are in callee-saved registers, which each
-  function saves in its frame first and restores before it returns.
-  Values passed to a runtime function or a jump's target move all at once
-  (`parallel_move`), since they may be in each other's registers.
-* **Every value is one 64-bit word.** An `i64` is itself, a bool is 0 or 1,
-  `()` is 0, and an `f64` is its raw bits (moved into an `xmm` register to
-  do arithmetic). Strings, lists, tuples, ranges, enum values and closures
-  are pointers to objects made by the runtime.
-* **Objects live in arenas**, numbered by depth (see "Arenas" in runtime.c).
-  Each runtime function that makes an object takes the depth of the arena
-  to make it in, worked out from the instruction's region: a function that
-  allocates in its own scope levels asks the runtime for depths when it
-  starts (`ella_enter`), keeps the first in a stack slot, and frees them
-  when it returns (`ella_leave`). A loop that carries values has two arenas
-  that take turns (`swap`), so the depths of its level and of its carried
-  values are kept in stack slots of their own.
-
-Ella's calling convention
--------------------------
-
-Ella functions don't use the C calling convention. The caller pushes the
-depths of the arenas its `mut` arguments live in (last first), then the
-arguments from last to first, then the depth of the arena for the result,
-then the closure being called, and calls the closure's code. The result
-comes back in `rax`. A direct call (`call_direct`) pushes 0 for the
-closure. So inside a function with n declared parameters:
-
-    [rbp + 16]              the closure (its captured values start 24 bytes in)
-    [rbp + 24]              where to put the result: an arena depth
-    [rbp + 32 + 8*i]        declared parameter i
-    [rbp + 32 + 8*(n + j)]  the depth of the arena of `mut` parameter j
-    [rbp - 8*k]             the slot of each other value that has no register, and of
-                            each callee-saved register the function uses
-
-The prologue loads the parameters that have registers. A function returns
-the final values of its `mut` parameters by writing them over the
-parameters' own words, where the caller reads them after the call.
-Pushing everything keeps calls uniform: any number of arguments, and floats
-travel like everything else. Calls into the runtime do use the C convention
-(arguments in rdi, rsi, rdx, rcx, r8, r9), with the stack aligned to 16
-bytes as it requires; each function's prologue aligns it.
-
-Each call increments a call depth, so that runaway recursion stops with
-the same "stack overflow" error as in the interpreters; so does each
-inlined call (`enter` and `leave`). Before it does, it puts its *site* in
-`ella_trace` at the depth: where it is and the function it is in, for the
-runtime's stack traces (`Site` in runtime.c; 0 for the call of `main`,
-which they leave out).
-
-Generators
-----------
-
-A generator function (a generator's body, see "Generators" in ella.ir)
-keeps its frame in its Gen (runtime.c), so that its values survive a
-`yield`: it addresses them from `r12`, which points to the end of the
-frame, instead of from `rbp`. `resume g` calls it like a closure, with the
-Gen as the closure, and its prologue sets `r12` and jumps to where it
-last stopped. A `yield` records the block to carry on at, and returns.
-Other Ella functions save `r12` before using it, as they do the other
-callee-saved registers, and a generator function restores it before it
-returns. A generator function keeps all its values in its frame, none in
-registers. Its scope levels are slot arenas the Gen keeps (`depths`), so
-regions name those rather than depths taken by `ella_enter`. `gen_new`
-fills in the frame's parameters, and the depths of the loops that carry
-values, at offsets known from the body's layout.
-
-Arrays and SIMD
----------------
-
-An array (runtime.c) has its length and where its items are in the same
-places as a list, so `len`, a `for` loop and reading an item are the same
-few instructions; `array_offset` checks the indexes against the shape
-inline. Arithmetic on arrays, `total` and `dot` are loops of AVX2
-instructions over four items at a time, in the ymm registers (which no
-value is ever in), then one at a time for the rest; see `array_arithmetic`
-and `reduction`. They give exactly what the interpreters give: f64 results
-are IEEE 754 either way, multiplying and adding stay separate (no fused
-multiply-adds), and the sums of `total` and `dot` are added in the order
-the language defines for them (docs/grammar.md §9, "Arrays"). An i64
-overflow is noticed in the vector code, and the runtime finds the first
-one again to report it. A `fused` instruction (ella.passes.fuse) does
-several steps in one loop, keeping each step's items in a ymm register,
-with masked loads and stores for the last few items (`fused`). The program sets `ella_uses_avx2`, so that the
-runtime stops at once on a CPU without AVX2. `vzeroupper` ends each loop,
-since the runtime's code uses the older SSE instructions.
-"""
+"""x64 code generation: turns IR into GNU assembly (Intel syntax) for Linux."""
 
 import struct
 from collections.abc import Callable
@@ -2102,8 +2005,7 @@ class CodeGen:
                 if tail is not None:
                     self.emit_tail_call(tail)
                     return
-                # Pass values to the target's parameters, all at once, since
-                # parameters can swap values, as loop variables can.
+                # Move parameters together so loop-carried values can swap safely.
                 self.parallel_move([(self.slots[p.id], self.slots[a.id]) for p, a in zip(target.params, args)])
                 self.emit(f"jmp {self.block_label(target)}")
             case Branch(cond, then, else_):

@@ -1,12 +1,4 @@
-"""Building and running native executables.
-
-    source --compile_program--> IR --optimize--> IR --codegen--> assembly
-    assembly + runtime.c --gcc--> executable
-
-gcc does the assembling and linking. The runtime is compiled once and the
-object file kept in the temporary directory, named by a hash of its source,
-so that building many programs (as the tests do) stays quick.
-"""
+"""Building and running native executables."""
 
 import hashlib
 import os
@@ -34,6 +26,7 @@ CFLAGS = ["-std=gnu17", "-O2", "-Wall", "-Wextra", "-ffp-contract=off"]
 def runtime_object() -> Path:
     """The compiled runtime, building it if this version hasn't been built yet."""
     source = RUNTIME.read_bytes()
+    # Include flags in the key: identical C source can compile to different objects.
     digest = hashlib.sha256(source + " ".join(CFLAGS).encode()).hexdigest()[:16]
     obj = Path(tempfile.gettempdir()) / f"ella-runtime-{digest}.o"
     if not obj.exists():

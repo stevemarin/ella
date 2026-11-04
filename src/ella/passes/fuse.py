@@ -1,37 +1,4 @@
-"""Fusion: arithmetic on arrays in a row becomes one `fused` instruction.
-
-`a * 2.0 + b - c` on arrays is three operations, each going over all the
-items and making a new array:
-
-    %4: Array[f64] = mul %1, %3 @1
-    %5: Array[f64] = add %4, %2 @1
-    %7: Array[f64] = sub %5, %6 @1
-
-Two of those arrays are only there to be read by the next operation. As one
-instruction, native code goes over the items once, reading a, b and c and
-writing the result, with no arrays in between (ella.codegen): for big
-arrays, which don't fit in the CPU's caches, that is most of the time saved.
-
-    %7: Array[f64] = fused %1, %3, %2, %6 [mul(0, 1) add(s0, 2) sub(s1, 3)] @1
-
-An operation takes in the one that made its operand in the same block,
-with nothing but constants between them. If code outside the group uses
-that array too, the step *keeps* it: the loop writes it as well, as an
-extra result of the instruction (`let t = a * 2.0` used by `t + b` and by
-later code is still read from a once). `total(...)` and (on f64s)
-`dot(...)` can end a group: then the loop adds up the items as it goes, and
-no array is made at all. So
-the steps run in their order, at the last one's place, with nothing able to
-see the difference: no other code runs in between, and the arrays they read
-can't change. Native code reports an error by running the steps one by one
-(ella.codegen), so even errors are the same as before.
-
-The code generator keeps each step's array in a register, and needs a few
-for the operands, so a group has at most MAX_STEPS steps, MAX_ARRAYS
-arrays and MAX_NUMBERS numbers among its operands. An i64 `*` isn't fused:
-AVX2 has no instruction for it. Nor is arithmetic on i32s, which the code
-generator only does in plain loops.
-"""
+"""Fusion: arithmetic on arrays in a row becomes one `fused` instruction."""
 
 from collections import Counter
 from collections.abc import Callable

@@ -1,42 +1,4 @@
-"""Static type checker: works out the type of every expression before the program runs.
-
-Ella is statically typed. Function parameters and results are annotated, and
-the checker infers everything else, mostly by reading types off values: in
-`let x = 1 + 2`, `x` is an `i64` because `1 + 2` is.
-
-Some types can't be read off right away. An empty list `[]` is a list of
-something, and `None` is an `Optional` of something. For these the checker
-uses a *type variable*, a placeholder to be filled in later. Using the value
-then decides it:
-
-    let mut seen = []        # seen: [?1]
-    seen = seen + [5]        # [?1] must equal [i64], so ?1 is i64
-
-Making two types equal, filling in type variables as needed, is called
-*unification*, and it is the heart of the checker (`unify` below). A type
-variable that is never decided defaults to `()`.
-
-The checker doesn't change the syntax tree. It records what it learns in
-tables keyed by node, which the lowering to IR reads:
-
-* `types`: the type of every expression, binding, parameter and pattern.
-* `kinds`: what each name refers to: a "local" or "global" variable, a
-  "variant" without fields, a "constructor" of a variant with fields, or a
-  "builtin" function.
-
-The tables are keyed by `id(node)` (the node's identity) rather than by the
-node itself, since two separate nodes can be equal as values.
-
-Function bodies are checked last. A function may use top-level names defined
-after it, as long as it is called after they are defined, so its body is only
-checked once every top-level name's type is known. See `check_program`.
-
-The first error normally stops the check. Editors want every error, and the
-types of everything that could be checked, so they set `errors` to a list:
-each step of `check_program` (defining an enum, checking a top-level line or
-a function body, ...) then records its error and the check goes on. See
-`attempt`.
-"""
+"""Static type checker: works out the type of every expression before the program runs."""
 
 import dataclasses
 from collections.abc import Callable, Iterable, Sequence
@@ -841,15 +803,18 @@ class Checker:
 
     def unify(self, a: Type, b: Type) -> bool:
         """Try to make two types equal by deciding type variables. Returns whether it worked."""
+        # Dereference type variable chains to find their current representatives
         a, b = resolve(a), resolve(b)
         if a is b or a is NEVER or b is NEVER:
             return True
+        # Bind free type variables using the occurs-checked bind() helper
         if isinstance(a, TyVar):
             return self.bind(a, b)
         if isinstance(b, TyVar):
             return self.bind(b, a)
         if isinstance(a, DeferredTy) or isinstance(b, DeferredTy):  # it is checked once the code is built
             return True
+        # Structural recursive unification across composite types
         match a, b:
             case ListTy(x), ListTy(y):
                 return self.unify(x, y)
@@ -882,6 +847,7 @@ class Checker:
 
     def bind(self, var: TyVar, t: Type) -> bool:
         """Decide a type variable, refusing infinite types like ?1 = [?1]."""
+        # Reject recursive types before storing the reference.
         if self.occurs(var, t):
             return False
         var.ref = t

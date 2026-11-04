@@ -1,3 +1,56 @@
+// ===============================================================================
+//     CHAPTER 9: THE LOW-LEVEL RUNTIME ENGINE & MEMORY SUBSYSTEM
+// ===============================================================================
+//
+// 1. THE ROLE OF A COMPILER RUNTIME
+// ---------------------------------
+// A native compiler rarely emits raw machine instructions for everything. While
+// simple operations (scalar integer addition, bitwise shifts, local branches)
+// translate directly into 1-3 machine opcodes, complex capabilities—string slicing,
+// array broadcasting, Unicode transcoding, error stack unwinding, and dynamic memory
+// management—are delegated to a minimal runtime library linked into every executable.
+//
+// 2. 64-BIT VIRTUAL MEMORY AS AN ALLOCATION STRATEGY
+// --------------------------------------------------
+// Traditional runtimes rely on general-purpose heaps (such as Doug Lea's dlmalloc or
+// jemalloc) with `malloc()` and `free()`. However, general-purpose heaps suffer from:
+//   * Non-deterministic fragmentation.
+//   * Per-allocation metadata overhead (chunk headers, free-list pointers).
+//   * Cache misses caused by scattered pointer-chasing.
+//
+// Ella leverages modern 64-bit Linux architecture (docs/memory-model.md §5, §14):
+//   * Address space is abundant (128 TiB of user-space virtual addresses).
+//   * The runtime reserves up to 32 TiB upfront with `mmap(..., MAP_NORESERVE)`.
+//     No physical RAM is committed until an address is actually written to.
+//   * Scope arenas allocate via ultra-fast *bump allocation*:
+//         top = top + round16(size);
+//   * Resetting an arena at scope or loop iteration exit is O(1):
+//         top = start;
+//   * Pages beyond 16 MiB are lazily returned to the Linux kernel via
+//     `madvise(MADV_DONTNEED)`.
+//
+// 3. CPU CACHE CONFLICT MITIGATION: ARENA OFFSET STAGGERING
+// ---------------------------------------------------------
+// Modern CPU caches (L1/L2) are set-associative (typically 8-way or 16-way). Addresses
+// that differ by exact multiples of large powers of two map to the identical cache set.
+//
+// When Ella's alternating loop arenas (`@k` and `@carryk`) take turns carrying values,
+// if both arenas started at exact power-of-two boundaries, corresponding objects would
+// land in identical cache sets, causing severe cache conflict thrashing and slowing down
+// tight numerical loops by over 10x!
+// The runtime eliminates this by offsetting each depth's arena base by a non-power-of-two
+// prime multiple (`#define STAGGER ((size_t)65 << 12)`).
+//
+// 4. GENERATIONAL POOL HANDLES: MEMORY SAFETY WITHOUT GC
+// ------------------------------------------------------
+// Objects that outlive lexical stack scopes live in a `Pool[T]`.
+// To guarantee complete safety against Use-After-Free (UAF) and cross-pool tampering:
+//   * A `Handle[T]` is packed into a single 64-bit word:
+//       [ 24 bits: Pool ID | 20 bits: Generation | 20 bits: Slot Index ]
+//   * Dereferencing a handle performs an O(1) generation check against the slot table.
+//     If the slot has been freed and reused, the generation mismatch triggers a safe
+//     trap instead of reading corrupted memory.
+//
 // The Ella runtime: support code linked into every native Ella program.
 //
 // The code generator (ella/codegen.py) turns IR into x64 assembly. Simple

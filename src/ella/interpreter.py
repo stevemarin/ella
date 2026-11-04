@@ -1,29 +1,4 @@
-"""Tree-walking interpreter: runs a program by evaluating its syntax tree directly.
-
-This is stage 2 of the roadmap. It defines what Ella programs mean, before
-there is an IR or a compiler, and later stages are checked against it.
-
-The core is `Interpreter.eval(expr, scope)`, one `match` over every kind of
-expression. Each case evaluates the parts of the node (recursively, with
-`eval`) and combines them. Variables live in `Scope`s (see ella.values),
-chained from the innermost block out to the global scope.
-
-Control flow that jumps out of the middle of an evaluation (`break`,
-`continue`, `return` and `?`) is done with Python exceptions. For example,
-`break` raises BreakSignal, which unwinds through any nested `eval` calls
-until the loop it belongs to catches it.
-
-There is no type checker yet, so types are checked as the program runs: `1 +
-true` is a run-time error here, where a later stage will reject it before the
-program starts.
-
-A generator's body runs on a thread of its own (`Generator`), so that it
-can stop at a `yield` in the middle of any expression and carry on later.
-Only one thread runs at a time: `next` hands control to the body's thread
-and waits until it yields or finishes, and `yield` hands it back. The body
-has an owner stack of its own (see "Finalizers"), which `next` puts in
-place while it runs.
-"""
+"""Tree-walking interpreter: runs a program by evaluating its syntax tree directly."""
 
 import sys
 import threading
@@ -1021,6 +996,7 @@ class Interpreter:
                     if signal.closure.function is not lambda_ or signal.closure.scope is not captured:
                         result = self.call(signal.closure, signal.call_args, signal.span)
                         break
+                    # Reuse this frame for a self-tail-call instead of growing Python's stack.
                     self.close_owner()
                     self.owners.append([])
                     for param, param_value in zip(lambda_.params, signal.call_args):

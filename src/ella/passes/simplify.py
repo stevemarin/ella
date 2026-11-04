@@ -1,17 +1,4 @@
-"""Simplify the control-flow graph: fewer, bigger blocks, with no detours.
-
-The lowering makes many small blocks, and the other passes leave behind
-blocks that do nothing but jump on. This pass repeats four tidy-ups until
-none applies:
-
-1. A branch on a constant becomes a jump to the side it always takes (and a
-   branch with the same block on both sides becomes a jump).
-2. Blocks that can no longer be reached are removed.
-3. A jump or branch to a block that only jumps on goes straight to where
-   that block goes.
-4. A block reached only by a jump from one other block is merged into it.
-   Its parameters are replaced by the values the jump passed.
-"""
+"""Simplify the control-flow graph: fewer, bigger blocks, with no detours."""
 
 from ella.ir import (
     Block,
@@ -29,6 +16,7 @@ from ella.passes.fold import constants
 
 def simplify_cfg(function: Function, module: Module) -> bool:
     changed_any = False
+    # Each rewrite can expose another, so repeat until the graph reaches a fixed point.
     while (
         fold_branches(function) | remove_unreachable(function) | skip_empty_blocks(function) | merge_blocks(function)
     ):

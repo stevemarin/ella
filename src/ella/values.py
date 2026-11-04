@@ -1,40 +1,4 @@
-"""Run-time values, shared by the interpreters.
-
-Ella values are represented by plain Python values where one fits:
-
-    Ella            Python
-    i64             int (checked to stay in the i64 range)
-    f64             float
-    f32             F32, a float an f32 can hold
-    i32             I32, an int an i32 can hold
-    bool            bool
-    str             str
-    ()              () (the empty tuple: unit is the tuple with no items)
-    (T, U)          tuple
-    [T]             list
-    Array[T]        ArrayValue: its shape and its items, in one flat list
-    a..b, a..=b     range
-    enum variants   VariantValue, or Constructor for a variant with fields
-    structs         VariantValue too (a struct is an enum with one variant),
-                    whose fields can change
-    functions       Closure (written in Ella) or Builtin (written in Python)
-                    in the AST interpreter; FunctionRef in the IR interpreter
-    Pool[T]         PoolValue, and Handle[T] is HandleValue
-    Arena           ArenaValue, and Ref[T] is RefValue
-    Gen[T]          GenValue, whose state belongs to the interpreter running it
-    Code[T]         CodeValue, holding the code's syntax tree
-
-Python's `bool` is a subclass of `int`, so code that tells values apart must
-test for `bool` before `int`. `type_name` does that, and the interpreter uses
-it for every type check.
-
-Ella has value semantics: binding, passing and returning all copy. Lists are
-mutable Python lists, so the AST interpreter calls `copy_value` whenever it
-reads a value out of a variable or a list. The copies cost memory and time,
-but they make the rules easy to see. The compiler copies only where a
-program could tell (see ella.lower), and the IR interpreter runs its `copy`
-instructions with `copy_value` too.
-"""
+"""Run-time values, shared by the interpreters."""
 
 import itertools
 import json
@@ -418,6 +382,7 @@ def copy_value(value: Value) -> Value:
     """
     match value:
         case list():
+            # Recurse only into value containers; immutable scalars can be shared.
             return [copy_value(item) for item in value]
         case tuple():
             return tuple(copy_value(item) for item in value)

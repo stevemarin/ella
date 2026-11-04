@@ -1,17 +1,4 @@
-"""Syntax tree for Ella, as produced by the parser.
-
-Nodes are frozen dataclasses grouped into three unions: `Expr`, `Pattern` and
-`TypeExpr` (type annotations as written, not checked types). Later stages
-`match` over them. Every node has a `span`: where it starts, or for infix and
-postfix nodes, where the operator is.
-
-Nodes keep only what later stages need. Punctuation, keywords and layout are
-gone, and a few conveniences are already rewritten: `x |> f(a)` arrives here
-as the call `f(x, a)`, and `-5` as the literal -5.
-
-`show` renders any node as a compact S-expression, for tests and the CLI.
-For example, `let x = 1 + 2 * 3` is shown as `(let [x] (+ 1 (* 2 3)))`.
-"""
+"""Syntax tree for Ella, as produced by the parser."""
 
 import json
 from collections.abc import Callable
@@ -676,6 +663,7 @@ def rebuild(node: object, walk: Callable[[object], object]) -> object:
     """A node with `walk` applied to its parts. Unchanged nodes are kept as they are."""
     if isinstance(node, tuple):
         items = tuple(walk(item) for item in node)
+        # Preserve identity when children are unchanged to avoid needless AST churn.
         return node if all(a is b for a, b in zip(items, node)) else items
     if is_dataclass(node) and not isinstance(node, type | Span):
         changes = {}

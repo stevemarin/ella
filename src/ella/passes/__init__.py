@@ -1,23 +1,4 @@
-"""Optimization passes over the IR.
-
-Each pass is a function `pass(function, module) -> bool` in its own module,
-which changes one IR function in place and says whether it changed anything.
-Each keeps the program's behavior exactly the same, including its errors:
-
-* `mem2reg`: promote local slots to SSA values (ella.passes.mem2reg)
-* `direct`: call known functions by name (ella.passes.direct)
-* `moves`: turn copies of values nothing else uses into moves (ella.passes.moves)
-* `fold`: constant folding and propagation (ella.passes.fold)
-* `simplify`: simplify the control-flow graph (ella.passes.simplify)
-* `dce`: dead-code elimination (ella.passes.dce)
-* `inline`: put small functions' bodies where they are called (ella.passes.inline)
-* `fuse`: make arithmetic on arrays in a row one loop (ella.passes.fuse)
-
-`optimize` runs passes over a whole module, verifying the IR before and after
-every pass, so a pass that breaks the IR's rules is caught right where it
-happens. `uv run ella --ir --passes mem2reg,fold file.ella` shows what any
-combination of passes does.
-"""
+"""Optimization passes over the IR."""
 
 from collections.abc import Callable
 

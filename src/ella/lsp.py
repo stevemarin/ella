@@ -1,37 +1,4 @@
-"""A language server for Ella, built on pygls: editors talk to it over stdin and stdout (the Language Server Protocol).
-
-It gives editors:
-
-* Errors, as you type: every error the analysis finds (see ella.analysis,
-  which keeps going after errors, unlike `ella FILE`).
-* Hover: a name's type, or an operator's.
-* Go to definition, for variables, functions, parameters, fields, methods,
-  variants, types and modules, in the file or in the modules it imports
-  (the standard library's too).
-* Semantic tokens: highlighting by what names are (parameters, functions,
-  types, ...), on top of the grammar's.
-* Completion: the names in scope, or the fields and methods after `.`.
-
-Each open document is analyzed when it's opened, and after each change once
-typing pauses for `DELAY` seconds. So is every other open document, which
-may import the one that changed: the analysis reads imported modules from
-the open documents, saved or not, and from disk otherwise, finding them
-from the workspace folder. Hover, definitions and highlighting come
-from the latest analysis, moved to follow the edits made since
-(`follow_edits`). When the text is too broken to analyze, the last analysis
-is kept.
-
-The analysis runs compile-time code, which might never finish, or might
-print (stdout is the connection to the editor). So it happens in a worker
-process, with stdout sent to stderr, which is killed and replaced if it takes
-longer than the timeout. One thing runs in the worker at a time.
-
-Positions: the analysis counts lines and characters from 1; LSP counts from
-0, in UTF-16 units by default. pygls converts between characters and the
-client's units.
-
-Run it with `ella-lsp` (installed with the `lsp` extra).
-"""
+"""A language server for Ella, built on pygls: editors talk to it over stdin and stdout (the Language Server Protocol)."""
 
 import argparse
 import asyncio
@@ -201,6 +168,7 @@ class EllaServer(LanguageServer):
                 analysis = Analysis([Problem(f"internal error while checking: {error!r}", 1, 1)], None)
         if uri not in self.workspace.text_documents:
             return
+        # Publish results for the exact snapshot analyzed, not later edits.
         if analysis.symbols is not None:
             self.symbols[uri] = source, analysis.symbols
         lines = source.splitlines()

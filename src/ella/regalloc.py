@@ -1,48 +1,4 @@
-"""Register allocation: which IR values live in registers, for the code generator (ella.codegen).
-
-The IR is in SSA form: each value is defined once, and its definition
-dominates its uses. Two values that are live at the same point then have
-definitions where one dominates the other, and the later one is defined
-while the earlier is live. So visiting blocks in dominator-tree order
-(each block before the blocks it dominates), and each block's
-instructions in order, every value live at a point has been given its
-place before that point, and a simple greedy choice works: give each
-value a register that no live value holds. Where none is free, the value
-*spills*: it lives in a stack slot for its whole life, as every value did
-before there was register allocation, and instructions read it from there.
-
-Calls
------
-
-Values are kept in registers across calls by the usual split:
-
-* Callee-saved registers (CALLEE_SAVED: rbx, r12 to r15) keep their values
-  across calls, because every function that uses one saves it first and
-  restores it before returning: C functions (the runtime) by the C calling
-  convention, Ella functions in their prologue and at `return`. A value
-  live across a call can only have one of these.
-* Caller-saved registers (CALLER_SAVED: rsi, rdi, r8 to r10) are free to
-  use, but a call may change them. Only values not live across any call
-  get one.
-
-rax, rcx, rdx and r11 are never allocated: the code generator uses them
-for its own work within an instruction (r11 for cycles of moves), and so
-are the xmm registers.
-
-Most instructions call the runtime (`calls`); the ones that don't are
-arithmetic and comparisons on numbers, reading fields and the like. Some
-call it partway through, using their operands or result after the call
-(`calls_partway`): making a list calls the runtime for the space, then
-stores the items. Their operands and results must survive the call too.
-Arithmetic on arrays, `total` and `dot` do too, and their AVX2 loops use the
-caller-saved registers, which hold nothing then.
-A function that takes arenas for its scope levels frees them at `return`
-before it reads the values it returns, which then must survive that call.
-The prologue takes the arenas before it loads the parameters.
-
-Generator functions keep every value in their frame (docs/memory-model.md
-§17): their values must survive a `yield`, which leaves the function.
-"""
+"""Register allocation: which IR values live in registers, for the code generator (ella.codegen)."""
 
 from dataclasses import dataclass, field
 
@@ -155,6 +111,7 @@ def allocate(function: Function, limit: int | None = None) -> Allocation:
         for instr, after in zip(block.instrs, live_after[block]):
             defined = {v.id for v in defined_by(instr)}
             if calls(instr):
+                # Caller-saved registers cannot hold values that survive a call.
                 crossing |= after - defined
             if calls_partway(instr):
                 crossing |= {a.id for a in instr.args} | defined

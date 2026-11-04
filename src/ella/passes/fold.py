@@ -1,23 +1,4 @@
-"""Constant folding and propagation: work out at compile time what doesn't depend on run time.
-
-*Folding* evaluates an instruction whose operands are all constants and
-replaces it by a `const`:
-
-    %1: i64 = const 2
-    %2: i64 = const 3
-    %3: i64 = mul %1, %2        becomes        %3: i64 = const 6
-
-*Propagation* carries constants further. A block parameter that receives the
-same constant on every path is that constant, and folding the instructions
-that use it may make more constants, so the pass repeats until nothing
-changes. (The simplify pass then turns a branch on a constant into a jump.)
-
-Folding uses the same operator functions as the interpreters
-(ella.operators), so a folded result is exactly what running the program
-would give. An operation that would fail at run time, like `1 // 0` or an
-overflow, is left alone: the program must still fail when it gets there,
-and only if it gets there.
-"""
+"""Constant folding and propagation: work out at compile time what doesn't depend on run time."""
 
 from typing import TypeIs
 

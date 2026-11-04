@@ -1,42 +1,4 @@
-"""Inlining: put a copy of a small function's body where it is called.
-
-A call costs more than the few instructions of a small function: pushing
-arguments, saving the frame, and taking arenas for its scope levels. And
-with the body in the caller, the other passes can work across it: a
-constant argument folds, a struct made only to be taken apart goes away.
-
-A call is inlined when it calls a known function (`call_direct`, or `call`
-of a `closure` made in the same function, whose captured values become
-arguments) that
-
-* is small: at most INLINE_LIMIT instructions, not counting constants,
-* isn't recursive: it can't reach itself through calls, closures or
-  generators, so inlining always ends, and
-* isn't a generator's body (those are only resumed).
-
-A call that passes a `mut` argument that is a pool's or arena's value (its
-region is @slot) isn't inlined: the callee may make objects in that
-argument's region, which only the callee can name.
-
-The call's block is split in two. The first half ends with `enter` (the
-inlined call still counts toward the call depth limit, and fails as the
-call would) and jumps to the copy of the callee's entry block, passing the
-arguments as its parameters. Each `return` of the copy becomes `reset`
-(freeing the callee's levels, running finalizers as returning would),
-`leave`, and a jump to the second half, whose parameters are the call's
-results.
-
-The callee's regions become the caller's: @result is the call's region,
-@mutj the region of the argument passed to `mut` parameter j, and its scope
-levels go above all of the caller's own levels (docs/memory-model.md §14),
-so they are freed before any of the caller's, just as a callee's arenas
-are. Two inlined calls in one function are never running at once, so they
-share those levels.
-
-Functions are inlined into their callers bottom up (`bottom_up`), callees
-first, so a callee's own small calls are already in the copy. The copy
-isn't inlined into again.
-"""
+"""Inlining: put a copy of a small function's body where it is called."""
 
 from collections.abc import Iterator
 from dataclasses import replace
@@ -80,6 +42,7 @@ def inline_calls(function: Function, module: Module) -> bool:
             if callee is None or not inlinable(callee, function, recursive) or "slot" in instr.out_regions:
                 continue
             work.insert(0, inline(function, block, k, callee, captured, base))
+            # Inlined scope levels sit above the caller's existing levels.
             function.levels = max(function.levels, base + callee.levels)
             changed = True
             break

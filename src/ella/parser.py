@@ -1,34 +1,4 @@
-"""Pratt parser: turns tokens into the syntax tree defined in ella.syntax.
-
-This follows docs/grammar.md: operator precedence from §8, and the grammar
-summary and parsing notes from §12.
-
-Most of the parser is "recursive descent": one method per kind of thing
-(`parse_if`, `parse_let`, `parse_type`, ...), each consuming its tokens and
-calling the others for the parts inside it.
-
-Expressions with operators use Pratt parsing (also called top-down operator
-precedence). `parse_expr(min_prec)` works in two steps:
-
-1. Parse one operand with `parse_prefix`: a literal, a name, `(...)`, a prefix
-   operator such as `-x`, or a keyword form such as `if ...`.
-2. Loop: while the next token is an infix or postfix operator whose
-   precedence is at least `min_prec`, consume it and combine it with the
-   operand so far. For a binary operator, the right operand is parsed by a
-   recursive `parse_expr` with a higher `min_prec`, so it only takes
-   operators that bind tighter.
-
-For example, `1 + 2 * 3 - 4`: we parse `1` and see `+` (13). The right operand
-is `parse_expr(14)`, which reads `2`, sees `*` (14, allowed), and reads `3`.
-It then sees `-` (13, below 14) and stops, giving `2 * 3`. Back at the top,
-`-` (13) is allowed, so the result is `(1 + (2 * 3)) - 4`.
-
-Precedence lives in the `self.infix` and `self.prefix` tables.
-
-The first error normally stops the parser. For editors, `parse_partial`
-keeps going: a line of the program or of a block with an error becomes `()`,
-and parsing goes on with the next line of the same block (`parse_line`).
-"""
+"""Pratt parser: turns tokens into the syntax tree defined in ella.syntax."""
 
 from collections.abc import Callable
 from enum import Enum, auto
@@ -458,9 +428,17 @@ class Parser:
     def parse_expr(self, min_prec: int = LOWEST) -> Expr:
         """Parse an expression, taking only operators with precedence >= `min_prec`.
 
-        This is the heart of the Pratt parser; see the module docstring.
+        This is the core Pratt loop:
+          1. `parse_prefix()` acts as the Null Denotation (nud): consumes the leading
+             term (a literal, identifier, unary operator `-x`, grouped `(...)`, etc.).
+          2. While the upcoming operator has binding power >= `min_prec`, `parse_infix()`
+             acts as the Left Denotation (led): consumes the operator and associates it
+             with `left` and subsequent operands.
+          3. When an operator with lower precedence is encountered, the loop exits,
+             allowing the caller higher up the recursion stack to bind the looser operator.
         """
         left = self.parse_prefix()
+        # Each recursive right-hand parse leaves looser operators for this loop.
         while (op := self.infix_op()) is not None and self.infix[op][0] >= min_prec:
             left = self.parse_infix(left, op)
         return left
@@ -489,19 +467,19 @@ class Parser:
 
         span = self.take_binary_op(op)
         if assoc is Assoc.CHAIN:
+            # Chained comparisons: a < b < c is parsed as a unified Compare node
             return self.parse_comparison(left, op, span)
-        # The right operand may only contain tighter operators (prec + 1), so
-        # `a - b - c` groups to the left. For a right-associative operator it
-        # may also contain the same operator again (prec), so `a ** b ** c` is
-        # `a ** (b ** c)`.
+        # Recurse with prec + 1 for left-associative, or prec for right-associative (e.g. **)
         right = self.parse_expr(prec if assoc is Assoc.RIGHT else prec + 1)
         if assoc is Assoc.NONE and (next_op := self.infix_op()) is not None and self.infix[next_op][0] == prec:
             raise EllaError(f"'{next_op}' can't follow '{op}' without parentheses", self.peek().span)
         if op in ASSIGN_OPS:
+            # Assignment target must be an lvalue place: variable, index, or field
             if not isinstance(left, Name | Index | Member):
                 raise EllaError("can only assign to a name, an index like xs[0], or a field like p.x", span)
             return Assign(op, left, right, span)
         if op == "|>":
+            # Desugar pipeline into canonical call: x |> f(y) -> f(x, y)
             return self.make_pipe(left, right, span)
         return Binary(op, left, right, span)
 

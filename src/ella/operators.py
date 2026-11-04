@@ -1,12 +1,4 @@
-"""Ella's operators on run-time values, shared by every interpreter.
-
-The AST interpreter and the IR interpreter both call these functions, so that
-`7 // -2`, an out-of-range index or an i64 overflow behave (and fail, with the
-same message) identically however a program is run.
-
-Each function takes the operator's source span, used for the error message
-if the operation fails.
-"""
+"""Ella's operators on run-time values, shared by every interpreter."""
 
 import math
 from collections.abc import Callable
@@ -227,6 +219,7 @@ def broadcast(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...] | None:
     """The shape two shapes broadcast to, or None if they don't."""
     n = max(len(a), len(b))
     shape = []
+    # Align trailing dimensions; absent leading dimensions behave like size one.
     for x, y in zip((1,) * (n - len(a)) + a, (1,) * (n - len(b)) + b):
         if x != y and 1 not in (x, y):
             return None

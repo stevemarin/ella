@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     packages = package_path(options.path)
     status = 0
     try:
+        # Inspection modes stop at their named stage; run modes continue through the back end.
         if options.tokens:
             for token in tokenize(source):
                 print(f"{token.span}\t{token.kind.name}\t{token.text!r}")

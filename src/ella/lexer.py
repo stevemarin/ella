@@ -1,34 +1,4 @@
-"""Tokenizer: turns Ella source text into a flat list of tokens.
-
-The tokenizer (or lexer) is the first stage of the compiler. It reads the
-source one character at a time and groups characters into tokens: names,
-keywords, numbers, operators and so on. The parser then works on tokens and
-never has to think about characters, spaces or comments.
-
-Two parts of Ella need more than grouping characters:
-
-* **Layout.** Indentation defines blocks, as in Python. The tokenizer turns
-  line structure into three extra tokens: NEWLINE at the end of each line,
-  INDENT when a line is indented deeper than the one before, and DEDENT for
-  each level it moves back out. For example:
-
-      if x then          KEYWORD NAME KEYWORD NEWLINE
-          print(x)       INDENT NAME OP NAME OP NEWLINE
-      done()             DEDENT NAME OP OP NEWLINE
-
-  To the parser, INDENT and DEDENT act like the `{` and `}` of other languages.
-  Inside `(` and `[` brackets, line breaks are ignored, which is how a long
-  expression continues over several lines.
-
-* **String interpolation.** A string like `"Hi, {{name}}!"` contains an
-  expression. Instead of one token, the tokenizer produces pieces, with
-  ordinary tokens for the expression in the middle:
-
-      STRING_START  STRING_TEXT("Hi, ")  INTERP_START  NAME(name)  INTERP_END
-      STRING_TEXT("!")  STRING_END
-
-See docs/grammar.md §1 (lexical structure) and §2 (layout).
-"""
+"""Tokenizer: turns Ella source text into a flat list of tokens."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -323,16 +293,15 @@ class Lexer:
         width = self.column - 1  # the number of spaces skipped
         span = self.span()
         if width > self.indents[-1]:
-            # Deeper than the enclosing block: a new block starts. Any increase
-            # works; 4 spaces is the convention.
+            # Indented deeper: push new block indentation width and emit INDENT token
             self.indents.append(width)
             self.add(TokenKind.INDENT, self.pos, span)
             return
-        # Shallower: close blocks until we're back at a matching width. One
-        # DEDENT per block closed, so a line can end several blocks at once.
+        # Indented shallower: pop enclosing blocks and emit DEDENT for each closed level
         while width < self.indents[-1]:
             self.indents.pop()
             self.add(TokenKind.DEDENT, self.pos, span)
+        # Indentation must align with an existing enclosing block level
         if width != self.indents[-1]:
             raise EllaError("this line's indentation doesn't match any enclosing block", span)
 

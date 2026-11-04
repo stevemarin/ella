@@ -1,13 +1,4 @@
-"""The library: built-in functions with fixed types, such as `split` and `read_line`.
-
-Their types are in ella.checker.LIBRARY. Both interpreters call `call` here,
-and native code calls the runtime's `ella_lib_NAME` functions (runtime.c),
-which must behave exactly the same, error messages included.
-
-Strings are sequences of code points. Text from outside (standard input,
-files) must be valid UTF-8. Whitespace, digits and the grammar of numbers
-are ASCII only, so that C and Python agree on them exactly.
-"""
+"""The library: built-in functions with fixed types, such as `split` and `read_line`."""
 
 import errno
 import math
