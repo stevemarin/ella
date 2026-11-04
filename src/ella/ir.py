@@ -386,8 +386,11 @@ class Module:
     types: list[tuple[Any, Type]] = field(default_factory=list)
     generics: dict[str, Any] = field(default_factory=dict)  # name -> (Lambda, type parameters)
     specializations: dict[tuple[str, tuple[Type, ...]], str] = field(default_factory=dict)
-    # A struct or enum type with a `text` method, which a value printed may hold -> the method's function.
+    # A struct or enum type with a `text` method, which a value printed may hold -> the method's function;
+    # and likewise for `eq`, which `==` and `in` call (inside other values too), and `hash`.
     texts: dict[Type, str] = field(default_factory=dict)
+    eqs: dict[Type, str] = field(default_factory=dict)
+    hashes: dict[Type, str] = field(default_factory=dict)
 
 
 # Memory

@@ -67,9 +67,19 @@ class CallSite:
     function: str
 
 
-# Where calls the program doesn't write are: a finalizer's, and a `text` method's for `print`.
+# Where calls the program doesn't write are: a finalizer's, and those of `text`, `eq` and
+# `hash` methods, for `print`, for `==` inside other values (and `in`), and for `hash`.
 FINALIZER_SITE = Span(0, 0)
 TEXT_SITE = Span(0, 1)
+EQ_SITE = Span(0, 2)
+HASH_SITE = Span(0, 3)
+# What a stack trace says for each of those calls.
+SITE_LINES = {
+    FINALIZER_SITE: "  called to finalize a value",
+    TEXT_SITE: "  called to make a value's text",
+    EQ_SITE: "  called to compare two values",
+    HASH_SITE: "  called to hash a value",
+}
 
 
 def parse_place(text: str) -> Span | None:
@@ -132,10 +142,8 @@ class EllaError(Exception):
         for i, call in enumerate(self.trace or []):
             if i == TRACE_ENDS and self.omitted:
                 lines.append(f"  ... {self.omitted} more calls")
-            if call.span == FINALIZER_SITE:
-                lines.append("  called to finalize a value")
-            elif call.span == TEXT_SITE:
-                lines.append("  called to make a value's text")
+            if call.span in SITE_LINES:
+                lines.append(SITE_LINES[call.span])
             else:
                 lines.append(f"  called at {where(call.span)}{f' in {call.function}' if call.function else ''}")
         return "\n".join(lines)

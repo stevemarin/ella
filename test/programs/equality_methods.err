@@ -1,0 +1,2 @@
+16:13: precondition failed: a.bottom != 0 and b.bottom != 0
+  called to compare two values

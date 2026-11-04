@@ -104,15 +104,16 @@ struct Type {
 // A variant (or struct). A nocopy struct may have a finalizer, a closure run
 // on each value when it dies. `error` marks the built-in Error, whose fields
 // are its message, its cause (an Optional) and where it was made: equality and
-// the text form leave that out, and show the cause without its Some. `text`
-// is the closure of its type's `text` method, if it has one, which `print`
-// calls for its text form.
+// the text form leave that out, and show the cause without its Some. `text`,
+// `eq` and `hash` are the closures of its type's methods with those names, if
+// it has them: `print` calls `text` for its text form, `==` (inside other
+// values too) and `in` call `eq`, and `hash` calls `hash`.
 typedef struct {
     const char *name;
     word count;
     const Closure *finalize;
     word error;
-    const Closure *text;
+    const Closure *text, *eq, *hash;
     const Type *fields[];
 } VariantType;
 
@@ -140,6 +141,8 @@ typedef struct {
 extern const Site *ella_trace[];  // in the generated code, by depth
 const Site ella_finalizer_site = {0, 0, ""};
 const Site ella_text_site = {0, 1, ""};  // a `text` method's call, for print
+const Site ella_eq_site = {0, 2, ""};    // an `eq` method's, for == and in
+const Site ella_hash_site = {0, 3, ""};  // a `hash` method's, for hash
 
 // A stack trace of more calls than twice this shows only this many at each
 // end (TRACE_ENDS in ella.lexer).
@@ -178,6 +181,14 @@ static void print_trace(word depth) {
         }
         if (site == &ella_text_site) {
             fputs("  called to make a value's text\n", stderr);
+            continue;
+        }
+        if (site == &ella_eq_site) {
+            fputs("  called to compare two values\n", stderr);
+            continue;
+        }
+        if (site == &ella_hash_site) {
+            fputs("  called to hash a value\n", stderr);
             continue;
         }
         fputs("  called at ", stderr);
@@ -386,6 +397,7 @@ static void unregister(word object) {
 
 // In the generated code: call an Ella closure, with its result at `depth`, counting the call at `site`.
 extern word ella_call1(const Closure *closure, word argument, word depth, const Site *site);
+extern word ella_call2(const Closure *closure, word a, word b, word depth, const Site *site);
 static void free_pool(word pool);
 static void free_sub_arena(word arena);
 static void free_gen(word gen);
@@ -1082,6 +1094,8 @@ word ella_equal(word a, word b, const Type *t) {
     }
     case K_ENUM: {
         const Variant *x = (const Variant *)a, *y = (const Variant *)b;
+        const VariantType *first = t->parts[0];
+        if (first->eq) return ella_call2(first->eq, a, b, 0, &ella_eq_site) & 1;
         if (x->tag != y->tag) return 0;
         const VariantType *variant = t->parts[x->tag];
         for (word i = 0; i < (variant->error ? 2 : variant->count); i++) {
@@ -1873,6 +1887,7 @@ static uint64_t hash_value(word v, const Type *t) {
         // Its variant's name, without type arguments; an Error without where it was made.
         const Variant *x = (const Variant *)v;
         const VariantType *variant = t->parts[x->tag];
+        if (variant->hash) return (uint64_t)ella_call1(variant->hash, v, 0, &ella_hash_site);
         for (const char *c = variant->name; *c && *c != '['; c++) h = fnv(h, (unsigned char)*c);
         for (word i = 0; i < (variant->error ? 2 : variant->count); i++) {
             h = fnv(h, hash_value(x->fields[i], variant->fields[i]));

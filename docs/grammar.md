@@ -960,6 +960,8 @@ looped over and searched, like the built-in collections:
 | `next` | `for x in v`: v is an *iterator*, whose next item `next` gives | `(mut Self) -> Optional[T]` |
 | `contains` | `x in v` (`v.contains(x)`), `x not in v` | `(Self, T) -> bool` |
 | `text` | the text form, for `print`, `eprint` and `{{v}}` | `(Self) -> str` |
+| `eq` | `a == b`, `a != b`, and `in` on lists, inside other values too | `(Self, Self) -> bool` |
+| `hash` | `hash(v)`, inside other values too; a type with `eq` must have it | `(Self) -> i64` |
 
 ```ella
 struct Table[V]
@@ -1030,6 +1032,24 @@ for n in Countdown(3)
       text = (c: Celsius) -> str => "{{c.degrees}}°C"
 
   print([Celsius(21.5)])           # [21.5°C]
+  ```
+
+* `eq` decides `==` (and `!=`) wherever values of its type are compared:
+  alone, inside lists, tuples and other structs and enums, by `in` on a
+  list, and as the keys of a `Map` or items of a `Set`. Since those find
+  keys by `hash` first, a type with `eq` must have a `hash` method too,
+  giving equal values the same hash; `hash(v)` calls it, inside other
+  values too. Patterns still match field by field, and an error in either
+  method shows `called to compare two values` (or `called to hash a
+  value`) in the stack trace.
+
+  ```ella
+  struct Word
+      letters: str
+      eq = (a: Word, b: Word) -> bool => lower(a.letters) == lower(b.letters)
+      hash = (w: Word) -> i64 => hash(lower(w.letters))
+
+  print([Word("Hi")] == [Word("hI")])   # true
   ```
 
 * A user-defined constraint can ask for these methods too, so generic code
@@ -1410,7 +1430,9 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
   a variant's name, then its fields). Numbers, `bool`s and handles are
   one part each; `0.0` and `-0.0` hash the same, as do all NaNs; a range
   is its length and, unless empty, its start; a ref is its index; and an
-  `Error` leaves out where it was made, as `==` does.
+  `Error` leaves out where it was made, as `==` does. A struct or enum
+  with a `hash` method ([§9](#methods-provisional-syntax)) hashes to what
+  it gives, wherever it is.
 * Numbers are written in ASCII only, with no `_` and no spaces around them:
   `parse_i64(trim(line))` reads a number on a line of its own.
 * Text read from outside the program must be UTF-8: `read_line` stops with
@@ -1567,7 +1589,7 @@ for name in ages               # the keys, in order
 ```
 
 * `{k: v, ...}` is a `Map` literal, and `{}` an empty `Map`; `{x, ...}` is
-  a `Set` (below). They are `map_of([(k, v), ...])` and `set_of([x, ...])`,
+  a `Set` (below), and `{/}` an empty `Set`. They are `map_of([(k, v), ...])` and `set_of([x, ...])`,
   the library's whatever the program defines, so later keys replace
   earlier ones and a set keeps each item once:
 
@@ -1620,8 +1642,9 @@ for n in odd                   # the items, in order
   `s.intersection(t)` and `s.difference(t)` the items of `s` that are (or
   aren't) in `t`, in `s`'s order. `s.is_subset(t)` tells whether every
   item of `s` is in `t`.
-* Like a `Map`, a `Set` is copied, and compared with `==` (its order too);
-  it prints as `{1, 2, 3}`, and as `{}` when it is empty.
+* Like a `Map`, a `Set` is copied. It has `eq` and `hash` methods: sets are
+  `==` when they have the same items, in any order, so a set can be an
+  item of a set. It prints as `{1, 2, 3}`, and as `{/}` when it is empty.
 
 The module `iters` has lazy versions of the list functions, on generators
 ([§9](#generators-provisional-syntax)). They share names with those of
@@ -1858,6 +1881,7 @@ primary     = INT | FLOAT | string | "true" | "false" | IDENT
             | "[" [ expr { "," expr } [ "," ] ] "]"  (* list *)
             | "{" [ expr ":" expr { "," expr ":" expr } [ "," ] ] "}"  (* map; `{}` is an empty one *)
             | "{" expr { "," expr } [ "," ] "}"  (* set *)
+            | "{" "/" "}"                        (* an empty set *)
             | "type" type                        (* a type, as a value *)
             | splice ;
 string      = STRING_START { STRING_TEXT | INTERP_START expr INTERP_END } STRING_END ;
@@ -1921,8 +1945,7 @@ Parsing notes:
 
 * How SIMD vector types are named and written (`f32x4`?), and how they relate
   to `[T]`.
-* Whether `==` should use a method too (the text form can, with `text`), and
-  whether iteration should use a stateful iterator (`next`) rather than
+* Whether iteration should use a stateful iterator (`next`) rather than
   making a list.
 * Methods for built-in types (`xs.len()`), and functions in a type's
   namespace that don't take a value of it (`Stack.new()`).

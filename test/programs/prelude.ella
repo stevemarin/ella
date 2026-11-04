@@ -112,7 +112,7 @@ let main = () -> () =>
     print(evens.is_empty(), mut evens.insert_all([2, 4, 2, 6]), mut evens.insert_all([4, 8]), evens.items(), evens.is_empty())
     let left = map_of([("a", 1), ("b", 2)])
     print(left.merge(map_of([("b", 20), ("c", 30)])).items(), left.items(), left.is_empty(), new_set().union(evens).is_empty())
-    # Sets are values too; == also compares their order.
+    # Sets are values too; == compares their items, in any order.
     let mut more = odd
     mut more.insert(9)
     print(len(odd), len(more), odd == set_of([1, 3, 5, 7]), odd == set_of([7, 5, 3, 1]))

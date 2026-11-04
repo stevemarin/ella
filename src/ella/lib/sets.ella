@@ -10,8 +10,16 @@ struct Set[T: Eq]
     iter = (s: Set[T]) -> [T] => s._map.keys()
     items = (s: Set[T]) -> [T] => s._map.keys()
     is_empty = (s: Set[T]) -> bool => len(s._map) == 0
-    # A Set prints as its literal is written: {1, 2, 3} ({} if it is empty).
+    # Sets are equal when they have the same items, in any order, so their hash doesn't depend on it.
+    eq = (s: Set[T], t: Set[T]) -> bool => len(s._map) == len(t._map) and s.is_subset(t)
+    hash = (s: Set[T]) -> i64 =>
+        let mut h = len(s._map)
+        for item in s._map.keys()
+            h = h ^ hash(item)
+        h
+    # A Set prints as its literal is written: {1, 2, 3}, or {/} if it is empty.
     text = (s: Set[T]) -> str =>
+        if len(s._map) == 0 then return "{/}"
         let text = "{{s._map.keys()}}"
         "{" + text[1..len(text) - 1] + "}"
     # Adds an item, giving whether it is new.

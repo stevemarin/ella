@@ -312,10 +312,14 @@ class Parser:
         return items, trailing_comma
 
     def parse_braces(self) -> Expr:
-        """`{k: v, ...}` (a Map), `{x, ...}` (a Set), or `{}` (an empty Map)."""
+        """`{k: v, ...}` (a Map), `{x, ...}` (a Set), `{}` (an empty Map), or `{/}` (an empty Set)."""
         span = self.expect("{").span
         if self.accept("}"):
             return MapLit((), span)
+        if self.at("/") and self.peek(1).text == "}":
+            self.advance()
+            self.advance()
+            return SetLit((), span)
         first = self.parse_expr()
         if self.accept(":"):
             entries = [(first, self.parse_expr())]

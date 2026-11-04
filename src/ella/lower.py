@@ -1500,12 +1500,15 @@ class Lowerer:
             if self.has_method(right.type, "contains"):
                 result = self.call_method("contains", [right, left], BOOL, span, self.here())
             else:
+                self.need_methods(left.type, "eq", self.module.eqs, span)
                 result = self.emit("contains", BOOL, [left, right], span)
             return self.emit("not", BOOL, [result], span) if op == "not in" else result
         if op not in ("==", "!=") and self.has_method(left.type, "compare"):
             # `a < b` is `a.compare(b) < 0`.
             order = self.call_method("compare", [left, right], I64, span, self.here())
             return self.emit(COMPARE_OPS[op], BOOL, [order, self.const(0, span)], span)
+        if op in ("==", "!="):
+            self.need_methods(left.type, "eq", self.module.eqs, span)
         return self.emit(COMPARE_OPS[op], BOOL, [left, right], span)
 
     def lower_try(self, value: Value, t: Type, span: Span) -> Value:
@@ -1599,6 +1602,8 @@ class Lowerer:
         if name in LIBRARY:
             # Its result is new objects, made where they are wanted, or views of its first argument.
             values = [self.protect(self.lower(arg), args[i + 1 :], arg.span) for i, arg in enumerate(args)]
+            if name == "hash":
+                self.need_methods(values[0].type, "hash", self.module.hashes, span)
             region = dest or self.here()
             result = self.emit("builtin", self.type_of(expr), values, span, name, region=region)
             if name in VIEWS:
@@ -1647,6 +1652,8 @@ class Lowerer:
             result = Value(len(params), t.result)
             region = "" if not is_boxed(t.result) else "0" if name in VIEWS else "result"
             # Its errors are reported where it is called (EllaError.traced), as the interpreter does.
+            if name == "hash":
+                self.need_methods(t.params[0], "hash", self.module.hashes, span)
             instrs = [Instr("builtin", result, list(params), Span(0, 0), name, region=region)]
             if name in VIEWS:
                 copied = Value(len(params) + 1, t.result)
@@ -1701,9 +1708,15 @@ class Lowerer:
         return self.emit("to_text", STR, [value], span, region=region)
 
     def need_texts(self, t: Type, span: Span) -> None:
-        """Make the `text` methods that writing a value of type t calls: those of the structs and enums in it.
+        """Make the `text` methods that writing a value of type t calls: those of the structs and enums in it."""
+        self.need_methods(t, "text", self.module.texts, span)
 
-        A value of a type with one is written by calling it, so its parts aren't looked into.
+    def need_methods(self, t: Type, method: str, table: dict[Type, str], span: Span) -> None:
+        """Make the methods `method` (text, eq or hash) of the structs and enums a value of type t may hold.
+
+        They go in `table` (Module.texts, eqs or hashes), specialized for their type arguments, for the
+        IR interpreter and the runtime to call. A value of a type with one is handled by calling it,
+        so its parts aren't looked into.
         """
         seen: set[Type] = set()
         work = [t]
@@ -1717,9 +1730,9 @@ class Lowerer:
                     work.append(element)
                 case TupleTy(items):
                     work += items
-                case EnumTy(name, args) if "text" in self.module.enums[name].methods:
-                    if part not in self.module.texts:
-                        self.module.texts[part] = self.specialize(f"{name}.text", args, span)
+                case EnumTy(name, args) if method in self.module.enums[name].methods:
+                    if part not in table:
+                        table[part] = self.specialize(f"{name}.{method}", args, span)
                 case EnumTy(name, args):
                     info = self.module.enums[name]
                     mapping = dict(zip(info.params, args))

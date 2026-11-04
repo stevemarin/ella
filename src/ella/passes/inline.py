@@ -268,7 +268,8 @@ def bottom_up(module: Module) -> list[Function]:
 
 def unused_functions(module: Module) -> list[str]:
     """The functions the program can no longer reach from its entry, a finalizer or a text method, after inlining."""
-    kept = {module.entry} | {e.finalize for e in module.enums.values() if e.finalize} | set(module.texts.values())
+    kept = {module.entry} | {e.finalize for e in module.enums.values() if e.finalize}
+    kept |= {*module.texts.values(), *module.eqs.values(), *module.hashes.values()}
     reachable: set[str] = set()
     work = [*kept]
     while work:

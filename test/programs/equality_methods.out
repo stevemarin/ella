@@ -1,0 +1,10 @@
+true false false
+true true true
+true true true
+true true
+2 3 [Word("The"), Word("cat")]
+2
+true false true {{1, 2}}
+2 true {/} true false
+patterns compare fields
+true

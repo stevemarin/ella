@@ -19,7 +19,7 @@ and imports, with the prelude as standard library modules, then loops that
 carry values instead of piling them up, and benchmarks, then generators
 and iterators, then direct calls, inlining and register allocation, then
 stack traces, errors with causes and locations, and `main` giving a
-`Result`, then sets and more of the standard library). `make check` passes (1269 tests, ruff, strict mypy).
+`Result`, then sets and more of the standard library). `make check` passes (1279 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -57,7 +57,9 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 `sort_by`, `sum`, `fold`, `zip`, ...), constants, `Map[K, V]` and
 `Set[T]`, written in Ella.
 
-- An empty `Set` prints as `{}`, which reads as an empty `Map`.
+- A `Map`'s `==` still compares its order too: an `eq` method comparing
+  values would need `V: Eq`, which `Map[K: Eq, V]` doesn't ask for (maps
+  of functions are fine), and a method can't add a constraint of its own.
 - `hash` is structural, like `==`, and can't be customized: a type
   can't hash only the fields that matter, and since `==` can't be
   customized either, there is no use for a `Hash` constraint yet. A `Map`
@@ -110,8 +112,9 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 
 ### Types, methods and protocols
 
-- `==` can't be customized; it is structural and done by the runtime,
-  which would need to call Ella code, as it does for `text` methods.
+- A type with `eq` must also have `hash`, and nothing checks that they
+  agree (equal values must hash the same), nor that `eq` is an
+  equivalence.
 - A generator takes its nocopy arguments (a `Gen` given to another
   generator, say) only as new values: `squares(count(4))` works, but
   `squares(g)` for a variable `g` doesn't. Moving a local variable at its
@@ -384,6 +387,13 @@ Small steps that build on the above:
     `ella_call1` with a level of its own for the result. Error messages
     keep the built-in form, and a call shows as `called to make a value's
     text` in stack traces.
+13. `eq` and `hash` protocol methods, done like `text` (`Module.eqs`,
+    `Module.hashes`, and closures in type descriptors, called through
+    `ella_call2` and `ella_call1`): `==`, `!=`, `in` on lists and `hash`
+    use them, inside other values too, so `Map` keys and `Set` items are
+    told apart by them. A type with `eq` must have `hash`. `Set` has both:
+    sets are equal with the same items in any order. An empty `Set` is
+    written, and prints, as `{/}`.
 
 ### Done (2026-11-02, ninth round): errors and diagnostics
 

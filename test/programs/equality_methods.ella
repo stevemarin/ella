@@ -1,0 +1,46 @@
+# A struct or enum with `eq` and `hash` methods (docs/grammar.md §9): `==`, `!=` and `in` use
+# eq wherever its values are, and `hash` uses hash, so Maps and Sets keep them apart by eq.
+
+# A word that compares without case.
+struct Word
+    letters: str
+    eq = (a: Word, b: Word) -> bool => lower(a.letters) == lower(b.letters)
+    hash = (w: Word) -> i64 => hash(lower(w.letters))
+
+# A fraction, equal to the others of the same value.
+struct Ratio
+    top: i64
+    bottom: i64
+    eq = (a: Ratio, b: Ratio) -> bool =>
+        where
+            a.bottom != 0 and b.bottom != 0
+        a.top * b.bottom == b.top * a.bottom
+    hash = (_r: Ratio) -> i64 => 0
+
+let main = () -> () =>
+    print(Word("Hi") == Word("hI"), Word("a") != Word("A"), Word("a") == Word("b"))
+    print([Word("X")] == [Word("x")], (1, Word("q")) == (1, Word("Q")), Some(Word("z")) == Some(Word("Z")))
+    print(Word("b") in [Word("A"), Word("B")], Word("c") not in [Word("A")], hash(Word("Ab")) == hash(Word("aB")))
+    print(hash([Word("a")]) == hash([Word("A")]), hash((Word("a"), 1)) == hash((Word("A"), 1)))
+
+    # Maps and Sets find keys by hash and eq.
+    let mut counts: Map[Word, i64] = {}
+    for w in ["The", "the", "THE", "cat"]
+        counts[Word(w)] = counts.get_or(Word(w), 0) + 1
+    print(len(counts), counts[Word("tHe")], counts.keys())
+    print(len(set_of([Ratio(1, 2), Ratio(2, 4), Ratio(3, 6), Ratio(1, 3)])))
+
+    # Sets are equal when they have the same items in any order; {/} is an empty one.
+    print({1, 2, 3} == {3, 2, 1}, {1, 2} == {1, 2, 3}, hash({1, 2}) == hash({2, 1}), {{1, 2}, {2, 1}})
+    let seen = set_of([{"a", "b"}, {"b", "a"}, {"c"}])
+    let empty: Set[i64] = {/}
+    print(len(seen), {"b", "a"} in seen, empty, empty == {/}, {/} == {1})
+
+    # Patterns still match field by field.
+    match Word("Hi")
+        case Word("hi") => print("matched without case")
+        case _ => print("patterns compare fields")
+
+    # eq runs for each comparison, and can fail.
+    print(Ratio(1, 2) == Ratio(2, 4))
+    print([Ratio(1, 2)] == [Ratio(1, 0)])

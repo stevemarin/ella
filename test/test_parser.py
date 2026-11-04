@@ -593,6 +593,8 @@ def test_map_and_set_literals() -> None:
     assert one("{x,}") == "(set x)"
     assert one("{\n    1: [2],\n    3: [],\n}") == "(map (1 (list 2)) (3 (list)))"
     assert one("{(0, 1): {2}}") == "(map ((tuple 0 1) (set 2)))"
+    assert one("{/}") == "(set)"
+    assert one("{ / }") == "(set)"
 
 
 @pytest.mark.parametrize(

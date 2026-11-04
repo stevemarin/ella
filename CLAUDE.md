@@ -71,7 +71,8 @@ plain:
   level), generic functions, methods and constraints (built-in and
   user-defined, met structurally), the `update` protocol (an assignment
   line through an item of such a type becomes code that calls it,
-  `updates`, which the interpreters and lowering run instead), the `text` protocol (a type's text form for `print`),
+  `updates`, which the interpreters and lowering run instead), the `text`, `eq` and `hash` protocols (a type's text form
+  for `print`, its `==`, and its hash; `eq` needs `hash`),
   generators (a lambda with `yield`,
   `syntax.is_generator`; how each `for` loops is in `iterations`), and the
   rules for `nocopy` values (`check_copies`; a call giving a `Gen` takes
@@ -97,6 +98,7 @@ plain:
   are `MAX_CALL_DEPTH` (every backend's default call depth limit),
   `run_deep` (runs an interpreter on a thread with a big stack), `to_text`
   (whose `custom` calls `text` methods, for `print`; error messages leave it out),
+  `equal` (likewise for `eq` methods; patterns leave it out),
   `make_error` (a built-in `Error`, whose `error` flag makes `==` and the
   text form leave out its `at`) and `main_error` (the error of an `Err`
   that `main` returns).
@@ -159,8 +161,9 @@ plain:
   Generic functions are specialized per type arguments, and so are methods
   (functions named `Type.method`); operators on structs with methods like
   `add` become calls. Printing a value makes the `text` methods of the
-  types it may hold (`Module.texts`), which the IR interpreter and the
-  runtime (through type descriptors and `ella_call1`) call.
+  types it may hold (`Module.texts`), and `==`, `in` and `hash` their `eq`
+  and `hash` methods (`Module.eqs`, `hashes`), which the IR interpreter and
+  the runtime (through type descriptors, `ella_call1` and `ella_call2`) call.
 * `src/ella/ir_interpreter.py`: runs IR. Simulates the arenas (scope arenas,
   and an arena per pool slot), runs finalizers, checks every use and store
   ("memory check failed" means a compiler bug; a list's view, `View`, checks

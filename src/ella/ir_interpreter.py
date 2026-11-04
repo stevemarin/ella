@@ -96,8 +96,8 @@ from ella.ir import (
     verify,
 )
 from ella.ir import Value as IRValue
-from ella.lexer import FINALIZER_SITE, TEXT_SITE, CallSite, EllaError, Span
-from ella.library import Exit, Host
+from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, EllaError, Span
+from ella.library import FNV_OFFSET, Exit, Host, fnv, hash_bits
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
 from ella.operators import binary, compare, contains, index_into, slice_of, unary
@@ -117,6 +117,7 @@ from ella.values import (
     Value,
     VariantValue,
     copy_value,
+    equal,
     main_error,
     run_deep,
     to_text,
@@ -402,6 +403,55 @@ class IRInterpreter:
             self.module.functions[finalizer], [value], [None], 0, {}, FINALIZER_SITE, CallSite(FINALIZER_SITE, "")
         )
 
+    def call_protocol(self, table: dict[Type, str], t: Type, args: list[Value], site: Span, span: Span) -> Value:
+        """Call the `eq` or `hash` method of a type (Module.eqs or hashes), whose result is a number or bool."""
+        function = self.module.functions[table[t]]
+        result, _, _ = self.call(function, args, [None] * len(args), 0, {}, span, CallSite(site, ""))
+        return result
+
+    def equal(self, a: Value, b: Value, t: Type, span: Span) -> bool:
+        """`a == b` for values of type t: through the `eq` methods of the types in it (Module.eqs)."""
+        match t:
+            case EnumTy() if t in self.module.eqs:
+                result = self.call_protocol(self.module.eqs, t, [a, b], EQ_SITE, span)
+                assert isinstance(result, bool)
+                return result
+            case ListTy(element):
+                assert isinstance(a, list) and isinstance(b, list)
+                return len(a) == len(b) and all(self.equal(x, y, element, span) for x, y in zip(a, b))
+            case TupleTy(items):
+                assert isinstance(a, tuple) and isinstance(b, tuple)
+                return all(self.equal(x, y, item, span) for x, y, item in zip(a, b, items))
+            case EnumTy(name, args) if isinstance(a, VariantValue) and isinstance(b, VariantValue) and not a.error:
+                if a.variant != b.variant:
+                    return False
+                info = self.module.enums[name]
+                mapping = dict(zip(info.params, args))
+                types = [substitute(f, mapping) for f in info.variants[a.variant]]
+                return all(self.equal(x, y, field, span) for x, y, field in zip(a.fields, b.fields, types))
+        return equal(a, b)
+
+    def hash(self, value: Value, t: Type, span: Span) -> int:
+        """`hash(value)` for a value of type t, as unsigned bits: through the `hash` methods (Module.hashes)."""
+        match t:
+            case EnumTy() if t in self.module.hashes:
+                result = self.call_protocol(self.module.hashes, t, [value], HASH_SITE, span)
+                assert isinstance(result, int)
+                return result % 2**64
+            case ListTy(element):
+                assert isinstance(value, list)
+                return fnv(FNV_OFFSET, (self.hash(item, element, span) for item in value))
+            case TupleTy(items) if items:
+                assert isinstance(value, tuple)
+                return fnv(FNV_OFFSET, (self.hash(item, part, span) for item, part in zip(value, items)))
+            case EnumTy(name, args) if isinstance(value, VariantValue) and not value.error:
+                info = self.module.enums[name]
+                mapping = dict(zip(info.params, args))
+                types = [substitute(f, mapping) for f in info.variants[value.variant]]
+                h = fnv(FNV_OFFSET, bare_name(value.variant).partition("[")[0].encode())
+                return fnv(h, (self.hash(item, field, span) for item, field in zip(value.fields, types)))
+        return hash_bits(value)
+
     def text(self, value: Value, t: Type, span: Span, nested: bool = False) -> str:
         """A value's text form, as `print` writes it: through the `text` methods of the types in it (Module.texts).
 
@@ -637,8 +687,13 @@ class IRInterpreter:
                 self.globals[instr.name], self.global_tags[instr.name] = args[0], tags[0]
             case "neg" | "not" | "bitnot":
                 result = unary(UNARY[instr.op], args[0], span)
+            case "eq" | "ne" if self.module.eqs:  # through `eq` methods
+                compare(OPERATORS[instr.op], args[0], args[1], span)  # for its errors
+                result = self.equal(args[0], args[1], instr.args[0].type, span) == (instr.op == "eq")
             case "eq" | "ne" | "lt" | "le" | "gt" | "ge":
                 result = compare(OPERATORS[instr.op], args[0], args[1], span)
+            case "contains" if self.module.eqs and isinstance(args[1], list):
+                result = any(self.equal(item, args[0], instr.args[0].type, span) for item in args[1])
             case "contains":
                 result = contains(args[1], args[0], span)
             case op if op in OPERATORS:  # arithmetic, bitwise and ranges
@@ -674,6 +729,9 @@ class IRInterpreter:
                     result = View(container, part.start, part.stop)
                 size = LIST_VIEW if isinstance(result, View) else STR_VIEW
                 tag = self.shortest(tags[0], self.allocate(depth, size, instr, frame))
+            case "builtin" if instr.name == "hash":  # through `hash` methods
+                h = self.hash(args[0], instr.args[0].type, span)
+                result = h - 2**64 if h >= 2**63 else h
             case "builtin":
                 try:
                     result = call_library(instr.name, args, self.place(span), self.host)

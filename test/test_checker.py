@@ -849,6 +849,18 @@ def test_protocols() -> None:
             "update must take the key type get uses, and a (mut i64) -> ()",
         ),
         (
+            "struct R\n    n: i64\n    eq = (a: R, b: R) -> i64 => 1\n    hash = (r: R) -> i64 => 1",
+            "the method 'eq' must have the type (R, R) -> bool",
+        ),
+        (
+            "struct R\n    n: i64\n    hash = (r: R) -> bool => true",
+            "the method 'hash' must have the type (R) -> i64",
+        ),
+        (
+            "struct R\n    n: i64\n    eq = (a: R, b: R) -> bool => true",
+            "a type with an eq method needs a hash method too, so that equal values hash the same",
+        ),
+        (
             "struct R\n    n: i64\n    text = (r: R) -> i64 => 1",
             "the method 'text' must have the type (R) -> str",
         ),

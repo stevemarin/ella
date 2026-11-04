@@ -230,7 +230,9 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   literals, `{"a": 1}` and `{1, 2}`, and an `update` method lets
   `m[k] += [x]` and `m[k].count += 1` change the item in place. A `text`
   method gives a type its own text form for `print`, so maps and sets
-  print as their literals. See [TODO.md](TODO.md) for what could come next.
+  print as their literals, and `eq` and `hash` methods its own `==`
+  (sets are equal with the same items, in any order; `{/}` is an empty
+  set). See [TODO.md](TODO.md) for what could come next.
 
 ```sh
 uv run ella example_syntax.ella           # check and run a program (through the IR)

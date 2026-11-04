@@ -954,6 +954,10 @@ class Checker:
                     f"{show_type(get.result)})",
                     enum.span,
                 )
+        if "eq" in methods and "hash" not in methods:
+            raise EllaError(
+                "a type with an eq method needs a hash method too, so that equal values hash the same", enum.span
+            )
         if "update" in methods:
             if "get" not in methods or "set" not in methods:
                 raise EllaError("a type with an update method needs get and set methods too", enum.span)
@@ -993,6 +997,8 @@ class Checker:
             "compare": ("(Self, Self) -> i64", t == FuncTy((own, own), I64)),
             "len": ("(Self) -> i64", t == FuncTy((own,), I64)),
             "text": ("(Self) -> str", t == FuncTy((own,), STR)),
+            "eq": ("(Self, Self) -> bool", t == FuncTy((own, own), BOOL)),
+            "hash": ("(Self) -> i64", t == FuncTy((own,), I64)),
             "neg": ("(Self) -> R, without 'mut'", len(t.params) == 1 and not t.mutable),
             **{name: (binary, len(t.params) == 2 and not t.mutable) for name in OPERATOR_METHODS.values()},
             "get": ("(Self, K) -> V, without 'mut'", len(t.params) == 2 and not t.mutable),

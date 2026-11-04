@@ -354,19 +354,24 @@ def copy_value(value: Value) -> Value:
             return value
 
 
-def equal(a: Value, b: Value) -> bool:
+def equal(a: Value, b: Value, custom: Callable[[VariantValue, VariantValue], bool | None] | None = None) -> bool:
     """Structural equality: lists, tuples and variants are equal if their parts are.
 
     Values of different types are never equal. (Python would say `1 == True`.)
+    `custom` compares two struct or enum values whose type has an `eq` method
+    (by calling it), or gives None; without it, as in patterns, equality is
+    always structural.
     """
     if type_name(a) != type_name(b):
         return False
     if isinstance(a, list | tuple) and isinstance(b, list | tuple):
-        return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(equal(x, y, custom) for x, y in zip(a, b))
     if isinstance(a, VariantValue) and isinstance(b, VariantValue):
+        if custom is not None and (same := custom(a, b)) is not None:
+            return same
         if a.error:  # where an Error was made doesn't count
             return equal(a.fields[:2], b.fields[:2])
-        return a.variant == b.variant and equal(a.fields, b.fields)
+        return a.variant == b.variant and equal(a.fields, b.fields, custom)
     if isinstance(a, PoolValue | ArenaValue | GenValue | CodeValue):
         return a is b
     return a == b

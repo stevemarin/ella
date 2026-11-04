@@ -227,12 +227,16 @@ FNV_PRIME = 0x100000001B3
 CANONICAL_NAN = 0x7FF8000000000000
 
 
-def hash_value(value: Value) -> int:
-    h = hash_bits(value)
+def hash_value(value: Value, custom: Callable[[VariantValue], int | None] | None = None) -> int:
+    """`hash(value)`. `custom` gives the hash of a struct or enum value whose type has a `hash` method
+    (by calling it), or None."""
+    h = hash_bits(value, custom)
     return h - 2**64 if h >= 2**63 else h
 
 
-def hash_bits(value: Value) -> int:
+def hash_bits(value: Value, custom: Callable[[VariantValue], int | None] | None = None) -> int:
+    if isinstance(value, VariantValue) and custom is not None and (h := custom(value)) is not None:
+        return h % 2**64
     match value:
         case str():
             return fnv(FNV_OFFSET, (ord(c) for c in value))
@@ -243,7 +247,7 @@ def hash_bits(value: Value) -> int:
             bits = CANONICAL_NAN if math.isnan(value) else struct.unpack("<Q", struct.pack("<d", value + 0.0))[0]
             return fnv(FNV_OFFSET, [bits])
         case tuple() | list():  # () too
-            return fnv(FNV_OFFSET, (hash_bits(item) for item in value))
+            return fnv(FNV_OFFSET, (hash_bits(item, custom) for item in value))
         case range():
             # Ranges are equal when they hold the same numbers.
             size = max(0, value.stop - value.start) % 2**64
@@ -252,7 +256,7 @@ def hash_bits(value: Value) -> int:
             # Its variant's name, without its module or type arguments; an Error without where it was made.
             name = bare_name(variant).partition("[")[0]
             h = fnv(FNV_OFFSET, name.encode())
-            return fnv(h, (hash_bits(field) for field in (fields[:2] if error else fields)))
+            return fnv(h, (hash_bits(field, custom) for field in (fields[:2] if error else fields)))
         case HandleValue(slot, generation):
             return fnv(FNV_OFFSET, [slot | generation << 32])
         case RefValue(index=index):

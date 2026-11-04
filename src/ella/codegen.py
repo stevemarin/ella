@@ -253,6 +253,24 @@ class CodeGen:
             "    dec qword ptr [rip + ella_depth]",
             "    leave",
             "    ret",
+            "",
+            "# The same with two arguments, for `eq` methods: ella_call2(closure, a, b, result depth, site).",
+            "    .globl ella_call2",
+            "ella_call2:",
+            "    push rbp",
+            "    mov rbp, rsp",
+            "    mov rax, qword ptr [rip + ella_depth]",
+            "    lea r9, [rip + ella_trace]",
+            "    mov qword ptr [r9 + 8*rax], r8",
+            "    inc qword ptr [rip + ella_depth]",
+            "    push rdx                    # the second argument",
+            "    push rsi                    # the first",
+            "    push rcx                    # where the result goes",
+            "    push rdi                    # the closure",
+            "    call qword ptr [rdi]",
+            "    dec qword ptr [rip + ella_depth]",
+            "    leave",
+            "    ret",
         ]
         for name, function in self.module.functions.items():
             self.text = []
@@ -618,7 +636,11 @@ class CodeGen:
                 mapping = dict(zip(enum.params, args))
                 kind, count = ENUM_KIND, len(enum.variants)
                 finalize = self.finalizer(name) if enum.finalize else "0"
-                text = self.static_closure(self.module.texts[t]) if t in self.module.texts else "0"
+                # Its text, eq and hash methods, which the runtime calls.
+                protocols = [
+                    self.static_closure(table[t]) if t in table else "0"
+                    for table in (self.module.texts, self.module.eqs, self.module.hashes)
+                ]
                 error = int(is_builtin_error(self.module.enums, name))
                 for variant, fields in enum.variants.items():
                     field_labels = [self.type_descriptor(substitute(f, mapping)) for f in fields]
@@ -626,7 +648,8 @@ class CodeGen:
                     self.rodata += [
                         "    .balign 8",
                         f"{variant_label}:",
-                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}, {error}, {text}"
+                        f"    .quad {self.c_string(bare_name(variant))}, {len(fields)}, {finalize}, {error}, "
+                        + ", ".join(protocols)
                         + "".join(f", {f}" for f in field_labels),
                     ]
                     parts.append(variant_label)

@@ -42,8 +42,8 @@ from ella.checker import (
     finish,
     pattern_names,
 )
-from ella.lexer import FINALIZER_SITE, TEXT_SITE, CallSite, EllaError, Span
-from ella.library import Exit, Host
+from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, EllaError, Span
+from ella.library import Exit, Host, hash_value
 from ella.library import call as call_library
 from ella.modules import link
 from ella.operators import binary, compare, index_into, unary
@@ -814,7 +814,25 @@ class Interpreter:
             order = self.call(method, [left, right], span)
             assert isinstance(order, int)
             return ORDERING[op](order)
-        return compare(op, left, right, span)
+        return compare(op, left, right, span, self.custom_equal)
+
+    def custom_equal(self, a: VariantValue, b: VariantValue) -> bool | None:
+        """Whether two struct or enum values are equal by their type's `eq` method, if it has one."""
+        method = self.find_method(a, "eq")
+        if method is None:
+            return None
+        result = self.call(method, [a, b], EQ_SITE)
+        assert isinstance(result, bool)
+        return result
+
+    def custom_hash(self, value: VariantValue) -> int | None:
+        """A struct or enum value's hash by its type's `hash` method, if it has one."""
+        method = self.find_method(value, "hash")
+        if method is None:
+            return None
+        result = self.call(method, [value], HASH_SITE)
+        assert isinstance(result, int)
+        return result
 
     def evaluate_place(self, target: Expr, scope: Scope) -> tuple[Expr, list[tuple[Value | Member, Span]]]:
         """The root variable of `xs[i].f[j]`, and its indexes and fields, left to right, with their spans.
@@ -1273,6 +1291,8 @@ class Interpreter:
         return run
 
     def builtin_library(self, name: str) -> Callable[[list[Value], Span], Value]:
+        if name == "hash":  # through `hash` methods
+            return lambda args, span: hash_value(args[0], self.custom_hash)
         return lambda args, span: call_library(name, args, span, self.host)
 
     def builtin_run(self, args: list[Value], span: Span) -> Value:

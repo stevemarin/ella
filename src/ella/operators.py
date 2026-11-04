@@ -9,9 +9,10 @@ if the operation fails.
 """
 
 import math
+from collections.abc import Callable
 
 from ella.lexer import EllaError, Span
-from ella.values import Value, equal, fits_i64, to_text, type_name
+from ella.values import Value, VariantValue, equal, fits_i64, to_text, type_name
 
 
 def float_div(a: float, b: float) -> float:
@@ -142,18 +143,21 @@ def float_op(op: str, a: float, b: float, span: Span) -> Value:
     raise EllaError(f"'{op}' doesn't work on f64", span)
 
 
-def compare(op: str, a: Value, b: Value, span: Span) -> bool:
-    """One comparison of a chain: `==`, `<`, `in` and so on."""
+type Equal = Callable[[VariantValue, VariantValue], bool | None]
+
+
+def compare(op: str, a: Value, b: Value, span: Span, custom: Equal | None = None) -> bool:
+    """One comparison of a chain: `==`, `<`, `in` and so on. `custom` calls `eq` methods (see values.equal)."""
     if op in ("in", "not in"):
-        return contains(b, a, span) == (op == "in")
+        return contains(b, a, span, custom) == (op == "in")
     if type_name(a) != type_name(b):
         raise EllaError(f"'{op}' needs two values of the same type, not {type_name(a)} and {type_name(b)}", span)
     if type_name(a) == "function":
         raise EllaError("functions can't be compared", span)
     if op == "==":
-        return equal(a, b)
+        return equal(a, b, custom)
     if op == "!=":
-        return not equal(a, b)
+        return not equal(a, b, custom)
     # Ordering works on numbers and strings (strings compare by code point).
     match a, b:
         case bool(), bool():
@@ -171,11 +175,11 @@ def compare(op: str, a: Value, b: Value, span: Span) -> bool:
     raise EllaError(f"'{op}' doesn't work on {type_name(a)}", span)
 
 
-def contains(container: Value, item: Value, span: Span) -> bool:
+def contains(container: Value, item: Value, span: Span, custom: Equal | None = None) -> bool:
     """`item in container` for a list, a string (substring) or a range."""
     match container:
         case list():
-            return any(equal(element, item) for element in container)
+            return any(equal(element, item, custom) for element in container)
         case str() if isinstance(item, str):
             return item in container
         case range() if isinstance(item, int) and not isinstance(item, bool):
