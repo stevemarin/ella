@@ -254,6 +254,7 @@ from ella.checker import (
     PrimTy,
     TupleTy,
     Type,
+    finish,
     library_param,
     show_type,
     substitute,
@@ -1092,7 +1093,7 @@ class Verifier:
                     and (dest == STR or isinstance(dest, ListTy))
                 )
             case "builtin":
-                library: Type | None = LIBRARY.get(instr.name)
+                library: Type | None = finish(LIBRARY[instr.name]) if instr.name in LIBRARY else None
                 if library is not None and instr.name in GENERIC_LIBRARY and args:
                     library = substitute(library, {"T": library_param(instr.name, args)})
                 need(library is not None and dest is not None and FuncTy(tuple(args), dest) == library)

@@ -610,7 +610,7 @@ class Resolver:
                 return None
             case NamedType(name, args, span):
                 resolved = self.type_name(name, span, scope)
-                return NamedType(resolved, tuple(self.type(arg, scope) for arg in args), span)  # type: ignore[misc]
+                return replace(texpr, name=resolved, args=tuple(self.type(arg, scope) for arg in args))  # type: ignore[misc]
         return rebuild(texpr, lambda part: self.part(part, scope))  # type: ignore[return-value]
 
     def pattern(self, pattern: Pattern, scope: Scope, bind: set[str], top: bool = False) -> Pattern:

@@ -77,12 +77,13 @@ Longest match wins (`//=` before `//` before `/`).
 ==   !=   <    <=   >    >=
 =    +=   -=   *=   /=   //=  %=
 ->   =>   |>   ..   ..=  ?
-.    ,    :    (    )    [    ]    {    }    $
+.    ,    :    (    )    [    ]    {    }    $    ;
 ```
 
-`;`, `!` (alone), `@` and `` ` `` are not tokens; they are errors outside
+`!` (alone), `@` and `` ` `` are not tokens; they are errors outside
 strings and comments. `{` and `}` make map and set literals
-([§10](#the-prelude)).
+([§10](#the-prelude)). `;` is reserved for array shapes (`Array[f64; N, M]`,
+planned) and is an error everywhere else for now.
 
 ### Integer literals
 

@@ -59,6 +59,7 @@ from ella.syntax import (
     Compare,
     ConstraintDef,
     Continue,
+    Dim,
     EnumDef,
     Expr,
     FieldSplice,
@@ -188,8 +189,16 @@ MAX_DIMS = 32
 def array_item(t: Type) -> Type | None:
     """The item type of an `Array[T]`, or None for other types."""
     match resolve(t):
-        case BuiltinTy("Array", (item,)):
+        case BuiltinTy("Array", (item, *_)):
             return item
+    return None
+
+
+def array_dims(t: Type) -> tuple[Type, ...] | None:
+    """An array type's dimensions (SizeTys or TyVars), or None if its rank isn't tracked (or it's no array)."""
+    match resolve(t):
+        case BuiltinTy("Array", (_, *dims)) if dims:
+            return tuple(dims)
     return None
 
 
@@ -215,6 +224,24 @@ class DeferredTy:
 
 
 DEFERRED = DeferredTy()
+
+
+@dataclass(frozen=True, slots=True)
+class SizeTy:
+    """One dimension of an array type (TODO.md, "arrays typed by shape"): `Array[f64; N, 3, _]`.
+
+    `value` is a size (3), a size parameter's name ("N"), which only matches
+    itself, or "_" (ANY_SIZE) for a size not tracked, which matches any.
+    A size not known yet is a TyVar, like a type; unification decides it.
+    An array type's dimensions follow its item type in its args:
+    `BuiltinTy("Array", (F64, SizeTy("N"), SizeTy(3)))`. Without any, its
+    rank isn't tracked either: `Array[f64]` fits every array of f64.
+    """
+
+    value: int | str
+
+
+ANY_SIZE = SizeTy("_")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,7 +289,7 @@ class TyVar:
     ref: Type | None = None
 
 
-type Type = PrimTy | ListTy | TupleTy | FuncTy | EnumTy | BuiltinTy | ParamTy | TyVar | DeferredTy
+type Type = PrimTy | ListTy | TupleTy | FuncTy | EnumTy | BuiltinTy | ParamTy | SizeTy | TyVar | DeferredTy
 
 
 def resolve(t: Type) -> Type:
@@ -288,6 +315,8 @@ def finish(t: Type) -> Type:
             return FuncTy(tuple(finish(param) for param in params), finish(result), mutable)
         case EnumTy(name, args):
             return EnumTy(name, tuple(finish(arg) for arg in args))
+        case BuiltinTy("Array", (item, *_)):
+            return BuiltinTy("Array", (finish(item),))  # the IR and later stages don't track shapes
         case BuiltinTy(name, args):
             return BuiltinTy(name, tuple(finish(arg) for arg in args))
         case other:
@@ -308,6 +337,10 @@ def show_type(t: Type) -> str:
         case FuncTy(params, result, mutable):
             shown = (("mut " if i in mutable else "") + show_type(p) for i, p in enumerate(params))
             return "(" + ", ".join(shown) + f") -> {show_type(result)}"
+        case BuiltinTy("Array", (item, *dims)) if dims:
+            return f"Array[{show_type(item)}; " + ", ".join(map(show_type, dims)) + "]"
+        case SizeTy(value):
+            return str(value)
         case EnumTy(name, args) | BuiltinTy(name, args) if args:
             return f"{name}[" + ", ".join(map(show_type, args)) + "]"
         case EnumTy(name) | BuiltinTy(name):
@@ -339,6 +372,43 @@ def substitute(t: Type, params: dict[str, Type]) -> Type:
             return t
 
 
+def is_size(t: Type) -> bool:
+    """Whether a name in a generic's scope stands for a size (a size parameter, or one a `let` decided)."""
+    return isinstance(t, SizeTy | TyVar)
+
+
+def named_sizes(t: Type) -> set[str]:
+    """The size parameters a type mentions: `Array[T; N, 3]` mentions N."""
+    match t:
+        case SizeTy(str() as name) if name != "_":
+            return {name}
+        case ListTy(element):
+            return named_sizes(element)
+        case TupleTy(items) | BuiltinTy(args=items) | EnumTy(args=items):
+            return set().union(*map(named_sizes, items))
+        case FuncTy(params, result):
+            return set().union(named_sizes(result), *map(named_sizes, params))
+    return set()
+
+
+def replace_sizes(t: Type, sizes: dict[str, Type]) -> Type:
+    """Replace the size parameters in `t`, as `substitute` replaces type parameters."""
+    match t:
+        case SizeTy(str() as name) if name in sizes:
+            return sizes[name]
+        case ListTy(element):
+            return ListTy(replace_sizes(element, sizes))
+        case TupleTy(items):
+            return TupleTy(tuple(replace_sizes(item, sizes) for item in items))
+        case FuncTy(args, result, mutable):
+            return FuncTy(tuple(replace_sizes(arg, sizes) for arg in args), replace_sizes(result, sizes), mutable)
+        case EnumTy(name, args):
+            return EnumTy(name, tuple(replace_sizes(arg, sizes) for arg in args))
+        case BuiltinTy(name, args):
+            return BuiltinTy(name, tuple(replace_sizes(arg, sizes) for arg in args))
+    return t
+
+
 def describe_kind(t: Type) -> str:
     """The general kind of a type, used to check what operators allow: "i64", "list", "function", ..."""
     match resolve(t):
@@ -358,6 +428,8 @@ def describe_kind(t: Type) -> str:
             return "unknown"
         case DeferredTy():
             return "?"
+        case SizeTy():
+            return "size"
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,15 +614,20 @@ LIBRARY: dict[str, FuncTy] = {
     "min": FuncTy((NUM_T, NUM_T), NUM_T),
     "max": FuncTy((NUM_T, NUM_T), NUM_T),
     # Arrays (docs/grammar.md §10, "Arrays").
-    "array": FuncTy((ListTy(NUM_T),), BuiltinTy("Array", (NUM_T,))),
+    "array": FuncTy((ListTy(NUM_T),), BuiltinTy("Array", (NUM_T, ANY_SIZE))),
     "fill": FuncTy((ListTy(I64), NUM_T), BuiltinTy("Array", (NUM_T,))),
     "reshape": FuncTy((BuiltinTy("Array", (NUM_T,)), ListTy(I64)), BuiltinTy("Array", (NUM_T,))),
     "shape": FuncTy((BuiltinTy("Array", (NUM_T,)),), ListTy(I64)),
     "flat": FuncTy((BuiltinTy("Array", (NUM_T,)),), ListTy(NUM_T)),
     "total": FuncTy((BuiltinTy("Array", (NUM_T,)),), NUM_T),
     "dot": FuncTy((BuiltinTy("Array", (NUM_T,)), BuiltinTy("Array", (NUM_T,))), NUM_T),
-    "matmul": FuncTy((BuiltinTy("Array", (NUM_T,)), BuiltinTy("Array", (NUM_T,))), BuiltinTy("Array", (NUM_T,))),
-    "transpose": FuncTy((BuiltinTy("Array", (NUM_T,)),), BuiltinTy("Array", (NUM_T,))),
+    "matmul": FuncTy(
+        (BuiltinTy("Array", (NUM_T, SizeTy("N"), SizeTy("K"))), BuiltinTy("Array", (NUM_T, SizeTy("K"), SizeTy("M")))),
+        BuiltinTy("Array", (NUM_T, SizeTy("N"), SizeTy("M"))),
+    ),
+    "transpose": FuncTy(
+        (BuiltinTy("Array", (NUM_T, SizeTy("N"), SizeTy("M"))),), BuiltinTy("Array", (NUM_T, SizeTy("M"), SizeTy("N")))
+    ),
 }
 
 
@@ -696,7 +773,8 @@ class Checker:
         self.defined: set[int] = set()  # top-level enums already defined
         self.item_sets: set[int] = set()  # `v[k]` places stored with v's `set` method
         self.level = 0  # the stage being checked
-        self.type_params: dict[str, Type] = {}  # in a generic function's body: T -> ParamTy("T")
+        self.type_params: dict[str, Type] = {}  # in a generic function's body: T -> ParamTy("T"), and sizes
+        self.binding_sizes = False  # checking a `let`'s type, where a new size name stands for the value's size
         # Checks that need final types, made once everything has been checked.
         self.later_stage_uses: list[tuple[str, Type, Span]] = []  # variables used in a later stage
         # Patterns that must match every value of a type: a match's cases, a let's or a for's pattern.
@@ -786,8 +864,19 @@ class Checker:
                 )
             case EnumTy(n, xs), EnumTy(m, ys):
                 return n == m and all(self.unify(x, y) for x, y in zip(xs, ys))
+            case BuiltinTy("Array", xs), BuiltinTy("Array", ys) if len(xs) != len(ys):
+                # One rank isn't tracked (or they differ): the items must match, and the other's sizes
+                # not decided yet aren't tracked either.
+                if len(xs) > 1 and len(ys) > 1:
+                    return False
+                for dim in (xs if len(xs) > 1 else ys)[1:]:
+                    if isinstance(dim := resolve(dim), TyVar):
+                        dim.ref = ANY_SIZE
+                return self.unify(xs[0], ys[0])
             case BuiltinTy(n, xs), BuiltinTy(m, ys):
                 return n == m and all(self.unify(x, y) for x, y in zip(xs, ys))
+            case (SizeTy("_"), SizeTy()) | (SizeTy(), SizeTy("_")):
+                return True  # a size not tracked fits any
             case _:
                 return a == b
 
@@ -926,6 +1015,16 @@ class Checker:
         """
         params = params if params is not None else self.type_params
         match texpr:
+            case NamedType(name, args, span, dims) if dims is not None:
+                if name != "Array":
+                    raise EllaError(f"only an Array has dimensions, not {name}", span)
+                if len(dims) > MAX_DIMS:
+                    raise EllaError(f"an array has at most {MAX_DIMS} dimensions, not {len(dims)}", span)
+                t = self.annotation(NamedType(name, args, span), params)
+                assert isinstance(t, BuiltinTy)
+                return BuiltinTy("Array", (*t.args, *(self.dim(dim, params) for dim in dims)))
+            case NamedType(name, (), span) if name in params and is_size(params[name]):
+                raise EllaError(f"'{name}' is a size, not a type", span)
             case NamedType(name, (), span) if name in params:
                 return params[name]
             case NamedType(name, (), span) if name in PRIMITIVE_NAMES:
@@ -972,10 +1071,54 @@ class Checker:
                     tuple(self.annotation(arg, params) for arg in args), self.annotation(result, params), mutable
                 )
 
+    def let_type(self, texpr: TypeExpr, value: Type, span: Span, what: str) -> Type:
+        """A `let`'s type, which the value must have. A size name not known yet stands for the value's size: one
+        the value's type has (`N` in `let b: Array[f64; N] = a` with `a` an `Array[f64; 3]` is 3), or, if that
+        isn't tracked, a size of its own, which only matches itself, like a size parameter."""
+        known = set(self.type_params)
+        self.binding_sizes = True
+        try:
+            declared = self.annotation(texpr)
+        finally:
+            self.binding_sizes = False
+        self.expect(value, declared, span, what)
+        for name in self.type_params.keys() - known:
+            size = self.type_params[name]
+            assert isinstance(size, TyVar)
+            if isinstance(found := resolve(size), TyVar):
+                found.ref = SizeTy(name)
+            elif found == ANY_SIZE:
+                size.ref = SizeTy(name)
+        return declared
+
+    def dim(self, dim: Dim, params: dict[str, Type]) -> Type:
+        """One dimension of an array type. In a `let`'s type, a size name not known yet stands for the value's
+        size, decided by unification, and is known from there on: `let a: Array[f64; N] = xs` then
+        `let b: Array[f64; N] = a * 2.0`."""
+        match dim.value:
+            case int(size):
+                return SizeTy(size)
+            case "_":
+                return ANY_SIZE
+            case str(name) if name in params:
+                if not is_size(params[name]):
+                    raise EllaError(f"'{name}' is a type, not a size", dim.span)
+                return params[name]
+            case str(name) if self.binding_sizes and params is self.type_params:
+                params[name] = self.fresh()
+                return params[name]
+            case str(name):
+                raise EllaError(
+                    f"unknown size '{name}'; a function's size parameters go after a ';': f[T; {name}]", dim.span
+                )
+        raise AssertionError(dim)
+
     # Enums
 
     def declare_enum(self, enum: EnumDef) -> None:
         """Make an enum's name known, so types can refer to it before its variants are read."""
+        if enum.size_params:
+            raise EllaError(f"size parameters, like '{enum.size_params[0]}', aren't supported yet", enum.span)
         self.enums[enum.name] = EnumInfo(enum.name, enum.type_params, {})
 
     def define_enum(self, enum: EnumDef, env: Env) -> None:
@@ -1222,7 +1365,7 @@ class Checker:
         assert isinstance(let.value, Lambda)
         self.functions[id(let)] = let
         type_params, constraints = let.bindings[0].type_params, let.bindings[0].constraints
-        t = self.lambda_type(let.value, type_params, constraints)
+        t = self.lambda_type(let.value, type_params, constraints, sizes=let.bindings[0].size_params)
         for binding in let.bindings:
             self.bind_name(
                 self.globals,
@@ -1514,18 +1657,26 @@ class Checker:
                             self.generic_uses.append(
                                 (name, tuple(type_args.values()), tuple(zip(info.type_params, needs)), span)
                             )
-                            return substitute(info.type, type_args)
-                        return info.type
+                            return self.fresh_sizes(substitute(info.type, type_args))
+                        return self.fresh_sizes(info.type) if info.kind == "global" else info.type
             case Let(bindings, value_expr):
                 type_params = bindings[0].type_params
+                if bindings[0].size_params and (env is not self.globals or not isinstance(value_expr, Lambda)):
+                    raise EllaError("only a top-level function can have size parameters", bindings[0].span)
                 if type_params and (env is not self.globals or not isinstance(value_expr, Lambda)):
                     raise EllaError("only a top-level function can have type parameters", bindings[0].span)
                 if isinstance(value_expr, Lambda):
                     # A `let`-bound function can call itself by name. (A generic
                     # function's own name is its top-level name.)
-                    self_names = [] if type_params else list(bindings)
+                    self_names = [] if type_params or bindings[0].size_params else list(bindings)
                     t: Type = self.check_lambda(
-                        value_expr, env, self_names, type_params, bindings[0].constraints, env is not self.globals
+                        value_expr,
+                        env,
+                        self_names,
+                        type_params,
+                        bindings[0].constraints,
+                        env is not self.globals,
+                        bindings[0].size_params,
                     )
                     self.types[id(value_expr)] = t
                 else:
@@ -1533,8 +1684,9 @@ class Checker:
                 for binding in bindings:
                     binding_type = t
                     if binding.type is not None:
-                        binding_type = self.annotation(binding.type)
-                        self.expect(t, binding_type, value_expr.span, f"the value of '{binding.name}'")
+                        binding_type = self.let_type(
+                            binding.type, t, value_expr.span, f"the value of '{binding.name}'"
+                        )
                     self.types[id(binding)] = binding_type
                     function = isinstance(value_expr, Lambda)
                     self.bind_name(
@@ -1552,8 +1704,7 @@ class Checker:
             case LetPattern(pattern, value_expr, span, mutable, type_expr):
                 t = self.check(value_expr, env)
                 if type_expr is not None:
-                    declared = self.annotation(type_expr)
-                    self.expect(t, declared, value_expr.span, "the value of the 'let'")
+                    declared = self.let_type(type_expr, t, value_expr.span, "the value of the 'let'")
                     t = declared
                 bound = Env(env)
                 self.check_pattern(pattern, t, bound)
@@ -1624,8 +1775,8 @@ class Checker:
                     return getter.result
                 if isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     return self.handle_item(container, index_type, index.span)
-                if (array_of := array_item(container)) is not None:
-                    return container if self.array_index(index_type, index.span) else array_of
+                if array_item(container) is not None:
+                    return self.array_index(container, index_type, index.span)
                 if resolve(index_type) == RANGE and (isinstance(container, ListTy) or container == STR):
                     return container  # a slice: `xs[1..3]`
                 if not self.unify(index_type, I64):
@@ -1829,8 +1980,11 @@ class Checker:
         let = self.top_level.get(id(function))
         if let is None:
             return  # a function made at run time of the compile-time code: already checked
-        self_names = [] if let.bindings[0].type_params else list(let.bindings)
-        self.check_lambda(function, self.globals, self_names, let.bindings[0].type_params, let.bindings[0].constraints)
+        first = let.bindings[0]
+        self_names = [] if first.type_params or first.size_params else list(let.bindings)
+        self.check_lambda(
+            function, self.globals, self_names, first.type_params, first.constraints, sizes=first.size_params
+        )
         self.check_now(function)
 
     # Structs
@@ -1905,10 +2059,11 @@ class Checker:
             raise EllaError(f"'{op}' doesn't work on {show_type(array)}", span)
         other = b if array is resolve(a) else a
         if array_item(other) is not None:
-            if not self.unify(a, b):
+            if not self.unify(item, array_item(other)):  # type: ignore[arg-type]
                 raise EllaError(
                     f"'{op}' needs two arrays of the same type, not {show_type(a)} and {show_type(b)}", span
                 )
+            array = self.array_shapes(a, b, True, f"'{op}'", span)
         elif not self.unify(other, item):
             raise EllaError(
                 f"'{op}' on an array needs another array or a number of its items' type, "
@@ -1923,23 +2078,63 @@ class Checker:
             raise EllaError(f"'/' works on arrays of f64 or f32 only, not {show_type(array)}", span)
         return array
 
-    def array_index(self, index_type: Type, span: Span) -> bool:
+    def array_shapes(self, a: Type, b: Type, broadcast: bool, what: str, span: Span) -> Type:
+        """The shape of the result of an operation on two arrays (with the same items) that must have the same
+        shape, or, with `broadcast`, shapes that broadcast: lined up from the last, each two sizes the same, or
+        one of them 1. A size not tracked (`_`) leaves it to the run time, as does a rank not tracked."""
+        dims_a, dims_b = array_dims(a), array_dims(b)
+        item = array_item(a)
+        assert item is not None
+        if dims_a is None or dims_b is None:
+            return BuiltinTy("Array", (item,))
+        if not broadcast and len(dims_a) != len(dims_b):
+            raise EllaError(f"{what} needs two arrays of the same shape, not {show_type(a)} and {show_type(b)}", span)
+        dims: list[Type] = []
+        for i in range(1, max(len(dims_a), len(dims_b)) + 1):
+            x = resolve(dims_a[-i]) if i <= len(dims_a) else SizeTy(1)
+            y = resolve(dims_b[-i]) if i <= len(dims_b) else SizeTy(1)
+            if broadcast and x == SizeTy(1):
+                dims.append(y)
+            elif broadcast and y == SizeTy(1):
+                dims.append(x)
+            elif ANY_SIZE in (x, y):
+                dims.append(ANY_SIZE if broadcast else x if y == ANY_SIZE else y)
+            elif self.unify(x, y):
+                dims.append(x)
+            else:
+                shapes = f"{show_type(a)} and {show_type(b)}"
+                if broadcast:
+                    raise EllaError(f"{what} needs arrays whose shapes broadcast, not {shapes}", span)
+                raise EllaError(f"{what} needs two arrays of the same shape, not {shapes}", span)
+        return BuiltinTy("Array", (item, *reversed(dims)))
+
+    def array_index(self, array: Type, index_type: Type, span: Span) -> Type:
         """An array's index: an i64 or a range for each dimension, `a[i]`, `a[i, j]` or `a[1..3, j]` (or a tuple of
-        them, `a[t]`). Is it a slice (with a range)?"""
+        them, `a[t]`). The type of what it gives: an item (the very object `array_item` gives), or a slice (with
+        a range), whose dimensions are a `_` for each range and the dimensions left out."""
         t = resolve(index_type)
         items = t.items if isinstance(t, TupleTy) and t.items else (t,)
         if len(items) > MAX_DIMS:
             raise EllaError(f"an array has at most {MAX_DIMS} dimensions, so it can't take {len(items)} indexes", span)
-        sliced = False
+        ranges = []
         for item in items:
             if resolve(item) == RANGE:
-                sliced = True
+                ranges.append(ANY_SIZE)
             elif not self.unify(item, I64):
                 raise EllaError(
                     f"an array's index must be an i64 or a range, or a tuple of them, not {show_type(index_type)}",
                     span,
                 )
-        return sliced
+        element = array_item(array)
+        assert element is not None
+        dims = array_dims(array)
+        if dims is not None:
+            many = "index" if len(dims) == 1 else "indexes"
+            if len(items) > len(dims) or (not ranges and len(items) < len(dims)):
+                raise EllaError(f"{show_type(array)} takes {len(dims)} {many}, not {len(items)}", span)
+            if ranges:
+                return BuiltinTy("Array", (element, *ranges, *dims[len(items) :]))
+        return BuiltinTy("Array", (element,)) if ranges else element
 
     def compare_type(self, op: str, a: Type, b: Type, span: Span) -> None:
         """Check one comparison of a chain. Comparisons always give a bool."""
@@ -2046,7 +2241,7 @@ class Checker:
                 elif isinstance(container, BuiltinTy) and container.name in ("Pool", "Arena"):
                     t = self.handle_item(container, index_type, index.span)
                 elif (item := array_item(container)) is not None:
-                    if self.array_index(index_type, index.span):
+                    if self.array_index(container, index_type, index.span) is not item:
                         raise EllaError(f"can't {verb} a slice; change the items one by one", span)
                     t = item
                 else:
@@ -2074,10 +2269,19 @@ class Checker:
     # Functions
 
     def param_types(
-        self, type_params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...], span: Span
+        self,
+        type_params: tuple[str, ...],
+        constraints: tuple[tuple[str, ...], ...],
+        span: Span,
+        sizes: tuple[str, ...] = (),
     ) -> dict[str, Type]:
-        """A generic function's type parameters, as types, with what their constraints imply."""
+        """A generic function's type parameters, as types, with what their constraints imply, and its size
+        parameters (each a SizeTy of its name)."""
         result: dict[str, Type] = {}
+        for name in sizes:
+            if name in type_params or sizes.count(name) > 1:
+                raise EllaError(f"'{name}' is already a parameter", span)
+            result[name] = SizeTy(name)
         for i, name in enumerate(type_params):
             implied: frozenset[str] = frozenset()
             for constraint in constraints[i] if constraints else ():
@@ -2097,6 +2301,7 @@ class Checker:
         type_params: tuple[str, ...] = (),
         constraints: tuple[tuple[str, ...], ...] = (),
         infer: bool = False,
+        sizes: tuple[str, ...] = (),
     ) -> FuncTy:
         """A function's type, from its annotations.
 
@@ -2110,7 +2315,7 @@ class Checker:
         known before anything is checked.
         """
         outer = self.type_params
-        self.type_params = outer | self.param_types(type_params, constraints, function.span)
+        self.type_params = outer | self.param_types(type_params, constraints, function.span, sizes)
         try:
             params: list[Type] = []
             for param in function.params:
@@ -2153,17 +2358,18 @@ class Checker:
         type_params: tuple[str, ...] = (),
         constraints: tuple[tuple[str, ...], ...] = (),
         infer: bool = False,
+        sizes: tuple[str, ...] = (),
     ) -> FuncTy:
         """A lambda's type. Its body is checked later, once all top-level names are known.
 
         `self_names` are the `let` bindings it can call itself by. `infer`
         allows types to be left out (see `lambda_type`).
         """
-        t = self.lambda_type(function, type_params, constraints, infer)
+        t = self.lambda_type(function, type_params, constraints, infer, sizes)
         captured = self.capture(env)
         for binding in self_names:
             captured.vars[binding.name] = VarInfo(t, False, "local", level=self.level, binder=binding)
-        params = self.type_params | self.param_types(type_params, constraints, function.span)
+        params = self.type_params | self.param_types(type_params, constraints, function.span, sizes)
         if id(function) not in self.checked:
             inferred = any(param.type is None for param in function.params) or function.return_type is None
             self.pending_bodies.append(PendingBody(function, captured, t, self.level, params, self.quotes, inferred))
@@ -2480,6 +2686,9 @@ class Checker:
                 if isinstance(arg, MutArg):
                     raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
                 self.expect(self.check(arg, env), t, arg.span, f"argument {i} of {name}()")
+            if name == "dot":  # the two arrays must have the same shape
+                first, second = (self.types[id(arg)] for arg in args)
+                self.array_shapes(first, second, False, "dot()", span)
             return function.result
         if name in REFLECTION:
             params, reflected = REFLECTION[name]
@@ -2598,9 +2807,16 @@ class Checker:
             return function
         arg = self.fresh()
         self.generic_uses.append((name, (arg,), (("T", (GENERIC_LIBRARY[name],)),), span))
-        t = substitute(function, {"T": arg})
+        t = self.fresh_sizes(substitute(function, {"T": arg}))
         assert isinstance(t, FuncTy)
         return t
+
+    def fresh_sizes(self, t: Type) -> Type:
+        """A top-level function's (or the library's) type at one use: each size parameter becomes a size to
+        decide, as `matmul(a, b)` decides N, K and M from a and b. (Only those have size parameters; a size a
+        `let` decided is a TyVar, not a SizeTy name.)"""
+        names = named_sizes(t)
+        return replace_sizes(t, {name: self.fresh() for name in names}) if names else t
 
     def check_arity(self, name: str, arity: int, args: tuple[Expr, ...], span: Span) -> None:
         if len(args) != arity:
@@ -2647,7 +2863,7 @@ class Checker:
         match t:
             case DeferredTy():
                 return DEFERRED
-            case ListTy(element) | BuiltinTy("Array", (element,)):
+            case ListTy(element) | BuiltinTy("Array", (element, *_)):
                 return element
             case PrimTy("str"):
                 return STR

@@ -321,6 +321,115 @@ runtime; new functions with fixed types are cheap to add that way.
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
 
+### In progress: arrays typed by shape
+
+Plan (agreed 2026-11-03; modelled on Futhark's size types). Static
+shapes only *add* checks: the runtime keeps every shape check it has, so
+memory safety never depends on them, and where a size isn't known the
+fallback is today's run-time error.
+
+**Syntax.** Dimensions follow a `;` (a token nowhere else; grammar.md §2
+says `;` isn't one yet):
+
+```ella
+Array[f64]              # any rank, any sizes: today's meaning, unchanged
+Array[f64; _, _]        # rank 2, sizes not tracked
+Array[f64; N, 3]        # rank 2: N rows (a size name), exactly 3 columns
+let matmul[T: Num; N, K, M] = (a: Array[T; N, K], b: Array[T; K, M]) -> Array[T; N, M]
+let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / f64(N)
+```
+
+`Array[T;]` (no dimensions) is an error. Size parameters go after `;` in
+a generic's brackets, so their kind is declared, not inferred.
+
+**Rules.**
+
+- A dimension is a literal (`3`), a size name (`N`) or `_`.
+- In a local annotation, a size name's first use binds it to the value's
+  real size, and later uses check against it:
+  `let a: Array[f64; N1, N2] = load()` then
+  `let b: Array[f64; N2, N1] = transpose(a)` checks statically. (A typo
+  only binds a new name, losing a check, so this was accepted.)
+- A size name is also an `i64` value in its scope: `for i in 0..N1`.
+- Size names unify like type variables. Inside a function a size
+  parameter is rigid: `N` against `3` or `M` is a static error. Sizes
+  never cause specialization (lowering erases them).
+- `_` fits anything without binding. Where a `_` (or unknown-rank) value
+  reaches a place naming its sizes or rank (annotated `let`, argument,
+  return), a run-time `check_shape` goes there: "array of shape [2, 3]
+  where [N, 4] was expected". It also defines the size values.
+- Broadcasting: line up from the right; each pair must unify, or one be
+  the literal 1. A `_` side gives `_` (the run-time check decides);
+  unknown rank on either side gives unknown rank. `[N, M] + [K]` with
+  different names is a static error (use `_` to defer).
+- Indexing checks the index count statically when the rank is known. In
+  a slice an `i64` drops its dimension, a range gives `_`, dimensions left
+  out keep their sizes.
+- Library: `transpose: Array[T; N, M] -> Array[T; M, N]`; `matmul` as
+  above (inner `K` mismatch is a compile error); `dot` needs equal
+  shapes; `array(xs) -> Array[T; _]`; `fill`, `reshape` take a list and
+  give unknown rank (annotate to get a shape; a tuple form
+  `fill((N, M), x)` can come later); `total -> T`.
+- New `sums(a, axis)`: sums over one dimension; `axis` must be a literal
+  for a typed result: `Array[T; N1, N2]`, `1` -> `Array[T; N1]`.
+- `arr.transpose()` (library functions as methods) is a separate feature.
+
+**Implementation.**
+
+- checker.py: size terms (literal, rigid param, unification var, `_`);
+  an array type holding its dims or "unknown rank" (keep it
+  `BuiltinTy("Array", (item, *dims))` so `array_item` and its ~30 users
+  barely change; `unify` must handle size terms); the rules above;
+  library types; a table (keyed by `id(node)`, like `updates`) of where
+  run-time shape checks go and which size names they bind.
+- parser.py / syntax.py: `;` in type arguments and type parameter lists
+  (`Binding`/`EnumDef` get size params beside `type_params`).
+- lower.py: erase dims when making IR types (the IR compares types
+  exactly, e.g. ir.py's `dest in (BuiltinTy("Array", (F64,)), ...)`);
+  emit `check_shape` (new IR op) and bind size values.
+- `check_shape` and `sums` in every backend with identical messages:
+  interpreter.py, ir_interpreter.py, codegen.py, runtime.c (+ library.py
+  for `sums`).
+- docs/grammar.md (§2 tokens, §9 Arrays, Generic functions, §10
+  built-ins), editors/vscode grammar, tests, test/programs.
+
+**Steps.**
+
+1. Lexer: `;` token (SEMICOLON). *(done)*
+2. Parser + AST: `Array[T; dims]` types and `[T; N]` parameter lists,
+   with parser tests; `show()` output. *(done: `NamedType.dims`, a tuple
+   of `Dim` (int, name or "_") or None for no `;`; `size_params` on
+   `Binding` and `EnumDef`; `Parser.parse_type_params` reads both. The
+   checker rejects both as "not supported yet" (`annotation`,
+   `declare_enum`, `declare_function`); step 3 replaces those errors.)*
+3. Checker, static only: size terms, rank and sizes, unification,
+   library signatures, index counts, broadcasting; lowering erases dims.
+   No run-time checks yet: `_` to named coercions are trusted.
+   *(done. In checker.py: `SizeTy` (3, "N", or "_" = `ANY_SIZE`); an
+   array type is `BuiltinTy("Array", (item, *dims))`, `array_dims` gives
+   them (None: rank not tracked). Sizes not known yet are `TyVar`s.
+   `unify`: `_` fits any size; a rank not tracked fits any rank (and makes
+   the other side's undecided sizes `_`). `finish` erases dims, so
+   lowering, the IR (its verifier `finish`es `LIBRARY` types) and the
+   backends never see them. Size names share `type_params` with type
+   parameters (`is_size`: a SizeTy or TyVar there); `param_types` takes
+   `sizes`. `let_type`: a `let`'s new size name is a fresh TyVar that
+   unification decides, or, if the value's size is `_`, a rigid
+   `SizeTy(name)` (step 4 must check it at run time). `fresh_sizes` gives
+   each use of a top-level function or library function fresh sizes
+   (`named_sizes`, `replace_sizes`). `array_shapes` (broadcasting and
+   `dot`), `array_index` (index counts, slice shapes), and `LIBRARY`'s
+   `array`, `transpose`, `matmul`. Tests: test_checker.py
+   `test_array_shapes`, `test_broadcasting_shapes`,
+   `test_size_parameters` (`shape_of` shows types with shapes).
+   Loose ends: structs/enums can't have size parameters yet (rejected in
+   `declare_enum`); a let's rigid `SizeTy("N")` equals another function's
+   `N` (harmless unless an inferred lambda type carries it out); an
+   undecided size prints as `?6` in errors.)*
+4. Run-time `check_shape` at the boundaries, size names as values.
+5. `sums(a, axis)`.
+6. Docs, editor grammar, test programs.
+
 ### Next
 
 Small steps that build on the above:

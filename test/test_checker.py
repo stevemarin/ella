@@ -33,6 +33,13 @@ def type_of(source: str) -> str:
     return show_type(checker.type_of(program.body[-1]))
 
 
+def shape_of(source: str) -> str:
+    """The type of the last top-level expression, with array shapes (which `type_of`, as lowering, leaves out)."""
+    program = parse(source)
+    checker = check(program)
+    return show_type(checker.types[id(program.body[-1])])
+
+
 def binding_type(source: str, name: str) -> str:
     """The type of a top-level `let` binding."""
     program = parse(source)
@@ -1547,3 +1554,60 @@ def test_generator_types() -> None:
     assert prepared_type_of(GEN + "let mut g = count(1)\nnext(mut g)") == "Optional[i64]"
     struct = "struct C\n    n: i64\n    next = (mut c: C) -> Optional[str] => None\n"
     assert prepared_type_of(struct + "let mut c = C(1)\nnext(mut c)") == "Optional[str]"
+
+
+def test_array_shapes() -> None:
+    # TODO.md, "arrays typed by shape": dimensions are sizes, size names and `_`; checked statically.
+    ok = "let a: Array[f64; N, M] = transpose(reshape(array([1.0, 2.0]), [1, 2]))\n"
+    assert shape_of(ok + "let b: Array[f64; M, N] = transpose(a)\nb") == "Array[f64; M, N]"
+    assert shape_of(ok + "a[0, 1]") == "f64"
+    assert shape_of(ok + "a[0..1]") == "Array[f64; _, M]"
+    assert shape_of(ok + "a[0, 0..1]") == "Array[f64; _]"
+    assert shape_of(ok + "a * 2.0 + a") == "Array[f64; N, M]"
+    assert shape_of("let v = array([1.0])\nv") == "Array[f64; _]"
+    assert shape_of("let a: Array[f64] = array([1.0])\na") == "Array[f64]"
+    assert error(ok + "let b: Array[f64; N, M] = transpose(a)").message == (
+        "the value of 'b' should be Array[f64; N, M], not Array[f64; M, N]"
+    )
+    assert error(ok + "a[0]").message == "Array[f64; N, M] takes 2 indexes, not 1"
+    assert error(ok + "a[0, 0, 0]").message == "Array[f64; N, M] takes 2 indexes, not 3"
+    assert error(ok + "a + transpose(a)").message == (
+        "'+' needs arrays whose shapes broadcast, not Array[f64; N, M] and Array[f64; M, N]"
+    )
+    assert error(ok + "dot(a, transpose(a))").message == (
+        "dot() needs two arrays of the same shape, not Array[f64; N, M] and Array[f64; M, N]"
+    )
+    assert error(ok + "matmul(a, a)").message.startswith("argument 2 of matmul() should be")
+    assert error("let a: Array[f64; 2] = fill([3], 1.0)\nlet b: Array[f64; 3] = a").message == (
+        "the value of 'b' should be Array[f64; 3], not Array[f64; 2]"
+    )
+    assert error("let a: [i64; 2] = [1]").message.startswith("expected")
+    assert error("let a: Optional[i64; 2] = None").message == "only an Array has dimensions, not Optional"
+    assert error("let f[T] = (a: Array[f64; T]) -> f64 => 1.0").message == "'T' is a type, not a size"
+    assert error("let f[; N] = (a: N) -> f64 => 1.0").message == "'N' is a size, not a type"
+    assert error("let f = (a: Array[f64; N]) -> f64 => 1.0").message.startswith("unknown size 'N'")
+
+
+def test_broadcasting_shapes() -> None:
+    ok = "let a: Array[i64; N, 3] = fill([2, 3], 1)\nlet r: Array[i64; 1, 3] = fill([1, 3], 1)\n"
+    assert shape_of(ok + "a + array([1, 2, 3])") == "Array[i64; N, _]"
+    assert shape_of(ok + "a + r") == "Array[i64; N, 3]"
+    assert shape_of(ok + "a + fill([3], 1)") == "Array[i64]"
+    assert error(ok + "let c: Array[i64; 4] = fill([4], 1)\na + c").message.startswith("'+' needs arrays whose")
+
+
+def test_size_parameters() -> None:
+    mm = "let mm[T: Num; N, K, M] = (a: Array[T; N, K], b: Array[T; K, M]) -> Array[T; N, M] => matmul(a, b)\n"
+    ok = mm + "let a: Array[f64; 2, 3] = fill([2, 3], 1.0)\nlet b: Array[f64; 3, 4] = fill([3, 4], 1.0)\n"
+    assert shape_of(ok + "mm(a, b)") == "Array[f64; 2, 4]"
+    assert error(ok + "mm(a, a)").message.startswith("argument 2 should be Array[f64; 3, ")
+    assert error("let f[; N] = (a: Array[f64; N]) -> Array[f64; 3] => a").message == (
+        "the function's result should be Array[f64; 3], not Array[f64; N]"
+    )
+    # Each use decides the sizes anew; a function with only size parameters can call itself with others.
+    rec = "let f[; N] = (a: Array[f64; N], n: i64) -> f64 => if n == 0 then 1.0 else f(a[0..1], n - 1)\n"
+    assert shape_of(rec + "f(array([1.0]), 1)") == "f64"
+    assert error("let f[; N, N] = (a: Array[f64; N]) -> f64 => 1.0").message == "'N' is already a parameter"
+    assert error("let g = () -> i64 =>\n    let f[; N] = 1\n    f\nprint(g())").message == (
+        "only a top-level function can have size parameters"
+    )

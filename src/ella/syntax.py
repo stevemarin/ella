@@ -24,10 +24,23 @@ from ella.lexer import EllaError, Span
 
 @dataclass(frozen=True, slots=True)
 class NamedType:
-    """`i64`, `str`, or a generic type with arguments: `Result[f64, Error]`."""
+    """`i64`, `str`, or a generic type with arguments: `Result[f64, Error]`.
+
+    `dims` has an array type's dimensions, after a `;`: `Array[f64; N, 3]`
+    has two. None (no `;`) leaves the rank open: `Array[f64]`.
+    """
 
     name: str
     args: tuple[TypeExpr, ...]
+    span: Span
+    dims: tuple[Dim, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Dim:
+    """One dimension of an array type: a size (`3`), a size name (`N`), or `_` for a size not tracked."""
+
+    value: int | str
     span: Span
 
 
@@ -155,7 +168,8 @@ class Binding:
     """One target of a `let`: `x`, `mut x`, `x: i64`, or a generic function's `sum[T: Add]`.
 
     `constraints` has the constraints of each type parameter: `[T: Ord + Add]`
-    has (("Ord", "Add"),).
+    has (("Ord", "Add"),). `size_params` has the size parameters, after a
+    `;`: `[T: Num; N, M]` has ("N", "M").
     """
 
     name: str
@@ -164,6 +178,7 @@ class Binding:
     span: Span
     type_params: tuple[str, ...] = ()
     constraints: tuple[tuple[str, ...], ...] = ()
+    size_params: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +537,7 @@ class EnumDef:
     nocopy: bool = False
     methods: tuple[Method, ...] = ()
     constraints: tuple[tuple[str, ...], ...] = ()
+    size_params: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -720,6 +736,8 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
     """Render a node compactly: expressions and patterns as S-expressions, types as Ella syntax."""
     match node:
         # Types
+        case NamedType(name, args, dims=dims) if dims is not None:
+            return f"{name}[{show_list(args)}; {', '.join(str(d.value) for d in dims)}]"
         case NamedType(name, args):
             return f"{name}[{show_list(args)}]" if args else name
         case ListType(element):
@@ -868,21 +886,26 @@ def show_label(label: str | None) -> list[str]:
     return [] if label is None else [f"{label}:"]
 
 
-def show_type_params(params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...]) -> str:
-    """`[T: Ord + Add, U]`, or nothing without type parameters."""
-    if not params:
+def show_type_params(
+    params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...], sizes: tuple[str, ...] = ()
+) -> str:
+    """`[T: Ord + Add, U]` or `[T; N, M]`, or nothing without type or size parameters."""
+    if not params and not sizes:
         return ""
     constraints = constraints or tuple(() for _ in params)
-    return f"[{', '.join(f'{p}: {" + ".join(c)}' if c else p for p, c in zip(params, constraints))}]"
+    text = ", ".join(f"{p}: {' + '.join(c)}" if c else p for p, c in zip(params, constraints))
+    if sizes:
+        text += "; " + ", ".join(sizes)
+    return f"[{text}]"
 
 
 def show_head(enum: EnumDef) -> str:
-    return enum.name + show_type_params(enum.type_params, enum.constraints)
+    return enum.name + show_type_params(enum.type_params, enum.constraints, enum.size_params)
 
 
 def show_binding(binding: Binding) -> str:
     text = f"mut {binding.name}" if binding.mutable else binding.name
-    text += show_type_params(binding.type_params, binding.constraints)
+    text += show_type_params(binding.type_params, binding.constraints, binding.size_params)
     return text if binding.type is None else f"{text}: {show(binding.type)}"
 
 

@@ -55,9 +55,14 @@ def test_operators_longest_match() -> None:
     assert texts("a**b<<c>>d!=e") == ["a", "**", "b", "<<", "c", ">>", "d", "!=", "e"]
 
 
-@pytest.mark.parametrize("char", [";", "!", "@", "`", "é"])
+@pytest.mark.parametrize("char", ["!", "@", "`", "é"])
 def test_invalid_characters(char: str) -> None:
     assert "unexpected character" in error(f"a {char} b").message
+
+
+def test_semicolon() -> None:
+    # `;` separates an array type's dimensions from its item type: `Array[f64; N, M]`.
+    assert texts("Array[f64; N, 3]") == ["Array", "[", "f64", ";", "N", ",", "3", "]"]
 
 
 def test_braces_are_brackets() -> None:

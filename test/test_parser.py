@@ -543,6 +543,28 @@ def test_constrained_type_parameters() -> None:
     )
 
 
+def test_array_shapes() -> None:
+    # Dimensions follow a `;`: sizes, size names and `_` (TODO.md, "arrays typed by shape").
+    assert one("let a: Array[f64; N, 3, _] = b") == "(let [a: Array[f64; N, 3, _]] b)"
+    assert one("let a: Array[f64] = b") == "(let [a: Array[f64]] b)"
+    assert one("let a: Array[f64,; N,] = b") == "(let [a: Array[f64; N]] b)"
+    assert error("let a: Array[f64;] = b").message == "an array needs at least one dimension after ';'"
+    assert error("let a: Array[; N] = b").message == "expected an item type before ';'"
+    assert error("let a: Array[f64; 1.5] = b").message == "expected a size, a size name or '_', found '1.5'"
+
+
+def test_size_parameters() -> None:
+    assert one("let mm[T: Num; N, K] = (a: Array[T; N, K]) -> T => a") == (
+        "(let [mm[T: Num; N, K]] (lambda (a: Array[T; N, K]) -> T a))"
+    )
+    assert one("let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs)") == (
+        "(let [mean[; N]] (lambda (xs: Array[f64; N]) -> f64 (call total xs)))"
+    )
+    assert error("let f[; _] = (x: i64) -> i64 => x").message == "a size parameter needs a name"
+    assert error("let f[;] = (x: i64) -> i64 => x").message == "expected a size parameter after ';'"
+    assert error("let f[] = (x: i64) -> i64 => x").message == "expected a type parameter"
+
+
 def partial(source: str) -> tuple[list[str], list[str]]:
     """What `parse_partial` makes of `source`: each top-level expression, and the errors."""
     program, errors = parse_partial(tokenize(source), source)

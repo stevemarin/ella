@@ -47,6 +47,7 @@ from ella.syntax import (
     Compare,
     ConstraintDef,
     Continue,
+    Dim,
     EnumDef,
     Expr,
     FieldSplice,
@@ -921,13 +922,9 @@ class Parser:
         """One `let` target: `x`, `mut x`, `x: i64`, or `first[T]` for a generic function."""
         mutable = self.accept("mut")
         name = self.expect_kind(TokenKind.NAME, "a name")
-        params: list[tuple[str, tuple[str, ...]]] = []
-        if self.accept("["):
-            params, _ = self.parse_comma_list(self.parse_constrained_param, "]")
+        names, constraints, sizes = self.parse_type_params()
         type_ = self.parse_type() if self.accept(":") else None
-        names = tuple(name for name, _ in params)
-        constraints = tuple(c for _, c in params) if any(c for _, c in params) else ()
-        return Binding(name.text, mutable, type_, name.span, names, constraints)
+        return Binding(name.text, mutable, type_, name.span, names, constraints, sizes)
 
     def parse_constrained_param(self) -> tuple[str, tuple[str, ...]]:
         """A generic function's type parameter, with its constraints if any: `T`, `T: Ord + Add`."""
@@ -1048,7 +1045,7 @@ class Parser:
         """`enum Name[T, ...]`, then an indented list of variants and methods."""
         token = self.advance()
         name = self.expect_kind(TokenKind.NAME, "an enum name")
-        type_params, constraints = self.parse_type_params()
+        type_params, constraints, sizes = self.parse_type_params()
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         self.expect_kind(TokenKind.INDENT, "an indented list of variants")
         variants: list[Variant] = []
@@ -1070,6 +1067,7 @@ class Parser:
                     token.span,
                     methods=tuple(methods),
                     constraints=constraints,
+                    size_params=sizes,
                 )
 
     def parse_struct(self) -> EnumDef:
@@ -1081,7 +1079,7 @@ class Parser:
         nocopy = self.accept("nocopy")
         token = self.expect("struct")
         name = self.expect_kind(TokenKind.NAME, "a struct name")
-        type_params, constraints = self.parse_type_params()
+        type_params, constraints, sizes = self.parse_type_params()
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         self.expect_kind(TokenKind.INDENT, "an indented list of fields")
         names: list[str] = []
@@ -1111,15 +1109,51 @@ class Parser:
                     nocopy,
                     tuple(methods),
                     constraints,
+                    sizes,
                 )
 
-    def parse_type_params(self) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
-        """A struct's or enum's `[T: Ord, U]`, if any: the names, and their constraints (empty if none have any)."""
+    def parse_type_params(self) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], tuple[str, ...]]:
+        """A generic's `[T: Ord, U; N, M]`, if any: the type parameters' names, their constraints (empty if none
+        have any), and the size parameters, after a `;` (`[; N]` has only one)."""
         params: list[tuple[str, tuple[str, ...]]] = []
+        sizes: list[str] = []
         if self.accept("["):
-            params, _ = self.parse_comma_list(self.parse_constrained_param, "]")
+            params, semicolon = self.parse_until_semicolon(self.parse_constrained_param)
+            if semicolon:
+                sizes, _ = self.parse_comma_list(self.parse_size_param, "]")
+                if not sizes:
+                    raise EllaError("expected a size parameter after ';'", self.peek().span)
+            elif not params:
+                raise EllaError("expected a type parameter", self.peek().span)
         constraints = tuple(c for _, c in params) if any(c for _, c in params) else ()
-        return tuple(name for name, _ in params), constraints
+        return tuple(name for name, _ in params), constraints, tuple(sizes)
+
+    def parse_until_semicolon[T](self, parse_item: Callable[[], T]) -> tuple[list[T], bool]:
+        """Parse `item, item, ...` up to a `;` or the closing `]`, allowing a trailing comma. Was it a `;`?"""
+        items: list[T] = []
+        while not self.at(";") and not self.accept("]"):
+            items.append(parse_item())
+            if not self.accept(","):
+                if self.at(";"):
+                    break
+                self.expect("]")
+                return items, False
+        return items, self.accept(";")
+
+    def parse_size_param(self) -> str:
+        token = self.expect_kind(TokenKind.NAME, "a size parameter")
+        if token.text == "_":
+            raise EllaError("a size parameter needs a name", token.span)
+        return token.text
+
+    def parse_dim(self) -> Dim:
+        """One dimension of an array type: `3`, `N` or `_`."""
+        token = self.peek()
+        if self.at_kind(TokenKind.INT):
+            self.advance()
+            assert isinstance(token.value, int)
+            return Dim(token.value, token.span)
+        return Dim(self.expect_kind(TokenKind.NAME, "a size, a size name or '_'").text, token.span)
 
     def parse_method(self, methods: list[Method]) -> Method:
         """`name = function` in a struct or enum."""
@@ -1170,9 +1204,16 @@ class Parser:
             self.advance()
             name = self.parse_dotted(token)
             args: list[TypeExpr] = []
+            dims: list[Dim] | None = None
             if self.accept("["):
-                args, _ = self.parse_comma_list(self.parse_type, "]")
-            return NamedType(name, tuple(args), token.span)
+                args, semicolon = self.parse_until_semicolon(self.parse_type)
+                if semicolon:
+                    if not args:
+                        raise EllaError("expected an item type before ';'", self.peek().span)
+                    dims, _ = self.parse_comma_list(self.parse_dim, "]")
+                    if not dims:
+                        raise EllaError("an array needs at least one dimension after ';'", self.peek().span)
+            return NamedType(name, tuple(args), token.span, None if dims is None else tuple(dims))
         if self.accept("["):
             element = self.parse_type()
             self.expect("]")
