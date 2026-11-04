@@ -1398,9 +1398,10 @@ print(nodes[kid])                         # error: the handle is stale
 * Handles are plain values: they can be copied, stored and compared. Each
   remembers its slot's *generation*, which goes up when the slot's value
   is freed, so using a handle to a freed value is a run-time error
-  ("stale"), even after the slot is reused.
-* A pool can't be copied. A handle doesn't say which pool it is for, so
-  using it with the wrong pool of the same type isn't caught.
+  ("stale"), even after the slot is reused. It also identifies its pool,
+  so using it with another pool of the same type is a run-time error.
+  Slots are retired before their generation can wrap.
+* A pool can't be copied.
 
 ### Arenas **(provisional syntax)**
 

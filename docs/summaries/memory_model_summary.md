@@ -132,9 +132,9 @@ arena. `alloc` moves a non-copyable value into its slot or places a copy of a
 copyable boxed value there. `pool_set` copies a replacement into a fresh slot
 arena before freeing the previous one, so the replacement may safely derive
 from the old value. `free` finalizes and reclaims the slot's value. A handle
-encodes the slot and its generation; using a handle after its slot is freed
-or reused raises a stale-handle error. When a pool dies, its live slots are
-freed in reverse slot order.
+encodes its pool id, slot and generation; wrong-pool use and stale handles
+raise errors. Slots are retired before generation wrap. When a pool dies, its
+live slots are freed in reverse slot order.
 
 ### Arenas and refs
 
@@ -161,9 +161,11 @@ run newest-first within an arena, before its bytes are reused; nested arenas
 are reclaimed deepest-first. Moving a nocopy value transfers its finalizer
 registration rather than running and recreating it.
 
-This ordering is part of the runtime contract. Runtime-error termination
-does not unwind all active arenas and run their finalizers, so finalizers
-should not be treated as guaranteed process-exit handlers.
+This ordering is part of the runtime contract. Ordinary Ella runtime errors
+attempt to unwind active scopes and globals, running their finalizers. An
+explicit `exit` and out-of-memory termination do not unwind. A failure inside
+a finalizer during native error unwinding can stop the remaining cleanup, so
+finalizers should not be treated as process-exit handlers.
 
 ## Views and slices
 

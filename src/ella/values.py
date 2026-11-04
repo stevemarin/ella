@@ -158,6 +158,11 @@ class ArrayValue:
         return {"i64": 0, "i32": I32(0), "f64": 0.0, "f32": F32(0.0)}[self.item]
 
 
+pool_ids = itertools.count()
+MAX_POOL_SLOTS = 1 << 20
+MAX_HANDLE_GENERATION = 1 << 20
+
+
 @dataclass(eq=False, slots=True)
 class PoolValue:
     """A `Pool[T]`: slots holding values, each with a generation that goes up when it is freed.
@@ -169,6 +174,7 @@ class PoolValue:
     slots: list[Value | None] = field(default_factory=list)
     generations: list[int] = field(default_factory=list)
     free: list[int] = field(default_factory=list)
+    id: int = field(default_factory=lambda: next(pool_ids))
 
     def live(self) -> int:
         return sum(1 for slot in self.slots if slot is not None)
@@ -176,10 +182,11 @@ class PoolValue:
 
 @dataclass(frozen=True, slots=True)
 class HandleValue:
-    """A `Handle[T]`: which slot of a pool, and its generation when the value was put there."""
+    """A `Handle[T]`: its pool identity, slot and generation."""
 
     slot: int
     generation: int
+    pool: int
 
 
 # Numbers that tell arenas apart, for their refs.

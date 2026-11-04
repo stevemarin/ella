@@ -516,8 +516,8 @@ def is_array(t: Type) -> bool:
 def is_boxed(t: Type) -> bool:
     """Whether values of type `t` are references to objects in an arena.
 
-    A pool's handle is just a number, a slot and a generation, in one word,
-    and so is an arena's ref.
+    A pool's handle encodes its pool id, slot and generation in one word, and
+    so does an arena's ref encode the arena, generation and value index.
     """
     return t not in (I64, I32, F64, F32, BOOL, UNIT, NEVER) and not (
         isinstance(t, BuiltinTy) and t.name in ("Handle", "Ref")

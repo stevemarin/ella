@@ -377,7 +377,7 @@ def hash_bits(value: Value, custom: Callable[[VariantValue], int | None] | None 
             h = fnv(FNV_OFFSET, name.encode())
             return fnv(h, (hash_bits(field, custom) for field in (fields[:2] if error else fields)))
         case HandleValue(slot, generation):
-            return fnv(FNV_OFFSET, [slot | generation << 32])
+            return fnv(FNV_OFFSET, [slot | generation << 20])
         case RefValue(index=index):
             return fnv(FNV_OFFSET, [index])
     raise AssertionError(f"hash() of {value!r}")

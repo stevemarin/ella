@@ -173,9 +173,9 @@ don't design it yet.
 
 * `Pool[T]` holds fixed-size slots for one type `T`, created per type at
   compile time (§8).
-* A `Handle[T]` is `(slot index, generation)`. Every access checks the
-  generation. A stale handle **traps**; it never reads a reused slot. The
-  check is always on.
+* A `Handle[T]` identifies its pool, slot index and generation. Every access
+  checks all three, so using it with another pool or after its slot is freed
+  traps instead of reading an unrelated or reused value.
 * A handle that owns its slot is non-copyable. A shared, non-owning handle
   type is an open question.
 * Freed slots go on a free list. Shrinking pools (returning empty pages to
@@ -640,10 +640,13 @@ new value into a new arena and frees the old one.
 
 The cost is memory: changing a pooled value without replacing it leaves the
 old parts in its arena until the value is freed or replaced (region bloat,
-per value). A handle is one word: the slot and the generation. Freeing a
-value bumps its slot's generation, so a stale handle is always caught, even
-after the slot is reused. Natively, all arenas, scope and slot, are parts of
-one reserved range of address space, so the arena an object is in can be
+per value). A handle is one word. Freeing a value bumps its slot's generation,
+so a stale handle is caught after the slot is reused. A process-unique pool
+id also catches a handle used with another pool of the same type. Handles
+encode a 20-bit slot, 20-bit generation and 24-bit pool id. A slot whose
+generation reaches its limit is retired rather than reused; pool ids are
+never reused. Natively, all arenas, scope and slot, are parts of one reserved
+range of address space, so the arena an object is in can be
 worked out from its address: scope arenas of 1 GiB, two for each nested
 call the program may make (`--max-depth`) and some more (in at most 32 TiB:
 with very many, each is smaller), and about a million slot arenas of 16
@@ -672,7 +675,9 @@ that died, even after its slot arena is reused. This departs from §5 in
 two ways. Slot arenas are reused rather than never reused, since the
 checks don't depend on addresses; and a ref holds an index rather than
 an offset, so that it prints the same in every backend (`<ref 2>`). The
-limits are a slot arena's: 16 MiB, and about a million values, per arena.
+limits are a slot arena's: 16 MiB, and about a million values, per arena. A
+slot arena is also retired when its 24-bit ref generation reaches its limit,
+so stale refs cannot become valid after generation wrap.
 
 `Arena.set(ref, value)` replaces the value visible through `ref`, but does
 not reclaim the old value's storage. The replacement is copied before the
@@ -706,7 +711,10 @@ is made in the arena it goes to, so it is finalized there. The AST
 interpreter, which has no arenas, keeps an owner per function call and
 loop iteration instead, and moves values between owners the same way; the
 tests check that all the interpreters and native code finalize in the same
-order. Nothing is finalized when a program stops with an error.
+order. Ordinary runtime errors unwind active function scopes and globals,
+running their finalizers. Explicit `exit` and out-of-memory termination do
+not unwind. A failure inside a finalizer during native error unwinding can
+stop the remaining cleanup, so finalizers are not process-exit handlers.
 
 ### Not built
 

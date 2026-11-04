@@ -27,6 +27,9 @@
 
 typedef int64_t word;
 
+static int unwinding;
+static void unwind_arenas(void);
+
 #define UNUSED(x) (void)(x)
 
 // A string, as Unicode code points, so indexing and len() are simple. Its
@@ -238,6 +241,10 @@ static word start_error(word line, word column) {
 _Noreturn static void end_error(word depth) {
     fputc('\n', stderr);
     print_trace(depth);
+    if (!unwinding) {
+        unwinding = 1;
+        unwind_arenas();
+    }
     exit(1);
 }
 
@@ -309,6 +316,10 @@ _Noreturn static void out_of_memory(const char *what) {
 #define SLOT_ARENAS ((word)1 << 20)
 #define SLOT_SIZE ((size_t)16 << 20)  // 16 MiB per slot arena
 #define SLOT_DEPTH ((word)1 << 20)
+#define REF_GENERATIONS ((word)1 << 24)
+#define HANDLE_SLOTS ((word)1 << 20)
+#define HANDLE_GENERATIONS ((word)1 << 20)
+#define POOL_IDS ((word)1 << 24)
 #define KEEP_SCOPE ((size_t)16 << 20)  // when freeing, give memory beyond this back to the OS
 #define KEEP_SLOT ((size_t)64 << 10)
 
@@ -347,6 +358,7 @@ static size_t stagger;
 static Arena *scope_arenas;
 static Arena *slot_arenas;
 static word *free_slots, free_slot_count, slot_arenas_used;
+static word pool_ids_used;
 
 // The first depth not taken by a call in progress (depth 0 is global).
 word ella_next_depth = 1;
@@ -496,6 +508,8 @@ void ella_reset(word first, word end) {
     for (word depth = end - 1; depth >= first; depth--) free_arena(depth);
 }
 
+static void unwind_arenas(void) { ella_reset(0, ella_next_depth); }
+
 // A loop that carries values (docs/memory-model.md §6) ends an iteration:
 // free the levels of the loops inside it (first .. end - 1), run the
 // finalizers of the iteration's values (in arena `current`; the values the
@@ -533,6 +547,9 @@ static word new_slot_arena(void) {
 
 static void free_slot_arena(word depth) {
     free_arena(depth);
+    // Ref generations are encoded in 24 bits. Retire an arena before its
+    // generation could wrap and make an old ref valid again.
+    if (arena(depth)->generation >= REF_GENERATIONS) return;
     free_slots[free_slot_count++] = depth;
 }
 
@@ -1542,8 +1559,8 @@ word ella_move(word v, const Type *t, word depth) {
     }
     case K_POOL: {
         // A pool's header moves; its values stay in their slot arenas.
-        word *moved = alloc(5 * sizeof(word), depth);
-        memcpy(moved, (const void *)v, 5 * sizeof(word));
+        word *moved = alloc(6 * sizeof(word), depth);
+        memcpy(moved, (const void *)v, 6 * sizeof(word));
         unregister(v);
         ella_register((word)moved, NULL, depth);
         return (word)moved;
@@ -1586,11 +1603,9 @@ word ella_store_slot(word object, word value, const Type *t) {
     return ella_copy(value, t, depth);
 }
 
-// Pools. A pool has slots, each holding a value (in its own slot arena) or
-// free. A slot's generation goes up when its value is freed, and a handle
-// remembers the generation it was made with, so a handle to a freed value
-// is caught. A handle is one word: the slot in the low 32 bits, the
-// generation in the high 32.
+// Pools. Each slot holds a value in its own slot arena or is free. Handles
+// encode a process-unique pool id, slot and generation, so using a handle
+// with another pool is caught too. Pool ids are never reused.
 
 typedef struct {
     word generation;
@@ -1604,16 +1619,20 @@ typedef struct {
     word len, capacity;
     Slot *slots;
     word free;  // the most recently freed slot, or -1
+    word id;
 } Pool;
 
 word ella_pool_new(word depth) {
     Pool *pool = alloc(sizeof(Pool), depth);
-    *pool = (Pool){0, 0, 0, NULL, -1};
+    if (pool_ids_used == POOL_IDS) out_of_memory("too many pools");
+    *pool = (Pool){0, 0, 0, NULL, -1, pool_ids_used++};
     ella_register((word)pool, NULL, depth);  // when it dies, its values are freed
     return (word)pool;
 }
 
-static word handle(word slot, word generation) { return (word)(((uint64_t)generation << 32) | (uint64_t)slot); }
+static word handle(word pool, word slot, word generation) {
+    return (word)(((uint64_t)pool << 40) | ((uint64_t)generation << 20) | (uint64_t)slot);
+}
 
 word ella_alloc(Pool *pool, word value, const Type *t) {
     word slot;
@@ -1621,6 +1640,7 @@ word ella_alloc(Pool *pool, word value, const Type *t) {
         slot = pool->free;
         pool->free = pool->slots[slot].next_free;
     } else {
+        if (pool->len == HANDLE_SLOTS) out_of_memory("a pool holds too many values");
         if (pool->len == pool->capacity) {
             pool->capacity = pool->capacity ? 2 * pool->capacity : 8;
             pool->slots = realloc(pool->slots, (size_t)pool->capacity * sizeof(Slot));
@@ -1634,11 +1654,14 @@ word ella_alloc(Pool *pool, word value, const Type *t) {
     // A value that can't be copied is moved, with its finalizers.
     s->value = ella_move(value, t, s->depth);
     pool->live++;
-    return handle(slot, s->generation);
+    return handle(pool->id, slot, s->generation);
 }
 
 static Slot *slot_of(Pool *pool, word h, word line, word column) {
-    word slot = (word)((uint64_t)h & 0xFFFFFFFF), generation = (word)((uint64_t)h >> 32);
+    word slot = (word)((uint64_t)h & 0xFFFFF);
+    word generation = (word)(((uint64_t)h >> 20) & 0xFFFFF);
+    word pool_id = (word)((uint64_t)h >> 40);
+    if (pool_id != pool->id) fail(line, column, "handle belongs to another pool");
     if (slot >= pool->len || pool->slots[slot].generation != generation || pool->slots[slot].depth < 0) {
         fail(line, column, "handle <handle %" PRId64 ":%" PRId64 "> is stale: its value was freed", slot, generation);
     }
@@ -1661,9 +1684,11 @@ void ella_free(Pool *pool, word h, word line, word column) {
     word slot = s - pool->slots;
     word depth = s->depth;
     s->depth = -1;
-    s->generation++;
-    s->next_free = pool->free;
-    pool->free = slot;
+    if (s->generation < HANDLE_GENERATIONS - 1) {
+        s->generation++;
+        s->next_free = pool->free;
+        pool->free = slot;
+    }
     pool->live--;
     free_slot_arena(depth);
 }
@@ -1688,12 +1713,11 @@ static void free_pool(word object) {
 // Sub-arenas: an Ella `Arena`. All its values live in one slot arena, and
 // are freed together, which bumps the slot arena's generation. A ref is one
 // word: the slot arena's number (less SLOT_DEPTH) in the high 20 bits, its
-// generation (its low 24 bits) in the next 24, and which of the arena's
+// generation (24 bits) in the next 24, and which of the arena's
 // values in the low 20. So a ref is checked against the arena with one
 // comparison, which also catches a ref to another arena.
 
 #define REF_INDEXES ((word)1 << 20)
-#define REF_GENERATIONS ((word)1 << 24)
 
 typedef struct {
     word depth;  // its slot arena
@@ -1711,7 +1735,7 @@ word ella_arena_new(word depth) {
 static word ref_index(word ref) { return (word)((uint64_t)ref % REF_INDEXES); }
 
 static word ref_base(const SubArena *arena) {
-    word generation = slot_arenas[arena->depth - SLOT_DEPTH].generation % REF_GENERATIONS;
+    word generation = slot_arenas[arena->depth - SLOT_DEPTH].generation;
     return (word)(((uint64_t)(arena->depth - SLOT_DEPTH) << 44) | ((uint64_t)generation << 20));
 }
 
@@ -1747,6 +1771,10 @@ void ella_arena_set(SubArena *arena, word ref, word value, const Type *t, word l
 void ella_arena_free(SubArena *arena) {
     arena->len = 0;
     free_arena(arena->depth);
+    // A ref's generation has 24 bits. Give this live Arena a fresh slot
+    // arena instead of allowing its old refs to become valid after wrap.
+    if (arena->depth >= SLOT_DEPTH && slot_arenas[arena->depth - SLOT_DEPTH].generation >= REF_GENERATIONS)
+        arena->depth = new_slot_arena();
 }
 
 word ella_arena_len(const SubArena *arena) { return arena->len; }
@@ -2086,9 +2114,9 @@ static void put_value(Buffer *b, word v, const Type *t, int nested, int custom) 
         break;
     case K_HANDLE:
         put_ascii(b, "<handle ");
-        put_i128(b, (word)((uint64_t)v & 0xFFFFFFFF));
+        put_i128(b, (word)((uint64_t)v & 0xFFFFF));
         put(b, ':');
-        put_i128(b, (word)((uint64_t)v >> 32));
+        put_i128(b, (word)(((uint64_t)v >> 20) & 0xFFFFF));
         put(b, '>');
         break;
     case K_STR: {
@@ -2821,7 +2849,9 @@ static uint64_t hash_value(word v, const Type *t) {
     }
     case K_REF:
         return fnv(h, (uint64_t)ref_index(v));
-    default:  // i64, bool and handles
+    case K_HANDLE:
+        return fnv(h, ((uint64_t)v & 0xFFFFF) | (((uint64_t)v >> 20 & 0xFFFFF) << 20));
+    default:  // i64 and bool
         return fnv(h, (uint64_t)v);
     }
 }

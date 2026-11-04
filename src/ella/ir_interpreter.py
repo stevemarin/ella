@@ -116,6 +116,8 @@ from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, s
 from ella.syntax import Expr, Name, bare_name
 from ella.values import (
     MAX_CALL_DEPTH,
+    MAX_HANDLE_GENERATION,
+    MAX_POOL_SLOTS,
     UNIT,
     ArenaValue,
     ArrayValue,
@@ -248,6 +250,8 @@ class IRInterpreter:
         self.arena_slots: dict[int, int] = {}  # id of an Arena -> its slot arena
         self.high_water: dict[tuple[str, int], int] = defaultdict(int)
         self.sites: dict[tuple[str, Span, str], Site] = defaultdict(Site)
+        self.unwinding = False
+        self.next_pool_id = 0
 
     def run(self) -> int:
         """Run the program, returning its exit status."""
@@ -259,6 +263,12 @@ class IRInterpreter:
             self.free(0, 1)  # the globals, at the end of the program
         except EllaError as error:
             error.traced([call for call in self.calls if call is not None])
+            self.unwinding = True
+            try:
+                for depth in reversed(range(len(self.arenas))):
+                    self.free_arena(depth)
+            finally:
+                self.unwinding = False
             raise
         except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
             self.out.flush()
@@ -359,7 +369,11 @@ class IRInterpreter:
         arena = self.arena(depth)
         while arena.finals:
             value, finalizer = arena.finals.pop()
-            self.finalize(value, finalizer)
+            try:
+                self.finalize(value, finalizer)
+            except EllaError:
+                if not self.unwinding:
+                    raise
         return arena
 
     def swap(self, level: int, frame: Frame) -> None:
@@ -557,8 +571,11 @@ class IRInterpreter:
             self.free(base, base + function.levels)
             self.calls.pop()
             return returned
+        except EllaError:
+            if self.unwinding:
+                self.free(base, base + function.levels)
+            raise
         finally:
-            # After an error, the program stops: nothing is freed or finalized.
             self.next_depth = base
             self.depth -= 1
             for depth in range(base, base + function.levels):
@@ -846,7 +863,8 @@ class IRInterpreter:
                 self.move_finals(result, depth)
                 tag = self.allocate(depth, deep_size(result), instr, frame)
             case "pool_new":
-                result = PoolValue()
+                result = PoolValue(id=self.next_pool_id)
+                self.next_pool_id += 1
                 self.pool_arenas[id(result)] = []
             case "arena_new":
                 result = ArenaValue()
@@ -979,6 +997,8 @@ class IRInterpreter:
         assert isinstance(pool, PoolValue)
         arenas = self.pool_arenas[id(pool)]
         if instr.op == "alloc":
+            if not pool.free and len(pool.slots) == MAX_POOL_SLOTS:
+                raise EllaError("a pool holds too many values", instr.span)
             depth = self.new_slot_arena()
             value = copy_value(key)  # a value that can't be copied is moved, finalizers and all
             self.move_finals(value, depth)
@@ -991,9 +1011,11 @@ class IRInterpreter:
                 pool.slots.append(value)
                 pool.generations.append(0)
                 arenas.append(depth)
-            return HandleValue(slot, pool.generations[slot]), None
+            return HandleValue(slot, pool.generations[slot], pool.id), None
         assert isinstance(key, HandleValue)
-        if key.slot >= len(pool.slots) or pool.generations[key.slot] != key.generation:
+        if key.pool != pool.id:
+            raise EllaError("handle belongs to another pool", instr.span)
+        if key.slot < 0 or key.slot >= len(pool.slots) or pool.generations[key.slot] != key.generation:
             raise EllaError(f"handle {to_text(key)} is stale: its value was freed", instr.span)
         depth = arenas[key.slot]
         match instr.op:
@@ -1011,8 +1033,9 @@ class IRInterpreter:
             case _:  # free
                 self.free_arena(depth)
                 pool.slots[key.slot] = None
-                pool.generations[key.slot] += 1
-                pool.free.append(key.slot)
+                if pool.generations[key.slot] < MAX_HANDLE_GENERATION - 1:
+                    pool.generations[key.slot] += 1
+                    pool.free.append(key.slot)
         return UNIT, None
 
     def execute_arena(self, instr: Instr, args: list[Value], frame: Frame) -> tuple[Value, Tag]:
@@ -1037,7 +1060,12 @@ class IRInterpreter:
                 return UNIT, None
         ref = args[1]
         assert isinstance(ref, RefValue)
-        if ref.arena != arena.id or ref.generation != arena.generation:
+        if (
+            ref.arena != arena.id
+            or ref.generation != arena.generation
+            or ref.index < 0
+            or ref.index >= len(arena.values)
+        ):
             raise EllaError(f"ref {to_text(ref)} is stale: its arena was freed, or it is another arena's", instr.span)
         if instr.op == "pool_get":
             return arena.values[ref.index], (depth, self.arena(depth).generation)

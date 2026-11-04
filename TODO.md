@@ -143,15 +143,14 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
 - Arenas hold at most 16 MiB and about a million values each (a slot
-  arena's size), and a ref's generation is 24 bits, so a ref kept through
-  16 million frees of its slot arena could be taken for a live one.
+  arena's size). Slot arenas are retired before the 24-bit ref generation
+  wraps; pool slots are retired before their 20-bit handle generation wraps.
 - `Arena.set` retains replaced allocations until `free(mut arena)`; use a
   `Pool` for independently replaceable values. Pool slot arenas reserve 16
   MiB of virtual address space each, but the current Map benchmarks use under
   9 MiB resident memory, so chunked or size-class storage is not yet justified
   by measured resident usage.
-- Owning (non-copyable) handles, and handles that know their pool; a handle
-  used with the wrong pool of the same type isn't caught.
+- Owning (non-copyable) handles remain open.
 - Region bloat remains where loops don't carry values (memory-model.md
   §12, §16): a variable a loop both replaces and changes in place, a global
   replaced in a loop that calls Ella functions, loops left by a labeled

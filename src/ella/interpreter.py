@@ -120,6 +120,8 @@ from ella.syntax import (
 from ella.values import (
     F32,
     MAX_CALL_DEPTH,
+    MAX_HANDLE_GENERATION,
+    MAX_POOL_SLOTS,
     UNIT,
     ArenaValue,
     ArrayValue,
@@ -267,6 +269,8 @@ class Interpreter:
         # the program calls `main`.
         self.calls: list[CallSite | None] = []
         self.running: str | None = ""
+        self.unwinding = False
+        self.next_pool_id = 0
         self.names: dict[int, str] = {}  # id of a lambda -> the function's name, from its `let`
         self.checker = checker
         self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
@@ -341,17 +345,21 @@ class Interpreter:
         except Exit as stop:  # `exit(status)`: nothing more runs, not even finalizers
             self.out.flush()
             return stop.status
-        except EllaError as error:
+        except (EllaError, ReturnSignal, BreakSignal, ContinueSignal) as error:
+            if isinstance(error, ReturnSignal):
+                error = EllaError("'return' outside of a function", error.span)
+            elif isinstance(error, BreakSignal):
+                error = EllaError("'break' outside of a loop", error.span)
+            elif isinstance(error, ContinueSignal):
+                error = EllaError("'continue' outside of a loop", error.span)
             error.traced([])  # one in the top-level code
-            raise
-        # Signals that escape to the top level weren't inside anything that
-        # could catch them.
-        except ReturnSignal as signal:
-            raise EllaError("'return' outside of a function", signal.span) from None
-        except BreakSignal as signal:
-            raise EllaError("'break' outside of a loop", signal.span) from None
-        except ContinueSignal as signal:
-            raise EllaError("'continue' outside of a loop", signal.span) from None
+            self.unwinding = True
+            try:
+                while self.owners:
+                    self.close_owner()
+            finally:
+                self.unwinding = False
+            raise error from None
 
     def declare_top_level(self, program: Program) -> None:
         """Make every top-level name exist before the program starts (docs/grammar.md §3).
@@ -1067,8 +1075,15 @@ class Interpreter:
         """End the innermost owner, finalizing its values (newest first), except those `keep` holds."""
         if keep is not None and len(self.owners) > 1:
             self.adopt(keep, -1, -2)
+        failure: EllaError | None = None
         for value in reversed(self.owners.pop()):
-            self.finalize(value)
+            try:
+                self.finalize(value)
+            except EllaError as error:
+                if failure is None:
+                    failure = error
+        if failure is not None and not self.unwinding:
+            raise failure
 
     def finalize(self, value: Value) -> None:
         """Run a value's finalizer; a pool finalizes its values, from the last slot to the first, and an arena
@@ -1190,6 +1205,17 @@ class Interpreter:
         except GeneratorClosed:
             generator.outcome = ("closed", None)
         except BaseException as error:  # noqa: BLE001  (raised again in the thread that called next)
+            # The generator's thread has stopped, so its owners must be
+            # unwound here. Mark it done before handing the error back: the
+            # caller's error cleanup will see the GenValue and must not try
+            # to resume this already-dead thread while closing it.
+            self.unwinding = True
+            try:
+                while self.owners:
+                    self.close_owner()
+            finally:
+                self.unwinding = False
+            generator.done = True
             generator.outcome = ("error", error)
         generator.back.release()
 
@@ -1254,13 +1280,16 @@ class Interpreter:
     # Pools
 
     def new_pool(self) -> Value:
-        pool = PoolValue()
+        pool = PoolValue(id=self.next_pool_id)
+        self.next_pool_id += 1
         self.owners[-1].append(pool)
         return pool
 
     def pool_slot(self, pool: PoolValue, handle: HandleValue, span: Span) -> Value:
         """The value a handle refers to, which must still be there."""
-        if handle.slot >= len(pool.slots) or pool.generations[handle.slot] != handle.generation:
+        if handle.pool != pool.id:
+            raise EllaError("handle belongs to another pool", span)
+        if handle.slot < 0 or handle.slot >= len(pool.slots) or pool.generations[handle.slot] != handle.generation:
             raise EllaError(f"handle {to_text(handle)} is stale: its value was freed", span)
         value = pool.slots[handle.slot]
         assert value is not None
@@ -1273,7 +1302,12 @@ class Interpreter:
 
     def arena_slot(self, arena: ArenaValue, ref: RefValue, span: Span) -> Value:
         """The value a ref refers to, which must be in this arena and not freed."""
-        if ref.arena != arena.id or ref.generation != arena.generation:
+        if (
+            ref.arena != arena.id
+            or ref.generation != arena.generation
+            or ref.index < 0
+            or ref.index >= len(arena.values)
+        ):
             raise EllaError(f"ref {to_text(ref)} is stale: its arena was freed, or it is another arena's", span)
         return arena.values[ref.index]
 
@@ -1294,6 +1328,8 @@ class Interpreter:
             return UNIT
         value = self.eval(rest[0], scope)
         if name == "alloc":
+            if isinstance(pool, PoolValue) and not pool.free and len(pool.slots) == MAX_POOL_SLOTS:
+                raise EllaError("a pool holds too many values", span)
             # The pool or arena owns the value from now on, and finalizes it when it is freed.
             for owner in range(len(self.owners)):
                 moving = {id(v) for v in self.finalizable(value)}
@@ -1309,13 +1345,14 @@ class Interpreter:
                 slot = len(pool.slots)
                 pool.slots.append(value)
                 pool.generations.append(0)
-            return HandleValue(slot, pool.generations[slot])
+            return HandleValue(slot, pool.generations[slot], pool.id)
         assert isinstance(pool, PoolValue) and isinstance(value, HandleValue)
         held = self.pool_slot(pool, value, span)
         self.finalize_held(held)
         pool.slots[value.slot] = None
-        pool.generations[value.slot] += 1
-        pool.free.append(value.slot)
+        if pool.generations[value.slot] < MAX_HANDLE_GENERATION - 1:
+            pool.generations[value.slot] += 1
+            pool.free.append(value.slot)
         return UNIT
 
     # Staging (see ella.staging)
