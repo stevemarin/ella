@@ -674,6 +674,16 @@ checks don't depend on addresses; and a ref holds an index rather than
 an offset, so that it prints the same in every backend (`<ref 2>`). The
 limits are a slot arena's: 16 MiB, and about a million values, per arena.
 
+`Arena.set(ref, value)` replaces the value visible through `ref`, but does
+not reclaim the old value's storage. The replacement is copied before the
+table entry changes, so it is safe for the new value to be derived from the
+old one. Since all refs in an `Arena` share one bump-allocated slot arena,
+replaced objects remain allocated until `free(mut arena)`; repeated sets
+can therefore use memory proportional to the total size of all replacements
+since the last free. Treat an `Arena` as append-until-reset storage. Use a
+`Pool` when values need independent replacement or freeing: replacing a pool
+slot allocates its new value separately and then releases the old slot arena.
+
 The checker and the lowering treat an arena like a pool: it can't be
 copied, and a value borrowed from one is copied before anything could free
 it. The IR reuses the pool operations (`alloc`, `pool_get`, `pool_set`,

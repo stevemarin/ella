@@ -145,6 +145,11 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - Arenas hold at most 16 MiB and about a million values each (a slot
   arena's size), and a ref's generation is 24 bits, so a ref kept through
   16 million frees of its slot arena could be taken for a live one.
+- `Arena.set` retains replaced allocations until `free(mut arena)`; use a
+  `Pool` for independently replaceable values. Pool slot arenas reserve 16
+  MiB of virtual address space each, but the current Map benchmarks use under
+  9 MiB resident memory, so chunked or size-class storage is not yet justified
+  by measured resident usage.
 - Owning (non-copyable) handles, and handles that know their pool; a handle
   used with the wrong pool of the same type isn't caught.
 - Region bloat remains where loops don't carry values (memory-model.md
