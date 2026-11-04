@@ -38,7 +38,6 @@ Ella is engineered to be an open, readable implementation of foundational compil
 - [Chapter 19: Native AOT Driver & Host Toolchain Orchestration (`src/ella/native.py`)](#chapter-19-native-aot-driver--host-toolchain-orchestration)
 - [Chapter 20: Language Server Protocol (LSP) Architecture (`src/ella/lsp.py`)](#chapter-20-language-server-protocol-lsp-architecture)
 - [Chapter 21: The IR Virtual Machine & Hardware Arena Simulator (`src/ella/ir_interpreter.py`)](#chapter-21-the-ir-virtual-machine--hardware-arena-simulator)
-- [Appendix: In-Depth Module Essays](#appendix-in-depth-module-essays)
 
 ---
 
@@ -103,526 +102,6 @@ The compiler driver exposes flags for inspecting intermediate representations at
 - `ella --profile prog.ella`: Executes the IR interpreter and displays peak memory usage per scope.
 - `ella --asm prog.ella`: Emits raw Intel-syntax x64 GNU assembly.
 - `ella --native prog.ella`: Compiles and executes a native ELF binary.
-
----
-
-## Chapter 1: Lexical Analysis & Layout-Sensitive Grammars
-
-*Primary Module:* [`src/ella/lexer.py`](./src/ella/lexer.py)
-
-### 1. Theoretical Foundations
-
-- **Maximal Munch (Longest Match Rule):** In lexical analysis (Dragon Book, Chapter 3), when multiple token patterns can match the current stream, the scanner always consumes the longest valid prefix. Ella achieves this by sorting operator definitions longest-first: `//=` is tokenized as a single compound assignment operator rather than `//` followed by `=`.
-
-- **The Off-Side Rule (Peter J. Landin 1966):** Following Landin's landmark paper *"The Next 700 Programming Languages"*, Ella uses 2D indentation to represent block structures without curly braces. The scanner tracks an indentation stack (`self.indents = [0]`) and synthesizes virtual delimiters:
-
-  - `NEWLINE`: Marks the end of a logical statement line.
-  - `INDENT`: Synthesized when indentation increases (acts as `{`).
-  - `DEDENT`: Synthesized when indentation decreases (acts as `}`).
-- **Bracket Sensitivity:** When open parentheses `(` or brackets `[` are active (`self.brackets`), newlines are treated as ordinary whitespace, allowing multi-line expressions without continuation backslashes.
-
-### 2. String Interpolation State Machine
-
-String interpolation (`"The total is {{x + 1}}"`) is parsed without nested scanner recursion by deconstructing the literal into discrete lexical tokens:
-
-```text
-STRING_START -> STRING_TEXT("The total is ") -> INTERP_START -> [Token(NAME, "x"), Token(OP, "+"), Token(INT, "1")] -> INTERP_END -> STRING_END
-```
-
-This allows the parser to parse interpolated expressions using identical grammar rules to top-level code.
-
----
-
-## Chapter 2: Abstract Syntax Trees & Expression-Oriented Grammars
-
-*Primary Module:* [`src/ella/syntax.py`](./src/ella/syntax.py)
-
-### 1. Parse Tree vs. Abstract Syntax Tree
-
-A Parse Tree contains concrete syntactic tokens (colons, commas, parenthesis tokens, indentation markers). An Abstract Syntax Tree (AST) retains purely semantic structure:
-
-- Syntactic sugar is normalized during AST construction (e.g., pipeline operator `x |> f(y)` desugars directly into the call `f(x, y)`).
-- Every AST node preserves its `Span(line, column, file)` coordinates for precise diagnostic reporting.
-
-### 2. Expression-Oriented Design
-
-In Ella, statements do not exist in isolation; **everything is an expression**:
-
-- An `if-then-else` block evaluates to the value of its executed branch:
-
-  ```ella
-  let status = if score >= 50 then "pass" else "fail"
-  ```
-
-- Blocks `{ ... }` evaluate to their final expression (or unit `()` if empty).
-
-- Assignments (`x = 5`) evaluate to `()`.
-
-### 3. S-Expression Canonical Serialization (`show()`)
-
-Ella defines an S-expression serialization format for ASTs:
-
-```text
-Source:         let x = 1 + 2 * 3
-S-Expression:   (let [x] (+ 1 (* 2 3)))
-```
-
-This provides human-readable snapshot testing without fragile object comparisons.
-
----
-
-## Chapter 3: Top-Down Operator Precedence & Pratt Parsing
-
-*Primary Module:* [`src/ella/parser.py`](./src/ella/parser.py)
-
-### 1. Theoretical Breakthrough (Vaughan Pratt, POPL 1973)
-
-Traditional recursive descent parsers require a separate grammar production and mutually recursive function for every precedence level:
-$$\text{expr} \to \text{term} (('+' \mid '-') \text{term})^* \quad;\quad \text{term} \to \text{factor} (('*' \mid '/') \text{factor})^*$$
-Pratt parsing associates numeric binding powers directly with tokens:
-
-- **Higher number = binds tighter:** e.g., `*` (precedence 14) binds tighter than `+` (precedence 13).
-
-### 2. Null Denotations vs. Left Denotations
-
-- **Null Denotation (`nud` / `parse_prefix`):** What a token means when starting an expression (literals, identifiers, unary `-x`, `(x + 1)`, keyword expressions like `if`).
-
-- **Left Denotation (`led` / `parse_infix`):** What a token means when combining with an expression on its left (`+`, `*`, `==`, member access `.`, indexing `[i]`, calls `(args)`).
-
-### 3. Associativity Mechanics
-
-- **Left-associative (`a - b - c`):** Parse right-hand side with `prec + 1` (rejects equal-precedence operators, forcing left-grouping).
-
-- **Right-associative (`a ** b ** c`):** Parse right-hand side with `prec` (accepts equal-precedence operators, forcing right-grouping).
-
----
-
-## Chapter 4: Intermediate Representation (IR) & Static Single Assignment
-
-*Primary Module:* [`src/ella/ir.py`](./src/ella/ir.py)
-
-### 1. The Role of an IR
-
-The Intermediate Representation (IR) bridges high-level syntax trees and bare-metal machine code:
-
-- Nested expressions are flattened into explicit control-flow basic blocks.
-- Variable mutations are made explicit via loads, stores, and SSA values.
-- Memory allocations are tagged with concrete region targets.
-
-### 2. Block Parameters vs. Classical $\phi$-Nodes
-
-In classical SSA (e.g. LLVM), control-flow joins use $\phi$-functions:
-$$\%z = \phi [ \%x, \text{block}_1 ], [ \%y, \text{block}_2 ]$$
-$\phi$-nodes suffer from placement ordering constraints and parallel-copy hazards.
-
-Following Andrew Appel (1998, *"SSA is Functional Programming"*) and modern IRs (Swift SIL, MLIR, Rust Cranelift), Ella replaces $\phi$-nodes with **Block Parameters**:
-
-```text
-then_block:
-    jump join_block(%val_then)
-else_block:
-    jump join_block(%val_else)
-join_block(%result: i64):
-    ...
-```
-
-Blocks act like local functions; control-flow branches pass arguments directly.
-
-### 3. Region Annotations
-
-Every heap-allocated object explicitly designates its target memory region:
-
-- `@0`: Function frame scope level.
-- `@1, @2, ...`: Nested loop iteration levels.
-- `@result`: The caller's result arena (zero-copy return construction).
-- `@mut0`: The arena of a mutable caller variable.
-- `@carry1`: Alternating ping-pong loop carried state.
-- `@global`: Global top-level process arena.
-
----
-
-## Chapter 5: AST Lowering & Compiler-Directed Region Inference
-
-*Primary Module:* [`src/ella/lower.py`](./src/ella/lower.py)
-
-### 1. Tree Flattening & Closure Conversion
-
-Lowering flattens nested syntax trees into linear three-address basic blocks:
-
-- **Closure Conversion:** Lambdas capturing local variables are lifted into top-level functions whose captured environment is passed as explicit leading parameters.
-- **Return Normalization:** Function returns jump to a unified exit block to ensure postconditions and finalizers execute reliably.
-
-### 2. Simplified Tofte–Talpin Region Inference
-
-Ella manages dynamic memory **without a garbage collector** (Mads Tofte & Jean-Pierre Talpin 1997):
-
-- **Destination-Driven Lowering:** Expressions are compiled with a designated *destination region*. When evaluating `return [1, 2, 3]`, the list is constructed directly in `@result` (the caller's arena), completely avoiding return copies.
-- **Tracking `borrows` and `lives`:** The lowering tracks which variables an object aliases (`borrows`) and the shortest-lived region it depends on (`lives`). Deep copies are inserted only if:
-  1. A mutable container is stored somewhere that could observe in-place mutations.
-  2. An object would outlive its enclosing scope arena.
-
-### 3. Taming Region Bloat: Alternating Loop Arenas
-
-In classic region systems, loop accumulators (`for i in 0..n: acc = acc + [i]`) leak memory in the outer scope until the entire function returns. Ella completely eliminates loop region bloat:
-
-- Outer variables carried across iterations are detected automatically (`carried_by`).
-- The loop uses two alternating scope arenas: `@k` (current iteration) and `@carryk` (previous state).
-- At the iteration latch (`swap k`), the current iteration's arena becomes the carried arena, and the old carried arena is freed.
-- At most **two versions** of carried state are alive at any time, reducing memory from $O(N)$ to $O(1)$.
-
----
-
-## Chapter 6: The IR Optimization Pipeline
-
-*Primary Module:* [`src/ella/passes/__init__.py`](./src/ella/passes/__init__.py)
-
-### 1. Iterative Fixed-Point Transformation
-
-Optimization passes are decoupled into focused, single-purpose transformations. Because passes create optimization opportunities for one another (e.g. constant folding enables branch deletion, which enables dead code elimination, which enables copy-to-move elision), passes run iteratively until no further transformations occur (`CLEANUP = ["moves", "fold", "simplify", "dce"]`).
-
-### 2. The Trap Preservation Invariant
-
-A compiler optimization must never alter observable program behavior, **including dynamic runtime traps**:
-
-- Division by zero (`x / 0`), integer overflow, or out-of-bounds indexing must NEVER be folded or speculatively deleted if that error would have occurred during unoptimized execution.
-
-### 3. Continuous Verification
-
-The IR verifier (`verify()`) runs before and after every single optimization pass, asserting SSA dominance, type consistency, and block terminator invariants.
-
----
-
-### Chapter 6.1: SSA Construction
-
-*Primary Module:* [`src/ella/passes/mem2reg.py`](./src/ella/passes/mem2reg.py)
-
-#### 1. Braun et al. (CC 2013) vs. Cytron et al. (1991)
-
-Classical SSA construction (Cytron 1991) requires computing dominator trees, iterated dominance frontiers ($IDF$), and variable stacks.
-
-Ella implements the algorithm of Matthias Braun et al. (Compiler Construction 2013):
-
-- To resolve a variable's value at instruction $I$, look backwards in the basic block for the latest `store`.
-- If not found, query the block's predecessors:
-  - One predecessor: Take the value from the predecessor's end.
-  - Multiple predecessors: Add a new block argument (parameter) and query all incoming branch edges recursively.
-- Trivial block parameters (parameters that receive the same value from all paths) are pruned via `remove_trivial_params`.
-
----
-
-### Chapter 6.2: Value-Semantics Optimization
-
-*Primary Module:* [`src/ella/passes/moves.py`](./src/ella/passes/moves.py)
-
-#### 1. Moves as Compiler Optimizations
-
-In Rust or C++, moving is a user-visible language semantic rule requiring programmers to manage ownership and learn "use-after-move" errors.
-
-In Ella, **everything is conceptually a deep copy**. Moving is an invisible compiler optimization:
-
-- When value `%1` is copied (`%2 = copy %1`) and the compiler proves that `%1` is never read again, the copy is elided and `%1` is moved into place.
-- Safety invariants:
-  1. `%1` has exactly one use in the entire function (`uses[original.id] == 1`).
-  2. `%1`'s definition dominates `%2`, and `%2` post-dominates `%1`.
-  3. The path between `%1` and `%2` does not cross a loop cycle.
-
----
-
-### Chapter 6.3: Constant Folding & Propagation
-
-*Primary Module:* [`src/ella/passes/fold.py`](./src/ella/passes/fold.py)
-
-- **Constant Folding:** Replaces instructions whose operands are literal constants with pre-computed `const` values.
-- **Constant Propagation:** Follows Kildall's semi-lattice dataflow framework, replacing block parameters with constants when all incoming branches pass identical literal values.
-- **Trap Safety:** If folding an operation triggers an error (such as division by zero or integer overflow), folding is skipped so the trap fires dynamically at runtime.
-
----
-
-### Chapter 6.4: CFG Canonicalization
-
-*Primary Module:* [`src/ella/passes/simplify.py`](./src/ella/passes/simplify.py)
-
-Performs four canonical control-flow graph tidy-ups:
-
-1. **Branch Folding:** Replaces boolean constant branches with unconditional jumps.
-2. **Unreachable Code Elimination:** Deletes blocks unreachable from function entry.
-3. **Jump Threading:** Short-circuits empty trampoline blocks that do nothing but jump onward.
-4. **Block Coalescing:** Merges block $B$ into block $A$ when $A$ jumps unconditionally to $B$ and $B$ has $A$ as its sole predecessor.
-
----
-
-### Chapter 6.5: Dead Code Elimination
-
-*Primary Module:* [`src/ella/passes/dce.py`](./src/ella/passes/dce.py)
-
-- Sweeps instructions whose results are unused.
-- **Purity Guarantee:** Only instructions proven to be side-effect-free and trap-free are deleted (e.g. constant generation, tuple extraction, IEEE float math). Memory indexing or integer arithmetic that could trap is retained.
-- **Level Trimming:** Calls `trim_levels()` to delete scope arena allocations if all allocating instructions in that level were eliminated.
-
----
-
-### Chapter 6.6: Procedure Inlining
-
-*Primary Module:* [`src/ella/passes/inline.py`](./src/ella/passes/inline.py)
-
-- Eliminates call overhead and exposes callee bodies to intraprocedural optimization.
-- **Preconditions:** Callee size $\le$ `INLINE_LIMIT = 50`, non-recursive (verified by cycle detection on the call graph), and non-generator.
-- **Bottom-Up Ordering:** Inlines callees before callers so that leaf functions are absorbed first.
-- **Arena Level Remapping:** Shifts callee arena levels above all caller levels to guarantee strict LIFO deallocation.
-
----
-
-### Chapter 6.7: Call Devirtualization
-
-*Primary Module:* [`src/ella/passes/direct.py`](./src/ella/passes/direct.py)
-
-- Identifies global variables holding static top-level closures that are initialized once at startup.
-- Converts indirect closure invocations (`call %closure(args)`) into direct relative function calls (`call_direct func_name(args)`).
-- Unlocks subsequent inlining for devirtualized call sites.
-
----
-
-### Chapter 6.8: Array Loop Fusion
-
-*Primary Module:* [`src/ella/passes/fuse.py`](./src/ella/passes/fuse.py)
-
-- **Defeating the Memory Wall (Wulf & McKee 1995):** In numerical pipelines (`a * 2.0 + b - c`), executing separate loops incurs severe memory bandwidth penalties by reading and writing intermediate temporary buffers to RAM.
-- **Kernel Fusion:** Combines consecutive array operations into a single AVX2 SIMD loop. Intermediate results remain resident in 256-bit YMM vector registers, completely eliminating temporary buffer allocations.
-- **Reduction Fusion:** Fuses horizontal reductions (`total`, `dot`) directly onto arithmetic chains, computing scalar values with zero heap array allocation.
-
----
-
-## Chapter 7: Operational Semantics & the Reference Interpreter
-
-*Primary Module:* [`src/ella/interpreter.py`](./src/ella/interpreter.py)
-
-### 1. Dual Operational Roles
-
-1. **The Ground-Truth Language Specification:** Defines the normative operational semantics of Ella before any IR lowering or native compilation occurs.
-2. **The Stage -1 Metaprogramming Engine:** When compile-time splices (`$expr`) appear outside quotes, this interpreter executes them during compilation, producing residual syntax trees.
-
-### 2. Big-Step Natural Semantics
-
-Implements big-step evaluation ($\text{eval}(e, \sigma) \Downarrow (v, \sigma')$) recursively matching on `Expr` nodes. Control flow alterations (`return`, `break`, `continue`, `?`) are modeled via private Python exception signals unwinding the evaluation stack.
-
-### 3. Cooperative Generator Coroutines
-
-Generators are executed on cooperative host threads (`threading.Thread`), synchronizing control transfer tokens across `yield` and `next`.
-
----
-
-## Chapter 8: Machine Code Generation & x64 Native Execution
-
-*Primary Module:* [`src/ella/codegen.py`](./src/ella/codegen.py)
-
-### 1. Unified 64-Bit Word Model
-
-Every runtime Ella value occupies exactly one 64-bit word:
-
-- `i64`: 64-bit two's complement integer.
-- `bool`: `0` or `1`.
-- `f64`: Raw IEEE-754 bits in general registers, moved into XMM registers for arithmetic.
-- Boxed objects (strings, lists, arrays, tuples, closures): 64-bit pointers into arena memory.
-
-### 2. Calling Conventions
-
-- **Internal Ella Convention:** Uses a uniform stack-based convention that passes closure headers, caller result arena depths, arguments, and mutable argument arena depths.
-
-- **System V AMD64 ABI:** Switches to standard C ABI register passing (`rdi, rsi, rdx, rcx, r8, r9`) with 16-byte stack alignment when invoking the C runtime engine.
-
-### 3. Parallel Move Cycle Resolution
-
-When transferring values to target registers during block branches, mutual register dependencies (e.g. `rax <- rbx` and `rbx <- rax`) are resolved using cycle detection and scratch register `r11`.
-
----
-
-## Chapter 9: The Low-Level Runtime Engine & Memory Subsystem
-
-*Primary Module:* [`src/ella/runtime.c`](./src/ella/runtime.c)
-
-### 1. 32 TiB Virtual Memory Reservation
-
-Ella does not use `malloc()` and `free()`. Instead:
-
-- The runtime reserves up to 32 TiB of virtual address space upfront via `mmap(..., MAP_NORESERVE)`.
-- Allocation is an ultra-fast bump pointer increment:
-
-  ```c
-  top = top + round16(size);
-  ```
-
-- Deallocation at scope exit is an $O(1)$ pointer reset. Pages exceeding 16 MiB are lazily released back to the OS via `madvise(MADV_DONTNEED)`.
-
-### 2. Mitigating CPU Cache Conflict Thrashing
-
-Set-associative L1/L2 caches map power-of-two address multiples to identical cache lines. If alternating loop arenas (`@k` and `@carryk`) started at exact power-of-two boundaries, ping-ponging values would thrash the identical cache sets. The runtime solves this by staggering each arena's base by a non-power-of-two prime offset:
-
-```c
-#define STAGGER ((size_t)65 << 12)
-```
-
-### 3. Generational Pool Handles
-
-Long-lived objects reside in a `Pool[T]`. Handles pack:
-
-```text
-[ 24 bits: Pool ID | 20 bits: Generation | 20 bits: Slot Index ]
-```
-
-Dereferencing a handle performs an $O(1)$ generation check against the slot table, safely trapping Use-After-Free bugs without a garbage collector.
-
----
-
-## Chapter 10: Multi-Stage Programming & Metaprogramming
-
-*Primary Module:* [`src/ella/staging.py`](./src/ella/staging.py)
-
-### 1. Multi-Stage Foundations (Taha & Sheard 1997)
-
-Computations are organized into discrete integer stages:
-
-- `quote e`: Lifts computation to stage $n+1$, producing a `Code[T]` value.
-- `$c`: Drops computation to stage $n-1$, splicing computed residual code.
-- `run(c)`: Compiles and executes code at the current stage.
-
-### 2. Cross-Stage Persistence & Hygiene
-
-- **Cross-Stage Persistence (CSP):** A variable bound at stage $n$ can be carried into stage $n+k$ as an embedded literal constant (`reify()`).
-
-- **Macro Hygiene:** Quoted variables are automatically $\alpha$-renamed (`x` becomes `x.4`), preventing accidental variable capture.
-- **Types as Values:** Types are first-class values (`Type[T]`), allowing compile-time reflection (`fields(t)`) and automatic code generation (`derive_eq`) without macros.
-
----
-
-## Chapter 11: Static Type Systems, Unification & Bidirectional Checking
-
-*Primary Module:* [`src/ella/checker.py`](./src/ella/checker.py)
-
-### 1. Bidirectional Type Checking (Pierce & Turner 2000)
-
-- **Synthesis Mode (`infer`):** Types are inferred upwards from sub-expressions.
-
-- **Checking Mode (`check`):** Expected types are propagated downwards into untyped lambdas and literals.
-
-### 2. First-Order Unification (Robinson 1965, Martelli-Montanari 1982)
-
-Type placeholders (`?1, ?2`) are solved through unification:
-
-- Solves type equations over structural terms.
-- The **Occurs Check** prevents infinite, circular types ($?1 \doteq [?1]$).
-- Unconstrained free type variables default safely to `()`.
-
-### 3. Exclusivity for `mut` Parameters
-
-Statically validates that mutable parameters do not alias any other argument within the same call, enforcing value-semantic independence at compile time.
-
----
-
-## Chapter 12: Runtime Value Representation & Object Model
-
-*Primary Module:* [`src/ella/values.py`](./src/ella/values.py)
-
-- Maps Ella types to host Python objects in the interpreter while enforcing 64-bit bounded semantics (`I64_MIN..I64_MAX`).
-- Implements explicit structural deep copying (`copy_value()`) to maintain pure value semantics.
-- Implements structural equality protocols (`equal()`) delegating to user-defined `eq` methods.
-
----
-
-## Chapter 13: Operator Semantics & Arithmetic Invariants
-
-*Primary Module:* [`src/ella/operators.py`](./src/ella/operators.py)
-
-- **Arithmetic Parity:** Fixed-width two's complement integer overflow trapping and truncation-towards-zero integer division matching x64 machine hardware.
-- **IEEE-754 Standards:** Floating-point division and exponentiation returning signed infinities or NaNs without host exceptions.
-- **SIMD Reductions:** Four-accumulator lane summation matching native AVX2 reduction orders.
-
----
-
-## Chapter 14: Standard Runtime Primitives & the Host Environment
-
-*Primary Module:* [`src/ella/library.py`](./src/ella/library.py)
-
-- **$O(1)$ UTF-32 Code Point Indexing:** Strings are represented as 32-bit Unicode code points (`uint32_t`), making random indexing and slicing strictly $O(1)$.
-- **Hermetic `Host` Context:** External I/O and process environments are encapsulated in a `Host` object, allowing deterministic test execution.
-
----
-
-## Chapter 15: Module Systems, Namespacing & Link-Time Synthesis
-
-*Primary Module:* [`src/ella/modules.py`](./src/ella/modules.py)
-
-- **The AST Linker (`link`):** Traverses module dependency graphs, detects import cycles, and topologically sorts units.
-- **Static Namespace Mangling:** Prefixes module-scoped symbols (`geo.area`, `geo.Circle`), unifying multi-file programs into a single flat AST for downstream compiler passes.
-- Automatically injects the standard library Prelude (`lists`, `maps`, `strings`, `math`).
-
----
-
-## Chapter 16: Pattern Matching Exhaustiveness & Maranget's Matrix Algorithm
-
-*Primary Module:* [`src/ella/exhaustive.py`](./src/ella/exhaustive.py)
-
-- **Luc Maranget (JFP 2007):** Represents match patterns as rows in a decision matrix.
-- **Usefulness & Exhaustiveness:** Specializes matrices over constructor signatures to verify whether every input value is covered.
-- **Witness Synthesis:** Generates concrete counterexample witnesses (e.g. `Some(None)`) when patterns are non-exhaustive, and flags dead pattern arms as compiler warnings.
-
----
-
-## Chapter 17: SSA Register Allocation & Chordal Graph Coloring
-
-*Primary Module:* [`src/ella/regalloc.py`](./src/ella/regalloc.py)
-
-- **The Hack (2007) / Pereira & Palsberg (2005) Theorem:** Live ranges of programs in SSA form construct **Chordal Graphs**.
-- **Linear-Time Optimal Coloring:** Chordal interference graphs can be colored in polynomial time via greedy assignment in dominator-tree order.
-- Values spanning across calls receive callee-saved registers (`rbx, r12..r15`); short-lived values receive caller-saved registers (`rsi, rdi, r8..r10`); excess values spill to stack slots.
-
----
-
-## Chapter 18: Resilient Parsing & IDE Static Code Intelligence
-
-*Primary Module:* [`src/ella/analysis.py`](./src/ella/analysis.py)
-
-- Implements fault-tolerant compiler services for interactive editors (LSP).
-- **Lenient Lexing:** Heuristically patches unclosed strings and dangling delimiters without altering source span coordinates.
-- **Partial Parsing:** Recovers from syntactic statement errors by inserting synthetic unit expressions `()` and synchronizing at statement boundaries.
-- Extracts live type hover data, semantic tokens, and autocompletion symbols.
-
----
-
-## Chapter 19: Native AOT Driver & Host Toolchain Orchestration
-
-*Primary Module:* [`src/ella/native.py`](./src/ella/native.py)
-
-- Ahead-Of-Time (AOT) native compilation driver.
-- **Content-Addressed Runtime Caching:** Hashes `runtime.c` with compiler flags using SHA-256, caching compiled objects in `/tmp` to make repeated native builds instantaneous.
-- Executes GCC to assemble Intel-syntax assembly and link the final native ELF binary.
-
----
-
-## Chapter 20: Language Server Protocol (LSP) Architecture
-
-*Primary Module:* [`src/ella/lsp.py`](./src/ella/lsp.py)
-
-- Implements standard JSON-RPC Language Server Protocol over stdio (`pygls`).
-- **Worker Process Isolation:** Runs static analysis and compile-time splices inside an isolated worker subprocess with timeouts, preventing infinite loops or `stdout` pollution from crashing the editor connection.
-- Bridges UTF-16 editor offsets and 1-based Unicode character coordinates.
-
----
-
-## Chapter 21: The IR Virtual Machine & Hardware Arena Simulator
-
-*Primary Module:* [`src/ella/ir_interpreter.py`](./src/ella/ir_interpreter.py)
-
-- Executes low-level three-address CFG IR directly.
-- **Hardware Arena Simulation:** Tags runtime values with `Tag(depth, generation)` indicating the shortest-lived arena containing any part of the object.
-- **Active Memory Invariants:** Dynamically traps Use-After-Free and dangling containment stores, serving as the ground-truth verification oracle for the compiler's memory placement decisions.
-
----
-
-## Appendix: In-Depth Module Essays
-
-These expanded notes complement the chapters above. Essays follow the chapter
-order, with a link to the implementation module; each module retains a short
-description in its source file.
 
 ### [`src/ella/__init__.py`](./src/ella/__init__.py)
 
@@ -713,6 +192,33 @@ science literature:
     Information and Computation 1997.
 - Compiler Architecture: Aho, Lam, Sethi, Ullman, "Compilers: Principles, Techniques,
     and Tools" (The Dragon Book), 2nd Edition, Addison-Wesley 2006.
+
+---
+
+## Chapter 1: Lexical Analysis & Layout-Sensitive Grammars
+
+*Primary Module:* [`src/ella/lexer.py`](./src/ella/lexer.py)
+
+### 1. Theoretical Foundations
+
+- **Maximal Munch (Longest Match Rule):** In lexical analysis (Dragon Book, Chapter 3), when multiple token patterns can match the current stream, the scanner always consumes the longest valid prefix. Ella achieves this by sorting operator definitions longest-first: `//=` is tokenized as a single compound assignment operator rather than `//` followed by `=`.
+
+- **The Off-Side Rule (Peter J. Landin 1966):** Following Landin's landmark paper *"The Next 700 Programming Languages"*, Ella uses 2D indentation to represent block structures without curly braces. The scanner tracks an indentation stack (`self.indents = [0]`) and synthesizes virtual delimiters:
+
+  - `NEWLINE`: Marks the end of a logical statement line.
+  - `INDENT`: Synthesized when indentation increases (acts as `{`).
+  - `DEDENT`: Synthesized when indentation decreases (acts as `}`).
+- **Bracket Sensitivity:** When open parentheses `(` or brackets `[` are active (`self.brackets`), newlines are treated as ordinary whitespace, allowing multi-line expressions without continuation backslashes.
+
+### 2. String Interpolation State Machine
+
+String interpolation (`"The total is {{x + 1}}"`) is parsed without nested scanner recursion by deconstructing the literal into discrete lexical tokens:
+
+```text
+STRING_START -> STRING_TEXT("The total is ") -> INTERP_START -> [Token(NAME, "x"), Token(OP, "+"), Token(INT, "1")] -> INTERP_END -> STRING_END
+```
+
+This allows the parser to parse interpolated expressions using identical grammar rules to top-level code.
 
 ### [src/ella/lexer.py](./src/ella/lexer.py)
 
@@ -818,6 +324,44 @@ See also:
 - docs/grammar.md §1 (Lexical structure)
 - docs/grammar.md §2 (Layout & Indentation)
 
+---
+
+## Chapter 2: Abstract Syntax Trees & Expression-Oriented Grammars
+
+*Primary Module:* [`src/ella/syntax.py`](./src/ella/syntax.py)
+
+### 1. Parse Tree vs. Abstract Syntax Tree
+
+A Parse Tree contains concrete syntactic tokens (colons, commas, parenthesis tokens, indentation markers). An Abstract Syntax Tree (AST) retains purely semantic structure:
+
+- Syntactic sugar is normalized during AST construction (e.g., pipeline operator `x |> f(y)` desugars directly into the call `f(x, y)`).
+- Every AST node preserves its `Span(line, column, file)` coordinates for precise diagnostic reporting.
+
+### 2. Expression-Oriented Design
+
+In Ella, statements do not exist in isolation; **everything is an expression**:
+
+- An `if-then-else` block evaluates to the value of its executed branch:
+
+  ```ella
+  let status = if score >= 50 then "pass" else "fail"
+  ```
+
+- Blocks `{ ... }` evaluate to their final expression (or unit `()` if empty).
+
+- Assignments (`x = 5`) evaluate to `()`.
+
+### 3. S-Expression Canonical Serialization (`show()`)
+
+Ella defines an S-expression serialization format for ASTs:
+
+```text
+Source:         let x = 1 + 2 * 3
+S-Expression:   (let [x] (+ 1 (* 2 3)))
+```
+
+This provides human-readable snapshot testing without fragile object comparisons.
+
 ### [src/ella/syntax.py](./src/ella/syntax.py)
 
 Syntax tree for Ella, as produced by the parser.
@@ -875,6 +419,32 @@ an S-expression printer (`show()`):
 - S-Expression: `(let [x] (+ 1 (* 2 3)))`
 
 S-expressions allow snapshot testing without fragile object comparisons or verbose JSON.
+
+---
+
+## Chapter 3: Top-Down Operator Precedence & Pratt Parsing
+
+*Primary Module:* [`src/ella/parser.py`](./src/ella/parser.py)
+
+### 1. Theoretical Breakthrough (Vaughan Pratt, POPL 1973)
+
+Traditional recursive descent parsers require a separate grammar production and mutually recursive function for every precedence level:
+$$\text{expr} \to \text{term} (('+' \mid '-') \text{term})^* \quad;\quad \text{term} \to \text{factor} (('*' \mid '/') \text{factor})^*$$
+Pratt parsing associates numeric binding powers directly with tokens:
+
+- **Higher number = binds tighter:** e.g., `*` (precedence 14) binds tighter than `+` (precedence 13).
+
+### 2. Null Denotations vs. Left Denotations
+
+- **Null Denotation (`nud` / `parse_prefix`):** What a token means when starting an expression (literals, identifiers, unary `-x`, `(x + 1)`, keyword expressions like `if`).
+
+- **Left Denotation (`led` / `parse_infix`):** What a token means when combining with an expression on its left (`+`, `*`, `==`, member access `.`, indexing `[i]`, calls `(args)`).
+
+### 3. Associativity Mechanics
+
+- **Left-associative (`a - b - c`):** Parse right-hand side with `prec + 1` (rejects equal-precedence operators, forcing left-grouping).
+
+- **Right-associative (`a ** b ** c`):** Parse right-hand side with `prec` (accepts equal-precedence operators, forcing right-grouping).
 
 ### [src/ella/parser.py](./src/ella/parser.py)
 
@@ -966,6 +536,50 @@ Precedence: `+` = 13 (left-assoc), `*` = 14 (left-assoc), `-` = 13 (left-assoc).
 Ella combines Pratt parsing for expressions with recursive descent for structured
 declarations (`parse_let`, `parse_struct`, `parse_enum`, `parse_import`).
 See docs/grammar.md §8 and §12 for the exact grammar specification.
+
+---
+
+## Chapter 4: Intermediate Representation (IR) & Static Single Assignment
+
+*Primary Module:* [`src/ella/ir.py`](./src/ella/ir.py)
+
+### 1. The Role of an IR
+
+The Intermediate Representation (IR) bridges high-level syntax trees and bare-metal machine code:
+
+- Nested expressions are flattened into explicit control-flow basic blocks.
+- Variable mutations are made explicit via loads, stores, and SSA values.
+- Memory allocations are tagged with concrete region targets.
+
+### 2. Block Parameters vs. Classical $\phi$-Nodes
+
+In classical SSA (e.g. LLVM), control-flow joins use $\phi$-functions:
+$$\%z = \phi [ \%x, \text{block}_1 ], [ \%y, \text{block}_2 ]$$
+$\phi$-nodes suffer from placement ordering constraints and parallel-copy hazards.
+
+Following Andrew Appel (1998, *"SSA is Functional Programming"*) and modern IRs (Swift SIL, MLIR, Rust Cranelift), Ella replaces $\phi$-nodes with **Block Parameters**:
+
+```text
+then_block:
+    jump join_block(%val_then)
+else_block:
+    jump join_block(%val_else)
+join_block(%result: i64):
+    ...
+```
+
+Blocks act like local functions; control-flow branches pass arguments directly.
+
+### 3. Region Annotations
+
+Every heap-allocated object explicitly designates its target memory region:
+
+- `@0`: Function frame scope level.
+- `@1, @2, ...`: Nested loop iteration levels.
+- `@result`: The caller's result arena (zero-copy return construction).
+- `@mut0`: The arena of a mutable caller variable.
+- `@carry1`: Alternating ping-pong loop carried state.
+- `@global`: Global top-level process arena.
 
 ### [src/ella/ir.py](./src/ella/ir.py)
 
@@ -1283,6 +897,37 @@ the calls in progress, each from its instruction's span and `within`. One
 at Span(0, 0) (in the function made for a library function used as a
 value) is reported at the innermost call instead (`EllaError.traced`).
 
+---
+
+## Chapter 5: AST Lowering & Compiler-Directed Region Inference
+
+*Primary Module:* [`src/ella/lower.py`](./src/ella/lower.py)
+
+### 1. Tree Flattening & Closure Conversion
+
+Lowering flattens nested syntax trees into linear three-address basic blocks:
+
+- **Closure Conversion:** Lambdas capturing local variables are lifted into top-level functions whose captured environment is passed as explicit leading parameters.
+- **Return Normalization:** Function returns jump to a unified exit block to ensure postconditions and finalizers execute reliably.
+
+### 2. Simplified Tofte–Talpin Region Inference
+
+Ella manages dynamic memory **without a garbage collector** (Mads Tofte & Jean-Pierre Talpin 1997):
+
+- **Destination-Driven Lowering:** Expressions are compiled with a designated *destination region*. When evaluating `return [1, 2, 3]`, the list is constructed directly in `@result` (the caller's arena), completely avoiding return copies.
+- **Tracking `borrows` and `lives`:** The lowering tracks which variables an object aliases (`borrows`) and the shortest-lived region it depends on (`lives`). Deep copies are inserted only if:
+  1. A mutable container is stored somewhere that could observe in-place mutations.
+  2. An object would outlive its enclosing scope arena.
+
+### 3. Taming Region Bloat: Alternating Loop Arenas
+
+In classic region systems, loop accumulators (`for i in 0..n: acc = acc + [i]`) leak memory in the outer scope until the entire function returns. Ella completely eliminates loop region bloat:
+
+- Outer variables carried across iterations are detected automatically (`carried_by`).
+- The loop uses two alternating scope arenas: `@k` (current iteration) and `@carryk` (previous state).
+- At the iteration latch (`swap k`), the current iteration's arena becomes the carried arena, and the old carried arena is freed.
+- At most **two versions** of carried state are alive at any time, reducing memory from $O(N)$ to $O(1)$.
+
 ### [src/ella/lower.py](./src/ella/lower.py)
 
 Lowering: turns a type-checked syntax tree into IR (see ella.ir).
@@ -1438,6 +1083,126 @@ exit:
   store s, (copy (load s.1) @0)
   reset 1
 ```
+
+---
+
+## Chapter 6: The IR Optimization Pipeline
+
+*Primary Module:* [`src/ella/passes/__init__.py`](./src/ella/passes/__init__.py)
+
+### 1. Iterative Fixed-Point Transformation
+
+Optimization passes are decoupled into focused, single-purpose transformations. Because passes create optimization opportunities for one another (e.g. constant folding enables branch deletion, which enables dead code elimination, which enables copy-to-move elision), passes run iteratively until no further transformations occur (`CLEANUP = ["moves", "fold", "simplify", "dce"]`).
+
+### 2. The Trap Preservation Invariant
+
+A compiler optimization must never alter observable program behavior, **including dynamic runtime traps**:
+
+- Division by zero (`x / 0`), integer overflow, or out-of-bounds indexing must NEVER be folded or speculatively deleted if that error would have occurred during unoptimized execution.
+
+### 3. Continuous Verification
+
+The IR verifier (`verify()`) runs before and after every single optimization pass, asserting SSA dominance, type consistency, and block terminator invariants.
+
+---
+
+### Chapter 6.1: SSA Construction
+
+*Primary Module:* [`src/ella/passes/mem2reg.py`](./src/ella/passes/mem2reg.py)
+
+#### 1. Braun et al. (CC 2013) vs. Cytron et al. (1991)
+
+Classical SSA construction (Cytron 1991) requires computing dominator trees, iterated dominance frontiers ($IDF$), and variable stacks.
+
+Ella implements the algorithm of Matthias Braun et al. (Compiler Construction 2013):
+
+- To resolve a variable's value at instruction $I$, look backwards in the basic block for the latest `store`.
+- If not found, query the block's predecessors:
+  - One predecessor: Take the value from the predecessor's end.
+  - Multiple predecessors: Add a new block argument (parameter) and query all incoming branch edges recursively.
+- Trivial block parameters (parameters that receive the same value from all paths) are pruned via `remove_trivial_params`.
+
+---
+
+### Chapter 6.2: Value-Semantics Optimization
+
+*Primary Module:* [`src/ella/passes/moves.py`](./src/ella/passes/moves.py)
+
+#### 1. Moves as Compiler Optimizations
+
+In Rust or C++, moving is a user-visible language semantic rule requiring programmers to manage ownership and learn "use-after-move" errors.
+
+In Ella, **everything is conceptually a deep copy**. Moving is an invisible compiler optimization:
+
+- When value `%1` is copied (`%2 = copy %1`) and the compiler proves that `%1` is never read again, the copy is elided and `%1` is moved into place.
+- Safety invariants:
+  1. `%1` has exactly one use in the entire function (`uses[original.id] == 1`).
+  2. `%1`'s definition dominates `%2`, and `%2` post-dominates `%1`.
+  3. The path between `%1` and `%2` does not cross a loop cycle.
+
+---
+
+### Chapter 6.3: Constant Folding & Propagation
+
+*Primary Module:* [`src/ella/passes/fold.py`](./src/ella/passes/fold.py)
+
+- **Constant Folding:** Replaces instructions whose operands are literal constants with pre-computed `const` values.
+- **Constant Propagation:** Follows Kildall's semi-lattice dataflow framework, replacing block parameters with constants when all incoming branches pass identical literal values.
+- **Trap Safety:** If folding an operation triggers an error (such as division by zero or integer overflow), folding is skipped so the trap fires dynamically at runtime.
+
+---
+
+### Chapter 6.4: CFG Canonicalization
+
+*Primary Module:* [`src/ella/passes/simplify.py`](./src/ella/passes/simplify.py)
+
+Performs four canonical control-flow graph tidy-ups:
+
+1. **Branch Folding:** Replaces boolean constant branches with unconditional jumps.
+2. **Unreachable Code Elimination:** Deletes blocks unreachable from function entry.
+3. **Jump Threading:** Short-circuits empty trampoline blocks that do nothing but jump onward.
+4. **Block Coalescing:** Merges block $B$ into block $A$ when $A$ jumps unconditionally to $B$ and $B$ has $A$ as its sole predecessor.
+
+---
+
+### Chapter 6.5: Dead Code Elimination
+
+*Primary Module:* [`src/ella/passes/dce.py`](./src/ella/passes/dce.py)
+
+- Sweeps instructions whose results are unused.
+- **Purity Guarantee:** Only instructions proven to be side-effect-free and trap-free are deleted (e.g. constant generation, tuple extraction, IEEE float math). Memory indexing or integer arithmetic that could trap is retained.
+- **Level Trimming:** Calls `trim_levels()` to delete scope arena allocations if all allocating instructions in that level were eliminated.
+
+---
+
+### Chapter 6.6: Procedure Inlining
+
+*Primary Module:* [`src/ella/passes/inline.py`](./src/ella/passes/inline.py)
+
+- Eliminates call overhead and exposes callee bodies to intraprocedural optimization.
+- **Preconditions:** Callee size $\le$ `INLINE_LIMIT = 50`, non-recursive (verified by cycle detection on the call graph), and non-generator.
+- **Bottom-Up Ordering:** Inlines callees before callers so that leaf functions are absorbed first.
+- **Arena Level Remapping:** Shifts callee arena levels above all caller levels to guarantee strict LIFO deallocation.
+
+---
+
+### Chapter 6.7: Call Devirtualization
+
+*Primary Module:* [`src/ella/passes/direct.py`](./src/ella/passes/direct.py)
+
+- Identifies global variables holding static top-level closures that are initialized once at startup.
+- Converts indirect closure invocations (`call %closure(args)`) into direct relative function calls (`call_direct func_name(args)`).
+- Unlocks subsequent inlining for devirtualized call sites.
+
+---
+
+### Chapter 6.8: Array Loop Fusion
+
+*Primary Module:* [`src/ella/passes/fuse.py`](./src/ella/passes/fuse.py)
+
+- **Defeating the Memory Wall (Wulf & McKee 1995):** In numerical pipelines (`a * 2.0 + b - c`), executing separate loops incurs severe memory bandwidth penalties by reading and writing intermediate temporary buffers to RAM.
+- **Kernel Fusion:** Combines consecutive array operations into a single AVX2 SIMD loop. Intermediate results remain resident in 256-bit YMM vector registers, completely eliminating temporary buffer allocations.
+- **Reduction Fusion:** Fuses horizontal reductions (`total`, `dot`) directly onto arithmetic chains, computing scalar values with zero heap array allocation.
 
 ### [`src/ella/passes/__init__.py`](./src/ella/passes/__init__.py)
 
@@ -1854,6 +1619,25 @@ To prevent register spilling within the inner SIMD loop:
 - If intermediate array results are also referenced outside the fused block, the loop
     emits them as secondary results without re-scanning memory.
 
+---
+
+## Chapter 7: Operational Semantics & the Reference Interpreter
+
+*Primary Module:* [`src/ella/interpreter.py`](./src/ella/interpreter.py)
+
+### 1. Dual Operational Roles
+
+1. **The Ground-Truth Language Specification:** Defines the normative operational semantics of Ella before any IR lowering or native compilation occurs.
+2. **The Stage -1 Metaprogramming Engine:** When compile-time splices (`$expr`) appear outside quotes, this interpreter executes them during compilation, producing residual syntax trees.
+
+### 2. Big-Step Natural Semantics
+
+Implements big-step evaluation ($\text{eval}(e, \sigma) \Downarrow (v, \sigma')$) recursively matching on `Expr` nodes. Control flow alterations (`return`, `break`, `continue`, `?`) are modeled via private Python exception signals unwinding the evaluation stack.
+
+### 3. Cooperative Generator Coroutines
+
+Generators are executed on cooperative host threads (`threading.Thread`), synchronizing control transfer tokens across `yield` and `next`.
+
 ### [src/ella/interpreter.py](./src/ella/interpreter.py)
 
 Tree-walking interpreter: runs a program by evaluating its syntax tree directly.
@@ -1910,6 +1694,31 @@ A generator is a function that can suspend at `yield` and resume at `next`.
 Because the AST interpreter does not maintain a native call stack or heap frame, it runs
 each generator's body on a cooperative Python thread (`threading.Thread`), synchronizing
 execution through handoff events so that only one thread executes at a time.
+
+---
+
+## Chapter 8: Machine Code Generation & x64 Native Execution
+
+*Primary Module:* [`src/ella/codegen.py`](./src/ella/codegen.py)
+
+### 1. Unified 64-Bit Word Model
+
+Every runtime Ella value occupies exactly one 64-bit word:
+
+- `i64`: 64-bit two's complement integer.
+- `bool`: `0` or `1`.
+- `f64`: Raw IEEE-754 bits in general registers, moved into XMM registers for arithmetic.
+- Boxed objects (strings, lists, arrays, tuples, closures): 64-bit pointers into arena memory.
+
+### 2. Calling Conventions
+
+- **Internal Ella Convention:** Uses a uniform stack-based convention that passes closure headers, caller result arena depths, arguments, and mutable argument arena depths.
+
+- **System V AMD64 ABI:** Switches to standard C ABI register passing (`rdi, rsi, rdx, rcx, r8, r9`) with 16-byte stack alignment when invoking the C runtime engine.
+
+### 3. Parallel Move Cycle Resolution
+
+When transferring values to target registers during block branches, mutual register dependencies (e.g. `rax <- rbx` and `rbx <- rax`) are resolved using cycle detection and scratch register `r11`.
 
 ### [src/ella/codegen.py](./src/ella/codegen.py)
 
@@ -2040,6 +1849,64 @@ with masked loads and stores for the last few items (`fused`). The program sets 
 runtime stops at once on a CPU without AVX2. `vzeroupper` ends each loop,
 since the runtime's code uses the older SSE instructions.
 
+---
+
+## Chapter 9: The Low-Level Runtime Engine & Memory Subsystem
+
+*Primary Module:* [`src/ella/runtime.c`](./src/ella/runtime.c)
+
+### 1. 32 TiB Virtual Memory Reservation
+
+Ella does not use `malloc()` and `free()`. Instead:
+
+- The runtime reserves up to 32 TiB of virtual address space upfront via `mmap(..., MAP_NORESERVE)`.
+- Allocation is an ultra-fast bump pointer increment:
+
+  ```c
+  top = top + round16(size);
+  ```
+
+- Deallocation at scope exit is an $O(1)$ pointer reset. Pages exceeding 16 MiB are lazily released back to the OS via `madvise(MADV_DONTNEED)`.
+
+### 2. Mitigating CPU Cache Conflict Thrashing
+
+Set-associative L1/L2 caches map power-of-two address multiples to identical cache lines. If alternating loop arenas (`@k` and `@carryk`) started at exact power-of-two boundaries, ping-ponging values would thrash the identical cache sets. The runtime solves this by staggering each arena's base by a non-power-of-two prime offset:
+
+```c
+#define STAGGER ((size_t)65 << 12)
+```
+
+### 3. Generational Pool Handles
+
+Long-lived objects reside in a `Pool[T]`. Handles pack:
+
+```text
+[ 24 bits: Pool ID | 20 bits: Generation | 20 bits: Slot Index ]
+```
+
+Dereferencing a handle performs an $O(1)$ generation check against the slot table, safely trapping Use-After-Free bugs without a garbage collector.
+
+---
+
+## Chapter 10: Multi-Stage Programming & Metaprogramming
+
+*Primary Module:* [`src/ella/staging.py`](./src/ella/staging.py)
+
+### 1. Multi-Stage Foundations (Taha & Sheard 1997)
+
+Computations are organized into discrete integer stages:
+
+- `quote e`: Lifts computation to stage $n+1$, producing a `Code[T]` value.
+- `$c`: Drops computation to stage $n-1$, splicing computed residual code.
+- `run(c)`: Compiles and executes code at the current stage.
+
+### 2. Cross-Stage Persistence & Hygiene
+
+- **Cross-Stage Persistence (CSP):** A variable bound at stage $n$ can be carried into stage $n+k$ as an embedded literal constant (`reify()`).
+
+- **Macro Hygiene:** Quoted variables are automatically $\alpha$-renamed (`x` becomes `x.4`), preventing accidental variable capture.
+- **Types as Values:** Types are first-class values (`Type[T]`), allowing compile-time reflection (`fields(t)`) and automatic code generation (`derive_eq`) without macros.
+
 ### [src/ella/staging.py](./src/ella/staging.py)
 
 Multi-stage programming: code as values, made with `quote` and combined with `$`.
@@ -2118,6 +1985,30 @@ evaluates them using the reference AST interpreter (`ella.interpreter`), and rep
 them with the generated residual AST. The expanded tree is then checked and lowered
 normally; the IR and native compiler never see staging primitives.
 
+---
+
+## Chapter 11: Static Type Systems, Unification & Bidirectional Checking
+
+*Primary Module:* [`src/ella/checker.py`](./src/ella/checker.py)
+
+### 1. Bidirectional Type Checking (Pierce & Turner 2000)
+
+- **Synthesis Mode (`infer`):** Types are inferred upwards from sub-expressions.
+
+- **Checking Mode (`check`):** Expected types are propagated downwards into untyped lambdas and literals.
+
+### 2. First-Order Unification (Robinson 1965, Martelli-Montanari 1982)
+
+Type placeholders (`?1, ?2`) are solved through unification:
+
+- Solves type equations over structural terms.
+- The **Occurs Check** prevents infinite, circular types ($?1 \doteq [?1]$).
+- Unconstrained free type variables default safely to `()`.
+
+### 3. Exclusivity for `mut` Parameters
+
+Statically validates that mutable parameters do not alias any other argument within the same call, enforcing value-semantic independence at compile time.
+
 ### [src/ella/checker.py](./src/ella/checker.py)
 
 Static type checker: works out the type of every expression before the program runs.
@@ -2184,6 +2075,16 @@ types, resolved variable identities, and constructor metadata in dictionaries ke
 - `checker.kinds[id(name)]`: Resolves names to local slots, globals, or constructors.
 This keeps the AST purely syntactic and decouples passes cleanly.
 
+---
+
+## Chapter 12: Runtime Value Representation & Object Model
+
+*Primary Module:* [`src/ella/values.py`](./src/ella/values.py)
+
+- Maps Ella types to host Python objects in the interpreter while enforcing 64-bit bounded semantics (`I64_MIN..I64_MAX`).
+- Implements explicit structural deep copying (`copy_value()`) to maintain pure value semantics.
+- Implements structural equality protocols (`equal()`) delegating to user-defined `eq` methods.
+
 ### [src/ella/values.py](./src/ella/values.py)
 
 Run-time values, shared by the interpreters.
@@ -2240,6 +2141,16 @@ to the global namespace. Looking up a variable traverses parent pointers until f
 `MAX_CALL_DEPTH` enforces a uniform recursion ceiling across all backends to trap
 runaway recursion before the host machine runs out of native stack memory.
 
+---
+
+## Chapter 13: Operator Semantics & Arithmetic Invariants
+
+*Primary Module:* [`src/ella/operators.py`](./src/ella/operators.py)
+
+- **Arithmetic Parity:** Fixed-width two's complement integer overflow trapping and truncation-towards-zero integer division matching x64 machine hardware.
+- **IEEE-754 Standards:** Floating-point division and exponentiation returning signed infinities or NaNs without host exceptions.
+- **SIMD Reductions:** Four-accumulator lane summation matching native AVX2 reduction orders.
+
 ### [src/ella/operators.py](./src/ella/operators.py)
 
 Ella's operators on run-time values, shared by every interpreter.
@@ -2283,6 +2194,15 @@ and interpreters route operators through standard method protocols:
 - `a[i] = v`-> `mut a.set(i, v)`
 - `x in c`  -> `c.contains(x)`
 
+---
+
+## Chapter 14: Standard Runtime Primitives & the Host Environment
+
+*Primary Module:* [`src/ella/library.py`](./src/ella/library.py)
+
+- **$O(1)$ UTF-32 Code Point Indexing:** Strings are represented as 32-bit Unicode code points (`uint32_t`), making random indexing and slicing strictly $O(1)$.
+- **Hermetic `Host` Context:** External I/O and process environments are encapsulated in a `Host` object, allowing deterministic test execution.
+
 ### [src/ella/library.py](./src/ella/library.py)
 
 The library: built-in functions with fixed types, such as `split` and `read_line`.
@@ -2323,6 +2243,16 @@ Ella routes all process interaction through a `Host` context object:
 Every library function implemented in this module has a 1-to-1 C equivalent in
 `src/ella/runtime.c` (`ella_lib_split`, `ella_lib_parse_i64`, etc.). The test suite
 enforces that both backends produce identical results and matching error messages.
+
+---
+
+## Chapter 15: Module Systems, Namespacing & Link-Time Synthesis
+
+*Primary Module:* [`src/ella/modules.py`](./src/ella/modules.py)
+
+- **The AST Linker (`link`):** Traverses module dependency graphs, detects import cycles, and topologically sorts units.
+- **Static Namespace Mangling:** Prefixes module-scoped symbols (`geo.area`, `geo.Circle`), unifying multi-file programs into a single flat AST for downstream compiler passes.
+- Automatically injects the standard library Prelude (`lists`, `maps`, `strings`, `math`).
 
 ### [src/ella/modules.py](./src/ella/modules.py)
 
@@ -2406,6 +2336,16 @@ even if the entry file has a top-level name like `len` (see their
 read-only imported variables are checked; private fields and methods are
 checked by the checker, which knows the types of values.
 
+---
+
+## Chapter 16: Pattern Matching Exhaustiveness & Maranget's Matrix Algorithm
+
+*Primary Module:* [`src/ella/exhaustive.py`](./src/ella/exhaustive.py)
+
+- **Luc Maranget (JFP 2007):** Represents match patterns as rows in a decision matrix.
+- **Usefulness & Exhaustiveness:** Specializes matrices over constructor signatures to verify whether every input value is covered.
+- **Witness Synthesis:** Generates concrete counterexample witnesses (e.g. `Some(None)`) when patterns are non-exhaustive, and flags dead pattern arms as compiler warnings.
+
 ### [src/ella/exhaustive.py](./src/ella/exhaustive.py)
 
 Exhaustiveness: do a `match`'s cases cover every value of its subject's type?
@@ -2457,6 +2397,16 @@ To test usefulness, Maranget's algorithm inspects the first column's type:
     the algorithm constructs a concrete *witness counterexample* (e.g. `Some(None)` or `(false, _)`).
     The compiler reports this witness to the user:
         "error: match does not cover every value (e.g. Some(None))"
+
+---
+
+## Chapter 17: SSA Register Allocation & Chordal Graph Coloring
+
+*Primary Module:* [`src/ella/regalloc.py`](./src/ella/regalloc.py)
+
+- **The Hack (2007) / Pereira & Palsberg (2005) Theorem:** Live ranges of programs in SSA form construct **Chordal Graphs**.
+- **Linear-Time Optimal Coloring:** Chordal interference graphs can be colored in polynomial time via greedy assignment in dominator-tree order.
+- Values spanning across calls receive callee-saved registers (`rbx, r12..r15`); short-lived values receive caller-saved registers (`rsi, rdi, r8..r10`); excess values spill to stack slots.
 
 ### [src/ella/regalloc.py](./src/ella/regalloc.py)
 
@@ -2510,6 +2460,17 @@ x86-64 hardware enforces standard calling convention register roles:
     `regalloc.py`; reserved for codegen scratch operations, division (`rax:rdx`), and
     parallel move cycle resolution (`r11`).
 
+---
+
+## Chapter 18: Resilient Parsing & IDE Static Code Intelligence
+
+*Primary Module:* [`src/ella/analysis.py`](./src/ella/analysis.py)
+
+- Implements fault-tolerant compiler services for interactive editors (LSP).
+- **Lenient Lexing:** Heuristically patches unclosed strings and dangling delimiters without altering source span coordinates.
+- **Partial Parsing:** Recovers from syntactic statement errors by inserting synthetic unit expressions `()` and synchronizing at statement boundaries.
+- Extracts live type hover data, semantic tokens, and autocompletion symbols.
+
 ### [src/ella/analysis.py](./src/ella/analysis.py)
 
 What an editor needs to know about a program: its errors, what each name in it is, and what could be typed next.
@@ -2557,6 +2518,16 @@ Ella implements a multi-tier recovery architecture:
 - **Contextual Autocompletion (`complete`):**
     Extracts visible variable names, struct field accessors (`p.x`), enum variants,
     and library functions available at the active cursor position.
+
+---
+
+## Chapter 19: Native AOT Driver & Host Toolchain Orchestration
+
+*Primary Module:* [`src/ella/native.py`](./src/ella/native.py)
+
+- Ahead-Of-Time (AOT) native compilation driver.
+- **Content-Addressed Runtime Caching:** Hashes `runtime.c` with compiler flags using SHA-256, caching compiled objects in `/tmp` to make repeated native builds instantaneous.
+- Executes GCC to assemble Intel-syntax assembly and link the final native ELF binary.
 
 ### [src/ella/native.py](./src/ella/native.py)
 
@@ -2612,6 +2583,16 @@ Flags: `-std=gnu17 -O2 -Wall -Wextra -ffp-contract=off -lm`:
 - Translates raw numeric call site lines back into Ella source coordinate spans.
 - Reconstructs human-readable stack traces with source file locations and function names.
 
+---
+
+## Chapter 20: Language Server Protocol (LSP) Architecture
+
+*Primary Module:* [`src/ella/lsp.py`](./src/ella/lsp.py)
+
+- Implements standard JSON-RPC Language Server Protocol over stdio (`pygls`).
+- **Worker Process Isolation:** Runs static analysis and compile-time splices inside an isolated worker subprocess with timeouts, preventing infinite loops or `stdout` pollution from crashing the editor connection.
+- Bridges UTF-16 editor offsets and 1-based Unicode character coordinates.
+
 ### [src/ella/lsp.py](./src/ella/lsp.py)
 
 A language server for Ella, built on pygls: editors talk to it over stdin and stdout (the Language Server Protocol).
@@ -2659,6 +2640,16 @@ LSP defines positions using 0-based lines and UTF-16 code units (originating fro
 and VS Code's internal string representation). Ella internally uses 1-based lines and
 Unicode character code point counts. The LSP adapter cleanly maps between these coordinate
 systems.
+
+---
+
+## Chapter 21: The IR Virtual Machine & Hardware Arena Simulator
+
+*Primary Module:* [`src/ella/ir_interpreter.py`](./src/ella/ir_interpreter.py)
+
+- Executes low-level three-address CFG IR directly.
+- **Hardware Arena Simulation:** Tags runtime values with `Tag(depth, generation)` indicating the shortest-lived arena containing any part of the object.
+- **Active Memory Invariants:** Dynamically traps Use-After-Free and dangling containment stores, serving as the ground-truth verification oracle for the compiler's memory placement decisions.
 
 ### [src/ella/ir_interpreter.py](./src/ella/ir_interpreter.py)
 
@@ -2711,8 +2702,6 @@ Any failure of these checks is treated not as a user error, but as an internal
 The IR interpreter tracks high-water memory marks per scope depth and bytes allocated
 per source line, estimating native struct sizes to provide developers with detailed
 arena profiling reports.
-
-When a sub-arena or pool dies, its
 
 A generator function's frame (docs/memory-model.md §17) is kept in its
 Gen between resumes, along with its scope levels, which are slot arenas
