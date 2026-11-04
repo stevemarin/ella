@@ -369,8 +369,9 @@ word ella_next_depth = 1;
 static int poison;
 
 // With ELLA_ARENA_STATS set, the program reports the most memory its arenas
-// ever held at once when it finishes.
+// ever held at once. ELLA_RUNTIME_STATS reports all memory statistics.
 static size_t in_use, peak;
+static size_t copied_bytes;
 
 static size_t round16(size_t size) { return (size + 15) & ~(size_t)15; }
 
@@ -1473,7 +1474,7 @@ static int is_boxed(const Type *t) {
            t->kind != K_BOOL && t->kind != K_HANDLE && t->kind != K_REF;
 }
 
-word ella_copy(word v, const Type *t, word depth) {
+static word copy_inner(word v, const Type *t, word depth) {
     switch (t->kind) {
     case K_STR: {
         const Str *s = (const Str *)v;
@@ -1492,7 +1493,7 @@ word ella_copy(word v, const Type *t, word depth) {
         List *copy = ella_list_alloc(xs->len, depth);
         const Type *item = t->parts[0];
         for (word i = 0; i < xs->len; i++) {
-            copy->items[i] = is_boxed(item) ? ella_copy(xs->items[i], item, depth) : xs->items[i];
+            copy->items[i] = is_boxed(item) ? copy_inner(xs->items[i], item, depth) : xs->items[i];
         }
         return (word)copy;
     }
@@ -1501,7 +1502,7 @@ word ella_copy(word v, const Type *t, word depth) {
         Tuple *copy = ella_tuple_alloc(xs->len, depth);
         for (word i = 0; i < xs->len; i++) {
             const Type *item = t->parts[i];
-            copy->items[i] = is_boxed(item) ? ella_copy(xs->items[i], item, depth) : xs->items[i];
+            copy->items[i] = is_boxed(item) ? copy_inner(xs->items[i], item, depth) : xs->items[i];
         }
         return (word)copy;
     }
@@ -1517,7 +1518,7 @@ word ella_copy(word v, const Type *t, word depth) {
         Variant *copy = ella_variant_alloc(x->tag, x->count, depth);
         for (word i = 0; i < x->count; i++) {
             const Type *field = variant->fields[i];
-            copy->fields[i] = is_boxed(field) ? ella_copy(x->fields[i], field, depth) : x->fields[i];
+            copy->fields[i] = is_boxed(field) ? copy_inner(x->fields[i], field, depth) : x->fields[i];
         }
         return (word)copy;
     }
@@ -1526,13 +1527,20 @@ word ella_copy(word v, const Type *t, word depth) {
         Closure *copy = ella_closure_alloc(c->code, c->count, c->types, depth);
         for (word i = 0; i < c->count; i++) {
             const Type *item = c->types->parts[i];
-            copy->captured[i] = is_boxed(item) ? ella_copy(c->captured[i], item, depth) : c->captured[i];
+            copy->captured[i] = is_boxed(item) ? copy_inner(c->captured[i], item, depth) : c->captured[i];
         }
         return (word)copy;
     }
     default:  // (), i64, f64, bool, handles, refs; pools and arenas can't be copied
         return v;
     }
+}
+
+word ella_copy(word v, const Type *t, word depth) {
+    size_t before = in_use;
+    word copy = copy_inner(v, t, depth);
+    copied_bytes += in_use - before;
+    return copy;
 }
 
 // `move v @r`: a value that can't be copied, moved to another arena: copied
@@ -3170,6 +3178,24 @@ word ella_lib_max_f32(word a, word b, word line, word column, word depth) {
 extern word ella_main(char *stack);  // gives the exit status
 extern const word ella_uses_avx2;  // in the generated code: whether it has AVX2 and FMA instructions (for arrays)
 
+static int process_vm_peak(size_t *bytes) {
+    FILE *status = fopen("/proc/self/status", "r");
+    if (status == NULL) return 0;
+    char line[256];
+    size_t kib;
+    while (fgets(line, sizeof(line), status)) {
+        if (sscanf(line, "VmPeak: %zu kB", &kib) == 1) {
+            *bytes = kib * 1024;
+            fclose(status);
+            return 1;
+        }
+    }
+    int error = ferror(status) ? errno : 0;
+    fclose(status);
+    errno = error;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     __builtin_cpu_init();
     if (ella_uses_avx2 && !(__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))) {
@@ -3186,6 +3212,17 @@ int main(int argc, char **argv) {
     word status = ella_main(stack + stack_size);
     ella_reset(0, 1);  // the globals, and their finalizers
     fflush(stdout);
-    if (getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);
+    int runtime_stats = getenv("ELLA_RUNTIME_STATS") != NULL;
+    if (runtime_stats || getenv("ELLA_ARENA_STATS") != NULL) fprintf(stderr, "arena peak: %zu bytes\n", peak);
+    if (runtime_stats) {
+        size_t vm_peak;
+        if (!process_vm_peak(&vm_peak)) {
+            if (errno) fprintf(stderr, "can't read process virtual-memory peak: %s\n", strerror(errno));
+            else fputs("can't find VmPeak in /proc/self/status\n", stderr);
+            return 2;
+        }
+        fprintf(stderr, "virtual peak: %zu bytes\n", vm_peak);
+        fprintf(stderr, "bytes copied: %zu bytes\n", copied_bytes);
+    }
     return (int)status;
 }

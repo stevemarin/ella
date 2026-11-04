@@ -1,19 +1,30 @@
 # Benchmarks
 
-Programs that measure how fast native code runs and how much memory its
-arenas hold. Each `NAME.ella` has `NAME.out`, exactly what it prints, and
-`NAME.peak`, the most bytes its arenas may hold at once
-(`ELLA_ARENA_STATS`); [test_benchmarks.py](../test_benchmarks.py) checks
-both, so a change that brings back region bloat (docs/memory-model.md §6)
-fails the tests. Speed isn't checked, since it depends on the machine:
+Programs that measure native runtime and memory costs. Each `NAME.ella` has
+`NAME.out`, exactly what it prints, and `NAME.peak`, the maximum bytes its
+arenas may hold at once; [test_benchmarks.py](../test_benchmarks.py) checks
+the output and arena bound, so region bloat (docs/memory-model.md §6) fails
+the tests. Timing and other resource metrics are reported, not checked,
+because they depend on the machine:
 
     uv run python test/bench.py [NAME ...]
 
 compiles each one (optimized), runs it a few times, and prints the fastest
-time, arena peak, and process maximum resident set size. The arena peak
-covers Ella's arenas; RSS also includes runtime and compiler data. RSS is
-measured with `/usr/bin/time`, which is available on the supported Linux
-target. `make bench` does the same for all of them.
+wall time and maximum measured memory/copy volume:
+
+* **Arena peak** is the high-water amount held by Ella's arenas.
+* **Peak RSS** is the process's maximum resident set size, measured by
+  `/usr/bin/time`; it includes the runtime and other resident process data.
+* **Virtual peak** is the process's `VmPeak` from `/proc/self/status`, so it
+  includes reserved arena and stack address space even when most pages were
+  never resident.
+* **Deep-copy bytes** is the total rounded arena footprint created by
+  `ella_copy`, including recursively copied objects, headers and alignment.
+  It does not count moves, list appends, or other ordinary memory writes.
+
+Memory columns use MiB except virtual peak, which uses GiB. Memory and copy
+columns show the maximum observed across runs; time shows the fastest run.
+`make bench` runs all benchmarks.
 
 * `string_build`: a string rebuilt on every iteration of a loop in a function.
 * `tuple_replace`: a global tuple replaced now and then in a top-level loop.

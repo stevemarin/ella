@@ -35,7 +35,7 @@ typecheck: ## Strict type checking of src/ and test/
 
 check: lint format-check typecheck test ## Everything CI would run
 
-bench: ## Time the benchmarks in test/benchmarks natively, with their arena peaks (needs gcc)
+bench: ## Benchmark native time, memory, and deep-copy volume (needs gcc)
 	uv run python test/bench.py
 
 # Running programs (FILE=path/to/program.ella, default the syntax tour)
