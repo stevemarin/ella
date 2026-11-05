@@ -23,7 +23,7 @@ from ella.checker import (
 from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.library import Exit, Host, hash_value
 from ella.library import call as call_library
-from ella.modules import link
+from ella.modules import link, prelude
 from ella.operators import array_offset, binary, compare, index_into, unary
 from ella.parser import parse
 from ella.staging import (
@@ -69,6 +69,7 @@ from ella.syntax import (
     Member,
     MutArg,
     Name,
+    NamedType,
     NamePattern,
     OrPattern,
     Pattern,
@@ -412,7 +413,7 @@ class Interpreter:
                 if isinstance(value, Closure) and isinstance(value_expr, Lambda):
                     for binding in bindings:
                         value.scope.define(binding.name, value)
-                return value
+                return UNIT if bindings[0].type_params and scope is not self.globals else value
             case LetPattern(pattern, value_expr, span, mutable):
                 value = self.eval(value_expr, scope)
                 bound = self.match_pattern(pattern, value, scope)
@@ -778,6 +779,18 @@ class Interpreter:
 
         In `mut v.name(args)`, the method changes v.
         """
+        if self.checker is not None:
+            if (static := self.checker.static_methods.get(id(callee))) is not None:
+                enum_name, name, _ = static
+                return self.call_with_args(self.methods[enum_name][name], args, scope, span)
+            if (function_name := self.checker.builtin_methods.get(id(callee))) is not None:
+                builtin_function = self.lookup(function_name, scope, callee.span).value
+                assert builtin_function is not None
+                return self.call_with_args(builtin_function, (callee.target, *args), scope, span)
+            if (function_name := self.checker.extension_methods.get(id(callee))) is not None:
+                extension_function = self.lookup(function_name, scope, callee.span).value
+                assert extension_function is not None
+                return self.call_with_args(extension_function, (callee.target, *args), scope, span)
         receiver, name = callee.target, callee.name
         if isinstance(receiver, MutArg):
             root, indexes = self.evaluate_place(receiver.target, scope)
@@ -785,13 +798,42 @@ class Interpreter:
             function = self.method(value, name, callee.span)
             return self.call_with_args(function, args, scope, span, (value, (root, indexes, receiver.span)))
         value = self.eval(receiver, scope)
+        if isinstance(value, Constructor | VariantValue):
+            static_function = self.methods.get(value.enum, {}).get(name)
+            if isinstance(static_function, Closure) and not self.has_instance_receiver(static_function, value.enum):
+                return self.call_with_args(static_function, args, scope, span)
         if (
             self.find_method(value, name) is None
             and isinstance(value, VariantValue)
             and name in self.structs.get(value.enum, ())
         ):
             return self.call_with_args(value.fields[self.field_index(value, name, callee.span)], args, scope, span)
+        if self.checker is None and self.find_method(value, name) is None:
+            item = prelude().get(name)
+            if name == "len":
+                length_function = self.lookup(name, scope, callee.span).value
+                assert length_function is not None
+                return self.call_with_args(length_function, (receiver, *args), scope, span)
+            if name in LIBRARY:
+                function_name = name
+            elif item is not None and item.kind == "function":
+                function_name = item.name
+            else:
+                function_name = ""
+            if function_name:
+                receiver_function = self.lookup(function_name, scope, callee.span).value
+                assert receiver_function is not None
+                return self.call_with_args(receiver_function, (receiver, *args), scope, span)
         return self.call_with_args(self.method(value, name, callee.span), args, scope, span, (value, None))
+
+    def has_instance_receiver(self, function: Closure, enum: str) -> bool:
+        """Whether a type-body function's first parameter makes it an instance method."""
+        if not function.function.params:
+            return False
+        parameter_type = function.function.params[0].type
+        if isinstance(parameter_type, NamedType):
+            return parameter_type.name == enum
+        return False
 
     def text(self, value: Value) -> str:
         """A value's text form, as `print` writes it: through the `text` methods of the types in it."""

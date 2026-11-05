@@ -1,0 +1,31 @@
+struct Stack[T]
+    items: [T]
+    new = () -> Stack[T] => Stack([])
+    from = (items: [T]) -> Stack[T] => Stack(items)
+
+enum Token
+    End
+    create = () -> Token => End
+
+let work = () -> () =>
+    let prefix = "captured"
+    let identity[T] = (value: T) -> T => value
+    let tagged[T] = (_value: T) -> str => prefix
+    print(identity(1), identity("two"), tagged(true))
+
+let outer[T] = (value: T) -> T =>
+    let from_outer[U] = (_ignored: U) -> T => value
+    from_outer(0)
+
+let descend = (count: i64, value: str) -> str =>
+    let repeat[T] = (left: i64, item: T) -> T =>
+        if left == 0 then item else repeat(left - 1, item)
+    repeat(count, value)
+
+let stack: Stack[i64] = Stack.new()
+let built = Stack.from([7, 8])
+let doubled = [1, 2].map((value: i64) -> i64 => value * 2)
+print(stack.items.len(), built.items, " hi ".trim(), doubled)
+print(Token.create())
+work()
+print(outer(4), outer("outer"), descend(2, "recursive"))

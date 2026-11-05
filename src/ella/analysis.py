@@ -10,12 +10,17 @@ from pathlib import Path
 
 from ella.checker import (
     BUILTIN_TYPES,
+    GENERIC_LIBRARY,
     LIBRARY,
     PRIMITIVE_NAMES,
+    RANGE,
+    STR,
+    BuiltinTy,
     Checker,
     EnumTy,
     Env,
     FuncTy,
+    ListTy,
     ParamTy,
     Type,
     VarInfo,
@@ -451,8 +456,22 @@ class Checked:
 
     def members(self, member: Member) -> list[Completion]:
         """The fields and methods of the value before `.`."""
+        if isinstance(member.target, Name):
+            name_info = self.checker.resolved.get(id(member.target))
+            enum_name = (
+                name_info.enum
+                if name_info is not None and name_info.kind in ("constructor", "variant")
+                else member.target.name
+                if name_info is None
+                else ""
+            )
+            enum = self.checker.enums.get(enum_name)
+            if enum is not None and enum.static_methods:
+                return [Completion(name, "method", show_type(method)) for name, method in enum.static_methods.items()]
+
         t = self.type_of(member.target)
-        match resolve(t) if t is not None else None:
+        value_type = resolve(t) if t is not None else None
+        match value_type:
             case EnumTy(name, args):
                 info = self.checker.enums[name]
                 params = dict(zip(info.params, args))
@@ -465,14 +484,83 @@ class Checked:
                     Completion(method, "method", show_type(substitute(method_type, params)))
                     for method, method_type in info.methods.items()
                 ]
-                return found
+                assert value_type is not None
+                return found + self.extension_members(value_type, {item.label for item in found})
             case ParamTy(_, constraints) as param:
-                return [
+                found = [
                     Completion(method, "method", show_type(substitute(method_type, {"Self": param})))
                     for constraint in sorted(constraints)
                     for method, method_type in self.checker.constraints.get(constraint, {}).items()
                 ]
+                assert value_type is not None
+                return found + self.extension_members(value_type, {item.label for item in found})
+            case _ if value_type is not None:
+                return self.extension_members(value_type, set())
         return []
+
+    def extension_members(self, receiver: Type, seen: set[str]) -> list[Completion]:
+        """Receiver-first built-in and standard-library functions applicable to a value."""
+        found = []
+        names = set(self.checker.extension_functions) | set(LIBRARY) | {"len"}
+        for name in sorted(names - seen):
+            if name == "len":
+                value_type = resolve(receiver)
+                if (
+                    isinstance(value_type, ListTy)
+                    or value_type in (STR, RANGE)
+                    or isinstance(value_type, BuiltinTy)
+                    and value_type.name in ("Array", "Pool", "Arena")
+                ):
+                    found.append(Completion(name, "method"))
+                continue
+            candidates: list[tuple[FuncTy, tuple[str, ...], tuple[tuple[str, ...], ...]]] = []
+            if name in LIBRARY:
+                constraints: tuple[tuple[str, ...], ...] = (
+                    ((GENERIC_LIBRARY[name],),) if name in GENERIC_LIBRARY else ()
+                )
+                candidates.append((LIBRARY[name], ("T",) if name in GENERIC_LIBRARY else (), constraints))
+            else:
+                for function_name in self.checker.extension_functions.get(name, ()):
+                    info = self.checker.globals.vars.get(function_name)
+                    if info is not None and isinstance(info.type, FuncTy):
+                        candidates.append((info.type, info.type_params, info.constraints))
+            for function, type_params, constraints in candidates:
+                if not isinstance(function, FuncTy) or not function.params:
+                    continue
+                receiver_pattern = function.params[0]
+                type_args: dict[str, Type] = dict(zip(type_params, (self.checker.fresh() for _ in type_params)))
+                if type_params:
+                    specialized = substitute(function, type_args)
+                    assert isinstance(specialized, FuncTy)
+                    function = specialized
+                if self.checker.can_unify(receiver, function.params[0]):
+                    inferred: dict[str, Type] = {}
+
+                    def bind(
+                        pattern: Type,
+                        value: Type,
+                        type_params: tuple[str, ...] = type_params,
+                        inferred: dict[str, Type] = inferred,
+                    ) -> None:
+                        pattern, value = resolve(pattern), resolve(value)
+                        if isinstance(pattern, ParamTy) and pattern.name in type_params:
+                            inferred[pattern.name] = value
+                        elif isinstance(pattern, ListTy) and isinstance(value, ListTy):
+                            bind(pattern.element, value.element)
+                        elif isinstance(pattern, EnumTy) and isinstance(value, EnumTy) and pattern.name == value.name:
+                            for left, right in zip(pattern.args, value.args):
+                                bind(left, right)
+
+                    bind(receiver_pattern, receiver)
+                    if any(
+                        param in inferred
+                        and any(self.checker.unmet(inferred[param], need) is not None for need in needs)
+                        for param, needs in zip(type_params, constraints)
+                    ):
+                        continue
+                    found.append(Completion(name, "method"))
+                    break
+        return found
 
 
 def walk(node: object) -> Iterator[object]:

@@ -371,6 +371,12 @@ class Linker:
         self.load(module)
         return module
 
+    def extension_function(self, name: str, span: Span) -> None:
+        """Load the prelude function that may serve as a built-in receiver method."""
+        item = prelude().get(name)
+        if item is not None and item.kind == "function":
+            self.library(item.module, span)
+
     def check_cycle(self, module: Module, span: Span) -> None:
         """A module being loaded can't be imported again by one of its imports."""
         if any(m is module for m in self.loading):
@@ -741,17 +747,26 @@ class Resolver:
             node = node.target
         members.reverse()
         if not isinstance(node, Name) or node.name == "return" or scope.value(node.name) is not None:
+            self.linker.extension_function(expr.name, expr.span)
             return rebuild(expr, lambda part: self.part(part, scope))  # type: ignore[return-value]
         path = [(node.name, node.span)] + [
             (m.name, Span(m.span.line, m.span.column + 1, m.span.file)) for m in members
         ]
         found = self.path_item(path)
         if found is None:
-            result: Expr = Name(self.value_name(node.name, node.span, scope), node.span)
+            type_item = self.module.top.get(node.name)
+            if node.name in scope.types or (type_item is not None and type_item.kind == "enum"):
+                result: Expr = Name(type_item.name if type_item is not None else node.name, node.span)
+            else:
+                self.linker.extension_function(members[-1].name, members[-1].span)
+                result = Name(self.value_name(node.name, node.span, scope), node.span)
             taken = 1
         else:
             item, taken = found
-            result = Name(self.use_value(item, path[taken - 1][1]), path[taken - 1][1])
+            value = (
+                item.name if item.kind == "enum" and taken < len(path) else self.use_value(item, path[taken - 1][1])
+            )
+            result = Name(value, path[taken - 1][1])
         for member in members[taken - 1 :]:
             result = Member(result, member.name, member.span)
         return result

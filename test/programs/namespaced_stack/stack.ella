@@ -1,0 +1,7 @@
+struct Stack[T]
+    items: [T]
+    new = () -> Stack[T] => Stack([])
+
+enum Token
+    End
+    create = () -> Token => End

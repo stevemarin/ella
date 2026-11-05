@@ -30,7 +30,7 @@ stack traces, errors with causes and locations, and `main` giving a
 | Native code | x64 assembly plus a C runtime with real arenas, and SSA register allocation; byte-for-byte the same output and errors as the interpreters |
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers, generators that keep their frame and levels in the `Gen` |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
-| User types | Structs, enums, methods, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
+| User types | Structs, enums, instance and type-namespace functions, receiver calls for compatible prelude functions, operators (`add`, `compare`, ...), protocols (`get`, `set`, `iter`, `next`, `contains`, `len`); generators (`yield`, `Gen[T]`, `next`) |
 | Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `log10`, `log2`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `sets`, `strings`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `fold`, `flatten`, `flat_map`, `position`, `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`, `max_by`, `partition`, `chunks`, `unique`, `map_of`, `group_by`, `counts`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, `tau`, `e`, `inf`, `nan`, `Map[K, V]` and `Set[T]`, and strings (`repeat`, `lines`, `words`, `trim_start`, `trim_end`, `strip_prefix`, `strip_suffix`, `split_once`, `count_of`, `is_digit`, `is_alpha`, `is_space`); lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules; packages found on a package path (`--path`, `ELLA_PATH`) |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
@@ -87,9 +87,8 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 - Top-level functions and methods must give their whole type, even
   `let f: (i64) -> i64 = (x) => x + 1`, whose declared type could supply
   it. Lambdas with inferred types have one type, decided by their first
-  use; only top-level generic functions can be used at several.
+  use; generic functions bound with `let` can be used at several types.
 - `print` and `eprint` as values take one argument, not any number.
-- Generic functions must be top-level; there are no generic lambdas.
 - The numbers are `i64`, `i32`, `f64` and `f32` (and `Array[T]` of them);
   no `i8`, `i16` or fixed-size SIMD vector types, and no f32 literals.
 - No negative indexing (deliberate for now).
@@ -129,8 +128,6 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   its keys.
 - The AST interpreter runs each generator on a thread of its own, so
   recursion through thousands of generators is slow there.
-- No functions in a type's namespace that don't take a value
-  (`Stack.new()`), and no methods on built-in types (`xs.len()`).
 - Constraints can't require other constraints or operators
   (`constraint Ring: Add`), and `Num` is only met by `i64` and `f64`.
 - Protocol method names (`get`, `set`, `iter`, `add`, ...) are reserved for

@@ -176,7 +176,11 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
   and `in` (`contains`), and programs can define their own
   constraints, which any type with the right methods meets
   (`constraint Shape` with `area: (Self) -> f64`, then `let total[T: Shape]`).
-  See [docs/grammar.md](docs/grammar.md) §9.
+  Functions in a type's namespace can be called without a receiver
+  (`Stack.new()`), and compatible prelude functions can be called on their
+  first argument (`xs.map(f)`, `" text ".trim()`). Local `let`-bound
+  generic functions can specialize at several types while capturing local
+  values. See [docs/grammar.md](docs/grammar.md) §9.
 * Programs can read input (`read_line`, `read_file`, `args`), convert and
   parse numbers, and work with strings (`split`, `join`, `find`,
   `replace`, `trim`, `chars`, slices like `s[1..3]`)

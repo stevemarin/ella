@@ -1,0 +1,4 @@
+import stack
+
+let value: stack.Stack[i64] = stack.Stack.new()
+print(value.items.len(), " hi ".trim(), stack.Token.create())

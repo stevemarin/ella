@@ -69,6 +69,7 @@ from ella.syntax import (
     Assert,
     Assign,
     Binary,
+    Binding,
     BoolLit,
     Break,
     Call,
@@ -214,6 +215,15 @@ class PendingFunction:
 
 
 @dataclass(slots=True)
+class LocalGeneric:
+    """A local generic function template and the values it captures at its binding."""
+
+    name: str
+    captures: tuple[tuple[str, str], ...]
+    self_names: list[str]
+
+
+@dataclass(slots=True)
 class Carried:
     """A variable a loop carries between iterations: its name, its kind outside the loop, and its slot inside it."""
 
@@ -276,6 +286,8 @@ class Lowerer:
         self.module.tables.add(checker)
         self.pending: list[PendingFunction] = []
         self.subst: dict[str, Type] = {}  # in a specialized generic function: its type arguments
+        self.local_generics: dict[int, LocalGeneric] = {}
+        self.local_generic_ids = count(1)
         self.quotes: list[Value] = []  # the `quote_begin`s of the quotes whose splices are being lowered
         self.globals_changed: set[str] = set()  # globals changed in place anywhere
 
@@ -814,6 +826,29 @@ class Lowerer:
         self.pending.append(PendingFunction(function, name, captures, self_names, t, self.subst))
         return self.emit("closure", t, captured, span, name, region=region)
 
+    def lower_local_generic(self, bindings: tuple[Binding, ...], function: Lambda, span: Span) -> None:
+        """Register a local generic function and snapshot its lexical captures."""
+        visible: dict[str, str] = {}
+        for scope in self.scopes:
+            visible.update(scope)
+        used = names_in(function)
+        visible = {
+            name: slot
+            for name, slot in visible.items()
+            if name in used and (slot == SELF or not self.nocopy(self.function.locals[slot]))
+        }
+        captures = []
+        for index, (name, _) in enumerate(visible.items()):
+            value = self.place(self.read_local(name, span), self.here(), span, mutable=False)
+            slot_name = f"\0generic.{id(bindings[0])}.{index}"
+            self.bind(slot_name, value, span)
+            captures.append((name, slot_name))
+        generic_name = f"{bindings[0].name}.local.{next(self.local_generic_ids)}"
+        self.module.generics[generic_name] = (function, bindings[0].type_params)
+        local = LocalGeneric(generic_name, tuple(captures), [binding.name for binding in bindings])
+        for binding in bindings:
+            self.local_generics[id(binding)] = local
+
     def lower_function(self, pending: PendingFunction) -> None:
         """Make the IR function for a lambda: captures and parameters, `where`, body, and exit."""
         function, t = pending.function, pending.type
@@ -993,6 +1028,8 @@ class Lowerer:
             # Variables
             case Name(name):
                 kind = self.checker.kinds[id(expr)]
+                if kind == "local" and any(scope.get(name) == SELF for scope in reversed(self.scopes)):
+                    return self.read_name(name, kind, span, dest)
                 if kind == "variant":
                     return self.emit("variant", self.type_of(expr), [], span, name, region=dest)
                 if (wrapper := self.checker.wrappers.get(id(expr))) is not None:
@@ -1004,6 +1041,16 @@ class Lowerer:
                         self.scopes = scopes
                 if id(expr) in self.checker.instances:
                     args = tuple(self.concrete(arg) for arg in self.checker.instances[id(expr)])
+                    binding = self.checker.resolved[id(expr)].binder
+                    if isinstance(binding, Binding) and id(binding) in self.local_generics:
+                        local = self.local_generics[id(binding)]
+                        captured = [
+                            self.place(self.read_local(slot, span), dest, span, mutable=False)
+                            for _, slot in local.captures
+                        ]
+                        captures = [(name, value.type) for (name, _), value in zip(local.captures, captured)]
+                        function = self.specialize(local.name, args, span, captures, local.self_names, self.subst)
+                        return self.emit("closure", self.type_of(expr), captured, span, function, region=dest)
                     function = self.specialize(name, args, span)
                     return self.emit("closure", self.type_of(expr), [], span, function, region=dest)
                 if kind == "builtin":  # a library function as a value
@@ -1012,6 +1059,9 @@ class Lowerer:
                     return self.emit("closure", t, [], span, self.library_function(name, t, span), region=dest)
                 return self.read_name(name, kind, span, dest)
             case Let(bindings, value_expr):
+                if bindings[0].type_params and isinstance(value_expr, Lambda) and self.scopes:
+                    self.lower_local_generic(bindings, value_expr, span)
+                    return self.const((), span)
                 t = self.type_of(value_expr)
                 region = self.home(bindings[0].name, t, id(bindings[0]))
                 if isinstance(value_expr, Lambda):
@@ -1500,11 +1550,26 @@ class Lowerer:
             if is_builtin_error(self.checker.enums, self.checker.resolved[id(callee)].enum):
                 items = self.error_fields(items, span, dest)
             return self.build("variant", self.type_of(expr), items, span, dest, callee.name)
-        if isinstance(callee, Member) and id(callee) in self.checker.methods:
+        if isinstance(callee, Member) and id(callee) in self.checker.static_methods:
+            enum_name, name, type_args = self.checker.static_methods[id(callee)]
+            function = self.namespace_method(enum_name, name, type_args, span)
+        elif isinstance(callee, Member) and id(callee) in self.checker.methods:
             # `v.name(args)` calls v's method with v first. A `mut v` is passed like any `mut` argument.
             receiver = callee.target
             function = self.method(self.type_of(receiver), callee.name, span)
             args = (receiver, *args)
+        elif isinstance(callee, Member) and id(callee) in self.checker.builtin_methods:
+            name = self.checker.builtin_methods[id(callee)]
+            return self.lower_builtin(expr, name, (callee.target, *args), span, dest)
+        elif isinstance(callee, Member) and id(callee) in self.checker.extension_methods:
+            name = self.checker.extension_methods[id(callee)]
+            if id(callee) in self.checker.instances:
+                type_args = tuple(self.concrete(arg) for arg in self.checker.instances[id(callee)])
+                function_name = self.specialize(name, type_args, span)
+                function = self.emit("closure", self.type_of(callee), [], span, function_name, region=dest)
+            else:
+                function = self.read_name(name, "global", span, dest)
+            args = (callee.target, *args)
         else:
             function = self.lower(callee)
         values: list[Value] = []
@@ -1519,6 +1584,15 @@ class Lowerer:
                 # needs protecting from the call itself, as well as from later arguments.
                 values.append(self.protect(self.lower(arg), args[i + 1 :], arg.span, calls=True))
         return self.emit_call(function, values, places, self.type_of(expr), span, dest)
+
+    def namespace_method(self, enum: str, name: str, args: tuple[Type, ...], span: Span) -> Value:
+        """A generic function in a type's namespace, without a receiver."""
+        key = f"{enum}.{name}"
+        type_args = tuple(self.concrete(arg) for arg in args)
+        function_name = self.specialize(key, type_args, span)
+        function, params = self.module.generics[key]
+        function_type = self.generic_type(function, dict(zip(params, type_args)))
+        return self.emit("closure", function_type, [], span, function_name, region=self.here())
 
     def emit_call(
         self, function: Value, values: list[Value], places: list[MutPlace], t: Type, span: Span, dest: str
@@ -1728,7 +1802,15 @@ class Lowerer:
         self.emit_call(function, [container, key, value], [place], UNIT, span, self.here())
         return value
 
-    def specialize(self, name: str, args: tuple[Type, ...], span: Span) -> str:
+    def specialize(
+        self,
+        name: str,
+        args: tuple[Type, ...],
+        span: Span,
+        captures: list[tuple[str, Type]] | None = None,
+        self_names: list[str] | None = None,
+        outer_subst: dict[str, Type] | None = None,
+    ) -> str:
         """The IR function for a generic function with these type arguments: `first[i64]`.
 
         A method of a type without type parameters is just `Point.norm`.
@@ -1740,9 +1822,16 @@ class Lowerer:
                 raise EllaError(f"{name} is used with too many different types", span)
             specialized = f"{name}[{', '.join(show_type(arg) for arg in args)}]" if params else name
             self.module.specializations[key] = specialized
-            subst = dict(zip(params, args))
+            subst = (outer_subst or {}) | dict(zip(params, args))
             self.pending.append(
-                PendingFunction(function, specialized, [], [], self.generic_type(function, subst), subst)
+                PendingFunction(
+                    function,
+                    specialized,
+                    captures or [],
+                    self_names or [],
+                    self.generic_type(function, subst),
+                    subst,
+                )
             )
         return self.module.specializations[key]
 

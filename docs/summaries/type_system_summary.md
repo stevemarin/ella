@@ -41,8 +41,9 @@ concrete type meets a constraint structurally when the methods and
 signatures match; there is no separate implementation declaration. This
 keeps generic dispatch static: specialized functions call concrete methods,
 and the current backend does not need runtime dictionaries or virtual
-dispatch. Generic functions are currently top-level; generic lambdas are
-not supported.
+dispatch. A generic function can be bound locally with `let`; it may capture
+local values, and is specialized independently at each use. This is a
+generic function binding, not an anonymous polymorphic function value.
 
 Specialization/monomorphization means each concrete instantiation can produce
 its own IR function. This simplifies runtime representation and optimization,
@@ -53,12 +54,16 @@ in the same checker machinery.
 
 ## Methods, operators, and protocols
 
-Methods are associated with struct or enum types. A method call resolves
-from the receiver's checked type and is recorded in checker tables for
-lowering. Operator methods provide defined behavior for user types (for
-example, `add` for `+` and `compare` for ordering). Built-in types retain
-their built-in operator paths. The checker validates method signatures and
-operator requirements before lowering.
+Methods are associated with struct or enum types. A function whose first
+parameter is the owning type is an instance method; one without that
+receiver is a type-namespace function such as `Stack.new()`. Instance
+method calls resolve from the receiver's checked type and are recorded in
+checker tables for lowering. Operator methods provide defined behavior for
+user types (for example, `add` for `+` and `compare` for ordering).
+Compatible receiver-first prelude functions can also be called as
+`value.function(args)`; these lower to ordinary calls with the value
+prepended. The checker validates method signatures and operator
+requirements before lowering.
 
 Protocols such as `get`, `set`, `iter`, `next`, `contains`, and `len` are
 also structural conventions: syntax or built-ins select the corresponding
@@ -103,8 +108,8 @@ lowering, IR type verification, and tests for all execution paths. Keep
 diagnostics tied to source spans. Be especially cautious where a new feature
 affects both type equality and runtime representation.
 
-Known limits include top-level-only generics, conservative name-based
-exclusivity, limitations in exhaustiveness reasoning over integer ranges,
-and no constraint-local method requirements beyond the currently modeled
-signatures. Consult TODO.md and grammar open questions for current status.
-
+Known limits include no anonymous polymorphic function values, conservative
+name-based exclusivity, limitations in exhaustiveness reasoning over integer
+ranges, and no constraint-local method requirements beyond the currently
+modeled signatures. Consult TODO.md and grammar open questions for current
+status.

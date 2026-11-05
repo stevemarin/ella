@@ -153,7 +153,15 @@ def test_completing_fields_and_methods() -> None:
         ("x", "property", "f64"),
         ("y", "property", "f64"),
         ("norm2", "method", "(Point) -> f64"),
+        ("hash", "method", ""),
     ]
+
+
+def test_completing_type_namespace_and_receiver_functions() -> None:
+    source = "struct Stack[T]\n    items: [T]\n    new = () -> Stack[T] => Stack([])\nprint(Stack.\n"
+    assert names(source, 4, 13) == ["new"]
+    assert {"map", "len"} <= set(names("let xs = [1, 2]\nprint(xs.\n", 2, 10))
+    assert {"trim", "upper"} <= set(names('print("text".\n', 1, 14))
 
 
 def test_no_completions_in_strings_or_comments() -> None:

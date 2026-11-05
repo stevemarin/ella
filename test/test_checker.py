@@ -566,10 +566,6 @@ def test_struct_and_generic_types() -> None:
             "'p' is passed as 'mut', so it can't also be used in another argument of the same call",
         ),
         ("struct P\n    x: i64\nP(1).y", "P has no field 'y'"),
-        (
-            "let f = () -> () =>\n    let g[T] = (x: T) -> T => x\n    ()",
-            "only a top-level function can have type parameters",
-        ),
         ("let add[T] = (a: T, b: T) -> T => a + b", "'+' on T needs the constraint Add, like [T: Add]"),
         (
             "let n = 3\nlet c = $(if n > 2 then quote 1 else quote 2)",
@@ -691,6 +687,29 @@ def test_constrained_generics() -> None:
     assert type_of(source) == "i64"
 
 
+def test_local_generic_functions() -> None:
+    source = "let apply = (x: i64) -> i64 =>\n    let id[T] = (y: T) -> T => y\n    id(x)\napply(3)"
+    assert type_of(source) == "i64"
+
+
+def test_type_namespace_functions() -> None:
+    source = (
+        "struct Stack[T]\n"
+        "    items: [T]\n"
+        "    new = () -> Stack[T] => Stack([])\n"
+        "let stack: Stack[i64] = Stack.new()\n"
+        "stack.items"
+    )
+    assert type_of(source) == "[i64]"
+    assert type_of("enum Token\n    End\n    create = () -> Token => End\nToken.create()") == "Token"
+    assert type_of("struct P\n    f = (n: i64) -> i64 => n\nP.f(3)") == "i64"
+
+
+def test_builtin_receiver_methods() -> None:
+    assert prepared_type_of("[1, 2].map((x: i64) -> i64 => x * 2)") == "[i64]"
+    assert prepared_type_of('" a ".trim()') == "str"
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [
@@ -760,14 +779,6 @@ def test_methods() -> None:
     ("source", "message"),
     [
         ("struct P\n    x: i64\n    f = 3", "a method must be a function, like 'f = (x: P) -> ... => ...'"),
-        (
-            "struct P\n    x: i64\n    f = (n: i64) -> i64 => n",
-            "a method's first parameter is the value it is called on, so it must be a P",
-        ),
-        (
-            "struct P[T]\n    x: T\n    f = (p: P[i64]) -> i64 => 1",
-            "a method's first parameter is the value it is called on, so it must be a P[T]",
-        ),
         ("struct P\n    x: i64\n    x = (p: P) -> i64 => 1", "'x' is already a field of P"),
         (
             "struct P\n    x: i64\n    compare = (p: P, q: P) -> bool => true",

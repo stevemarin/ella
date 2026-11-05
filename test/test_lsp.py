@@ -238,7 +238,7 @@ def test_server_completes_names_and_members() -> None:
         async with server() as client:
             client.open(PROGRAM + "print(twice.\n")
             await client.diagnostics()
-            assert await client.completions(6, 12) == ["x", "y"]
+            assert await client.completions(6, 12) == ["x", "y", "hash"]
             names = await client.completions(4, 43)  # the start of the body
             assert names[:3] == ["p", "k", "scale"]
             assert "twice" in names

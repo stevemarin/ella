@@ -605,7 +605,7 @@ Template-style parameters checked at each use remain possible later, for
 code that constraints can't express.
 
 Later, structs and enums got **methods**, and programs their own
-constraints ([grammar.md §9](grammar.md#methods-provisional-syntax)). A
+constraints ([grammar.md §9](grammar.md#methods)). A
 method is a function of its type's parameters, specialized like a generic
 function (`Stack.push[i64]`), so a method call is a direct call even
 through a constraint: dispatch stays static, as §8 asks. A user-defined
@@ -618,6 +618,14 @@ place can be one; `iter` makes a list (or str, or range) to loop over,
 the simplest choice, at the cost of the memory for it. An operator on
 such a type is a call, which may change globals, so the lowering's
 analysis of what changes in place counts it as one.
+
+Type bodies also hold namespace functions: a function whose first
+parameter is not the owning type is called as `Stack.new()`, with no
+implicit receiver. Such functions can use the owning type's parameters.
+Generic `let`-bound functions can also be local; each use specializes the
+function, while its local captures are copied into the generated closure.
+Calls like `xs.map(f)` are resolved to compatible receiver-first prelude
+functions and lowered as ordinary direct calls, not runtime method lookup.
 
 ### Structs
 

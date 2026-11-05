@@ -637,7 +637,7 @@ let found = loop
 
 * `for pattern in expr` iterates over a list, string, or range, a
   generator ([§9](#generators-provisional-syntax)), or a struct or enum
-  with an `iter` or `next` method ([§9](#methods-provisional-syntax)). The
+  with an `iter` or `next` method ([§9](#methods)). The
   pattern must match every item, as a `let`'s must.
 * `for pattern in mut place` advances an iterator or generator that is a
   `mut` variable (or an element of one), in place: after a `break`, it
@@ -779,7 +779,7 @@ returns `None`. The enclosing function's return type must be compatible.
   indexing)**. Indexing a string gives a one-character string; strings count
   Unicode code points, and can't be assigned into. Pools are indexed with
   handles, arenas with refs, and structs and enums with `get` and `set` methods with any key
-  ([§9](#methods-provisional-syntax)).
+  ([§9](#methods)).
 * `a[i, j]` is `a[(i, j)]`: indexing with a tuple. An array takes one `i64`
   for each of its dimensions ([§9](#arrays-provisional-syntax)), and a
   type with `get` and `set` methods can take tuple keys this way: `grid[1, 2]`.
@@ -862,8 +862,12 @@ let found = None         # Optional of something; used as Optional[str] later
 * `print`, `eprint` and `len` are values too, taking one argument
   (`map(xs, print)`), as are variant constructors (`map(xs, Some)`, or
   `let make = Point`) and library functions like `trim`
-  ([§10](#10-built-ins)). The other built-ins can only be called.
-* Enums, structs and top-level functions can be generic.
+  ([§10](#10-built-ins)). A prelude function whose first argument accepts
+  a value can also be called as `value.function(args)`, for example
+  `" hello ".trim()` or `[1, 2].map(f)`. The other built-ins can only be
+  called.
+* Enums and structs can be generic. Top-level and local functions can also
+  have type parameters.
 
 ### Warnings
 
@@ -935,11 +939,12 @@ match p
   the same way.
 * Structs are values, like everything else: `let q = p` copies.
 
-### Methods **(provisional syntax)**
+### Methods
 
 A struct or enum can define functions of its own, *methods*, alongside its
-fields or variants. A method takes the value it is called on as its first
-parameter, and is called with `value.name(...)`:
+fields or variants. A function whose first parameter is the type is an
+instance method, called with `value.name(...)`. A function without that
+receiver is in the type's namespace and is called with `Type.name(...)`:
 
 ```ella
 struct Point
@@ -949,10 +954,12 @@ struct Point
     move = (mut p: Point, dx: f64, dy: f64) -> () =>
         p.x += dx
         p.y += dy
+    origin = () -> Point => Point(0.0, 0.0)
 
 let mut p = Point(3.0, 4.0)
 print(p.norm2())          # 25.0
 mut p.move(1.0, 0.0)      # p is Point(4.0, 4.0)
+print(Point.origin())
 
 enum Shape
     Circle(f64)
@@ -963,13 +970,15 @@ enum Shape
             case Rect(w, h) => w * h
 ```
 
-* A method's first parameter must be of its type: `Point`, or `Stack[T]`
-  in `struct Stack[T]`. A method of a generic type is generic in the
-  type's parameters, and is specialized for each set of type arguments it
-  is used with, like a generic function.
+* An instance method's first parameter must be of its type: `Point`, or
+  `Stack[T]` in `struct Stack[T]`. A method of a generic type is generic in
+  the type's parameters, and is specialized for each set of type arguments
+  it is used with, like a generic function. Namespace functions have no
+  implicit receiver, and can use those same type parameters.
 * Each type has its own methods, so different types can have methods with
   the same name. A method can't have the name of a field, and only
-  top-level structs and enums can have methods.
+  top-level structs and enums can have methods. Protocol methods such as
+  `get`, `set` and `iter` must be instance methods.
 * A method whose first parameter is `mut` changes the value it is called
   on, which is marked as for any `mut` argument: `mut p.move(1.0, 0.0)`.
   The value must be a place: a `mut` variable, or a field or item of one
@@ -1285,20 +1294,28 @@ work()                 # prints: working, closing app
   before the fields it holds.
 * If the program stops with an error, finalizers don't run.
 
-### Generic functions **(provisional syntax)**
+### Generic functions
 
-A top-level function can have type parameters, after its name:
+A function bound with `let` can have type parameters after its name, either
+at the top level or inside another function:
 
 ```ella
 let first[T] = (xs: [T]) -> T => xs[0]
 let swap[A, B] = (p: Pair[A, B]) -> Pair[B, A] => Pair(p.second, p.first)
+
+let use = (prefix: str) -> str =>
+    let tag[T] = (value: T) -> str => prefix
+    tag(1)
 
 print(first([1, 2]))       # T is i64
 print(first(["a"]))        # T is str
 ```
 
 * The type arguments are inferred from each use. Each different set of
-  them makes a separate copy of the function when compiling.
+  them makes a separate copy of the function when compiling. A local
+  generic function can call itself recursively and captures local values
+  by copy, like any other lambda; its type parameters are not available as
+  an anonymous polymorphic function value.
 * Inside the function, a type parameter is a type of its own, which only
   matches itself. Values of type `T` can be passed around, stored and
   printed; anything more needs a *constraint*.
@@ -1586,7 +1603,7 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
   is its length and, unless empty, its start; a ref is its index; and an
   `Error` leaves out where it was made, as `==` does; an array is the
   tuple of its shape and its items. A struct or enum
-  with a `hash` method ([§9](#methods-provisional-syntax)) hashes to what
+  with a `hash` method ([§9](#methods)) hashes to what
   it gives, wherever it is.
 * Numbers are written in ASCII only, with no `_` and no spaces around them:
   `parse_i64(trim(line))` reads a number on a line of its own.
@@ -1609,7 +1626,7 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
   `"0"`), and one it can't hold exactly goes by the value it does hold
   (`format_f64(2.675, 2)` is `"2.67"`).
 * `abs`, `min` and `max` work on two `i64`s or two `f64`s, like a generic
-  function with `[T: Num]` ([§9](#generic-functions-provisional-syntax)).
+  function with `[T: Num]` ([§9](#generic-functions)).
   Their definitions say what happens with NaN and `-0.0`: `min(nan, 1.0)`
   is NaN, `min(1.0, nan)` is `1.0`, and `min(0.0, -0.0)` is `0.0`.
 
@@ -1622,7 +1639,7 @@ a ref `<ref 2>` (which of the arena's values it is), a generator `<gen>`, and co
 with the code as an S-expression.
 
 Structs and enums can give themselves `len`, operators, indexing,
-iteration, `in` and their text form with methods ([§9](#methods-provisional-syntax)).
+iteration, `in` and their text form with methods ([§9](#methods)).
 A `Map` or `Set` is written as its literal is: `{"a": 1}`, `{1, 2}`.
 
 `assert expr` is a keyword expression rather than a function, so that a
@@ -1710,7 +1727,7 @@ itself. They can also be imported like any module
 | `pi`, `tau`, `e` | `f64` | 3.141592653589793, 6.283185307179586 (2π) and 2.718281828459045 |
 | `inf`, `nan` | `f64` | infinity (`1.0 / 0.0`) and not a number (`0.0 / 0.0`) |
 
-They are ordinary generic functions ([§9](#generic-functions-provisional-syntax)),
+They are ordinary generic functions ([§9](#generic-functions)),
 so they are values too, and a type given to `sort` must be `Ord`: a
 number, a string, or a struct or enum with a `compare` method. With pipes
 they read left to right: `words |> filter(long) |> map(upper)`.
@@ -1731,7 +1748,7 @@ what `trim` removes: space, `\t`, `\n`, `\r`, `\v` and `\f`.
 
 `Map[K, V]` is a struct ([§9](#structs-provisional-syntax)) mapping keys to
 values, kept in the order the keys were first set, with protocol methods
-([§9](#methods-provisional-syntax)):
+([§9](#methods)):
 
 ```ella
 let mut ages = new_map()       # a Map[str, i64], once it is used
@@ -1763,7 +1780,7 @@ for name in ages               # the keys, in order
   it has none.
 * `m.merge(other)` has the keys of `m`, then the new ones of `other`, with
   `other`'s values where both have a key.
-* `Map` has `update` ([§9](#methods-provisional-syntax)), so as a line,
+* `Map` has `update` ([§9](#methods)), so as a line,
   `m[k] += [x]` adds to the list in place, and `m[k].count += 1` changes
   a field of a struct in the map; the key must be there already.
 * Keys are told apart by `==`, finding them by their `hash`. So `0.0` and
@@ -2103,12 +2120,8 @@ Parsing notes:
   and slices of arrays.
 * Whether iteration should use a stateful iterator (`next`) rather than
   making a list.
-* Methods for built-in types (`xs.len()`), and functions in a type's
-  namespace that don't take a value of it (`Stack.new()`).
 * Whether a constraint should be able to require other constraints, or
   operators (`constraint Ring: Add` ...).
-* Generic functions inside functions. Generic functions currently support
-  the built-in constraints `Eq`, `Ord`, `Add` and `Num`.
 * Whether `comptime` (still reserved) is worth having as shorthand for a
   splice, now that staging uses `quote` and `$`.
 * Compile-time type parameters checked at each use, for template-style

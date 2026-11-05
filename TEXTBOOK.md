@@ -1569,6 +1569,39 @@ Ella generic functions specify constraints: `let total[T: Shape] = (items: [T]) 
     type arguments used. This avoids generic runtime dispatch; values still use
     their ordinary runtime representations, including boxed representations where
     required.
+- A generic function can be bound inside another function with `let`, capture
+    locals by copy, and specialize separately at each call:
+
+    ```ella
+    let with_prefix = (prefix: str) -> str =>
+        let tag[T] = (_value: T) -> str => prefix
+        tag(42)
+    ```
+
+    The binding is polymorphic at its uses, but the language does not create an
+    anonymous polymorphic function value.
+
+### Methods and Type Namespaces
+
+A type body can define instance methods and namespace functions. A function
+whose first parameter is the owning type is called with that value as receiver;
+a function without that parameter is called through the type name:
+
+```ella
+struct Stack[T]
+    items: [T]
+    new = () -> Stack[T] => Stack([])
+    count = (s: Stack[T]) -> i64 => s.items.len()
+
+let stack: Stack[i64] = Stack.new()
+print(stack.count())
+```
+
+The checker records the distinction and lowering specializes namespace
+functions using the enclosing type's arguments. The prelude has receiver-style
+calls too: `[1, 2].map(f)` is resolved to the applicable `map` function and
+lowered as a call with the list prepended. This provides methods on built-in
+values without adding runtime virtual dispatch.
 
 ### Static Law of Exclusivity for `mut` Parameters
 

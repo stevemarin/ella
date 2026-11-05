@@ -158,6 +158,14 @@ def test_methods_come_with_their_type(tmp_path: Path) -> None:
     assert run(tmp_path, files) == "9\n"
 
 
+def test_type_namespace_functions_are_imported_with_their_type(tmp_path: Path) -> None:
+    files = {
+        "stack.ella": "struct Stack[T]\n    items: [T]\n    new = () -> Stack[T] => Stack([])\n",
+        "main.ella": "import stack\nlet value: stack.Stack[i64] = stack.Stack.new()\nprint(value.items)\n",
+    }
+    assert run(tmp_path, files) == "[]\n"
+
+
 def test_each_module_runs_once_and_imports_first(tmp_path: Path) -> None:
     files = {
         "log.ella": 'print("log")\nlet lines = ["first"]\n',

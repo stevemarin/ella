@@ -62,6 +62,16 @@ def test_functions_print() -> None:
     assert value("() -> () => ()") == "<function>"
 
 
+def test_unchecked_interpreter_runs_namespace_and_receiver_calls() -> None:
+    source = (
+        "struct Stack[T]\n"
+        "    items: [T]\n"
+        "    new = () -> Stack[T] => Stack([])\n"
+        'let stack: Stack[i64] = Stack.new()\nprint(stack.items.len(), " hi ".trim())\n'
+    )
+    assert output(source) == ["0 hi"]
+
+
 # Operators
 
 

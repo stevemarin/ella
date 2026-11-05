@@ -7,7 +7,7 @@ from functools import partial
 from itertools import count
 
 from ella.exhaustive import missing, redundant
-from ella.lexer import EllaError, Span
+from ella.lexer import STD, EllaError, Span
 from ella.syntax import (
     Assert,
     Assign,
@@ -71,6 +71,7 @@ from ella.syntax import (
     While,
     WildcardPattern,
     Yield,
+    bare_name,
     is_generator,
     mentions_return,
     parts,
@@ -319,7 +320,7 @@ def substitute(t: Type, params: dict[str, Type]) -> Type:
     """Replace the type parameters in `t`: `Some(T)` with T = i64 has a field of type i64."""
     match t:
         case ParamTy(name):
-            return params[name]
+            return params.get(name, t)
         case ListTy(element):
             return ListTy(substitute(element, params))
         case TupleTy(items):
@@ -417,6 +418,7 @@ class EnumInfo:
     # constraints in `constraints` (one tuple per type parameter, or none).
     methods: dict[str, FuncTy] = field(default_factory=dict)
     constraints: tuple[tuple[str, ...], ...] = ()
+    static_methods: dict[str, FuncTy] = field(default_factory=dict)
 
 
 # `Self` in a constraint's methods: the type that meets it.
@@ -681,6 +683,10 @@ def check_code(code: Expr, program: Checker) -> Checker:
     checker.globals = Env(None, dict(program.globals.vars))
     checker.constraints = program.constraints
     checker.method_functions = program.method_functions
+    checker.extension_functions = {name: list(functions) for name, functions in program.extension_functions.items()}
+    checker.extension_methods = dict(program.extension_methods)
+    checker.builtin_methods = dict(program.builtin_methods)
+    checker.static_methods = dict(program.static_methods)
     checker.predefined = program.predefined
     checker.module_names = program.module_names
     checker.enum_files = program.enum_files
@@ -690,6 +696,9 @@ def check_code(code: Expr, program: Checker) -> Checker:
         "resolved",
         "members",
         "methods",
+        "extension_methods",
+        "builtin_methods",
+        "static_methods",
         "instances",
         "type_values",
         "quote_levels",
@@ -729,6 +738,10 @@ class Checker:
         self.constraints: dict[str, dict[str, FuncTy]] = {}  # user-defined constraint -> its methods' types, with SELF
         self.method_functions: dict[tuple[str, str], Lambda] = {}  # (struct or enum, method) -> its function
         self.methods: dict[int, str] = {}  # `.name` node called as a method -> the method's name
+        self.extension_functions: dict[str, list[str]] = {}
+        self.extension_methods: dict[int, str] = {}  # member call -> prelude function's linked name
+        self.builtin_methods: dict[int, str] = {}  # member call -> built-in function name
+        self.static_methods: dict[int, tuple[str, str, tuple[Type, ...]]] = {}
         self.wrappers: dict[int, Lambda] = {}  # `print`, `len` or a constructor used as a value -> a lambda calling it
         self.updates: dict[int, Block] = {}  # `v[k] op= x` with v's `update` method -> the code that runs instead
         self.lines: set[int] = set()  # assignments that are lines of blocks, whose values aren't used
@@ -968,7 +981,15 @@ class Checker:
                 t, mutable, "global", level=level, binder=binder, type_params=type_params, constraints=constraints
             )
         else:
-            env.vars[name] = VarInfo(t, mutable, "local", level=self.level, binder=binder)
+            env.vars[name] = VarInfo(
+                t,
+                mutable,
+                "local",
+                level=self.level,
+                binder=binder,
+                type_params=type_params,
+                constraints=constraints,
+            )
             if isinstance(binder, Binding | NamePattern):
                 self.declared[id(binder)] = binder
                 if mutable:
@@ -1127,7 +1148,11 @@ class Checker:
             raise EllaError("only a top-level struct or enum can have methods", enum.span)
         # The type parameters' constraints are checked even without methods, which use them.
         self.param_types(enum.type_params, enum.constraints, enum.span)
-        methods = {method.name: self.define_method(enum, method) for method in enum.methods}
+        methods: dict[str, FuncTy] = {}
+        static_methods: dict[str, FuncTy] = {}
+        for method in enum.methods:
+            function_type, instance = self.define_method(enum, method)
+            (methods if instance else static_methods)[method.name] = function_type
         if "get" in methods and "set" in methods:
             get, set_ = methods["get"], methods["set"]
             if set_.params[1:] != (get.params[1], get.result):
@@ -1149,11 +1174,11 @@ class Checker:
                     f"update must take the key type get uses, and a (mut {show_type(get.result)}) -> ()",
                     enum.span,
                 )
-        self.enums[enum.name] = dataclasses.replace(info, methods=methods)
+        self.enums[enum.name] = dataclasses.replace(info, methods=methods, static_methods=static_methods)
         self.define_variants(self.enums[enum.name], env)
 
-    def define_method(self, enum: EnumDef, method: Method) -> FuncTy:
-        """A method's type. It is checked like a top-level generic function with the enum's type parameters."""
+    def define_method(self, enum: EnumDef, method: Method) -> tuple[FuncTy, bool]:
+        """A method or namespace function, checked with its enum's type parameters."""
         function = method.function
         if method.name in enum.field_names:
             raise EllaError(f"'{method.name}' is already a field of {enum.name}", method.span)
@@ -1166,11 +1191,11 @@ class Checker:
         self.method_functions[enum.name, method.name] = function
         params = self.param_types(enum.type_params, enum.constraints, enum.span)
         own = EnumTy(enum.name, tuple(params[name] for name in enum.type_params))
-        if not t.params or t.params[0] != own:
-            raise EllaError(
-                f"a method's first parameter is the value it is called on, so it must be a {show_type(own)}",
-                function.span,
-            )
+        instance = bool(t.params) and t.params[0] == own
+        if not instance:
+            if method.name == "finalize":
+                raise EllaError("a finalize method must take its struct as its first parameter", function.span)
+            return t, False
         # Methods with these names give operators and built-ins, so their types are fixed.
         binary = "(Self, T) -> R, without 'mut'"
         iterable = describe_kind(t.result) in ("list", "str", "range", "Gen") or isinstance(resolve(t.result), EnumTy)
@@ -1211,7 +1236,7 @@ class Checker:
         if method.name in expected and not expected[method.name][1]:
             what = expected[method.name][0].replace("Self", show_type(own))
             raise EllaError(f"the method '{method.name}' must have the type {what}", function.span)
-        return t
+        return t, True
 
     def define_constraint(self, constraint: ConstraintDef) -> None:
         """A user-defined constraint: the methods, with their types, that a type needs to meet it."""
@@ -1281,6 +1306,15 @@ class Checker:
                 case LetPattern(pattern):
                     names = (n.name for n in pattern_names(pattern))
                     self.pending_globals.update(name for name in names if name not in self.globals.vars)
+
+        standard_files = {file for file, _ in program.modules if file.startswith(f"{STD}/")}
+        for let in functions:
+            if let.span.file not in standard_files:
+                continue
+            for binding in let.bindings:
+                name = bare_name(binding.name)
+                if not name.startswith("_"):
+                    self.extension_functions.setdefault(name, []).append(binding.name)
 
         for expr in program.body:
             if not self.attempt(expr, defined_names(expr), partial(self.check, expr, self.globals)):
@@ -1629,12 +1663,14 @@ class Checker:
                 type_params = bindings[0].type_params
                 if bindings[0].size_params and (env is not self.globals or not isinstance(value_expr, Lambda)):
                     raise EllaError("only a top-level function can have size parameters", bindings[0].span)
-                if type_params and (env is not self.globals or not isinstance(value_expr, Lambda)):
-                    raise EllaError("only a top-level function can have type parameters", bindings[0].span)
+                if type_params and not isinstance(value_expr, Lambda):
+                    raise EllaError("a generic binding must be a function", bindings[0].span)
                 if isinstance(value_expr, Lambda):
                     # A `let`-bound function can call itself by name. (A generic
                     # function's own name is its top-level name.)
-                    self_names = [] if type_params or bindings[0].size_params else list(bindings)
+                    self_names = (
+                        [] if env is self.globals and (type_params or bindings[0].size_params) else list(bindings)
+                    )
                     t: Type = self.check_lambda(
                         value_expr,
                         env,
@@ -1666,7 +1702,7 @@ class Checker:
                         type_params,
                         bindings[0].constraints,
                     )
-                return t
+                return UNIT if type_params and env is not self.globals else t
             case LetPattern(pattern, value_expr, span, mutable, type_expr):
                 t = self.check(value_expr, env)
                 if type_expr is not None:
@@ -2334,7 +2370,15 @@ class Checker:
         t = self.lambda_type(function, type_params, constraints, infer, sizes)
         captured = self.capture(env)
         for binding in self_names:
-            captured.vars[binding.name] = VarInfo(t, False, "local", level=self.level, binder=binding)
+            captured.vars[binding.name] = VarInfo(
+                t,
+                False,
+                "local",
+                level=self.level,
+                binder=binding,
+                type_params=binding.type_params,
+                constraints=binding.constraints,
+            )
         params = self.type_params | self.param_types(type_params, constraints, function.span, sizes)
         if id(function) not in self.checked:
             inferred = any(param.type is None for param in function.params) or function.return_type is None
@@ -2488,6 +2532,16 @@ class Checker:
         `mut v.name(args)` calls a method whose first parameter is `mut`.
         """
         receiver, name = callee.target, callee.name
+        if isinstance(receiver, Name):
+            info = self.visible(receiver.name, env, receiver.span)
+            if info is not None and info.kind in ("variant", "constructor"):
+                enum = self.enums[info.enum]
+                if name in enum.static_methods:
+                    return self.check_namespace_call(enum, name, callee, args, env, span)
+            elif info is None:
+                type_info = self.enums.get(receiver.name)
+                if type_info is not None and name in type_info.static_methods:
+                    return self.check_namespace_call(type_info, name, callee, args, env, span)
         if isinstance(receiver, MutArg):
             t = self.check_place(receiver.target, env, "pass")
         else:
@@ -2501,13 +2555,26 @@ class Checker:
         method = self.method_type(value_type, name, span)
         if method is None:
             fields = isinstance(value_type, EnumTy) and name in self.enums[value_type.name].field_names
-            if isinstance(receiver, MutArg) or not fields:
+            if fields and not isinstance(receiver, MutArg):
+                # A field holding a function.
+                field_type = self.member_type(callee, value_type)
+                self.types[id(callee)] = field_type
+                return self.check_function_call(field_type, callee, args, env, span)
+            extension = self.extension_method(value_type, name, callee, span)
+            if extension is None:
                 hint = " (its constraints don't have one)" if isinstance(value_type, ParamTy) else ""
                 raise EllaError(f"{show_type(value_type)} has no method '{name}'{hint}", callee.span)
-            # A field holding a function.
-            field_type = self.member_type(callee, value_type)
-            self.types[id(callee)] = field_type
-            return self.check_function_call(field_type, callee, args, env, span)
+            method, receiver_name = extension
+            self.types[id(callee)] = method
+            self.check_arity(name, len(method.params) - 1, args, span)
+            all_args = (receiver, *args)
+            self.check_args(method, all_args, env, t)
+            self.check_exclusive(UnitLit(span), all_args)
+            if receiver_name in LIBRARY or receiver_name == "len":
+                self.builtin_methods[id(callee)] = receiver_name
+            else:
+                self.extension_methods[id(callee)] = receiver_name
+            return method.result
         if name == "finalize" and isinstance(value_type, EnumTy) and self.enums[value_type.name].finalize:
             raise EllaError("a finalize method runs by itself when the value dies, so it can't be called", span)
         if isinstance(value_type, EnumTy):
@@ -2522,6 +2589,92 @@ class Checker:
         self.check_args(method, (receiver, *args), env, t)
         self.check_exclusive(UnitLit(span), (receiver, *args))
         return method.result
+
+    def check_namespace_call(
+        self, enum: EnumInfo, name: str, callee: Member, args: tuple[Expr, ...], env: Env, span: Span
+    ) -> Type:
+        """Check `Type.function(...)`, which has no receiver argument."""
+        type_args = tuple(self.fresh() for _ in enum.params)
+        function = substitute(enum.static_methods[name], dict(zip(enum.params, type_args)))
+        assert isinstance(function, FuncTy)
+        if enum.params:
+            needs = enum.constraints or tuple(() for _ in enum.params)
+            self.generic_uses.append((f"{enum.name}.{name}", type_args, tuple(zip(enum.params, needs)), span))
+        self.private(name, enum.name, callee.span)
+        self.static_methods[id(callee)] = (enum.name, name, type_args)
+        self.types[id(callee)] = function
+        self.check_arity(name, len(function.params), args, span)
+        self.check_args(function, args, env)
+        self.check_exclusive(UnitLit(span), args)
+        return function.result
+
+    def extension_method(self, receiver: Type, name: str, callee: Member, span: Span) -> tuple[FuncTy, str] | None:
+        """Find a receiver-first standard-library or built-in function that accepts this value."""
+        if name == "len" and (isinstance(resolve(receiver), ListTy) or receiver == STR or resolve(receiver) == RANGE):
+            return FuncTy((receiver,), I64), name
+        if name == "len" and isinstance(receiver, BuiltinTy) and receiver.name in ("Array", "Pool", "Arena"):
+            return FuncTy((receiver,), I64), name
+        if name in LIBRARY:
+            function = LIBRARY[name]
+            if function.params:
+                provisional = function
+                if name in GENERIC_LIBRARY:
+                    specialized = substitute(function, {"T": self.fresh()})
+                    assert isinstance(specialized, FuncTy)
+                    provisional = specialized
+                if self.can_unify(receiver, provisional.params[0]):
+                    method = self.library_type(name, span)
+                    self.expect(receiver, method.params[0], span, f"the receiver of '{name}'")
+                    return method, name
+        for function_name in self.extension_functions.get(name, ()):
+            info = self.globals.vars.get(function_name)
+            if info is None or not isinstance(info.type, FuncTy) or not info.type.params:
+                continue
+            type_args = tuple(self.fresh() for _ in info.type_params)
+            specialized = substitute(info.type, dict(zip(info.type_params, type_args)))
+            assert isinstance(specialized, FuncTy)
+            fresh_method = self.fresh_sizes(specialized)
+            assert isinstance(fresh_method, FuncTy)
+            method = fresh_method
+            if not self.can_unify(receiver, method.params[0]):
+                continue
+            self.expect(receiver, method.params[0], span, f"the receiver of '{name}'")
+            if type_args:
+                self.instances[id(callee)] = type_args
+                needs = info.constraints or tuple(() for _ in info.type_params)
+                self.generic_uses.append((function_name, type_args, tuple(zip(info.type_params, needs)), span))
+            return method, function_name
+        return None
+
+    def can_unify(self, a: Type, b: Type) -> bool:
+        """Whether two types could unify, without deciding any type variables."""
+        a, b = resolve(a), resolve(b)
+        if isinstance(a, TyVar | DeferredTy) or isinstance(b, TyVar | DeferredTy):
+            return True
+        match a, b:
+            case ListTy(x), ListTy(y):
+                return self.can_unify(x, y)
+            case TupleTy(xs), TupleTy(ys):
+                return len(xs) == len(ys) and all(self.can_unify(x, y) for x, y in zip(xs, ys))
+            case FuncTy(xs, x, xm), FuncTy(ys, y, ym):
+                return (
+                    len(xs) == len(ys)
+                    and xm == ym
+                    and all(self.can_unify(p, q) for p, q in zip(xs, ys))
+                    and self.can_unify(x, y)
+                )
+            case EnumTy(n, xs), EnumTy(m, ys):
+                return n == m and len(xs) == len(ys) and all(self.can_unify(x, y) for x, y in zip(xs, ys))
+            case BuiltinTy(n, xs), BuiltinTy(m, ys):
+                if n != m:
+                    return False
+                if n == "Array" and len(xs) != len(ys):
+                    return (len(xs) == 1 or len(ys) == 1) and self.can_unify(xs[0], ys[0])
+                return len(xs) == len(ys) and all(self.can_unify(x, y) for x, y in zip(xs, ys))
+            case (SizeTy("_"), SizeTy()) | (SizeTy(), SizeTy("_")):
+                return True
+            case _:
+                return a == b
 
     def method_type(self, t: Type, name: str, span: Span) -> FuncTy | None:
         """The type of the method `name` of values of type `t`, if they have one.
