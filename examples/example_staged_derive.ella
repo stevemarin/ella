@@ -1,0 +1,25 @@
+# Generate field-by-field functions from a type while compiling.
+struct Point
+    x: f64
+    y: f64
+
+struct ColorPoint
+    x: f64
+    y: f64
+    color: str
+
+let all_equal[T] = (names: [str], a: Code[T], b: Code[T]) -> Code[bool] =>
+    let mut test = quote true
+    for name in names
+        test = quote $test and $a.$name == $b.$name
+    test
+
+let derive_eq[T] = (t: Type[T]) -> Code[(T, T) -> bool] =>
+    quote (a: $t, b: $t) -> bool => $(all_equal(fields(t), quote a, quote b))
+
+let point_eq = $(derive_eq(type Point))
+let color_point_eq = $(derive_eq(type ColorPoint))
+
+print(point_eq(Point(1.0, 2.0), Point(1.0, 2.0)))
+print(point_eq(Point(1.0, 2.0), Point(1.0, 3.0)))
+print(color_point_eq(ColorPoint(1.0, 2.0, "red"), ColorPoint(1.0, 2.0, "blue")))

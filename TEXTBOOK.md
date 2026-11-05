@@ -386,26 +386,27 @@ The heart of Pratt parsing is a single while-loop:
 
 Precedence: `+` = 13 (left-assoc), `*` = 14 (left-assoc), `-` = 13 (left-assoc).
 
-  Step 1: `parse_expr(min_prec=LOWEST)`
-          - `parse_prefix()` consumes `1` -> left = 1
-          - Sees `+` (prec 13 >= 0): consumes `+`
-          - Recurses: right = `parse_expr(min_prec=14)` (since `+` is left-assoc, 13 + 1)
-              * In inner `parse_expr(14)`:
-                  - `parse_prefix()` consumes `2` -> left = 2
-                  - Sees `*` (prec 14 >= 14): consumes `*`
-                  - Recurses: right = `parse_expr(min_prec=15)`
-                      - `parse_prefix()` consumes `3` -> left = 3
-                      - Next token is `-` (prec 13). Since 13 < 15, inner loop terminates!
-                      - Returns 3.
-                  - Combines: left = `Binary('*', 2, 3)`
-                  - Next token is `-` (prec 13). Since 13 < 14, loop terminates!
-                  - Returns `Binary('*', 2, 3)`.
-          - Combines: left = `Binary('+', 1, Binary('*', 2, 3))`
-          - Loop continues at top level! Next token is `-` (prec 13 >= 0).
-          - Consumes `-`.
-          - Recurses: right = `parse_expr(min_prec=14)` -> parses `4`.
-          - Combines: left = `Binary('-', Binary('+', 1, Binary('*', 2, 3)), 4)`
-          - EOF reached -> Returns `((1 + (2 * 3)) - 4)`.
+`parse_expr(min_prec=LOWEST)`
+
+- `parse_prefix()` consumes `1` -> left = 1
+- Sees `+` (prec 13 >= 0): consumes `+`
+- Recurses: right = `parse_expr(min_prec=14)` (since `+` is left-assoc, 13 + 1)
+  - In inner `parse_expr(14)`:
+    - `parse_prefix()` consumes `2` -> left = 2
+    - Sees `*` (prec 14 >= 14): consumes `*`
+    - Recurses: right = `parse_expr(min_prec=15)`
+      - `parse_prefix()` consumes `3` -> left = 3
+      - Next token is `-` (prec 13). Since 13 < 15, inner loop terminates!
+      - Returns 3.
+    - Combines: left = `Binary('*', 2, 3)`
+    - Next token is `-` (prec 13). Since 13 < 14, loop terminates!
+    - Returns `Binary('*', 2, 3)`.
+- Combines: left = `Binary('+', 1, Binary('*', 2, 3))`
+- Loop continues at top level! Next token is `-` (prec 13 >= 0).
+- Consumes `-`.
+- Recurses: right = `parse_expr(min_prec=14)` -> parses `4`.
+- Combines: left = `Binary('-', Binary('+', 1, Binary('*', 2, 3)), 4)`
+- EOF reached -> Returns `((1 + (2 * 3)) - 4)`.
 
 ### Hybrid Architecture in Ella
 

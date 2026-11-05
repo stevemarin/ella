@@ -161,6 +161,15 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - Moving at the last use (`x = y`) only sees `y`'s own block, not
   liveness in general.
 - Copies are deep, even where a shallow copy would be safe.
+- Consider persistent collections or arena-local transient updates followed
+  by freezing/compacting the final value. If only one result is needed,
+  building it with ordinary mutation and then giving it value semantics is
+  simpler and likely sufficient. Structural sharing may help when several
+  versions must coexist (for example, retained snapshots); updates could
+  share unchanged parts, with a final copy of only the reachable graph when
+  it escapes its arena. This needs lifetime rules for every reference into
+  the arena, and may cost more than it saves when intermediate versions are
+  discarded or mutation in place is already possible.
 - Exclusivity and some global loop analysis still go by name. Borrow
   invalidation, local return placement, and local loop carrying use resolved
   binding identities.
@@ -191,6 +200,11 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 - No loop optimizations, common subexpression elimination, strength
   reduction (`n % 2` divides; test/benchmarks/arith.ella is mostly
   `idiv`), or escape analysis.
+- Consider compiler-checked `pure` and `infallible` function annotations.
+  Verify them transitively against called functions and operations; use
+  proven purity and infallibility to enable safe dead-call elimination and
+  common-subexpression elimination without changing observable effects or
+  runtime errors.
 - `iter` and copies allocate where a smarter lowering wouldn't.
 - Only x64 Linux, through gcc.
 

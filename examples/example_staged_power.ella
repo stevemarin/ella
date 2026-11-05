@@ -1,0 +1,10 @@
+# Generate a fixed number of multiplications while compiling.
+let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+    if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+
+let cube = (x: i64) -> i64 => $(power(3, quote x))
+let fifth = (x: i64) -> i64 => $(power(5, quote x))
+
+print(cube(4))
+print(fifth(2))
+print(cube(-3))
