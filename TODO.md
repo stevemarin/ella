@@ -786,6 +786,33 @@ memory-model §10 sketches threads. Arenas per thread, `nocopy` values moved
 between threads, and pools as the only shared state would fit the existing
 model without a GC. This is a long-term item that depends on ideas 3 and 5.
 
+Generators are a useful starting point for fibers: they already keep a
+stackless frame and its arenas alive across `yield`. They are not concurrent
+tasks yet; `next`/`yield` hands control directly between caller and generator,
+without a scheduler.
+
+Keep the design choices distinct:
+
+- **Stackless vs. stackful:** stackless fibers fit generator frames and need
+  explicit suspension points, but suspension must be represented through the
+  call chain. Stackful fibers can suspend inside ordinary calls, but require
+  saved stacks and make stack lifetime, cleanup, and memory use more complex.
+- **Cooperative vs. preemptive:** cooperative tasks suspend at explicit
+  points, keeping mutation and arena lifetimes easier to reason about, but
+  code that does not suspend can delay other tasks. Preemption improves
+  responsiveness but adds runtime complexity and can interrupt code in the
+  middle of an operation.
+- **Thread migration:** pinning a fiber to one OS thread keeps thread-local
+  state and arena ownership simple. Migration can improve load balancing, but
+  requires task-owned transferable arenas (or equivalent rules), and careful
+  handling of thread-affine resources.
+
+A natural first step is stackless, cooperative fibers, initially pinned to an
+OS thread. Consider migration at safe suspension points if work stealing is
+needed. Treat OS threads as workers for parallel execution, not as one thread
+per fiber. Before implementing this, decide whether arenas are owned by tasks
+or workers; they must never be concurrently shared.
+
 ### 9. Developer experience
 
 A REPL built on the AST interpreter, `ella fmt`, LSP rename, references and
