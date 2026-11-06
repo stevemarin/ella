@@ -762,6 +762,11 @@ wherever the lowering's borrow analysis shows no one could tell
 or generator holding a slice, which gets a copy; memory-model §4), the
 copy of a list that an iterator over it holds, and a loop that carries a
 slice of its own variable (`rest = rest[1..n]`), which copies each time.
+Also share immutable string storage when safe: literals and compile-time
+strings can be shared statically, and lifetime analysis can allow copies to
+reuse a backing buffer when it outlives every view. Keep copying or promote
+the buffer when a dynamic string must outlive its current arena; measure
+before adding runtime ownership or reference counting.
 Views made list and string headers bigger (memory-model §18, Results);
 codegen indexes lists inline, calling the runtime only to report an index
 out of range, which wins back the extra load.
@@ -823,3 +828,50 @@ Each is independent and fairly small.
 
 Once ideas 1 and 2 exist, rewriting the tokenizer or parser in Ella would be
 the ultimate test of the language, and a fun milestone.
+
+### 11. Symbols throughout the language
+
+Make names first-class without turning Ella into a dynamically scoped Lisp:
+keep lexical binding and static types, but use symbol identity consistently
+for identifiers, code generation, and APIs that manipulate names. A symbol
+used as a map key is not by itself a closed schema; validation of external
+data must still establish which keys exist and what their values mean.
+
+1. **Intern compiler identifiers.** Give identifiers in tokens, AST nodes,
+   imports, fields, methods and checker tables canonical identities instead
+   of repeatedly comparing spelling strings. Keep source spelling and spans
+   for diagnostics. Define module/package qualification and escaped
+   identifiers; do not make an identifier's spelling its binding identity.
+2. **Make quoted code symbol-aware and hygienic.** Represent references and
+   binders in `Code` with identity and scope, and replace staging's textual
+   fresh-name rewriting with fresh symbols. Preserve readable names for
+   printing and errors. Add macro-style expansion APIs on top of `quote` and
+   splicing, with tests for shadowing, nested quotes, imported names and
+   accidental capture. Code remains checked at the stage where it runs.
+3. **Add runtime symbols explicitly.** Introduce a `Symbol` value and a
+   literal/conversion syntax (choose it with grammar examples before
+   implementation). Specify equality, hashing, printing, qualification,
+   serialization and interning lifetime. Keep `str` distinct and require
+   explicit conversion; bound or otherwise account for interner growth in
+   long-running programs. Test native and interpreter behavior alike.
+4. **Use symbols for typed name sets.** Design a way to express a finite set
+   of allowed names and associate names with field types, reusing Ella's
+   structs, enums, constraints and generated code where possible. Diagnose
+   unknown and misspelled names statically when the set is known; retain
+   runtime checks for dynamic names. Do not treat `Map[Symbol, Json]` alone
+   as schema validation.
+5. **Connect schemas and external data.** Provide a schema/decoder path that
+   validates JSON keys, required fields and value types, then produces typed
+   Ella values. Generated validators should report the offending key and
+   source location/path, handle unknown keys by an explicit policy, and be
+   tested against malformed and evolving input.
+6. **Adopt in APIs and tools.** Add symbol-keyed map/record and reflection
+   examples to the library; update the parser, formatter, diagnostics,
+   completions, rename and generated-code display to preserve identities
+   while showing useful names. Document when callers should use `Symbol`
+   versus `str`.
+7. **Measure and stage rollout.** Add workloads for repeated identifiers,
+   dynamic interning, map lookups, schema validation and macro expansion.
+   Track time, allocations and retained interner memory. Keep ordinary
+   strings and existing programs unchanged unless measurements and a
+   separately reviewed language change justify otherwise.
