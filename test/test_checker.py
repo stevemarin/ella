@@ -788,6 +788,16 @@ twice(MyType(5))
 """
     assert type_of(source) == "i64"
 
+    bad_call = (
+        source
+        + """\
+struct Other
+    value: i64
+twice(Other(5))
+"""
+    )
+    assert error(bad_call).message == "twice needs T to be Lookup, and Other isn't: it has no method 'get'"
+
     missing = """\
 constraint Lookup
     get: (Self, str) -> i64
