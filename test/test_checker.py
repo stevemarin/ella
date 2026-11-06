@@ -808,6 +808,17 @@ struct MyType
 """
     assert error(missing).message == "MyType doesn't implement Lookup: it has no method 'get'"
 
+    partial = """\
+constraint Lookup
+    get: (Self, str) -> i64
+    contains: (Self, str) -> bool
+struct MyType
+    value: i64
+    implements Lookup
+        get = (m: MyType, s: str) -> i64 => m.value
+"""
+    assert error(partial).message == "MyType doesn't implement Lookup: it has no method 'contains'"
+
     outside_block = """\
 constraint Lookup
     get: (Self, str) -> i64
