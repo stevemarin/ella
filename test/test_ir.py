@@ -395,6 +395,13 @@ let d = quote
     $(wrap(quote y))
 print(run(d))
 """,
+    "spliced names aren't captured by generated binders": """\
+let wrap = (body: Code[i64]) -> Code[i64] => quote
+    let x = 1
+    $body
+let x = 2
+print(run(wrap(quote x)))
+""",
     "reflection at run time": """\
 struct P
     x: i64

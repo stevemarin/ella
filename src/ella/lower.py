@@ -1699,7 +1699,7 @@ class Lowerer:
         later stage, are evaluated here first, in the order the interpreter
         will want them (see ella.staging.build_code). The `quote` instruction
         gets the `quote_begin`s of the quotes it is inside the splices of
-        too, for their fresh names.
+        too, for their hygienic identities.
         """
         events: list[AnySplice | Name] = []
 
@@ -1711,11 +1711,11 @@ class Lowerer:
             events.append(node)
             return node
 
-        start_code(quote, self.module.tables, count()).build(splice, persist)  # names aren't needed here
+        start_code(quote, self.module.tables).build(splice, persist)  # names aren't needed here
         number = len(self.module.templates)
         outer = list(self.quotes)
         self.module.templates[number] = (quote, len(outer))
-        # `quote_begin` chooses the fresh names, which quotes in the splices may use.
+        # `quote_begin` chooses binder identities, which quotes in the splices may use.
         begin = self.emit("quote_begin", UNIT, [], span, index=number)
         self.quotes.append(begin)
         values = []

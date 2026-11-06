@@ -831,47 +831,46 @@ the ultimate test of the language, and a fun milestone.
 
 ### 11. Symbols throughout the language
 
-Make names first-class without turning Ella into a dynamically scoped Lisp:
-keep lexical binding and static types, but use symbol identity consistently
-for identifiers, code generation, and APIs that manipulate names. A symbol
-used as a map key is not by itself a closed schema; validation of external
-data must still establish which keys exist and what their values mean.
+Extend the existing staged-programming model with symbol identity and
+hygienic, composable macros, while keeping Ella's syntax, lexical scope and
+static typing. Do not adopt S-expression syntax, dynamic scoping or
+unrestricted `eval`.
 
-1. **Intern compiler identifiers.** Give identifiers in tokens, AST nodes,
-   imports, fields, methods and checker tables canonical identities instead
-   of repeatedly comparing spelling strings. Keep source spelling and spans
-   for diagnostics. Define module/package qualification and escaped
-   identifiers; do not make an identifier's spelling its binding identity.
-2. **Make quoted code symbol-aware and hygienic.** Represent references and
-   binders in `Code` with identity and scope, and replace staging's textual
-   fresh-name rewriting with fresh symbols. Preserve readable names for
-   printing and errors. Add macro-style expansion APIs on top of `quote` and
-   splicing, with tests for shadowing, nested quotes, imported names and
-   accidental capture. Code remains checked at the stage where it runs.
-3. **Add runtime symbols explicitly.** Introduce a `Symbol` value and a
-   literal/conversion syntax (choose it with grammar examples before
-   implementation). Specify equality, hashing, printing, qualification,
-   serialization and interning lifetime. Keep `str` distinct and require
-   explicit conversion; bound or otherwise account for interner growth in
-   long-running programs. Test native and interpreter behavior alike.
-4. **Use symbols for typed name sets.** Design a way to express a finite set
-   of allowed names and associate names with field types, reusing Ella's
-   structs, enums, constraints and generated code where possible. Diagnose
-   unknown and misspelled names statically when the set is known; retain
-   runtime checks for dynamic names. Do not treat `Map[Symbol, Json]` alone
-   as schema validation.
-5. **Connect schemas and external data.** Provide a schema/decoder path that
-   validates JSON keys, required fields and value types, then produces typed
-   Ella values. Generated validators should report the offending key and
-   source location/path, handle unknown keys by an explicit policy, and be
-   tested against malformed and evolving input.
-6. **Adopt in APIs and tools.** Add symbol-keyed map/record and reflection
-   examples to the library; update the parser, formatter, diagnostics,
-   completions, rename and generated-code display to preserve identities
-   while showing useful names. Document when callers should use `Symbol`
-   versus `str`.
-7. **Measure and stage rollout.** Add workloads for repeated identifiers,
-   dynamic interning, map lookups, schema validation and macro expansion.
-   Track time, allocations and retained interner memory. Keep ordinary
-   strings and existing programs unchanged unless measurements and a
-   separately reviewed language change justify otherwise.
+1. **Start in compiler-side staging (initial identity-based hygiene implemented).**
+   Quoted variable binders and references now carry fresh identities through
+   staging; source spellings remain available for display, and collision-free
+   internal names are materialized at the existing checker/runtime boundary.
+   Continue by making intentional capture explicit if needed, and test
+   shadowing, nested quotes, imports and capture. Expanded code remains
+   ordinary Ella code checked before it runs.
+2. **Use declaration identity, not spelling, for bindings.** Distinguish
+   shadowed bindings even when they have the same spelling. Resolve imported
+   names to their original declarations; package/module qualification
+   belongs to compiler declarations, while import aliases are local names
+   for those declarations. Make these changes where staging or correctness
+   needs them; do not add broad identifier interning solely on an assumed
+   performance benefit.
+3. **Keep the language model focused.** Build macro-style transformation
+   APIs on `quote` and splicing rather than replacing Ella's AST with a
+   universal Lisp-style code-as-data model. Preserve static checking and
+   lexical scope; macros add hygienic code generation, not dynamic binding
+   or unrestricted runtime evaluation.
+4. **Defer runtime symbols.** Runtime `Symbol` values, their literal syntax,
+   equality, hashing, module qualification, serialization and interning
+   lifetime are not part of the initial compiler-side work. Decide these
+   together only if a concrete runtime use case warrants them. In
+   particular, do not assume lexical-scope lifetimes for escaping symbols
+   or choose program-lifetime interning without accounting for unbounded
+   dynamic names. If added, keep `str` distinct and make string-to-symbol
+   conversion explicit.
+5. **Demonstrate typed external-data validation without compiler features
+   (example and cross-backend test implemented).** The example uses
+   reflection and staging to generate required-field checks, then decodes
+   known fields into a typed record. It starts from a parsed JSON value and
+   is not a JSON parser, compiler feature or built-in schema/decoder. Use it
+   to assess what the language expresses; add no schema-specific machinery.
+6. **Measure the implemented compiler work.** Hygiene correctness is tested
+   across the tree and IR interpreters; the JSON example runs across those,
+   optimized IR and native code. Add focused macro-expansion workloads if
+   performance becomes a concern. Keep existing programs and ordinary
+   string behavior unchanged.

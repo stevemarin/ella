@@ -30,6 +30,7 @@ from ella.staging import (
     AnySplice,
     Tables,
     has_splices,
+    materialize_hygiene,
     prepare,
     reflect,
     reify,
@@ -260,7 +261,7 @@ class Interpreter:
         # function call and loop iteration in progress, innermost last. When
         # an owner ends, it finalizes its values, newest first.
         self.owners: list[list[Value]] = [[]]
-        self.renamings: list[dict[int, str]] = []  # the fresh names of the quotes being built
+        self.quote_symbols: list[dict[int, int]] = []  # hygienic identities of binders in quotes being built
         self.generator: Generator | None = None  # the generator whose body is running, if any
 
         # The global scope holds the built-ins and every top-level `let`.
@@ -1384,13 +1385,13 @@ class Interpreter:
         def persist(name: Name) -> Expr:
             return reify(copy_value(self.lookup(name.name, scope, name.span).value), name.span)
 
-        # Quotes inside this one's splices may use its variables, by their fresh names.
+        # Quotes inside this one's splices may use its variables by identity.
         builder = start_code(quote, self.tables)
-        self.renamings.append(builder.renamed)
+        self.quote_symbols.append(builder.symbols)
         try:
-            return CodeValue(builder.build(splice, persist, self.renamings[:-1]))
+            return CodeValue(builder.build(splice, persist, self.quote_symbols[:-1]))
         finally:
-            self.renamings.pop()
+            self.quote_symbols.pop()
 
     def builtin_reflect(self, name: str) -> Callable[[list[Value], Span], Value]:
         def run(args: list[Value], span: Span) -> Value:
@@ -1411,8 +1412,9 @@ class Interpreter:
         assert isinstance(code, CodeValue)
         if self.checker is None:
             raise EllaError("run() needs a checked program", span)
-        self.tables.add(check_code(code.expr, self.checker))
-        return self.run_code(code.expr)
+        expr = materialize_hygiene(code.expr, self.checker.globals.vars)
+        self.tables.add(check_code(expr, self.checker))
+        return self.run_code(expr)
 
     def run_code(self, expr: Expr) -> Value:
         self.owners.append([])

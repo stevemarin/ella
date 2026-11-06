@@ -1,10 +1,10 @@
 """Multi-stage programming: code as values, made with `quote` and combined with `$`."""
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import count
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, TextIO, overload
 
 from ella.checker import (
     BuiltinTy,
@@ -70,9 +70,7 @@ if TYPE_CHECKING:
     from ella.interpreter import Interpreter
 
 
-def fresh_name(name: str, numbers: Iterator[int]) -> str:
-    """A new name for a variable bound in quoted code: `x` becomes `x.1`, and `x.1` becomes, say, `x.7`."""
-    return f"{name.split('.')[0]}.{next(numbers)}"
+_hygiene_ids = count(1)
 
 
 @dataclass(slots=True)
@@ -87,7 +85,6 @@ class Tables:
     kinds: dict[int, str] = field(default_factory=dict)  # NamePattern -> "binding" or "variant"
     quote_levels: dict[int, int] = field(default_factory=dict)  # Quote -> the stage of its body
     type_values: dict[int, Type] = field(default_factory=dict)  # `type T` -> T
-    numbers: Iterator[int] = field(default_factory=lambda: count(1))  # for fresh names, the same in every run
 
     @staticmethod
     def sharing(checker: Checker) -> Tables:
@@ -110,40 +107,39 @@ def build_code(
     tables: Tables,
     splice: Callable[[AnySplice], object],
     persist: Callable[[Name], Expr],
-    outer: Sequence[dict[int, str]] = (),
+    outer: Sequence[dict[int, int]] = (),
 ) -> Expr:
-    """The code a `quote` gives: its body, with fresh names, constants and spliced code.
+    """The code a `quote` gives: its body, with fresh binder identities, constants and spliced code.
 
     `splice` computes what each splice of this quote inserts (code, a type
     expression, or a field name), and `persist` the constant for each
     variable from an earlier stage, in the order they appear. The IR lowering uses the same walk to find them. `outer` are the
-    fresh names of the quotes this one is inside the splices of.
+    binder identities of quotes this one is inside the splices of.
     """
     return start_code(quote, tables).build(splice, persist, outer)
 
 
-def start_code(quote: Quote, tables: Tables, numbers: Iterator[int] | None = None) -> CodeBuilder:
-    """Start building a quote's code by choosing fresh names for its variables.
+def start_code(quote: Quote, tables: Tables) -> CodeBuilder:
+    """Start building a quote's code by assigning fresh identities to its binders.
 
-    The names must be chosen before its splices run: a quote inside one of
+    The identities must be chosen before its splices run: a quote inside one of
     them may refer to the variables (`quote let y = 1 ... $(f(quote y))`).
     """
     level = tables.quote_levels.get(id(quote))
     if level is None:
         raise EllaError("code made while compiling can't build more code while compiling", quote.span)
-    builder = CodeBuilder(quote, tables, level, numbers if numbers is not None else tables.numbers)
+    builder = CodeBuilder(quote, tables, level)
     builder.collect(quote.body)
     return builder
 
 
 class CodeBuilder:
-    def __init__(self, quote: Quote, tables: Tables, level: int, numbers: Iterator[int]) -> None:
+    def __init__(self, quote: Quote, tables: Tables, level: int) -> None:
         self.quote = quote
-        self.numbers = numbers
         self.tables = tables
         self.level = level  # the stage of the quote's body
-        self.renamed: dict[int, str] = {}  # binder node -> its fresh name
-        self.outer: Sequence[dict[int, str]] = ()
+        self.symbols: dict[int, int] = {}  # binder node -> its hygienic identity
+        self.outer: Sequence[dict[int, int]] = ()
         self.splice: Callable[[AnySplice], object] = lambda node: node
         self.persist: Callable[[Name], Expr] = lambda node: node
 
@@ -151,35 +147,39 @@ class CodeBuilder:
         self,
         splice: Callable[[AnySplice], object],
         persist: Callable[[Name], Expr],
-        outer: Sequence[dict[int, str]] = (),
+        outer: Sequence[dict[int, int]] = (),
     ) -> Expr:
         self.splice, self.persist, self.outer = splice, persist, outer
         return self.walk_expr(self.quote.body, 1)
 
-    def fresh(self, binder: object) -> str | None:
-        """The fresh name of a variable bound inside this quote, or a quote it is spliced into."""
-        for renamed in (self.renamed, *self.outer):
-            if id(binder) in renamed:
-                return renamed[id(binder)]
+    def fresh(self, binder: object) -> int | None:
+        """The identity of a variable bound inside this quote, or a quote it is spliced into."""
+        for symbols in (self.symbols, *self.outer):
+            if id(binder) in symbols:
+                return symbols[id(binder)]
         return None
 
     def collect(self, node: object) -> None:
-        """Give every variable bound inside the quote a fresh name.
+        """Give every variable bound inside the quote a fresh identity.
 
-        The alternatives of an or-pattern bind the same names, and get the same fresh names.
+        The alternatives of an or-pattern bind the same names, and get the same identity.
         """
         match node:
             case OrPattern(alternatives):
-                names: dict[str, str] = {}
+                names: dict[str, int] = {}
                 for binder in (b for alternative in alternatives for b in binders(alternative, self.tables)):
-                    self.renamed[id(binder)] = names.setdefault(binder.name, fresh_name(binder.name, self.numbers))
+                    identity = names.get(binder.name)
+                    if identity is None:
+                        identity = next(_hygiene_ids)
+                        names[binder.name] = identity
+                    self.symbols[id(binder)] = identity
                 for alternative in alternatives:
                     self.collect_parts(alternative)
                 return
             case Binding() | Param():
-                self.renamed[id(node)] = fresh_name(node.name, self.numbers)
-            case NamePattern() if self.tables.kinds.get(id(node)) == "binding":
-                self.renamed[id(node)] = fresh_name(node.name, self.numbers)
+                self.symbols[id(node)] = next(_hygiene_ids)
+            case NamePattern() if self.tables.kinds.get(id(node)) == "binding" and id(node) not in self.symbols:
+                self.symbols[id(node)] = next(_hygiene_ids)
         self.collect_parts(node)
 
     def collect_parts(self, node: object) -> None:
@@ -213,14 +213,14 @@ class CodeBuilder:
                     return node
                 fresh = self.fresh(info.binder)
                 if fresh is not None:
-                    return Name(fresh, span)
+                    return replace(node, hygiene=fresh)
                 if info.kind == "local" and info.level is not None and info.level < self.level:
                     return self.persist(node)
                 return node
-            case Binding() | Param() | NamePattern() if id(node) in self.renamed:
-                # Rename it, and walk its type, which may have splices too.
-                renamed = replace(node, name=self.renamed[id(node)])
-                return rebuild(renamed, lambda part: self.walk(part, depth))
+            case Binding() | Param() | NamePattern() if id(node) in self.symbols:
+                # Mark its identity, and walk its type, which may have splices too.
+                marked = replace(node, hygiene=self.symbols[id(node)])
+                return rebuild(marked, lambda part: self.walk(part, depth))
         return rebuild(node, lambda part: self.walk(part, depth))
 
     def walk_expr(self, node: Expr, depth: int) -> Expr:
@@ -234,6 +234,44 @@ def binders(pattern: object, tables: Tables) -> list[NamePattern]:
     if isinstance(pattern, NamePattern):
         return [pattern] if tables.kinds.get(id(pattern)) == "binding" else []
     return [b for part in parts(pattern) for b in binders(part, tables)]
+
+
+@overload
+def materialize_hygiene(node: Expr, reserved: Iterable[str] = ()) -> Expr: ...
+
+
+@overload
+def materialize_hygiene(node: Program, reserved: Iterable[str] = ()) -> Program: ...
+
+
+def materialize_hygiene(node: object, reserved: Iterable[str] = ()) -> object:
+    """Give hygienic identifiers collision-free names for the existing checker and runtime."""
+    occupied = set(reserved)
+    identities: set[int] = set()
+
+    def collect(current: object) -> None:
+        if isinstance(current, Name | Binding | Param | NamePattern):
+            occupied.add(current.name)
+            if current.hygiene is not None:
+                identities.add(current.hygiene)
+        for part in parts(current):
+            collect(part)
+
+    collect(node)
+    names: dict[int, str] = {}
+    for identity in sorted(identities):
+        candidate = f"__ella_hygiene_{identity}"
+        while candidate in occupied:
+            candidate += "_"
+        names[identity] = candidate
+        occupied.add(candidate)
+
+    def rewrite(current: object) -> object:
+        if isinstance(current, Name | Binding | Param | NamePattern) and current.hygiene is not None:
+            return replace(current, name=names[current.hygiene], hygiene=None)
+        return rebuild(current, rewrite)
+
+    return rewrite(node)
 
 
 def reify(value: Value, span: Span) -> Expr:
@@ -441,7 +479,8 @@ def prepare(
     checker.check_program(program)
     if not has_splices(program):
         return program, checker
-    expanded = expander.expand_program()
+    expanded = materialize_hygiene(expander.expand_program(), checker.globals.vars)
+    assert isinstance(expanded, Program)
     final = check(expanded)
     # The warnings are about the program as written, splices and all (a function only they call is used).
     final.warnings = checker.warnings

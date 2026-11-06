@@ -75,6 +75,17 @@ explicit in the language rather than tied to compiler passes. See
 [docs/grammar.md](docs/grammar.md) §11 and
 [src/ella/staging.py](src/ella/staging.py).
 
+Quoted binders and references carry fresh identities through staging, so
+spliced code cannot accidentally capture a generated variable. The existing
+checker and runtime receive collision-free internal names after expansion;
+source names remain available for display and diagnostics. Examples include
+[generated struct helpers](examples/example_staged_derive.ella) and
+[JSON shape validation using reflection and staging](examples/example_staged_json_validation.ella),
+which also exercises hygienic identity by generating a local that shares a
+spelling with caller code. The JSON validation is implemented in Ella rather
+than as compiler or built-in schema support. Runtime `Symbol` values remain
+future work.
+
 ## Implementation history and remaining work
 
 ### 1. Language front end
@@ -117,7 +128,9 @@ types, and finalization are implemented. See
 
 Done: `quote`, `$`, compile-time splices, generated types, structs, and
 generic functions are implemented, and since then methods and user-defined
-constraints. Runtime-built code works in the
+constraints. Generated binders and references carry hygiene identities
+through staging, with collision-free names at the existing checker boundary.
+Runtime-built code works in the
 interpreters; running it in native code (which would require a JIT) remains
 future work.
 

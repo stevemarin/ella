@@ -41,7 +41,16 @@ from ella.library import FNV_OFFSET, Exit, Host, fnv, hash_bits
 from ella.library import call as call_library
 from ella.lower import BINARY_OPS, COMPARE_OPS, Lowerer, compile_program
 from ella.operators import array_offset, array_slice, binary, compare, contains, index_into, slice_of, unary
-from ella.staging import AnySplice, CodeBuilder, reflect, reify, splice_value, start_code, type_from
+from ella.staging import (
+    AnySplice,
+    CodeBuilder,
+    materialize_hygiene,
+    reflect,
+    reify,
+    splice_value,
+    start_code,
+    type_from,
+)
 from ella.syntax import Expr, Name, bare_name
 from ella.values import (
     MAX_CALL_DEPTH,
@@ -1010,7 +1019,7 @@ class IRInterpreter:
         _, outer_count = self.module.templates[instr.index]
         builder = args[0]
         assert isinstance(builder, CodeBuilder)
-        outer = [b.renamed for b in args[1 : 1 + outer_count] if isinstance(b, CodeBuilder)]
+        outer = [b.symbols for b in args[1 : 1 + outer_count] if isinstance(b, CodeBuilder)]
         values = iter(args[1 + outer_count :])
 
         def splice(node: AnySplice) -> object:
@@ -1024,8 +1033,9 @@ class IRInterpreter:
     def run_code(self, code: Value, depth: int, span: Span) -> tuple[Value, Tag]:
         """`run`: check the code and lower it into the module as a function of its own, then call it."""
         assert isinstance(code, CodeValue)
-        checker = check_code(code.expr, self.module.checker)
-        name = Lowerer(checker, self.module).lower_code(code.expr)
+        expr = materialize_hygiene(code.expr, self.module.checker.globals.vars)
+        checker = check_code(expr, self.module.checker)
+        name = Lowerer(checker, self.module).lower_code(expr)
         verify(self.module)
         result, tag, _ = self.call(self.module.functions[name], [], [], depth, {}, span)
         return result, tag

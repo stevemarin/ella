@@ -1,0 +1,45 @@
+# The input is a JSON value produced by a parser; this example demonstrates
+# validating its object shape and decoding it without compiler or runtime support.
+enum Json
+    Object(Map[str, Json])
+    String(str)
+    Number(i64)
+    Bool(bool)
+    Null
+
+struct Person
+    name: str
+    age: i64
+
+# Generate a required-key check from a struct's reflected fields.
+let require_fields = (names: [str], object: Code[Map[str, Json]]) -> Code[bool] =>
+    let mut valid = quote true
+    for name in names
+        # This generated local deliberately has the caller's spelling. The
+        # spliced object expression must retain its own binding identity.
+        let check = quote
+            let object = $object
+            $(quote name) in object
+        valid = quote $valid and $check
+    valid
+
+let derive_required_fields[T] = (t: Type[T]) -> Code[(Map[str, Json]) -> bool] =>
+    quote (object: Map[str, Json]) -> bool => $(require_fields(fields(t), quote object))
+
+let has_person_fields = $(derive_required_fields(type Person))
+
+# Field values still need to be decoded and checked against their expected types.
+let decode_person = (value: Json) -> Optional[Person] =>
+    match value
+        case Object(object) if has_person_fields(object)
+            match (object["name"], object["age"])
+                case (String(name), Number(age)) => Some(Person(name, age))
+                case _ => None
+        case _ => None
+
+let ada = Object({"name": String("Ada"), "age": Number(36)})
+let bad_age = Object({"name": String("Ada"), "age": String("36")})
+let missing_age = Object({"name": String("Ada")})
+print(decode_person(ada))
+print(decode_person(bad_age))
+print(decode_person(missing_age))

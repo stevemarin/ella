@@ -1885,8 +1885,10 @@ print(run(power(2, quote 5)))     # 25
   than its own is an error: it doesn't exist yet.
 * Top-level variables other than functions belong to stage 0, so
   compile-time code can't read them.
-* Variables bound inside quoted code are renamed when the code is built
-  (`y` becomes `y.1`), so spliced code never captures the wrong variable.
+* Variables bound inside quoted code get fresh identities when the code is
+  built, so spliced code cannot capture them accidentally. The compiler
+  preserves readable source names and uses collision-free internal names
+  when checking and running the generated code.
 * A top-level name in quoted code means what it means in the module where
   the quote is written, even a private one, wherever the code is spliced
   or run: `quote _helper(x)` in `geo.ella` still calls `geo`'s `_helper`

@@ -1,0 +1,24 @@
+# Compiler-side symbols give quoted binders identity independent of spelling.
+
+let with_local = (body: Code[i64]) -> Code[i64] => quote
+    let value = 100
+    $body + value
+
+let value = 2
+let local_result = $(with_local(quote value))
+print(local_result)
+
+let with_parameter = (body: Code[i64]) -> Code[i64] => quote
+    let add = (value: i64) -> i64 => $body + value
+    add(10)
+
+let parameter_result = $(with_parameter(quote value))
+print(parameter_result)
+
+let with_pattern = (body: Code[i64]) -> Code[i64] => quote
+    match Some(7)
+        case Some(value) => $body + value
+        case None => 0
+
+let pattern_result = $(with_pattern(quote value))
+print(pattern_result)

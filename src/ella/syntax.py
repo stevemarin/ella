@@ -97,6 +97,7 @@ class NamePattern:
     name: str
     span: Span
     mutable: bool = False
+    hygiene: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,7 @@ class Binding:
     type_params: tuple[str, ...] = ()
     constraints: tuple[tuple[str, ...], ...] = ()
     size_params: tuple[str, ...] = ()
+    hygiene: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +181,7 @@ class Param:
     type: TypeExpr | None
     span: Span
     mutable: bool = False
+    hygiene: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +271,7 @@ class SetLit:
 class Name:
     name: str
     span: Span
+    hygiene: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
