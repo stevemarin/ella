@@ -836,13 +836,17 @@ hygienic, composable macros, while keeping Ella's syntax, lexical scope and
 static typing. Do not adopt S-expression syntax, dynamic scoping or
 unrestricted `eval`.
 
-1. **Start in compiler-side staging (initial identity-based hygiene implemented).**
-   Quoted variable binders and references now carry fresh identities through
+1. **Start in compiler-side staging (identity-based hygiene implemented).**
+   Quoted variable binders and references carry fresh identities through
    staging; source spellings remain available for display, and collision-free
    internal names are materialized at the existing checker/runtime boundary.
-   Continue by making intentional capture explicit if needed, and test
-   shadowing, nested quotes, imports and capture. Expanded code remains
-   ordinary Ella code checked before it runs.
+   The implementation is covered by tests for identity preservation,
+   collision-safe materialization, `or`-pattern binders and spliced names.
+   The `symbol_hygiene` program specifically checks generated locals, lambda
+   parameters and pattern binders against same-spelled caller variables across
+   all program-test backends. Continue by making intentional capture explicit
+   if needed, and testing shadowing, nested quotes, imports and other capture
+   cases. Expanded code remains ordinary Ella code checked before it runs.
 2. **Use declaration identity, not spelling, for bindings.** Distinguish
    shadowed bindings even when they have the same spelling. Resolve imported
    names to their original declarations; package/module qualification
@@ -869,8 +873,9 @@ unrestricted `eval`.
    known fields into a typed record. It starts from a parsed JSON value and
    is not a JSON parser, compiler feature or built-in schema/decoder. Use it
    to assess what the language expresses; add no schema-specific machinery.
-6. **Measure the implemented compiler work.** Hygiene correctness is tested
-   across the tree and IR interpreters; the JSON example runs across those,
-   optimized IR and native code. Add focused macro-expansion workloads if
+6. **Measure the implemented compiler work.** The symbol-hygiene program
+   runs across the tree and IR interpreters, optimized IR, and native code
+   (including optimized and spilling configurations); the JSON example also
+   runs across those backends. Add focused macro-expansion workloads if
    performance becomes a concern. Keep existing programs and ordinary
    string behavior unchanged.

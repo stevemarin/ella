@@ -1484,18 +1484,41 @@ The checker enforces stage discipline:
     earlier stage $n$ is statically prohibited (the variable does not yet exist).
     The type checker enforces this stage invariant across all variable accesses.
 
-### Generated Names & Alpha-Renaming
+### Binding Identity & Hygienic Generated Names
 
 A classic bug in macro systems is *variable capture* (Kohlbecker et al., 1986):
 if a macro introduces a variable named `temp`, it might inadvertently shadow or be
 shadowed by a variable named `temp` in the user's surrounding code.
 
-Ella reduces accidental variable capture through automatic $\alpha$-renaming:
+Ella's staging implementation gives quoted bindings **compiler-side identity**:
+each binding introduced in a quote receives a fresh identity, and references
+resolved by the checker to that binding carry the same identity. This metadata
+is attached to the AST nodes for names, `let` bindings, parameters and pattern
+binders. The source spelling remains available while code is being built, but
+spelling alone no longer determines which generated binding a reference means.
 
-- When code is built inside a quote, newly bound variables are alpha-renamed
-    (for example, `x` can become `x.4`).
-- This prevents spliced code from capturing or being captured by surrounding
-    bindings; hygiene does not imply that generated code is free of side effects.
+When the expanded program is ready for the existing name-based checker and
+runtime, the compiler materializes each identity as a collision-free internal
+name. It reserves names already in the program, then selects a unique name for
+each identity and rewrites both its binders and references. For example, a
+quoted local called `value` and a spliced caller expression that also refers to
+`value` remain distinct even though their original spellings match. Alternatives
+of an `or` pattern share one identity for each binding, as required by the
+pattern's semantics.
+
+This is compiler metadata, not a user-visible `Symbol` value: Ella has not
+added symbol literals, runtime interning, symbol equality or hashing, or a new
+general-purpose Lisp-style code-as-data model. Nor does hygiene imply that
+generated code is free of side effects. Expansion still produces ordinary Ella
+AST, which is checked again before lowering.
+
+The test program [`test/programs/symbol_hygiene.ella`](./test/programs/symbol_hygiene.ella)
+exercises generated locals, lambda parameters and pattern binders colliding by
+spelling with caller variables across the program-test backends. Focused
+implementation tests are in [`test/test_staging.py`](./test/test_staging.py).
+This is an initial identity-based hygiene mechanism; explicit intentional
+capture and broader cases such as nested quotes and imports remain follow-up
+work.
 
 ### Types as Values for Code Generation
 
