@@ -504,6 +504,14 @@ def test_methods_and_constraints() -> None:
     assert one(source) == "(enum Shape (Circle f64) Empty (area (lambda (s: Shape) -> f64 1.0)))"
     source = "constraint Stack\n    push: (mut Self, i64) -> ()\n    size: (Self) -> i64"
     assert one(source) == "(constraint Stack push: (mut Self, i64) -> () size: (Self) -> i64)"
+    source = (
+        "constraint Lookup\n    get: (Self, str) -> i64\n"
+        "struct MyType\n    value: i64\n    implements Lookup\n"
+        "        get = (m: MyType, s: str) -> i64 => m.value"
+    )
+    assert lines(source)[1] == (
+        "(struct MyType value: i64 (implements Lookup (get (lambda (m: MyType, s: str) -> i64 (. m value)))))"
+    )
     assert one("p.area()") == "(call (. p area))"
     # `mut` before a method call marks the value it is called on, wherever the call is.
     assert one("mut s.items[0].push(1, 2)") == "(call (. (mut (index (. s items) 0)) push) 1 2)"

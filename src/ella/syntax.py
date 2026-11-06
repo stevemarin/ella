@@ -506,6 +506,15 @@ class Method:
 
 
 @dataclass(frozen=True, slots=True)
+class Implementation:
+    """A constraint implemented by a struct, with the methods that implement it."""
+
+    constraint: str
+    methods: tuple[Method, ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class EnumDef:
     """`enum Name[T]` followed by an indented list of variants, or a struct.
 
@@ -529,6 +538,7 @@ class EnumDef:
     methods: tuple[Method, ...] = ()
     constraints: tuple[tuple[str, ...], ...] = ()
     size_params: tuple[str, ...] = ()
+    implementations: tuple[Implementation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,9 +840,21 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             return sexpr("yield", show(value))
         case Assert(expr):
             return sexpr("assert", show(expr))
-        case EnumDef(variants=variants, struct=True, field_names=names, nocopy=nocopy, methods=methods):
+        case EnumDef(
+            variants=variants,
+            struct=True,
+            field_names=names,
+            nocopy=nocopy,
+            methods=methods,
+            implementations=implementations,
+        ):
             fields = (f"{n}: {show(t)}" for n, t in zip(names, variants[0].fields))
-            functions = [sexpr(m.name, show(m.function)) for m in methods]
+            implemented = {(m.name, m.span) for impl in implementations for m in impl.methods}
+            functions = [sexpr(m.name, show(m.function)) for m in methods if (m.name, m.span) not in implemented]
+            functions.extend(
+                sexpr("implements", impl.constraint, *(sexpr(m.name, show(m.function)) for m in impl.methods))
+                for impl in implementations
+            )
             return sexpr("nocopy struct" if nocopy else "struct", show_head(node), *fields, *functions)
         case EnumDef(variants=variants, methods=methods):
             return sexpr(

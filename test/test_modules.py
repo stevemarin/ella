@@ -141,7 +141,8 @@ def test_an_enum_imported_with_as_brings_bare_variants(tmp_path: Path) -> None:
 
 def test_types_and_constraints_from_modules(tmp_path: Path) -> None:
     files = {
-        "sized.ella": "constraint Sized\n    size: (Self) -> i64\n\nstruct Box\n    n: i64\n    size = (b: Box) -> i64 => b.n\n",
+        "sized.ella": "constraint Sized\n    size: (Self) -> i64\n\nstruct Box\n    n: i64\n"
+        "    implements Sized\n        size = (b: Box) -> i64 => b.n\n",
         "main.ella": "import sized\nlet total[T: sized.Sized] = (xs: [T]) -> i64 =>\n"
         "    let mut n = 0\n    for x in xs\n        n += x.size()\n    n\nprint(total([sized.Box(2), sized.Box(3)]))\n",
     }

@@ -18,6 +18,7 @@ from ella.syntax import (
     EnumDef,
     Expr,
     For,
+    Implementation,
     Import,
     Index,
     Lambda,
@@ -729,12 +730,21 @@ class Resolver:
             for v in enum.variants
         )
         methods = tuple(Method(m.name, self.expr(m.function, inner), m.span) for m in enum.methods)
+        implementations = tuple(
+            Implementation(
+                self.constraint_name(impl.constraint, impl.span),
+                tuple(Method(m.name, self.expr(m.function, inner), m.span) for m in impl.methods),
+                impl.span,
+            )
+            for impl in enum.implementations
+        )
         return replace(
             enum,
             name=self.top_name(enum.name) if top else enum.name,
             variants=variants,
             methods=methods,
             constraints=self.constraints(enum.constraints, enum.span),
+            implementations=implementations,
         )
 
     def member(self, expr: Member, scope: Scope) -> Expr:

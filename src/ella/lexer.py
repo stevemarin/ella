@@ -151,8 +151,8 @@ class Token:
 
 KEYWORDS = frozenset({
     "and", "as", "assert", "break", "case", "comptime", "constraint", "continue", "else", "enum", "false", "for",
-    "if", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return", "struct", "then",
-    "true", "type", "where", "while", "yield",
+    "if", "implements", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return",
+    "struct", "then", "true", "type", "where", "while", "yield",
 })  # fmt: skip
 
 # Sorted longest first, so that `//=` is matched before `//` and `/`. This is

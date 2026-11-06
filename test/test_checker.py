@@ -775,6 +775,53 @@ def test_methods() -> None:
     assert type_of("struct H\n    f: (i64) -> str\nH((n: i64) -> str => '').f(1)") == "str"
 
 
+def test_explicit_constraint_implementations() -> None:
+    source = """\
+constraint Lookup
+    get: (Self, str) -> i64
+struct MyType
+    value: i64
+    implements Lookup
+        get = (m: MyType, s: str) -> i64 => if s == "four" then 4 else m.value
+let twice[T: Lookup] = (t: T) -> i64 => t.get("four") * 2
+twice(MyType(5))
+"""
+    assert type_of(source) == "i64"
+
+    missing = """\
+constraint Lookup
+    get: (Self, str) -> i64
+struct MyType
+    value: i64
+    implements Lookup
+        find = (m: MyType, s: str) -> i64 => m.value
+"""
+    assert error(missing).message == "MyType doesn't implement Lookup: it has no method 'get'"
+
+    outside_block = """\
+constraint Lookup
+    get: (Self, str) -> i64
+struct MyType
+    value: i64
+    get = (m: MyType, s: str) -> i64 => m.value
+    implements Lookup
+        other = (m: MyType) -> i64 => m.value
+"""
+    assert error(outside_block).message == "MyType doesn't implement Lookup: it has no method 'get'"
+
+    wrong_type = """\
+constraint Lookup
+    get: (Self, str) -> i64
+struct MyType
+    value: i64
+    implements Lookup
+        get = (m: MyType, s: str) -> str => "four"
+"""
+    assert error(wrong_type).message == (
+        "MyType doesn't implement Lookup: its method 'get' is (MyType, str) -> str, not (MyType, str) -> i64"
+    )
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [

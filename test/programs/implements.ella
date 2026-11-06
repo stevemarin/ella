@@ -1,0 +1,10 @@
+constraint Lookup
+    get: (Self, str) -> i64
+
+struct MyType
+    value: i64
+    implements Lookup
+        get = (m: MyType, s: str) -> i64 => if s == "four" then 4 else m.value
+
+let twice[T: Lookup] = (t: T) -> i64 => t.get("four") * 2
+print(twice(MyType(5)))

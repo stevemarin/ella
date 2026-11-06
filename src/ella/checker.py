@@ -1175,6 +1175,23 @@ class Checker:
                     enum.span,
                 )
         self.enums[enum.name] = dataclasses.replace(info, methods=methods, static_methods=static_methods)
+        own = EnumTy(enum.name, tuple(params[name] for name in enum.type_params))
+        for implementation in enum.implementations:
+            if implementation.constraint not in CONSTRAINTS and implementation.constraint not in self.constraints:
+                raise EllaError(f"unknown constraint '{implementation.constraint}'", implementation.span)
+            required = self.constraints.get(implementation.constraint, {})
+            declared = {method.name for method in implementation.methods}
+            missing = next((name for name in required if name not in declared), None)
+            reason = (
+                f": it has no method '{missing}'"
+                if missing is not None
+                else self.unmet(own, implementation.constraint)
+            )
+            if reason is not None:
+                raise EllaError(
+                    f"{enum.name} doesn't implement {implementation.constraint}{reason}",
+                    implementation.span,
+                )
         self.define_variants(self.enums[enum.name], env)
 
     def define_method(self, enum: EnumDef, method: Method) -> tuple[FuncTy, bool]:

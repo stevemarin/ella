@@ -52,7 +52,7 @@ identifiers, not keywords.
 ```text
 and         as          assert      break       case        comptime
 constraint  continue    else        enum        false       for
-if          import      in          let         loop        match
+if          implements  import      in          let         loop        match
 mut         nocopy      not         or          quote       return
 struct      then        true        type        where       while
 yield
@@ -1362,8 +1362,9 @@ constraint Shape
 
 struct Square
     side: f64
-    area = (s: Square) -> f64 => s.side * s.side
-    name = (s: Square) -> str => "square"
+    implements Shape
+        area = (s: Square) -> f64 => s.side * s.side
+        name = (s: Square) -> str => "square"
 
 let total[T: Shape] = (xs: [T]) -> f64 =>
     let mut sum = 0.0
@@ -1374,9 +1375,11 @@ let total[T: Shape] = (xs: [T]) -> f64 =>
 print(total([Square(2.0), Square(1.0)]))     # 5.0
 ```
 
-* A struct or enum meets a constraint if it has each of its methods, with
-  the same types (with `Self` replaced by the type). It doesn't say so: any
-  type with the methods will do. Other types never meet one.
+* A struct can declare `implements Shape` and define the required methods
+  inside that block. The checker verifies at the declaration that each
+  required method exists and has the right type (with `Self` replaced by the
+  struct type). A struct or enum with matching methods still meets a
+  constraint structurally even without an `implements` block.
 * In a generic function, a value of a type parameter has the methods of its
   constraints: `x.area()`. A method can be `mut` (`tick: (mut Self) -> ()`),
   and is then called as `mut x.tick()`. Two constraints of one type
@@ -2030,9 +2033,11 @@ enum        = "enum" IDENT [ "[" type_param { "," type_param } "]" ]
               NEWLINE INDENT ( variant | method ) { NEWLINE ( variant | method ) } NEWLINE DEDENT ;
 variant     = IDENT [ "(" type { "," type } ")" ] ;
 struct      = [ "nocopy" ] "struct" IDENT [ "[" type_param { "," type_param } "]" ]
-              NEWLINE INDENT ( field | method ) { NEWLINE ( field | method ) } NEWLINE DEDENT ;
+              NEWLINE INDENT ( field | method | implementation ) { NEWLINE ( field | method | implementation) }
+              NEWLINE DEDENT ;
 field       = IDENT ":" type ;
 method      = IDENT "=" expr ;                   (* a function; `finalize` for a nocopy struct *)
+implementation = "implements" path NEWLINE INDENT [ method { NEWLINE method } ] NEWLINE DEDENT ;
 constraint  = "constraint" IDENT
               NEWLINE INDENT IDENT ":" type { NEWLINE IDENT ":" type } NEWLINE DEDENT ;
 mut_call    = "mut" operator_expr ;              (* a method call: `mut s.push(3)` *)

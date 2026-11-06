@@ -25,6 +25,7 @@ from ella.syntax import (
     For,
     FunctionType,
     If,
+    Implementation,
     Import,
     Index,
     IntLit,
@@ -1049,10 +1050,11 @@ class Parser:
                 )
 
     def parse_struct(self) -> EnumDef:
-        """`struct Name[T, ...]` or `nocopy struct ...`, then an indented list of fields and methods.
+        """`struct Name[T, ...]` or `nocopy struct ...`, then fields, methods and implementations.
 
         A method is `name = function`. A `nocopy` struct may have a
-        `finalize` method, run when a value dies.
+        `finalize` method, run when a value dies. An implementation is
+        `implements Constraint`, followed by methods in its own block.
         """
         nocopy = self.accept("nocopy")
         token = self.expect("struct")
@@ -1063,8 +1065,12 @@ class Parser:
         names: list[str] = []
         types: list[TypeExpr] = []
         methods: list[Method] = []
+        implementations: list[Implementation] = []
         while True:
-            if self.at_kind(TokenKind.NAME) and self.at("=", 1):
+            if self.at("implements"):
+                implementation = self.parse_implementation(methods)
+                implementations.append(implementation)
+            elif self.at_kind(TokenKind.NAME) and self.at("=", 1):
                 methods.append(self.parse_method(methods))
             else:
                 field = self.expect_kind(TokenKind.NAME, "a field name")
@@ -1088,7 +1094,26 @@ class Parser:
                     tuple(methods),
                     constraints,
                     sizes,
+                    tuple(implementations),
                 )
+
+    def parse_implementation(self, methods: list[Method]) -> Implementation:
+        """`implements Constraint`, then methods implementing it."""
+        token = self.advance()
+        constraint = self.parse_dotted(self.expect_kind(TokenKind.NAME, "a constraint name"))
+        self.expect_kind(TokenKind.NEWLINE, "end of line")
+        self.expect_kind(TokenKind.INDENT, "an indented list of methods")
+        implementation_methods: list[Method] = []
+        while True:
+            if self.at_kind(TokenKind.DEDENT):
+                self.advance()
+                return Implementation(constraint, tuple(implementation_methods), token.span)
+            if not (self.at_kind(TokenKind.NAME) and self.at("=", 1)):
+                raise self.unexpected("a method implementation, like 'get = (x: MyType) => ...'")
+            method = self.parse_method(methods)
+            methods.append(method)
+            implementation_methods.append(method)
+            self.end_of_line()
 
     def parse_type_params(self) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], tuple[str, ...]]:
         """A generic's `[T: Ord, U; N, M]`, if any: the type parameters' names, their constraints (empty if none
