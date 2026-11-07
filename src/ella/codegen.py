@@ -195,6 +195,8 @@ class CodeGen:
         self.static_closures: set[str] = set()
         self.sites: dict[tuple[Span, str], Label] = {}  # call sites, for stack traces
         self.function_labels = {name: f"ella_fn_{i}" for i, name in enumerate(module.functions)}
+        # Numbered like functions, since a name may have characters a symbol can't (`f#S` of a local type).
+        self.global_labels = {name: f"ella_global_{i}" for i, name in enumerate(module.globals)}
         self.layouts: dict[str, Layout] = {}
         self.files = [""]  # the files of spans, numbered for the runtime's errors (0: the entry file)
         self.uses_avx2 = False  # whether the program has AVX2 instructions (for arrays)
@@ -315,7 +317,8 @@ class CodeGen:
         ]
         lines += ["", "# Global variables, and whether each has been set yet.", "    .bss", "    .balign 8"]
         for name in self.module.globals:
-            lines += [f"ella_global.{name}:", "    .zero 8", f"ella_global_set.{name}:", "    .zero 8"]
+            label = self.global_labels[name]
+            lines += [f"{label}:  # {name}", "    .zero 8", f"{label}_set:", "    .zero 8"]
         lines += [
             "",
             "# The site of each call in progress, by depth, for stack traces.",
@@ -803,16 +806,16 @@ class CodeGen:
                 self.emit(f"mov {self.local_slots[instr.name]}, rax")
             case "global_get":
                 ok = self.label("set")
-                self.emit(f"cmp qword ptr [rip + ella_global_set.{instr.name}], 0")
+                self.emit(f"cmp qword ptr [rip + {self.global_labels[instr.name]}_set], 0")
                 self.emit(f"jne {ok}")
                 self.call_c("ella_unset_global", self.c_string(instr.name), line, column)
                 self.text.append(f"{ok}:")
-                self.emit(f"mov rax, qword ptr [rip + ella_global.{instr.name}]")
+                self.emit(f"mov rax, qword ptr [rip + {self.global_labels[instr.name]}]")
                 self.store(dest)
             case "global_set":
                 self.load("rax", args[0])
-                self.emit(f"mov qword ptr [rip + ella_global.{instr.name}], rax")
-                self.emit(f"mov qword ptr [rip + ella_global_set.{instr.name}], 1")
+                self.emit(f"mov qword ptr [rip + {self.global_labels[instr.name]}], rax")
+                self.emit(f"mov qword ptr [rip + {self.global_labels[instr.name]}_set], 1")
             case "add" | "sub" | "mul" | "div" | "neg" if dest is not None and is_array(dest.type):
                 self.array_arithmetic(instr)
             case "add" | "sub" | "mul" | "div" | "pow":

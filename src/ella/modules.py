@@ -248,6 +248,7 @@ class Linker:
         self.order: list[Module] = []  # in the order their code runs
         self.loading: list[Module] = []  # the modules whose imports are being loaded, outermost first
         self.items: dict[str, Item] = {}  # every module's top-level names, by their names in the linked program
+        self.local_names: set[str] = set()  # the linked names of local types and their variants (`local_name`)
         self.warnings: list[EllaError] = []
 
     def link(self, program: Program) -> Program:
@@ -284,7 +285,13 @@ class Linker:
                 message = f"'{head}' is imported, and defined here too"
                 self.attempt(partial(self.fail, message, module.uses[name].span), None)
         resolver = Resolver(self, module)
-        module.body = tuple(self.line(partial(resolver.top_line, expr), expr.span) for expr in module.program.body)
+        body: list[Expr] = []
+        for expr in module.program.body:
+            linked = self.line(partial(resolver.top_line, expr), expr.span)
+            body += resolver.hoisted  # its local types, defined first
+            resolver.hoisted = []
+            body.append(linked)
+        module.body = tuple(body)
         for line in module.program.imports:
             if id(line) not in module.used:
                 self.warnings.append(EllaError(f"'{'.'.join(line.path)}' is imported but never used", line.span))
@@ -387,12 +394,17 @@ class Linker:
 
 @dataclass(slots=True)
 class Scope:
-    """The local names at some point of a module's code: variables, types (and type parameters), and variants."""
+    """The local names at some point of a module's code: variables, types (and type parameters), and variants.
+
+    A local type and its variants have names in the linked program (`linked`), since they are moved to
+    the top level (see `Resolver.local_name`); type parameters keep theirs.
+    """
 
     parent: Scope | None
     values: set[str] = field(default_factory=set)
     types: set[str] = field(default_factory=set)
     variants: set[str] = field(default_factory=set)
+    linked: dict[str, str] = field(default_factory=dict)
 
     def value(self, name: str) -> str | None:
         """What a local name is, "value" or "variant", or None if it isn't local."""
@@ -406,12 +418,25 @@ class Scope:
         return None
 
     def has_type(self, name: str) -> bool:
+        return self.type_name(name) is not None
+
+    def type_name(self, name: str) -> str | None:
+        """A local type's (or type parameter's) name in the linked program, or None if it isn't local."""
         scope: Scope | None = self
         while scope is not None:
             if name in scope.types:
-                return True
+                return scope.linked.get(name, name)
             scope = scope.parent
-        return False
+        return None
+
+    def variant_name(self, name: str) -> str:
+        """A local variant's name in the linked program (`value(name)` is "variant")."""
+        scope: Scope | None = self
+        while scope is not None:
+            if name in scope.variants:
+                return scope.linked.get(name, name)
+            scope = scope.parent
+        return name
 
 
 TOP = Scope(None)  # the scope of top-level code, where nothing is local
@@ -423,15 +448,32 @@ class Resolver:
     def __init__(self, linker: Linker, module: Module) -> None:
         self.linker = linker
         self.module = module
+        self.owner = ""  # the linked name of the top-level line being linked, in front of its local types' names
+        self.hoisted: list[EnumDef] = []  # its local types, moved to the top level in front of it
+        self.quotes = 0  # how many quotes the code being linked is in: types in them stay where they are
 
     # Lines
 
     def top_line(self, expr: Expr) -> Expr:
+        match expr:
+            case Let(bindings) if bindings:
+                self.owner = self.top_name(bindings[0].name)
+            case _:
+                self.owner = self.top_name("top")
         return self.expr(expr, TOP)
 
     def lines(self, exprs: tuple[Expr, ...], scope: Scope) -> tuple[Expr, ...]:
-        """A block's lines. When collecting errors, a line with one is left out."""
-        return tuple(self.linker.line(partial(self.expr, expr, scope), expr.span) for expr in exprs)
+        """A block's lines. When collecting errors, a line with one is left out.
+
+        A type defined here is moved to the top level (see `enum`), and so leaves the block, unless it is
+        its last line, which gives the block's value, `()`.
+        """
+        lines = [self.linker.line(partial(self.expr, expr, scope), expr.span) for expr in exprs]
+        return tuple(
+            line
+            for i, (expr, line) in enumerate(zip(exprs, lines))
+            if not (isinstance(expr, EnumDef) and isinstance(line, UnitLit)) or i == len(exprs) - 1
+        )
 
     # Names
 
@@ -505,8 +547,10 @@ class Resolver:
 
     def value_name(self, name: str, span: Span, scope: Scope) -> str:
         """A name used as a value."""
-        if name == "return" or scope.value(name) is not None:
+        if name == "return":
             return name
+        if (local := scope.value(name)) is not None:
+            return scope.variant_name(name) if local == "variant" else name
         item = self.item(name, span)
         if item is None:
             return self.unknown(name, span, BUILTIN_NAMES, "name")
@@ -524,7 +568,7 @@ class Resolver:
         """The variant a name in a pattern refers to, or None if it isn't one (so it binds a variable)."""
         local = scope.value(name) if "." not in name else None
         if local is not None:
-            return name if local == "variant" else None
+            return scope.variant_name(name) if local == "variant" else None
         item: Item | None
         if "." in name:
             path = [(part, span) for part in name.split(".")]
@@ -545,8 +589,8 @@ class Resolver:
         return item.name
 
     def type_name(self, name: str, span: Span, scope: Scope) -> str:
-        if "." not in name and scope.has_type(name):
-            return name
+        if "." not in name and (local := scope.type_name(name)) is not None:
+            return local
         if "." in name:
             found = self.path_item([(part, span) for part in name.split(".")])
             if found is None or found[1] != len(name.split(".")):
@@ -707,7 +751,11 @@ class Resolver:
                     ),
                 )
             case Quote(body, span):
-                return Quote(self.expr(body, Scope(scope)), span)
+                self.quotes += 1
+                try:
+                    return Quote(self.expr(body, Scope(scope)), span)
+                finally:
+                    self.quotes -= 1
             case MapLit(entries, span):
                 pairs = ListLit(tuple(TupleLit((key, value), key.span) for key, value in entries), span)
                 return Call(
@@ -724,16 +772,45 @@ class Resolver:
         assert library is not None
         return library.top[name].name
 
-    def enum(self, enum: EnumDef, scope: Scope) -> EnumDef:
-        """An enum or struct definition. At the top level, it and its variants get their linked names."""
+    def local_name(self, name: str) -> str:
+        """The linked name of a type or variant defined inside the top-level line being linked: `f#S` for S in
+        the function f, `f#2#S` for another one, `geo.area#S` in module geo.
+
+        Such a type is moved to the top level (`hoisted`), so that it is a top-level type to the checker,
+        the interpreters and the lowering, which find types by name, and it can give constants. That is
+        possible since it can't use its function's variables or type parameters, nor have methods. The
+        `#` keeps the name apart from any top-level name of a module (`f.S` could be module f's S), and
+        `bare_name` leaves out what is in front of it, so its values print as written.
+        """
+        linked = f"{self.owner}#{name}"
+        n = 1
+        while linked in self.linker.local_names:
+            n += 1
+            linked = f"{self.owner}#{n}#{name}"
+        self.linker.local_names.add(linked)
+        return linked
+
+    def enum(self, enum: EnumDef, scope: Scope) -> Expr:
+        """An enum or struct definition. At the top level, it and its variants get their linked names.
+
+        A local one gets new names (`local_name`) and is moved to the top level, in front of the line it is
+        in; it leaves `()` where it was. One in a quote stays there, as part of the code the quote makes.
+        """
         top = scope is TOP
+        hoist = not top and not self.quotes
+        linked: dict[str, str] = {}
         if not top:
             scope.types.add(enum.name)
             scope.variants.update(v.name for v in enum.variants)
+        if hoist:
+            linked = {
+                name: self.local_name(name) for name in dict.fromkeys([enum.name, *(v.name for v in enum.variants)])
+            }
+            scope.linked.update(linked)
         inner = Scope(scope, types=set(enum.type_params))
         variants = tuple(
             Variant(
-                self.top_name(v.name) if top else v.name,
+                self.top_name(v.name) if top else linked.get(v.name, v.name),
                 tuple(self.type(f, inner) for f in v.fields),  # type: ignore[misc]
                 v.span,
             )
@@ -749,14 +826,18 @@ class Resolver:
             )
             for impl in enum.implementations
         )
-        return replace(
+        resolved = replace(
             enum,
-            name=self.top_name(enum.name) if top else enum.name,
+            name=self.top_name(enum.name) if top else linked.get(enum.name, enum.name),
             variants=variants,
             methods=methods,
             constraints=self.constraints(enum.constraints, enum.span),
             implementations=implementations,
         )
+        if not hoist:
+            return resolved
+        self.hoisted.append(resolved)
+        return UnitLit(enum.span)
 
     def member(self, expr: Member, scope: Scope) -> Expr:
         """`a.b.c`: a path to an imported module's name (or an imported item), or members of a value."""
@@ -776,8 +857,8 @@ class Resolver:
         found = self.path_item(path)
         if found is None:
             type_item = self.module.top.get(node.name)
-            if scope.has_type(node.name):  # a local type, or a type parameter: `T.ZERO`
-                result: Expr = Name(node.name, node.span)
+            if (local := scope.type_name(node.name)) is not None:  # a local type, or a type parameter: `T.ZERO`
+                result: Expr = Name(local, node.span)
             elif type_item is not None and type_item.kind == "enum":
                 result = Name(type_item.name, node.span)
             else:

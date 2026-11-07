@@ -301,8 +301,9 @@ class Checked:
         self.linker = Linker(path, read, root, every=True, errors=link_errors, packages=packages)
         self.root = self.linker.root
         self.linked = self.linker.link(parsed)
-        # This file's code is last in the linked program; the checker's tables are about it.
-        self.program = replace(parsed, body=self.linked.body[len(self.linked.body) - len(parsed.body) :])
+        # This file's code, linked (with its local types moved to the top level); the checker's tables are
+        # about it.
+        self.program = replace(parsed, body=self.linker.entry.body)
         self.checker = Checker()
         self.checker.errors = []
         self.checker.library = path is not None and is_library(parsed)
@@ -382,12 +383,28 @@ class Checked:
                 found.append(Completion(name, "function" if item.kind == "function" else "variable", detail))
         return found
 
-    def shown(self, name: str) -> str | None:
-        """How a top-level name is written in this file, or None if it can't be: the prelude's without their module."""
+    def shown(self, name: str, at: Span | None = None) -> str | None:
+        """How a top-level name is written in this file (at `at`), or None if it can't be: the prelude's without
+        their module, and a local type's (`f#S`, moved to the top level by linking) only in its own function."""
+        if "#" in name:
+            owner = name.rpartition("#")[0].partition("#")[0]
+            return bare_name(name) if at is not None and self.owner_at(at) == owner else None
         if "." not in name:
             return name
         item = prelude().get(bare_name(name))
         return bare_name(name) if item is not None and item.name == name else None
+
+    def owner_at(self, span: Span) -> str | None:
+        """The linked name of the top-level line of this file that `span` is in, which its local types' names
+        start with (`Resolver.local_name`)."""
+        owner = None
+        for expr in self.program.body:
+            if isinstance(expr, EnumDef) and "#" in expr.name:
+                continue  # a local type, moved in front of its line
+            if (expr.span.line, expr.span.column) > (span.line, span.column):
+                break
+            owner = expr.bindings[0].name if isinstance(expr, Let) and expr.bindings else "top"
+        return owner
 
     def top_level_lines(self) -> list[int]:
         """The lines where top-level lines of the program start."""
@@ -423,7 +440,7 @@ class Checked:
             for var, info in env.vars.items():
                 bound = getattr(info.binder, "span", None)
                 later = info.kind == "local" and bound is not None and (bound.line, bound.column) > (line, column)
-                shown = self.shown(var) if env.parent is None else var
+                shown = self.shown(var, name.span) if env.parent is None else var
                 if shown is None or shown in seen or shown in ("return", PLACEHOLDER) or later:
                     continue
                 seen.add(shown)
@@ -434,7 +451,7 @@ class Checked:
                 seen.add(key)
                 found.append(Completion(key, "namespace", "module") if isinstance(target, Module) else self.item(key))
         for enum, enum_info in self.checker.enums.items():
-            shown = self.shown(enum)
+            shown = self.shown(enum, name.span)
             if shown is not None and shown not in seen:
                 found.append(Completion(shown, "struct" if enum_info.struct else "enum"))
         found += [
@@ -582,6 +599,10 @@ class Checked:
         return found
 
 
+# A local type's name in the linked program (`f#S`, `geo.area#2#S`), which hover text shows as written: `S`.
+LOCAL_TYPE = re.compile(r"[\w.]+#(?:\d+#)?(\w+)")
+
+
 def walk(node: object) -> Iterator[object]:
     """A syntax tree node and every node inside it, parents first."""
     yield node
@@ -654,7 +675,7 @@ class Symbols:
             return
         key = (token.span.line, token.span.column)
         if key not in self.found:
-            self.found[key] = Symbol(location(token), hover, kind, modifiers, definition)
+            self.found[key] = Symbol(location(token), LOCAL_TYPE.sub(r"\1", hover), kind, modifiers, definition)
 
     def show(self, node: object) -> str:
         t = self.checked.type_of(node)

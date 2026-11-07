@@ -182,3 +182,29 @@ print(none(Bag([1])), none(Bag(["a"])))
     out = io.StringIO()
     Interpreter(out, checker).run(program)
     assert out.getvalue() == "Bag([]) Bag([])\n"
+
+
+def test_local_types_move_to_the_top_level_but_not_out_of_quotes() -> None:
+    # Linking names a function's own types after it and puts them in front of it; a type in a quote is
+    # part of the code the quote makes, and stays in it.
+    source = """\
+let f = () -> i64 =>
+    struct S
+        n: i64
+    S(1).n
+let g = () -> Code[i64] =>
+    quote
+        struct S
+            n: i64
+        S(4).n + 1
+print(f(), run(g()))
+"""
+    program, checker = prepare(parse(source), io.StringIO())
+    assert [show(expr) for expr in program.body[:2]] == [
+        "(struct f#S n: i64)",
+        "(let [f] (lambda () -> i64 (block (. (call f#S 1) n))))",
+    ]
+    assert "(struct S n: i64)" in show(program.body[2])
+    out = io.StringIO()
+    Interpreter(out, checker).run(program)
+    assert out.getvalue() == "1 5\n"

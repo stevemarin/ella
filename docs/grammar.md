@@ -938,6 +938,14 @@ match p
   have names. So patterns, `==` and the text form (`Point(3.0, 2.0)`) work
   the same way.
 * Structs are values, like everything else: `let q = p` copies.
+* A struct or enum can also be defined inside a function, or any block.
+  Its name and its variants' names are local to the block, like a
+  variable's, so two functions can each have their own `Point`, and one
+  can hide a top-level type. It can't use the function's variables or
+  type parameters, and can't have methods ([§3](#3-program-structure)), but
+  it can give a constraint's constants (`implements Monoid` with only
+  `const`s). Error messages name it with its function: `f#Point`. Its
+  values print as `Point(...)`.
 
 ### Methods
 
@@ -1479,7 +1487,8 @@ print(fold_all(none))                 # Sum(0)
   `struct Acc[T: Monoid]`, `Acc[Sum]`'s methods see `Sum`'s constants. A
   generic type can also implement such a constraint itself
   (`struct Bag[T]` with `implements Monoid`).
-* For now, only a top-level struct or enum can give constants.
+* A struct or enum defined inside a function can give constants too, as
+  long as the constraint has no methods it would have to give.
 
 ### Pools **(provisional syntax)**
 

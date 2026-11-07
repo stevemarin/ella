@@ -127,7 +127,9 @@ plain:
   makes one program of them, in the order their code runs: each module's
   top-level names get its name in front (`geo.area`; the entry file's stay
   bare), and every use of a top-level name becomes that name, tracking
-  local scopes. It also checks private names (`_x`), imports and
+  local scopes. A type defined inside a function gets a name of its own
+  (`f#S`; `bare_name` prints `S`) and is moved to the top level in front of
+  it (`Resolver.local_name`). It also checks private names (`_x`), imports and
   read-only variables of other modules; the checker checks private fields
   and methods. `prepare` and the interpreter's `run` call it; `Linker`
   takes more options, for editors. It also turns map and set literals into

@@ -140,7 +140,6 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   operators beyond the built-in constraints', associated types, or
   constants computed at compile time (usable in types: `Array[f64;
   T.SIZE]`). `Num` is only met by the number types.
-- Only top-level types can give constants.
 - A constant is computed while compiling and written into the code, so
   its type can't hold functions, arrays or nocopy values (`reify` can't
   write them), and it can't read top-level variables, which don't exist yet
@@ -603,6 +602,23 @@ no multiply that notices overflow); broadcasting inside the fused loop
 itself (shapes that differ take the step-by-step path); slices that are
 views rather than copies, and assigning to slices; f32 literals (`to_f32`
 is the only way to write one).
+
+### Done (2026-11-06, second round): local types are top-level types
+
+Linking (ella.modules) gives a type defined inside a function, and its
+variants, a name of its own (`f#S`, `Resolver.local_name`) and moves it to
+the top level, in front of its function; uses inside the function get the
+new name, and outside it the name stays unknown. A local type can't use
+its function's variables or type parameters, or have methods, so one
+top-level copy is right however often the function runs. So two functions
+can each define an `S` (native code used to crash on that: the lowering
+found types by name), and a local type can give constants. Global
+variables' assembly symbols are numbered (`ella_global_N`), like
+functions', since their names may now have a `#`.
+(test/programs/local_types.ella, test/programs/local_type_modules/.)
+
+Still open: types made by compile-time code (quotes and splices) come after
+linking, so they aren't moved, and still can't give constants.
 
 ### Done (2026-11-06): constants through a type's own parameters
 

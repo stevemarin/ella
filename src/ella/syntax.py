@@ -674,12 +674,13 @@ class Program:
 
 
 def bare_name(name: str) -> str:
-    """A top-level name without the module in front, as linking gave it (ella.modules): `Point` for `geo.Point`.
+    """A top-level name without the module in front, as linking gave it (ella.modules): `Point` for `geo.Point`,
+    and without the function a local type is defined in: `S` for `f#S` (`Resolver.local_name`).
 
     This is how values print. Type arguments in brackets stay as they are.
     """
     head, bracket, rest = name.partition("[")
-    return head.rpartition(".")[2] + bracket + rest
+    return head.rpartition(".")[2].rpartition("#")[2] + bracket + rest
 
 
 def parts(node: object) -> list[object]:

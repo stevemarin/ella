@@ -300,3 +300,24 @@ def test_mut_names_in_patterns() -> None:
 def test_unused_variables_and_unreachable_code_are_warnings() -> None:
     found = analyze("let f = () -> i64 =>\n    let a = 1\n    return 2\n    3\nf()\n").problems
     assert [(p.line, p.column, p.warning) for p in found] == [(2, 9, True), (4, 5, True)]
+
+
+def test_local_types_are_shown_as_written_and_only_in_their_function() -> None:
+    # Linking moves a function's own types to the top level, named after it (`f#Spot`).
+    source = """\
+let f = () -> i64 =>
+    struct Spot
+        n: i64
+    let s = Spot(1)
+    s.n
+let g = () -> i64 =>
+    Sp
+print(f())
+"""
+    found = symbols(source)
+    assert found[2, 12].hover == "struct Spot(n: i64)"
+    assert found[4, 9].hover == "let s: Spot"
+    definition = found[4, 13].definition
+    assert definition is not None and (definition.line, definition.column) == (2, 12)
+    assert "Spot" in names(source, 5, 5)
+    assert not [name for name in names(source, 7, 7) if "Spot" in name]
