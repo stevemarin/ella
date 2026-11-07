@@ -1134,15 +1134,6 @@ class Checker:
             self.defined.add(id(enum))
             self.enum_files[enum.name] = enum.span.file
         self.declare_enum(enum)
-        for param, constraints in zip(enum.type_params, enum.constraints):
-            if with_constants := next((c for c in constraints if self.constraint_constants.get(c)), None):
-                # Its methods would need their type arguments while running, which the tree-walking
-                # interpreter doesn't know.
-                raise EllaError(
-                    f"a type's parameter can't be {with_constants} yet, since {with_constants} has constants; "
-                    f"a generic function's can ('let f[{param}: {with_constants}] = ...')",
-                    enum.span,
-                )
         params: dict[str, Type] = {name: ParamTy(name) for name in enum.type_params}
         if any(has_type_splice(f) for v in enum.variants for f in v.fields):
             raise EllaError("a type can't be spliced into a definition yet; use new_struct()", enum.span)
@@ -1750,6 +1741,15 @@ class Checker:
         constraint, constant_type = next(iter(found.items()))
         self.associated_constants[id(expr)] = (param.name, constraint, expr.name)
         return substitute(constant_type, {"Self": param})
+
+    def needs_type_args(self, enum_name: str) -> bool:
+        """Whether a struct's or enum's type parameters have a constraint with constants (`struct Acc[T: Monoid]`),
+        whose methods may read them (`T.NAME`): the tree-walking interpreter's values of it carry their type
+        arguments."""
+        info = self.enums.get(enum_name)
+        return info is not None and any(
+            self.constraint_constants.get(c) for constraints in info.constraints for c in constraints
+        )
 
     def implementation_of(self, type_name: str, constraint: str) -> str:
         """The constraint a struct or enum implements that gives it `constraint` (perhaps itself)."""

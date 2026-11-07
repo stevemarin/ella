@@ -1474,11 +1474,12 @@ print(fold_all(none))                 # Sum(0)
   (`T.NAME = x` is an error), and it can't be used in a type
   (`Array[f64; T.SIZE]`) yet.
 * A local variable named `T` hides the type parameter in `T.NAME`.
-* For now, only a top-level struct or enum can give constants, and a
-  struct's or enum's own type parameters can't have a constraint with
-  constants (`struct Acc[T: Monoid]` is an error); a generic function's can.
-  A generic type can still implement such a constraint
+* A struct's or enum's own type parameters can have such a constraint
+  too, and its methods read `T.NAME` for the type it holds: in
+  `struct Acc[T: Monoid]`, `Acc[Sum]`'s methods see `Sum`'s constants. A
+  generic type can also implement such a constraint itself
   (`struct Bag[T]` with `implements Monoid`).
+* For now, only a top-level struct or enum can give constants.
 
 ### Pools **(provisional syntax)**
 

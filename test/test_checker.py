@@ -1014,13 +1014,6 @@ constraint Monoid
             "h needs T to be B, and S isn't: it doesn't explicitly implement B",
         ),
         (
-            MONOID + "struct Acc[T: Monoid]\n    total: T",
-            (
-                "a type's parameter can't be Monoid yet, since Monoid has constants; a generic function's can "
-                "('let f[T: Monoid] = ...')"
-            ),
-        ),
-        (
             (
                 "constraint K\n    const X: i64\nlet main = () -> i64 =>\n    struct S\n        n: i64\n"
                 "        implements K\n            const X = 1\n    0"

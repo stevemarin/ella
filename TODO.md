@@ -140,12 +140,7 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   operators beyond the built-in constraints', associated types, or
   constants computed at compile time (usable in types: `Array[f64;
   T.SIZE]`). `Num` is only met by the number types.
-- A struct's or enum's own type parameters can't have a constraint with
-  constants (`struct Acc[T: Monoid]`), since the tree-walking interpreter
-  doesn't know a method's type arguments while it runs (the lowering does:
-  it specializes methods). It would have to carry them from each call's
-  receiver type, through operators, `print`, `for` and `==` too. Only
-  top-level types can give constants.
+- Only top-level types can give constants.
 - A constant is computed while compiling and written into the code, so
   its type can't hold functions, arrays or nocopy values (`reify` can't
   write them), and it can't read top-level variables, which don't exist yet
@@ -608,6 +603,19 @@ no multiply that notices overflow); broadcasting inside the fused loop
 itself (shapes that differ take the step-by-step path); slices that are
 views rather than copies, and assigning to slices; f32 literals (`to_f32`
 is the only way to write one).
+
+### Done (2026-11-06): constants through a type's own parameters
+
+A struct's or enum's own type parameters can now have a constraint with
+constants (`struct Acc[T: Monoid]`), and its methods read them as
+`T.EMPTY`. The lowering already specialized methods, so only the
+tree-walking interpreter changed: a value of such a type carries its type
+arguments (`VariantValue.type_args`, set where its constructor is called
+or named, or its variant without fields is used), and its methods get them
+in their scope (`typed_method`, through `with_type_args`). Since every
+method call, operator, `print`, `==`, `hash`, `for` and finalizer finds
+the method through the value, all of them know them
+(test/programs/generic_type_constants.ella).
 
 ### Done (2026-11-02, tenth round): a bigger standard library
 

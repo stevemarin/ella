@@ -30,6 +30,11 @@ class VariantValue:
     marks a built-in Error (its fields are message, cause and at), whose
     equality and text form leave out where it was made (`at`), and show its
     cause without the `Some`: `Error("bad row", Error("not a number"))`.
+
+    `type_args` are its type's type arguments (`Sum` in `Acc[Sum]`), kept
+    only for a type whose parameters have a constraint with constants, so
+    that its methods can read `T.NAME` (the tree-walking interpreter's
+    `with_type_args`). Equality, patterns and the text form leave them out.
     """
 
     enum: str
@@ -37,6 +42,7 @@ class VariantValue:
     fields: list[Value] = field(default_factory=list)
     nocopy: bool = False
     error: bool = False
+    type_args: tuple[Type, ...] = ()
 
 
 def main_error(error: Value, span: Span) -> EllaError:
@@ -211,7 +217,8 @@ class Constructor:
 
     The built-in Error's (`error`) takes a message and maybe a cause. Used as
     a value, its Errors are made where it is used (`at`), as the lowering's
-    function for it makes them.
+    function for it makes them. `type_args` are those of the values it
+    makes (see VariantValue).
     """
 
     enum: str
@@ -219,6 +226,7 @@ class Constructor:
     arity: int
     error: bool = False
     at: Span | None = None
+    type_args: tuple[Type, ...] = ()
 
 
 @dataclass(eq=False, slots=True)
@@ -388,8 +396,8 @@ def copy_value(value: Value) -> Value:
             return tuple(copy_value(item) for item in value)
         case ArrayValue(shape, items, item):
             return ArrayValue(shape, items.copy(), item)
-        case VariantValue(enum, variant, fields, nocopy, error) if fields and not nocopy:
-            return VariantValue(enum, variant, [copy_value(item) for item in fields], error=error)
+        case VariantValue(enum, variant, fields, nocopy, error, type_args) if fields and not nocopy:
+            return VariantValue(enum, variant, [copy_value(item) for item in fields], error=error, type_args=type_args)
         case _:
             return value
 

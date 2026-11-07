@@ -266,6 +266,9 @@ class Interpreter:
         self.nocopy: set[str] = set()  # the nocopy structs
         self.finalizers: dict[str, Value] = {}  # struct -> its finalize function
         self.methods: dict[str, dict[str, Value]] = {}  # struct or enum -> its methods
+        # The structs and enums whose type parameters have a constraint with constants: their values
+        # carry their type arguments (VariantValue.type_args), for `T.NAME` in their methods.
+        self.typed_enums: set[str] = set()
         # Values with finalizers, by owner: the program (globals), and each
         # function call and loop iteration in progress, innermost last. When
         # an owner ends, it finalizes its values, newest first.
@@ -421,6 +424,14 @@ class Interpreter:
                 ):
                     params = self.checker.resolved[id(expr)].type_params
                     return self.with_type_args(value, params, type_args, scope)
+                if (
+                    isinstance(value, Constructor | VariantValue)
+                    and value.enum in self.typed_enums
+                    and not value.type_args  # not one a variable holds (in `map`, f is `(T) -> U`)
+                    and self.checker
+                    and id(expr) in self.checker.types  # not a constructor's name in its call: that has the type
+                ):
+                    return replace(value, type_args=self.made_type_args(expr, scope))
                 return value
             case Let(bindings, value_expr):
                 if isinstance(value_expr, Lambda):
@@ -512,6 +523,8 @@ class Interpreter:
                 return self.call_member(callee, args, scope, span)
             case Call(callee, args, span):
                 function = self.eval(callee, scope)
+                if isinstance(function, Constructor) and function.enum in self.typed_enums and not function.type_args:
+                    function = replace(function, type_args=self.made_type_args(expr, scope))
                 if isinstance(function, Builtin) and function.name in ("alloc", "free"):
                     return self.call_pool(function.name, args, scope, span)
                 if isinstance(function, Builtin) and function.name == "next":
@@ -875,8 +888,12 @@ class Interpreter:
         """
         if self.checker is not None:
             if (static := self.checker.static_methods.get(id(callee))) is not None:
-                enum_name, name, _ = static
-                return self.call_with_args(self.methods[enum_name][name], args, scope, span)
+                enum_name, name, static_args = static
+                namespace_function = self.methods[enum_name][name]
+                if enum_name in self.typed_enums and isinstance(namespace_function, Closure):
+                    params = self.checker.enums[enum_name].params
+                    namespace_function = self.with_type_args(namespace_function, params, static_args, scope)
+                return self.call_with_args(namespace_function, args, scope, span)
             if (function_name := self.checker.builtin_methods.get(id(callee))) is not None:
                 builtin_function = self.lookup(function_name, scope, callee.span).value
                 assert builtin_function is not None
@@ -949,8 +966,26 @@ class Interpreter:
     def find_method(self, value: Value, name: str) -> Value | None:
         """The method `name` of a struct or enum value, if its type has one."""
         if isinstance(value, VariantValue):
-            return self.methods.get(value.enum, {}).get(name)
+            method = self.methods.get(value.enum, {}).get(name)
+            return None if method is None else self.typed_method(value, method)
         return None
+
+    def typed_method(self, value: VariantValue, method: Value) -> Value:
+        """A method of value's type that knows the type arguments value carries, for `T.NAME` in it."""
+        if not value.type_args or not isinstance(method, Closure):
+            return method
+        assert self.checker is not None
+        params = self.checker.enums[value.enum].params
+        return self.with_type_args(method, params, value.type_args, self.globals)
+
+    def made_type_args(self, expr: Expr, scope: Scope) -> tuple[Type, ...]:
+        """The type arguments of the values a constructor, its call, or a variant without fields (`expr`) makes."""
+        assert self.checker is not None
+        t = finish(self.checker.types[id(expr)])
+        if isinstance(t, FuncTy):
+            t = finish(t.result)
+        assert isinstance(t, EnumTy), f"{show_type(t)} isn't a struct or enum"
+        return tuple(self.bound_type(arg, scope) for arg in t.args)
 
     def method(self, value: Value, name: str, span: Span) -> Value:
         method = self.find_method(value, name)
@@ -1058,9 +1093,9 @@ class Interpreter:
                     raise EllaError(f"Error takes 1 or 2 arguments but was given {len(args)}", span)
                 assert isinstance(args[0], str)
                 return make_error(args[0], at or span, args[1] if len(args) == 2 else None)
-            case Constructor(enum, variant, arity):
+            case Constructor(enum, variant, arity, type_args=type_args):
                 self.check_arity(variant, arity, args, span)
-                value = VariantValue(enum, variant, list(args), nocopy=enum in self.nocopy)
+                value = VariantValue(enum, variant, list(args), nocopy=enum in self.nocopy, type_args=type_args)
                 if enum in self.finalizers:
                     self.owners[-1].append(value)
                 return value
@@ -1215,7 +1250,7 @@ class Interpreter:
             assert isinstance(value.state, Generator)
             self.close_generator(value.state)
         elif isinstance(value, VariantValue) and value.enum in self.finalizers:
-            self.call(self.finalizers[value.enum], [value], FINALIZER_SITE)
+            self.call(self.typed_method(value, self.finalizers[value.enum]), [value], FINALIZER_SITE)
 
     def finalize_held(self, value: Value) -> None:
         """Finalize everything a value holds: itself first, then its parts, last first.
@@ -1727,6 +1762,8 @@ class Interpreter:
             self.structs[enum.name] = enum.field_names
             if enum.nocopy:
                 self.nocopy.add(enum.name)
+        if self.checker is not None and self.checker.needs_type_args(enum.name):
+            self.typed_enums.add(enum.name)
         if enum.methods:
             for method in enum.methods:
                 self.names[id(method.function)] = f"{enum.name}.{method.name}"
