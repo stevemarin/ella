@@ -1,0 +1,2 @@
+2:50: the function's result should have shape [2], not [5]
+  called at 7:15 in main

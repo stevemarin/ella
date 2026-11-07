@@ -1,0 +1,7 @@
+# A `let` checks a value whose shape isn't sure, and its size names are numbers after it.
+let load = (n: i64) -> Array[i64] => reshape(array([1, 2, 3, 4, 5, 6]), if n == 2 then [2, 3] else [3, 2])
+
+let a: Array[i64; Rows, 3] = load(2)
+print(Rows, a[Rows - 1, 2])
+let b: Array[i64; Rows, 3] = load(3)
+print(b)

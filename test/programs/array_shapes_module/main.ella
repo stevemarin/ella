@@ -1,0 +1,7 @@
+import grid
+
+let main = () -> () =>
+    print(grid.count(), grid.Rows, grid.Columns, total(grid.cells))
+    print(grid.mean_row(array([1.0, 3.0])))
+    let Rows = 10
+    print(Rows)

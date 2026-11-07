@@ -1,0 +1,6 @@
+# A module's top-level size names are its top-level variables.
+let cells: Array[i64; Rows, Columns] = fill([2, 3], 1)
+
+let count = () -> i64 => Rows * Columns
+
+let mean_row[; N] = (row: Array[f64; N]) -> f64 => total(row) / to_f64(N)

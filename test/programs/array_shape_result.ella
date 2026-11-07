@@ -1,0 +1,7 @@
+# A result whose shape isn't sure is checked as the function returns.
+let ones[; N] = (like: Array[f64; N], n: i64) -> Array[f64; N] => fill([n], 1.0)
+
+let main = () -> () =>
+    let v = array([1.0, 2.0])
+    print(ones(v, 2))
+    print(ones(v, 5))

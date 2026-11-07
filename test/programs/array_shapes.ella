@@ -1,0 +1,68 @@
+# Arrays typed by shape: size names as numbers, run-time shape checks, and sums.
+
+let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / to_f64(N)
+
+# Size names are i64 variables, also in `where` conditions and in lambdas.
+let row_totals[; N, M] = (a: Array[f64; N, M]) -> [f64] =>
+    where
+        N > 0
+    let row = (i: i64) -> f64 => total(a[i, 0..M])
+    let mut result = []
+    for i in 0..N
+        result = result + [row(i)]
+    result
+
+let scale[; N] = (v: Array[f64; N], by: f64) -> Array[f64; N] => v * by
+
+# A result whose shape isn't sure is checked as the function returns.
+let column[; N] = (n: i64) -> Array[f64; N] => fill([n], 1.0)
+
+# Each call checks its arguments, a tail call too.
+let countdown[; N] = (v: Array[i64; N], n: i64) -> i64 => if n == 0 then N else countdown(v, n - 1)
+
+# A generator's size parameters.
+let indexes[; N] = (v: Array[i64; N]) -> Gen[i64] =>
+    for i in 0..N
+        yield i * 10
+
+let square[; N] = (a: Array[f64; N, N]) -> f64 => total(a) / to_f64(N)
+
+struct Point
+    at: Array[f64; 3]
+    norm2 = (p: Point) -> f64 => dot(p.at, p.at)
+
+let main = () -> () =>
+    let m: Array[f64; R, C] = reshape(array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), [2, 3])
+    print(R, C)
+    print(mean(array([1.0, 2.0, 4.0])))
+    print(row_totals(m))
+    let t: Array[f64; C, R] = transpose(m)
+    print(shape(t))
+    print(scale(array([1.0, 2.0]), 0.5))
+    let c: Array[f64; 4] = column(4)
+    print(c)
+    print(countdown(array([1, 2, 3]), 5))
+    for i in indexes(array([7, 8]))
+        print(i)
+    print(Point(array([1.0, 2.0, 2.0])).norm2())
+    let weights = (n: i64) => fill([n], 0.25)
+    let w: Array[f64; K] = weights(R * C)
+    print(K, total(w))
+
+    # sums along each axis, for every item type
+    print(sums(m, 0), sums(m, 1))
+    let ints = reshape(array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), [2, 3, 2])
+    print(sums(ints, 0))
+    print(sums(ints, 1))
+    print(sums(ints, 2))
+    print(sums(reshape(array([to_i32(1), to_i32(2), to_i32(3), to_i32(4)]), [2, 2]), 1))
+    print(sums(reshape(array([to_f32(0.1), to_f32(0.2), to_f32(0.3), to_f32(0.4)]), [2, 2]), 0))
+    print(sums(fill([0, 3], 1.0), 0), sums(fill([3, 0], 1), 0))
+    let axis = 1
+    print(shape(sums(fill([2, 3, 4], 1), axis)))
+
+    # Shapes that are checked when the program runs.
+    let unknown = fill([2, 2], 1.0)
+    let sized: Array[f64; 2, _] = unknown
+    print(shape(sized))
+    print(square(unknown))
