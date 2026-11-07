@@ -63,7 +63,7 @@ Functions have explicit parameter and result types at top level. Lambda paramete
 
 Direct self-recursion in tail position reuses the current frame when the function has no captures or `mut` parameters and takes scalar parameters. For example, accumulator-style Fibonacci can recurse for far more than the normal call-depth limit. The current guarantee does not yet cover mutual recursion, calls through function values, or functions with boxed parameters.
 
-Structs, enums, tuples, patterns, methods, operator methods, protocols, modules, imports, and generators are available. A file is a module; names starting with `_` are private. See the reference and syntax tour for the full surface area.
+Structs, enums, tuples, patterns, methods, operator methods, protocols, modules, imports, and generators are available. Generic functions take type parameters with constraints, such as `let largest[T: Ord]`; a program can define its own constraints (`constraint Shape`), which a type meets by declaring `implements Shape`, and constraints can require constants that generic code reads as `T.NAME`. A file is a module; names starting with `_` are private. See the reference and syntax tour for the full surface area.
 
 ## Types, numbers, and arrays
 
@@ -79,7 +79,7 @@ grid[1, 2] = 9
 print(grid[1, 2], shape(grid), total(grid))
 ```
 
-Array indices and shapes use `i64`. Slicing arrays currently creates a new array. Numeric array support includes `i64`, `i32`, `f64`, and `f32`; native SIMD coverage varies by type and operation. See the Arrays section in [`docs/grammar.md`](docs/grammar.md#arrays-provisional-syntax) for the current details.
+Array indices and shapes use `i64`. An array type can also state its shape, as in `Array[f64; N, 3]`, so the checker catches mismatched shapes while compiling; this is new and partly implemented (see the reference). Slicing arrays currently creates a new array. Numeric array support includes `i64`, `i32`, `f64`, and `f32`; native SIMD coverage varies by type and operation. See the Arrays section in [`docs/grammar.md`](docs/grammar.md#arrays-provisional-syntax) for the current details.
 
 ## Values, copies, views, and mutation
 

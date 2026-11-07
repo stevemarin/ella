@@ -50,7 +50,7 @@ The following observations are based on the checked-in source and docs:
 
 ### Local source locations
 
-* [README.md](../../README.md): project goals and pipeline; staging is
+* [README-Claude.md](../../README-Claude.md): project goals and pipeline; staging is
   interpreted at runtime by the AST and IR interpreters but not by native
   executables.
 * [grammar.md §11](../grammar.md#11-stages): staging semantics, including
@@ -433,7 +433,7 @@ source text or code was copied into the repository.
 | Material | Relevance |
 | --- | --- |
 | [jit.md](./jit.md) | Concise design exploration and proposed prototyping path. |
-| [README.md](../../README.md) | Project architecture and current native staging limitation. |
+| [README-Claude.md](../../README-Claude.md) | Project architecture and current native staging limitation. |
 | [grammar.md §11](../grammar.md#11-stages) | User-visible staging semantics. |
 | [staging summary](../summaries/staging_summary.md) | Runtime code construction and current backend differences. |
 | [`ir_interpreter.py`](../../src/ella/ir_interpreter.py) | Runtime `run` path, execution model, arena tags and dispatch. |

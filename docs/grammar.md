@@ -82,8 +82,8 @@ Longest match wins (`//=` before `//` before `/`).
 
 `!` (alone), `@` and `` ` `` are not tokens; they are errors outside
 strings and comments. `{` and `}` make map and set literals
-([§10](#the-prelude)). `;` is reserved for array shapes (`Array[f64; N, M]`,
-planned) and is an error everywhere else for now.
+([§10](#the-prelude)). `;` is only used in array shapes (`Array[f64; N, M]`, and size
+parameters `[T; N]`, [§9](#static-shapes)); anywhere else it is an error.
 
 ### Integer literals
 
@@ -1215,6 +1215,50 @@ print(matmul(m, transpose(m)))
 * An array prints as nested lists, one level per dimension:
   `array([[1, 2], [3, 4]])`.
 
+#### Static shapes
+
+**(provisional; partly implemented)** An array type can also give its
+shape after a `;`, so that the checker finds mismatched shapes while
+compiling:
+
+```ella
+Array[f64]              # any rank, any sizes
+Array[f64; _, _]        # rank 2, sizes not tracked
+Array[f64; N, 3]        # rank 2: N rows (a size name), exactly 3 columns
+
+let mm[T: Num; N, K, M] = (a: Array[T; N, K], b: Array[T; K, M]) -> Array[T; N, M] => matmul(a, b)
+let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / to_f64(len(xs))
+```
+
+* A dimension is a size (`3`), a size name (`N`) or `_`, which fits any
+  size. `Array[T;]`, with no dimensions, is an error, and only `Array` has
+  dimensions.
+* Size parameters follow a `;` in a top-level function's brackets, after
+  any type parameters (`[T: Num; N, K, M]`, or `[; N]` alone). Inside the
+  function a size parameter is fixed: `N` against `3`, or against another
+  size parameter, is an error. Each call decides them anew, from its
+  arguments.
+* In a local annotation, a size name's first use takes the value's size,
+  and later uses must agree:
+  `let a: Array[f64; N, M] = ...` then `let b: Array[f64; M, N] = transpose(a)`.
+* The checker knows the shapes the library gives: `transpose` swaps two
+  dimensions, `matmul` needs the inner sizes to agree, `dot` needs equal
+  shapes, `array(xs)` has one dimension of a size not tracked (`_`), and
+  `fill` and `reshape` give an array whose rank isn't tracked.
+* Indexing checks the number of indexes when the rank is known (`a[0]` on
+  an `Array[f64; N, M]` is an error). In a slice, an `i64` drops its
+  dimension, a range gives `_`, and dimensions left out keep their sizes.
+* Arithmetic broadcasts shapes as at run time, lined up from the right:
+  each two sizes must agree, or one be the size 1; `_` gives `_`, and a
+  rank not tracked on either side gives a rank not tracked.
+* Shapes are erased after checking: they never make separate copies of a
+  function, and the run-time checks of the operations themselves stay.
+  **Not yet implemented:** where a `_` (or an array whose rank isn't
+  tracked) reaches a place that names a size, the size is trusted rather
+  than checked at run time, so a wrong shape shows up later, as the
+  operation's own run-time error. Size names can't be used as numbers
+  (`for i in 0..N`) yet, and structs and enums can't have size parameters.
+
 ### Errors
 
 `Error` is a built-in struct for the error side of a `Result`, holding a
@@ -2105,9 +2149,11 @@ expr        = let | assignment | lambda | if | match | for | while | loop
             | break | continue | return | yield | assert | enum | struct | constraint
             | quote | mut_call | operator_expr ;
 
-let         = "let" binding [ "[" type_param { "," type_param } "]" ] "=" { binding "=" } expr
+let         = "let" binding [ type_params ] "=" { binding "=" } expr
             | "let" [ "mut" ] pattern [ ":" type ] "=" expr ;  (* destructuring: the pattern starts with "(" or IDENT "(" *)
+type_params = "[" ( type_param { "," type_param } [ ";" sizes ] | ";" sizes ) "]" ;
 type_param  = IDENT [ ":" path { "+" path } ] ;      (* built-in or user-defined constraints *)
+sizes       = IDENT { "," IDENT } ;                  (* size parameters (§9, static shapes) *)
 binding     = [ "mut" ] IDENT [ ":" type ] ;      (* type parameters: first binding only *)
 assignment  = target ( "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" ) expr ;
 target      = IDENT | operator_expr index | operator_expr "." IDENT ;
@@ -2177,12 +2223,13 @@ pattern_atom = "_" | [ "mut" ] IDENT | literal | literal ( ".." | "..=" ) litera
             | path [ "(" pattern { "," pattern } ")" ]  (* a dotted path is a variant or struct: geo.Circle(r) *)
             | "(" pattern "," [ pattern { "," pattern } ] ")" ;
 
-type        = path [ "[" type { "," type } "]" ]  (* geo.Point, p.Pair[i64] *)
+type        = path [ "[" type { "," type } [ ";" dim { "," dim } ] "]" ]  (* geo.Point, p.Pair[i64], Array[f64; N, 3] *)
             | "$" ( IDENT | "(" expr ")" )      (* in a quote: a spliced type *)
             | "[" type "]"
             | "(" ")"
             | "(" [ [ "mut" ] type { "," [ "mut" ] type } ] ")" "->" type
             | "(" type "," [ type { "," type } ] ")" ;
+dim         = INT | IDENT | "_" ;                (* a size, a size name, or any size *)
 ```
 
 Parsing notes:
@@ -2229,11 +2276,10 @@ Parsing notes:
 
 ## Open questions
 
-* Fixed-size SIMD vector types (`f32x4`?) beside `Array[T]`, narrower
-  item types for arrays, broadcasting between arrays of different shapes,
-  and slices of arrays.
-* Whether iteration should use a stateful iterator (`next`) rather than
-  making a list.
+* Fixed-size SIMD vector types (`f32x4`?) beside `Array[T]`, item types
+  narrower than 32 bits, slices of arrays that are views (and can be
+  assigned to), and checking static shapes at run time where they can't be
+  known while compiling.
 * Whether a constraint should be able to require operators beyond the
   built-in constraints', associated types, and constants usable in types
   (computed at compile time).
@@ -2244,7 +2290,7 @@ Parsing notes:
 * Generic computed types (`new_struct` makes structs without type
   parameters) and splicing types into struct definitions.
 * Importing several names of a module at once (`import geo: area,
-  Shape`), passing imports on (re-exports), and libraries outside the
-  program's root and the standard library.
+  Shape`), passing imports on (re-exports), and a way for a project to
+  name its packages (a manifest) rather than the package path.
 * Whether imports should be allowed to form cycles, for functions in two
   modules that call each other.

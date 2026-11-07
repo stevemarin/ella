@@ -2,8 +2,8 @@
 
 These notes explain implementation ideas and invariants behind Ella's major
 subsystems. They are aimed at people changing the language, compiler, runtime,
-or tooling. The [language reference](docs/grammar.md) defines user-facing
-syntax; [GETTING_STARTED.md](GETTING_STARTED.md) is the shorter introduction.
+or tooling. The [language reference](../grammar.md) defines user-facing
+syntax; [GETTING_STARTED.md](../../GETTING_STARTED.md) is the shorter introduction.
 
 * [Compiler pipeline and IR](compiler_pipeline_summary.md)
 * [Type system, generics, and protocols](type_system_summary.md)

@@ -2,20 +2,24 @@
 
 Ella arrays are multidimensional, homogeneous numeric values with a flat
 row-major buffer and run-time shape. Their source syntax and built-ins are
-described in [`docs/grammar.md`](docs/grammar.md) §9. The key implementation
-areas are `ArrayValue` and numerical operations in
-[`src/ella/library.py`](src/ella/library.py), array lowering in
-[`src/ella/lower.py`](src/ella/lower.py), fusion in
-[`src/ella/passes/fuse.py`](src/ella/passes/fuse.py), and native loops in
-[`src/ella/codegen.py`](src/ella/codegen.py) and
-[`src/ella/runtime.c`](src/ella/runtime.c).
+described in [`docs/grammar.md`](../grammar.md) §9. The key implementation
+areas are `ArrayValue` in [`src/ella/values.py`](../../src/ella/values.py),
+item-by-item operators in [`src/ella/operators.py`](../../src/ella/operators.py),
+array library functions in
+[`src/ella/library.py`](../../src/ella/library.py), array lowering in
+[`src/ella/lower.py`](../../src/ella/lower.py), fusion in
+[`src/ella/passes/fuse.py`](../../src/ella/passes/fuse.py), and native loops in
+[`src/ella/codegen.py`](../../src/ella/codegen.py) and
+[`src/ella/runtime.c`](../../src/ella/runtime.c).
 
 ## Representation and shape
 
 An `Array[T]` contains a flat sequence of `i64`, `i32`, `f64`, or `f32`
 items plus a dimension count and shape. Logical multidimensional indexing is
-converted to a row-major offset. Rank and dimensions are run-time data; the
-type parameter identifies only the item type. Constructors such as `array`,
+converted to a row-major offset. Rank and dimensions are run-time data. A
+type may also give a static shape (`Array[f64; N, 3]`), which only the
+checker uses: it is erased before lowering, so the IR and backends see just
+the item type, and the run-time shape checks stay. Constructors such as `array`,
 `fill`, and `reshape` create or reinterpret shape while preserving the item
 count rules documented in the grammar.
 

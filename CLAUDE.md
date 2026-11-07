@@ -2,7 +2,15 @@
 
 A statically typed language for learning and fun, implemented in pure Python
 3.15. Native executables also link a small C runtime (`src/ella/runtime.c`),
-built with gcc. See [README.md](README.md) for goals and roadmap.
+built with gcc. See [README-Claude.md](README-Claude.md) for goals, design
+and the status of each feature, and [TODO-Claude.md](TODO-Claude.md) for
+open work, plans and the log of finished work.
+
+* **Docs come in pairs.** [README.md](README.md) and [TODO.md](TODO.md)
+  are short and written for people; README-Claude.md and TODO-Claude.md
+  are the detailed versions, for you. When a change affects one, update
+  its partner too (the human one only where a reader would notice).
+  Ignore TEXTBOOK.md.
 
 * **Language reference:** [docs/grammar.md](docs/grammar.md). It is the source
   of truth for syntax and semantics. If the implementation needs a rule to
@@ -251,6 +259,7 @@ plain:
   `test/test_interpreter.py`, `test/test_ir.py` (including differential tests
   of both interpreters, the optimized IR and native code), `test/test_passes.py`,
   `test/test_native.py`, `test/test_regalloc.py`, `test/test_cli.py`, `test/test_analysis.py`,
+  `test/test_staging.py`,
   `test/test_lsp.py` (starts `ella-lsp` as a client would),
   `test/test_vscode.py`, `test/test_modules.py` (programs of several
   files). Native tests need
@@ -267,5 +276,5 @@ plain:
   natively by `test/test_benchmarks.py`; `test/bench.py` times them.
 
 Stage 7 (staged programming, structs, generics, pools, nocopy and
-finalizers) is done, and so are modules; see README.md, TODO.md and
-docs/memory-model.md §15 for what is still open.
+finalizers) is done, and so are modules; see README-Claude.md,
+TODO-Claude.md and docs/memory-model.md §15 for what is still open.

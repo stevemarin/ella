@@ -1,9 +1,9 @@
 # Type system, generics, and protocols
 
 This note describes the current checker model. The language details are in
-[`docs/grammar.md`](docs/grammar.md), especially §§9–10. Implementation is
-centered in [`src/ella/checker.py`](src/ella/checker.py), with method and
-operator lowering in [`src/ella/lower.py`](src/ella/lower.py).
+[`docs/grammar.md`](../grammar.md), especially §§9–10. Implementation is
+centered in [`src/ella/checker.py`](../../src/ella/checker.py), with method and
+operator lowering in [`src/ella/lower.py`](../../src/ella/lower.py).
 
 ## Type representation and inference
 
@@ -36,12 +36,21 @@ ordering capabilities). At a generic call, the checker infers or reads
 concrete type arguments, verifies the constraints, and records the
 instantiation for lowering.
 
-User-defined constraints declare required methods with a `Self` type. A
-concrete type meets a constraint structurally when the methods and
-signatures match; there is no separate implementation declaration. This
-keeps generic dispatch static: specialized functions call concrete methods,
-and the current backend does not need runtime dictionaries or virtual
-dispatch. A generic function can be bound locally with `let`; it may capture
+User-defined constraints declare required methods with a `Self` type, and
+can require other constraints (`constraint Ranked: Named + Ord`) and
+typed constants (`const EMPTY: Self`). A struct or enum meets a
+user-defined constraint only by declaring `implements Shape` (with a block
+of methods, or after defining them); having matching methods is not enough.
+The checker verifies the required methods and signatures at the
+declaration, and a type implements each user-defined constraint once.
+Built-in constraints are still met as their table says. Generic code reads
+a constant as `T.NAME`; each implementation's value is computed once at
+compile time (`staging.Expander.write_constant`) and written into the code
+as a literal, or a global made before the program runs. A struct's own type
+parameters can carry such constraints (`struct Acc[T: Monoid]`), so its
+methods see `T.EMPTY` too. Dispatch stays static: specialized functions
+call concrete methods, and the backend needs no runtime dictionaries or
+virtual dispatch. A generic function can be bound locally with `let`; it may capture
 local values, and is specialized independently at each use. This is a
 generic function binding, not an anonymous polymorphic function value.
 
@@ -108,8 +117,15 @@ lowering, IR type verification, and tests for all execution paths. Keep
 diagnostics tied to source spans. Be especially cautious where a new feature
 affects both type equality and runtime representation.
 
+Array types may carry static shapes (`Array[f64; N, 3]`, size parameters
+`[; N]`): sizes are `SizeTy`s or type variables inside the `Array`
+`BuiltinTy`, unified like types and erased by `finish` before lowering
+(docs/grammar.md §9, "Static shapes").
+
 Known limits include no anonymous polymorphic function values, conservative
 name-based exclusivity, limitations in exhaustiveness reasoning over integer
-ranges, and no constraint-local method requirements beyond the currently
-modeled signatures. Consult TODO.md and grammar open questions for current
-status.
+ranges, no operators or associated types in user-defined constraints,
+constants that can't be used in types, and no run-time checks of static
+shapes yet. Consult [TODO.md](../../TODO.md) (or the detailed
+[TODO-Claude.md](../../TODO-Claude.md)) and the grammar's open questions
+for current status.

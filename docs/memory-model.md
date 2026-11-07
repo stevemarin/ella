@@ -1,7 +1,7 @@
 # Ella memory model
 
 **Status:** mostly implemented, in roadmap stages 6 and 7 of the
-[README](../README.md). Stage 6 built steps 1 to 5 and 9 of the
+[README-Claude.md](../README-Claude.md). Stage 6 built steps 1 to 5 and 9 of the
 [plan](#9-implementation-plan): explicit copies, lists that change in place,
 `mut` parameters, scope arenas whose placement the compiler chooses and the
 IR interpreter checks, and real arenas in native code. Stage 7 built steps
@@ -340,7 +340,7 @@ code only after the rules are settled and tested.
    pool slots use arenas instead of size-class slabs; see §15.)*
 
 Each step should keep every test program producing the same output through
-both interpreters, as the README requires today.
+every backend, as README-Claude.md requires today.
 
 ## 10. Later: threads
 

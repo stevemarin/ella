@@ -192,7 +192,7 @@ DEFERRED = DeferredTy()
 
 @dataclass(frozen=True, slots=True)
 class SizeTy:
-    """One dimension of an array type (TODO.md, "arrays typed by shape"): `Array[f64; N, 3, _]`.
+    """One dimension of an array type (TODO-Claude.md, "arrays typed by shape"): `Array[f64; N, 3, _]`.
 
     `value` is a size (3), a size parameter's name ("N"), which only matches
     itself, or "_" (ANY_SIZE) for a size not tracked, which matches any.

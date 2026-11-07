@@ -2,8 +2,8 @@
 
 Ella treats each source file as a module. Imports are resolved and linked
 before type checking/lowering, producing one whole-program syntax tree with
-qualified names. The language rules are in [`docs/grammar.md`](docs/grammar.md)
-§3; the implementation is in [`src/ella/modules.py`](src/ella/modules.py).
+qualified names. The language rules are in [`docs/grammar.md`](../grammar.md)
+§3; the implementation is in [`src/ella/modules.py`](../../src/ella/modules.py).
 
 ## Names and module identity
 
@@ -26,6 +26,14 @@ rewrites names into unique qualified names, attaches source-file identity to
 spans, then returns one program for the checker and later compiler stages.
 Later phases therefore operate on a unified namespace rather than resolving
 module syntax themselves.
+
+Linking also moves each struct or enum defined inside a function to the top
+level, just before that function, under a name of its own (`f#S`,
+`Resolver.local_name`; `bare_name` prints `S`). Uses inside the function get
+the new name. A local type can't use its function's variables or type
+parameters, so one top-level copy is correct however often the function
+runs, and two functions can each define their own `S`. Types made by
+compile-time code appear after linking, so they are not moved.
 
 Modules are found first relative to the program root, then through package
 paths passed by CLI options or `ELLA_PATH`, and finally in the bundled
@@ -72,6 +80,5 @@ compiler's normal first-error behavior confusing.
 
 Current limitations include no import cycles, no re-exports, one import
 target per statement, and no general third-party package registry. See
-TODO.md and the grammar's module open questions for changes under
+[TODO.md](../../TODO.md) and the grammar's module open questions for changes under
 consideration.
-

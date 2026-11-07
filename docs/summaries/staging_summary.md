@@ -2,9 +2,9 @@
 
 Ella treats code as a typed value and supports compile-time as well as
 run-time staging. The syntax and examples are in
-[`docs/grammar.md`](docs/grammar.md) §11. The implementation is primarily in
-[`src/ella/staging.py`](src/ella/staging.py), with stage checks and type
-metadata in [`src/ella/checker.py`](src/ella/checker.py).
+[`docs/grammar.md`](../grammar.md) §11. The implementation is primarily in
+[`src/ella/staging.py`](../../src/ella/staging.py), with stage checks and type
+metadata in [`src/ella/checker.py`](../../src/ella/checker.py).
 
 ## Core model
 

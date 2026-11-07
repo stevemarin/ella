@@ -3,8 +3,8 @@
 Generators make lazy sequences that suspend and resume a function body. They
 are implemented through IR terminators and persistent frames rather than by
 rewriting the body into a separate source-level state machine. User syntax is
-documented in [`docs/grammar.md`](docs/grammar.md) §9; memory lifetime details
-are in [`docs/memory-model.md`](docs/memory-model.md) §17.
+documented in [`docs/grammar.md`](../grammar.md) §9; memory lifetime details
+are in [`docs/memory-model.md`](../memory-model.md) §17.
 
 ## Language behavior
 

@@ -2,11 +2,11 @@
 
 This document describes the memory model as implemented in the compiler and
 native runtime. The fuller design and implementation history is in
-[`docs/memory-model.md`](docs/memory-model.md). The most relevant code is
-[`src/ella/lower.py`](src/ella/lower.py), [`src/ella/ir.py`](src/ella/ir.py),
-[`src/ella/ir_interpreter.py`](src/ella/ir_interpreter.py),
-[`src/ella/codegen.py`](src/ella/codegen.py), and
-[`src/ella/runtime.c`](src/ella/runtime.c).
+[`docs/memory-model.md`](../memory-model.md). The most relevant code is
+[`src/ella/lower.py`](../../src/ella/lower.py), [`src/ella/ir.py`](../../src/ella/ir.py),
+[`src/ella/ir_interpreter.py`](../../src/ella/ir_interpreter.py),
+[`src/ella/codegen.py`](../../src/ella/codegen.py), and
+[`src/ella/runtime.c`](../../src/ella/runtime.c).
 
 ## The contract
 

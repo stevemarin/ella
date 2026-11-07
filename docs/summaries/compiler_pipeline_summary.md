@@ -2,14 +2,14 @@
 
 This is a developer guide to how an Ella source file reaches the tree
 interpreter, IR interpreter, or native executable. Main sources are
-[`src/ella/parser.py`](src/ella/parser.py),
-[`src/ella/checker.py`](src/ella/checker.py),
-[`src/ella/lower.py`](src/ella/lower.py),
-[`src/ella/ir.py`](src/ella/ir.py),
-[`src/ella/passes/`](src/ella/passes/),
-[`src/ella/ir_interpreter.py`](src/ella/ir_interpreter.py),
-[`src/ella/codegen.py`](src/ella/codegen.py), and
-[`src/ella/native.py`](src/ella/native.py).
+[`src/ella/parser.py`](../../src/ella/parser.py),
+[`src/ella/checker.py`](../../src/ella/checker.py),
+[`src/ella/lower.py`](../../src/ella/lower.py),
+[`src/ella/ir.py`](../../src/ella/ir.py),
+[`src/ella/passes/`](../../src/ella/passes/),
+[`src/ella/ir_interpreter.py`](../../src/ella/ir_interpreter.py),
+[`src/ella/codegen.py`](../../src/ella/codegen.py), and
+[`src/ella/native.py`](../../src/ella/native.py).
 
 ## Pipeline
 
@@ -55,7 +55,7 @@ copy/move cleanup, folding, CFG simplification, and dead-code elimination,
 then attempts inlining and cleanup again, and finally fuses eligible array
 operations. Each pass mutates IR in place and reports whether it changed
 anything. The optimizer verifies after each pass. See
-[`src/ella/passes/__init__.py`](src/ella/passes/__init__.py) for ordering and
+[`src/ella/passes/__init__.py`](../../src/ella/passes/__init__.py) for ordering and
 individual pass modules for their rules.
 
 Passes must preserve observable behavior, including runtime errors, source

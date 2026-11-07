@@ -578,7 +578,7 @@ def test_constrained_type_parameters() -> None:
 
 
 def test_array_shapes() -> None:
-    # Dimensions follow a `;`: sizes, size names and `_` (TODO.md, "arrays typed by shape").
+    # Dimensions follow a `;`: sizes, size names and `_` (TODO-Claude.md, "arrays typed by shape").
     assert one("let a: Array[f64; N, 3, _] = b") == "(let [a: Array[f64; N, 3, _]] b)"
     assert one("let a: Array[f64] = b") == "(let [a: Array[f64]] b)"
     assert one("let a: Array[f64,; N,] = b") == "(let [a: Array[f64; N]] b)"

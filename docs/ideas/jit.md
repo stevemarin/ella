@@ -12,7 +12,7 @@ that code at the stage where `run` appears. The AST and IR interpreters support
 runtime-built code. Native code does not: it can build and run code while
 compiling, but reports an error if it reaches runtime staging operations. See
 [grammar.md §11](../grammar.md#11-stages), [the staging summary](../summaries/staging_summary.md),
-and [README.md](../../README.md).
+and [README-Claude.md](../../README-Claude.md).
 
 Today, the native path is:
 

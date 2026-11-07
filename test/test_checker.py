@@ -1845,7 +1845,7 @@ def test_generator_types() -> None:
 
 
 def test_array_shapes() -> None:
-    # TODO.md, "arrays typed by shape": dimensions are sizes, size names and `_`; checked statically.
+    # TODO-Claude.md, "arrays typed by shape": dimensions are sizes, size names and `_`; checked statically.
     ok = "let a: Array[f64; N, M] = transpose(reshape(array([1.0, 2.0]), [1, 2]))\n"
     assert shape_of(ok + "let b: Array[f64; M, N] = transpose(a)\nb") == "Array[f64; M, N]"
     assert shape_of(ok + "a[0, 1]") == "f64"
