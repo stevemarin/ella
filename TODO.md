@@ -94,9 +94,16 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 - No negative indexing (deliberate for now).
 - The warning for cases that never match doesn't compare ranges with
   literals or each other (`case 1` after `case 0..5` isn't reported), and
-  ranges never count as covering an `i64`. Unused top-level variables,
-  methods and enum variants aren't reported, nor two unused functions
-  that only call each other.
+  ranges never count as covering an `i64`. Consider representing integer
+  pattern coverage as intervals, respecting inclusive/exclusive endpoints,
+  then use it to detect covered literals and ranges and to prove coverage
+  over finite integer domains. Keep guards out of coverage (they can be
+  false), and keep floats and strings conservative, requiring a wildcard or
+  binding. Exact interval boundaries, especially integer limits, need tests;
+  more aggressive analysis risks false warnings, while conservative analysis
+  can miss useful cases. Unused top-level variables, methods and enum
+  variants aren't reported, nor two unused functions that only call each
+  other.
 - Native code has room for about two scope levels per nested call; a deep
   recursion through loops can run out of scope arenas before the depth
   limit, which the interpreters don't.
@@ -148,6 +155,18 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
   9 MiB resident memory, so chunked or size-class storage is not yet justified
   by measured resident usage.
 - Owning (non-copyable) handles remain open.
+- Make `nocopy` ownership more ergonomic without introducing a general
+  borrow checker or lifetime parameters. Start by allowing a local
+  non-copyable value to move into a generator call when the compiler proves
+  the call is its last use; test that later uses are rejected and that
+  cleanup agrees across interpreters and native code. A broader follow-up
+  could add a parameter mode to function types to distinguish taking a
+  non-copyable argument from borrowing it, then revisit yielding such values
+  and iterator ownership separately. This could make generators and owned
+  resources easier to compose, but ownership rules affect calls, returns,
+  closures, generators and finalization, so incorrect rules risk
+  use-after-free or double-finalization bugs. Keep the first change narrow;
+  a general ownership system is outside the memory model's stated goals.
 - Region bloat remains where loops don't carry values (memory-model.md
   §12, §16): a variable a loop both replaces and changes in place, a global
   replaced in a loop that calls Ella functions, loops left by a labeled
@@ -175,6 +194,15 @@ From [docs/memory-model.md](docs/memory-model.md) §11, §12 and §15:
 
 ### Staging
 
+- Consider compile-time type parameters and a small set of compile-time value
+  parameters, initially integers, distinct from runtime arguments. They could
+  express types or operations whose shape depends on known values, with no
+  runtime cost, but overlap with staging and computed types and can increase
+  checker complexity, compile time and generated code. Start by specifying
+  syntax, specialization and checking at each use; cache by the full set of
+  compile-time arguments, and diagnose nonterminating or excessive
+  computation and specialization growth. Prototype a concrete use before
+  committing to the feature.
 - Native code can't run code built at run time (`run` needs an interpreter).
 - A quote inside a function defined inside a splice can't refer to the
   variables of the quote the splice is in. The checker now rejects this
