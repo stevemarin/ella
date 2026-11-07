@@ -1,0 +1,20 @@
+# A module whose function defines a type, with constants, that its generic
+# function reads.
+constraint Counter
+    step: (Self) -> Self
+    const START: Self
+
+let count[T: Counter] = (n: i64) -> T =>
+    let mut x = T.START
+    for _ in 0..n
+        x = x.step()
+    x
+
+let tally = (n: i64) -> str =>
+    struct Tally
+        marks: str
+        implements Counter
+            step = (t: Tally) -> Tally => Tally(t.marks + "|")
+            const START = Tally("")
+    let t: Tally = count(n)
+    "{{t}}"

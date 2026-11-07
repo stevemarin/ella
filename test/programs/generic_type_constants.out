@@ -1,0 +1,12 @@
+Sum(5) Product(24)
+sum(2) = Sum(5)
+[product(3) = Product(24), product(1) = Product(5)]
+sum(3) = Sum(15)
+true true
+sum(0) = Sum(0) Product(1)
+sum(2) = Sum(3) product(2) = Product(20)
+days: sum(2) = Sum(15) (starts at Sum(0))
+growth: product(1) = Product(3) (starts at Product(1))
+Sum(0) Product(1) Sum(4)
+Product(6) Product(7)
+2

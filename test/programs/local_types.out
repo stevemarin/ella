@@ -1,0 +1,6 @@
+local sum: Sum(105)
+joined: Sum("abcd") Sum("xy")
+top-level sum: Sum(3)
+[Red, Green, Red] 2
+[Red, Blue(3)] 7
+["Point(0, 0)", "Point(1, 1)", "Point(2, 4)"]

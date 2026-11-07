@@ -1,0 +1,81 @@
+# A struct's or enum's own type parameters can have a constraint with
+# constants: its methods read them as `T.NAME`, for the type it holds.
+constraint Monoid
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+    const LABEL: str
+
+struct Sum
+    n: i64
+    implements Monoid
+        combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n)
+        const EMPTY = Sum(0)
+        const LABEL = "sum"
+
+struct Product
+    n: i64
+    implements Monoid
+        combine = (a: Product, b: Product) -> Product => Product(a.n * b.n)
+        const EMPTY = Product(1)
+        const LABEL = "product"
+
+struct Acc[T: Monoid]
+    items: [T]
+    # A static function: its type arguments come from where it is called.
+    new = () -> Acc[T] => Acc([])
+    total = (a: Acc[T]) -> T =>
+        let mut out = T.EMPTY
+        for x in a.items
+            out = out.combine(x)
+        out
+    add = (a: Acc[T], b: Acc[T]) -> Acc[T] => Acc(a.items + b.items)
+    text = (a: Acc[T]) -> str => "{{T.LABEL}}({{len(a.items)}}) = {{a.total()}}"
+    eq = (a: Acc[T], b: Acc[T]) -> bool => "{{a.total()}}" == "{{b.total()}}"
+    hash = (_a: Acc[T]) -> i64 => len(T.LABEL)
+
+let sums = Acc([Sum(2), Sum(3)])
+let products = Acc([Product(2), Product(3), Product(4)])
+print(sums.total(), products.total())
+# Printing calls text, here inside a list too.
+print(sums)
+print([products, Acc([Product(5)])])
+# An operator calls add.
+print(sums + Acc([Sum(10)]))
+# == calls eq, which reads the constants of each side's type.
+print(Acc([Sum(5)]) == sums, Acc([Product(6)]) == Acc([Product(2), Product(3)]))
+let empty: Acc[Sum] = Acc.new()
+let no_products: Acc[Product] = Acc.new()
+print(empty, no_products.total())
+
+# A value made in a generic function gets the type it is called with.
+let pair[T: Monoid] = (x: T, y: T) -> Acc[T] => Acc([x, y])
+print(pair(Sum(1), Sum(2)), pair(Product(4), Product(5)))
+
+# A generic type can hold another, and pass its parameter on.
+struct Ledger[T: Monoid]
+    name: str
+    acc: Acc[T]
+    report = (l: Ledger[T]) -> str => "{{l.name}}: {{l.acc}} (starts at {{T.EMPTY}})"
+
+print(Ledger("days", Acc([Sum(7), Sum(8)])).report())
+print(Ledger("growth", Acc([Product(3)])).report())
+
+# An enum, with a variant that has no fields.
+enum Maybe[T: Monoid]
+    Nothing
+    Just(T)
+    value = (m: Maybe[T]) -> T =>
+        match m
+            case Nothing => T.EMPTY
+            case Just(x) => x
+
+let nothing_sum: Maybe[Sum] = Nothing
+let nothing_product: Maybe[Product] = Nothing
+print(nothing_sum.value(), nothing_product.value(), Just(Sum(4)).value())
+
+# A constructor used as a value makes values of the type it is used at.
+let justs = map([Product(6), Product(7)], Just)
+print(justs[0].value(), justs[1].value())
+
+# Sets and maps call hash and eq, which read their type's constants too.
+print(len({sums, Acc([Sum(1), Sum(4)]), Acc([Sum(9)])}))

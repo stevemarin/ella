@@ -1,0 +1,16 @@
+import counts
+
+# The same name as the module's local type, and as one of the main file's.
+let tens = (n: i64) -> str =>
+    struct Tally
+        value: i64
+        implements counts.Counter
+            step = (t: Tally) -> Tally => Tally(t.value + 10)
+            const START = Tally(0)
+    let t: Tally = counts.count(n)
+    "{{t}}"
+
+struct Tally
+    value: i64
+
+print(counts.tally(3), tens(4), Tally(1))

@@ -1,0 +1,90 @@
+# Types defined inside functions are local to them, even with the same
+# names, and can give constants.
+constraint Monoid
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+    const LABEL: str
+
+let fold_all[T: Monoid] = (xs: [T]) -> str =>
+    let mut acc = T.EMPTY
+    for x in xs
+        acc = acc.combine(x)
+    "{{T.LABEL}}: {{acc}}"
+
+struct Acc[T: Monoid]
+    items: [T]
+    total = (a: Acc[T]) -> T =>
+        let mut out = T.EMPTY
+        for x in a.items
+            out = out.combine(x)
+        out
+
+struct Sum
+    n: i64
+    implements Monoid
+        combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n)
+        const EMPTY = Sum(0)
+        const LABEL = "top-level sum"
+
+let sums = () -> str =>
+    # The same name as the top-level struct, which it hides here.
+    struct Sum
+        n: i64
+        implements Monoid
+            combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n + 1)
+            const EMPTY = Sum(100)
+            const LABEL = "local sum"
+    fold_all([Sum(1), Sum(2)])
+
+let lengths = () -> str =>
+    struct Sum
+        text: str
+        implements Monoid
+            combine = (a: Sum, b: Sum) -> Sum => Sum(a.text + b.text)
+            const EMPTY = Sum("")
+            const LABEL = "joined"
+    let joined = fold_all([Sum("ab"), Sum("cd")])
+    "{{joined}} {{Acc([Sum("x"), Sum("y")]).total()}}"
+
+print(sums())
+print(lengths())
+print(fold_all([Sum(1), Sum(2)]))
+
+# Enums too, with the same variant names in different functions.
+let lights = () -> str =>
+    enum Light
+        Red
+        Green
+    let all = [Red, Green, Red]
+    let mut reds = 0
+    for light in all
+        match light
+            case Red => reds += 1
+            case Green => ()
+    "{{all}} {{reds}}"
+
+let paints = () -> str =>
+    enum Paint
+        Red
+        Blue(i64)
+    let shade = (p: Paint) -> i64 =>
+        match p
+            case Red => 0
+            case Blue(n) => n
+    "{{[Red, Blue(3)]}} {{shade(Blue(7))}}"
+
+print(lights())
+print(paints())
+
+# A type defined in a loop's body is one type, whatever the iteration.
+let points = () -> [str] =>
+    let mut out: [str] = []
+    for i in 0..3
+        struct Point
+            x: i64
+            y: i64
+        let p = Point(i, i * i)
+        out += ["{{p}}"]
+    out
+
+print(points())
