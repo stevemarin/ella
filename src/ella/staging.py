@@ -26,6 +26,7 @@ from ella.checker import (
 from ella.lexer import EllaError, Span
 from ella.modules import link
 from ella.syntax import (
+    AssociatedConst,
     Binary,
     Binding,
     BoolLit,
@@ -35,6 +36,7 @@ from ella.syntax import (
     FieldSplice,
     FloatLit,
     FunctionType,
+    Implementation,
     IntLit,
     Lambda,
     Let,
@@ -61,7 +63,7 @@ from ella.syntax import (
     parts,
     rebuild,
 )
-from ella.values import CodeValue, TypeValue, Value, VariantValue
+from ella.values import F32, I32, CodeValue, TypeValue, Value, VariantValue
 
 # What can be spliced into a quote: code, a type, or a field's name.
 type AnySplice = Splice | TypeSplice | FieldSplice
@@ -279,8 +281,12 @@ def reify(value: Value, span: Span) -> Expr:
     match value:
         case bool():
             return BoolLit(value, span)
+        case I32():
+            return Call(Name("to_i32", span), (IntLit(int(value), span),), span)
         case int():
             return IntLit(value, span)
+        case F32():
+            return Call(Name("to_f32", span), (FloatLit(float(value), span),), span)
         case float():
             return FloatLit(value, span)
         case str():
@@ -477,7 +483,7 @@ def prepare(
     checker = Checker()
     expander = Expander(program, checker, out)
     checker.check_program(program)
-    if not has_splices(program):
+    if not has_splices(program) and not has_constants(program):
         return program, checker
     expanded = materialize_hygiene(expander.expand_program(), checker.globals.vars)
     assert isinstance(expanded, Program)
@@ -488,9 +494,16 @@ def prepare(
 
 
 def uses_staging(node: object) -> bool:
-    """Whether some code has a quote, a splice, or a type as a value."""
-    stage_nodes = Quote | Splice | TypeSplice | FieldSplice | TypeLit
+    """Whether some code has a quote, a splice, a type as a value, or a constant (computed while compiling)."""
+    stage_nodes = Quote | Splice | TypeSplice | FieldSplice | TypeLit | AssociatedConst
     return isinstance(node, stage_nodes) or any(uses_staging(part) for part in parts(node))
+
+
+def has_constants(program: Program) -> bool:
+    """Whether a program's types give constants, which are computed while compiling."""
+    return any(
+        isinstance(expr, EnumDef) and any(impl.constants for impl in expr.implementations) for expr in program.body
+    )
 
 
 def has_splices(node: object, depth: int = 0) -> bool:
@@ -522,6 +535,8 @@ class Expander:
         self.expanding: set[int] = set()
         self.interpreter: Interpreter = Interpreter(out, checker, self.tables)
         self.interpreter.prepare_function = self.prepare_function
+        self.interpreter.prepare_code = self.expand
+        self.constant_globals: list[Expr] = []  # `let`s of the constants that `write_constant` keeps in globals
         # Top-level functions and methods, which compile-time code may call.
         self.top_level = {
             id(expr.value) for expr in program.body if isinstance(expr, Let) and isinstance(expr.value, Lambda)
@@ -545,18 +560,49 @@ class Expander:
         body: list[Expr] = [
             struct_definition(info, self.program.span) for info in self.checker.enums.values() if info.created
         ]
+        constants = len(body)  # where the globals holding constants go: before any code runs
         for expr in self.program.body:
             if isinstance(expr, Let) and isinstance(expr.value, Lambda):
                 body.append(replace(expr, value=self.expand_function(expr.value)))
-            elif isinstance(expr, EnumDef) and expr.methods:
+            elif isinstance(expr, EnumDef) and (expr.methods or expr.implementations):
                 methods = tuple(
                     replace(m, function=self.expand_function(m.function)) if isinstance(m.function, Lambda) else m
                     for m in expr.methods
                 )
-                body.append(replace(expr, methods=methods))
+                implementations = tuple(
+                    replace(impl, constants=tuple(self.write_constant(expr, impl, c) for c in impl.constants))
+                    for impl in expr.implementations
+                )
+                body.append(replace(expr, methods=methods, implementations=implementations))
             else:
                 body.append(self.expand(expr))
+        body[constants:constants] = self.constant_globals
         return replace(self.program, body=tuple(body))
+
+    def write_constant(self, enum: EnumDef, implementation: Implementation, const: AssociatedConst) -> AssociatedConst:
+        """A constant with its value, computed now, written in as code.
+
+        A number, bool or string (or a variant without fields) is a literal,
+        which reading `T.NAME` computes. Anything bigger is a global the
+        program makes once (`constant_globals`), which reading it borrows,
+        unless its type has the type parameters of a generic type: a global
+        has one type.
+        """
+        value = self.interpreter.compute_constant(enum.name, implementation.constraint, const.name)
+        span = const.value.span
+        try:
+            code = reify(value, span)
+        except EllaError:
+            # The checker only lets constants have types whose values can be written as code.
+            raise AssertionError(f"constant {enum.name}.{const.name} can't be written as code") from None
+        if isinstance(code, BoolLit | IntLit | FloatLit | StringLit | UnitLit | Name) or enum.type_params:
+            return replace(const, value=code, written=True)
+        required = self.checker.constraint_constants[implementation.constraint][const.name]
+        t = substitute(required, {"Self": EnumTy(enum.name)})
+        # A dotted name, like a module's top-level names, so the module's code sees it (Checker.visible).
+        name = f"{enum.name}.__const_{implementation.constraint.replace('.', '_')}_{const.name}"
+        self.constant_globals.append(Let((Binding(name, False, reify_type(t, span), span),), code, span))
+        return replace(const, value=Name(name, span), written=True)
 
     def expand_function(self, function: Lambda) -> Lambda:
         """A top-level function with its splices expanded: needed before it can run while compiling."""

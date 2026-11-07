@@ -271,17 +271,31 @@ struct Vec2
     compare = (a: Vec2, b: Vec2) -> i64 => if a.length2() < b.length2() then -1 else 1
     flip = (mut v: Vec2) -> () =>
         v = Vec2(v.y, v.x)
+    implements Sized
 let mut arrow = Vec2(1.0, 0.0) + Vec2(0.0, 2.0)
 mut arrow.flip()
 assert arrow.length2() == 5.0 and arrow.x == 2.0
 assert bigger(arrow, Vec2(1.0, 1.0)) == arrow   # Vec2 has compare, so it is Ord
 
-# a user-defined constraint lists methods; any type that has them meets it
+# a type explicitly implements a user-defined constraint
 constraint Sized
     length2: (Self) -> f64
 let longest[T: Sized] = (a: T, b: T) -> f64 =>
     if a.length2() > b.length2() then a.length2() else b.length2()
 assert longest(Vec2(3.0, 4.0), arrow) == 25.0
+
+# a constraint can require others, and constants that each type gives;
+# generic code reads them as T.NAME
+constraint Measure: Sized + Ord
+    const UNIT: Self
+let to_unit[T: Measure] = (x: T) -> f64 => if x > T.UNIT then x.length2() else 1.0
+struct Meters
+    m: f64
+    compare = (a: Meters, b: Meters) -> i64 => if a.m < b.m then -1 else if a.m > b.m then 1 else 0
+    implements Measure
+        length2 = (d: Meters) -> f64 => d.m * d.m
+        const UNIT = Meters(1.0)
+assert to_unit(Meters(3.0)) == 9.0 and to_unit(Meters(0.5)) == 1.0
 
 # protocol methods: get and set give v[k], iter gives `for`, contains gives `in`
 struct Row

@@ -2,15 +2,18 @@ import io
 import shutil
 from pathlib import Path
 
+import pytest
+
 from ella.checker import check
 from ella.interpreter import Interpreter
 from ella.ir_interpreter import IRInterpreter
+from ella.lexer import EllaError
 from ella.lower import compile_program
 from ella.native import run_native
 from ella.parser import parse
 from ella.passes import optimize
 from ella.staging import Tables, materialize_hygiene, prepare, start_code
-from ella.syntax import Block, Let, Name, NamePattern, Quote, parts
+from ella.syntax import Block, EnumDef, Let, Name, NamePattern, Quote, parts, show
 
 
 def test_quoted_binders_and_references_share_hygiene_identity() -> None:
@@ -97,3 +100,85 @@ def test_staged_json_validation_example() -> None:
         native_out = io.StringIO()
         run_native(source, native_out, path=path)
         assert native_out.getvalue() == expected
+
+
+CONSTANTS = """\
+constraint Counted
+    const COUNT: i64
+    const NAMES: [str]
+let loud = () -> i64 =>
+    print("computing")
+    let mut n = 0
+    for i in 0..4
+        n += i
+    n
+struct R
+    n: i64
+    implements Counted
+        const COUNT = loud()
+        const NAMES = ["a", "b"]
+let f[T: Counted] = (_x: T) -> i64 => T.COUNT + T.COUNT + len(T.NAMES)
+print("run", f(R(1)))
+"""
+
+
+def test_constants_are_computed_once_while_compiling() -> None:
+    # What the computation prints comes out while compiling, once, before the program runs.
+    out = io.StringIO()
+    program, checker = prepare(parse(CONSTANTS), out)
+    assert out.getvalue() == "computing\n"
+    tree_out = io.StringIO()
+    Interpreter(tree_out, checker).run(program)
+    assert tree_out.getvalue() == "run 14\n"
+    # The code holds the values: a number as a literal, a list in a global, made before any code runs,
+    # which reading the constant borrows.
+    [struct] = [expr for expr in program.body if isinstance(expr, EnumDef) and expr.name == "R"]
+    assert [show(c.value) for c in struct.implementations[0].constants] == ["6", "R.__const_Counted_NAMES"]
+    assert show(program.body[0]) == '(let [R.__const_Counted_NAMES: [str]] (list "a" "b"))'
+
+    ir_out = io.StringIO()
+    IRInterpreter(compile_program(CONSTANTS, ir_out), ir_out).run()
+    assert ir_out.getvalue() == "computing\nrun 14\n"
+    if shutil.which("gcc") is not None:
+        native_out = io.StringIO()
+        run_native(CONSTANTS, native_out)
+        assert native_out.getvalue() == "computing\nrun 14\n"
+
+
+def compile_error(source: str) -> EllaError:
+    with pytest.raises(EllaError) as info:
+        prepare(parse(source), io.StringIO())
+    return info.value
+
+
+def test_constants_that_cant_be_computed() -> None:
+    monoid = "constraint M\n    combine: (Self, Self) -> Self\n    const E: Self\n"
+    fold = "let fold[T: M] = (xs: [T]) -> T =>\n    let mut acc = T.E\n    for x in xs\n        acc = acc.combine(x)\n    acc\n"
+    own = "struct S\n    n: i64\n    implements M\n        combine = (a: S, _b: S) -> S => a\n        const E = fold([S(1)])\n"
+    assert compile_error(monoid + own + fold).message == "constant S.E needs its own value to be computed"
+    divide = "constraint K\n    const Z: i64\nlet div = (a: i64, b: i64) -> i64 => a // b\n"
+    error = compile_error(divide + "struct R\n    n: i64\n    implements K\n        const Z = div(1, 0)\n")
+    assert (str(error.span), error.message) == ("3:40", "integer division by zero")
+    stop = "constraint K\n    const Z: i64\nlet stop = () -> i64 =>\n    exit(3)\n    0\n"
+    message = compile_error(stop + "struct R\n    n: i64\n    implements K\n        const Z = stop()\n").message
+    assert message == "exit() can't stop the program while it is being compiled"
+
+
+def test_constants_of_generic_types_stay_literals() -> None:
+    # A global has one type, but a Bag[T]'s constant is a Bag of each T it is used with.
+    source = """\
+constraint Empty
+    const NONE: Self
+struct Bag[T]
+    items: [T]
+    implements Empty
+        const NONE = Bag([])
+let none[T: Empty] = (_x: T) -> T => T.NONE
+print(none(Bag([1])), none(Bag(["a"])))
+"""
+    program, checker = prepare(parse(source), io.StringIO())
+    [bag] = [expr for expr in program.body if isinstance(expr, EnumDef) and expr.name == "Bag"]
+    assert show(bag.implementations[0].constants[0].value) == "(call Bag (list))"
+    out = io.StringIO()
+    Interpreter(out, checker).run(program)
+    assert out.getvalue() == "Bag([]) Bag([])\n"

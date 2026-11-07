@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ella.analysis import Location, Symbol, analyze, complete, follow_edits
+from ella.analysis import TOKEN_TYPES, Location, Symbol, analyze, complete, follow_edits
 from ella.modules import LIBRARY_DIR
 
 ROOT = Path(__file__).parent.parent
@@ -28,6 +28,7 @@ def test_working_programs_have_no_problems(path: Path) -> None:
     analysis = analyze(path.read_text())
     assert analysis.problems == []
     assert analysis.symbols
+    assert {symbol.kind for symbol in analysis.symbols} <= {"", *TOKEN_TYPES}  # what the language server sends
 
 
 def test_every_error_is_found() -> None:
@@ -162,6 +163,61 @@ def test_completing_type_namespace_and_receiver_functions() -> None:
     assert names(source, 4, 13) == ["new"]
     assert {"map", "len"} <= set(names("let xs = [1, 2]\nprint(xs.\n", 2, 10))
     assert {"trim", "upper"} <= set(names('print("text".\n', 1, 14))
+
+
+MONOID = """\
+constraint Named
+    const NAME: str
+constraint Monoid: Named
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+struct Sum
+    n: i64
+    implements Monoid
+        combine = (a: Sum, _b: Sum) -> Sum => a
+        const EMPTY = Sum(0)
+        const NAME = "sum"
+"""
+
+
+def test_completing_constants_of_type_parameters() -> None:
+    # `T.` has the constants of T's constraints and their parents; `x.` has the methods, once each.
+    assert [
+        (c.label, c.kind, c.detail) for c in complete(MONOID + "let f[T: Monoid] = (x: T) -> T => T.\n", 12, 37)
+    ] == [
+        ("EMPTY", "constant", "T"),
+        ("NAME", "constant", "str"),
+    ]
+    assert names(MONOID + "let f[T: Monoid] = (x: T) -> T => x.\n", 12, 37) == ["combine"]
+
+
+def test_symbols_of_constants() -> None:
+    found = symbols(MONOID + "let f[T: Monoid] = (x: T) -> T => T.EMPTY.combine(x)\nprint(f(Sum(1)), Sum(2))\n")
+    assert (found[12, 35].hover, found[12, 35].kind) == ("T: type parameter", "typeParameter")
+    empty = found[12, 37]
+    assert (empty.hover, empty.kind, empty.modifiers) == ("T.EMPTY: T", "variable", ("readonly",))
+    assert empty.definition == Location(5, 11, 5)  # in the constraint
+    assert (found[11, 15].hover, found[11, 15].definition) == ("Sum.NAME: str", Location(2, 11, 4))  # inherited
+    assert found[5, 11].hover == "Monoid.EMPTY: Self"
+
+
+def test_constraint_errors_dont_stop_analysis() -> None:
+    source = "constraint A: Nope\n    f: (Self) -> i64\nconstraint B: B\n    g: (Self) -> i64\nlet x: i64 = 'a'\n"
+    assert problems(source) == [
+        "1:1: unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Num, A, B",
+        "3:1: constraint cycle: B -> B",
+        "5:14: the value of 'x' should be i64, not str",
+    ]
+
+
+def test_errors_computing_constants() -> None:
+    # Constants are computed while analyzing, as they are while compiling.
+    source = (
+        "constraint K\n    const Z: i64\nlet div = (a: i64, b: i64) -> i64 => a // b\n"
+        "struct R\n    n: i64\n    implements K\n        const Z = div(1, 0)\n"
+    )
+    assert problems(source) == ["3:40: integer division by zero"]
+    assert problems(source.replace("div(1, 0)", "div(1, 1)")) == []
 
 
 def test_no_completions_in_strings_or_comments() -> None:

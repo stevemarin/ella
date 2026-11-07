@@ -68,8 +68,15 @@ plain:
   `len` and constructors used as values get a small lambda calling them
   (`wrappers`), which the lowering makes into a function. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
-  level), generic functions, methods and constraints (built-in and
-  user-defined, met structurally), the `update` protocol (an assignment
+  level), generic functions, methods and constraints (built-in, and
+  user-defined ones, met by `implements`, which can require others,
+  `constraint_closure`, and constants, read as `T.NAME`:
+  `associated_constants`, whose value each type's implementation gives,
+  `implementation_constants`, compile-time code computed once by
+  `staging.Expander.write_constant` and written in as a literal; the
+  lowering inlines it in each specialization, and the interpreter binds a
+  generic function's type arguments, `with_type_args`, to find it), the
+  `update` protocol (an assignment
   line through an item of such a type becomes code that calls it,
   `updates`, which the interpreters and lowering run instead), the `text`, `eq` and `hash` protocols (a type's text form
   for `print`, its `==`, and its hash; `eq` needs `hash`),
@@ -91,8 +98,10 @@ plain:
 * `src/ella/staging.py`: multi-stage programming: building code from quotes
   (fresh names, constants, and splices of code, types and field names),
   reflection on types (`fields(t)`, ...), and expanding splices outside quotes
-  before lowering (`prepare` = check + expand + check again; use it rather
-  than `check` to run a program).
+  and computing types' constants (`T.NAME`: a literal, or a global made
+  first, `constant_globals`; editors compute them too) before lowering (`prepare` =
+  check + expand + check again; use it rather than `check` to run a
+  program).
 * `src/ella/values.py`: run-time values (plain Python values where possible),
   scopes, copying, equality and text form. Shared by the interpreters, as
   are `MAX_CALL_DEPTH` (every backend's default call depth limit),

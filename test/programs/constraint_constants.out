@@ -1,0 +1,11 @@
+tag 1=10 tag 2=20 total 30
+red=1 green=2 green=2 total 5
+sum of 3: Sum(9)
+product of 3: Product(24)
+Sum(0)
+Score(9)
+Score(-1)
+Grade(5) Grade(0) Grade(3)
+Grade(4)
+Table([0, 1, 4, 9, 0, 1, 4, 9]) table after Sum(3) of 1: Table([0, 1, 4, 9, 0, 1, 4, 9, 0, 1, 4, 9])
+4 0.1 0.3333333333333333 5

@@ -11,6 +11,7 @@ from ella.lexer import STD, EllaError, Span
 from ella.syntax import (
     Assert,
     Assign,
+    AssociatedConst,
     Binary,
     Binding,
     Block,
@@ -682,6 +683,15 @@ def check_code(code: Expr, program: Checker) -> Checker:
     checker.enums = program.enums
     checker.globals = Env(None, dict(program.globals.vars))
     checker.constraints = program.constraints
+    checker.constraint_parents = dict(program.constraint_parents)
+    checker.constraint_spans = dict(program.constraint_spans)
+    checker.constraint_own_methods = dict(program.constraint_own_methods)
+    checker.constraint_constants = dict(program.constraint_constants)
+    checker.constraint_own_constants = dict(program.constraint_own_constants)
+    checker.constraint_closure = dict(program.constraint_closure)
+    checker.type_implementations = dict(program.type_implementations)
+    checker.implementation_constants = dict(program.implementation_constants)
+    checker.associated_constants = dict(program.associated_constants)
     checker.method_functions = program.method_functions
     checker.extension_functions = {name: list(functions) for name, functions in program.extension_functions.items()}
     checker.extension_methods = dict(program.extension_methods)
@@ -735,7 +745,16 @@ class Checker:
         self.quotes = 0  # how many quotes the code being checked is in (minus splices)
         self.env = Env(None)  # the scope of the expression being checked, for splices in its types
         self.instances: dict[int, tuple[Type, ...]] = {}  # use of a generic function -> its type arguments
-        self.constraints: dict[str, dict[str, FuncTy]] = {}  # user-defined constraint -> its methods' types, with SELF
+        self.constraints: dict[str, dict[str, FuncTy]] = {}  # flattened user constraint methods, with SELF
+        self.constraint_parents: dict[str, tuple[str, ...]] = {}
+        self.constraint_spans: dict[str, Span] = {}
+        self.constraint_own_methods: dict[str, dict[str, FuncTy]] = {}
+        self.constraint_constants: dict[str, dict[str, Type]] = {}
+        self.constraint_own_constants: dict[str, dict[str, Type]] = {}
+        self.constraint_closure: dict[str, frozenset[str]] = {}
+        self.type_implementations: dict[str, frozenset[str]] = {}
+        self.implementation_constants: dict[tuple[str, str, str], Expr] = {}
+        self.associated_constants: dict[int, tuple[str, str, str]] = {}
         self.method_functions: dict[tuple[str, str], Lambda] = {}  # (struct or enum, method) -> its function
         self.methods: dict[int, str] = {}  # `.name` node called as a method -> the method's name
         self.extension_functions: dict[str, list[str]] = {}
@@ -793,6 +812,7 @@ class Checker:
         self.iterations: dict[int, tuple[bool, str]] = {}
         self.loops: list[LoopInfo] = []  # the loops we are inside, innermost last
         self.pending_bodies: list[PendingBody] = []
+        self.pending_constants: list[tuple[AssociatedConst, Type]] = []  # with the type each must have
 
         # For editors. With `errors` a list, errors are collected there rather
         # than raised (see `attempt`), and `failed` has the names whose
@@ -1114,6 +1134,15 @@ class Checker:
             self.defined.add(id(enum))
             self.enum_files[enum.name] = enum.span.file
         self.declare_enum(enum)
+        for param, constraints in zip(enum.type_params, enum.constraints):
+            if with_constants := next((c for c in constraints if self.constraint_constants.get(c)), None):
+                # Its methods would need their type arguments while running, which the tree-walking
+                # interpreter doesn't know.
+                raise EllaError(
+                    f"a type's parameter can't be {with_constants} yet, since {with_constants} has constants; "
+                    f"a generic function's can ('let f[{param}: {with_constants}] = ...')",
+                    enum.span,
+                )
         params: dict[str, Type] = {name: ParamTy(name) for name in enum.type_params}
         if any(has_type_splice(f) for v in enum.variants for f in v.fields):
             raise EllaError("a type can't be spliced into a definition yet; use new_struct()", enum.span)
@@ -1176,23 +1205,108 @@ class Checker:
                 )
         self.enums[enum.name] = dataclasses.replace(info, methods=methods, static_methods=static_methods)
         own = EnumTy(enum.name, tuple(params[name] for name in enum.type_params))
+        self.define_variants(self.enums[enum.name], env)
+        implemented: set[str] = set()
         for implementation in enum.implementations:
             if implementation.constraint not in CONSTRAINTS and implementation.constraint not in self.constraints:
                 raise EllaError(f"unknown constraint '{implementation.constraint}'", implementation.span)
-            required = self.constraints.get(implementation.constraint, {})
-            declared = {method.name for method in implementation.methods}
-            missing = next((name for name in required if name not in declared), None)
-            reason = (
-                f": it has no method '{missing}'"
-                if missing is not None
-                else self.unmet(own, implementation.constraint)
-            )
-            if reason is not None:
+            constraint = implementation.constraint
+            closure = self.constraint_closure.get(constraint, frozenset({constraint}))
+            for previous in implemented:
+                # Each constraint has one implementation, so its constants have one value.
+                shared = closure & self.constraint_closure.get(previous, frozenset({previous}))
+                if repeated := sorted(shared & self.constraint_parents.keys()):
+                    via = "" if previous == repeated[0] else f" (through {previous})"
+                    raise EllaError(f"{enum.name} already implements {repeated[0]}{via}", implementation.span)
+            implemented.add(constraint)
+            required_methods = self.constraints.get(constraint, {})
+            required_constants = self.constraint_constants.get(constraint, {})
+            declared_constants = {const.name: const for const in implementation.constants}
+            extra_constant = next((name for name in declared_constants if name not in required_constants), None)
+            if extra_constant is not None:
                 raise EllaError(
-                    f"{enum.name} doesn't implement {implementation.constraint}{reason}",
+                    f"{constraint} has no constant named '{extra_constant}'",
+                    declared_constants[extra_constant].span,
+                )
+            missing_constant = next((name for name in required_constants if name not in declared_constants), None)
+            if missing_constant is not None:
+                raise EllaError(
+                    f"{enum.name} doesn't implement {constraint}: it has no constant '{missing_constant}'",
                     implementation.span,
                 )
-        self.define_variants(self.enums[enum.name], env)
+            for name, required in required_methods.items():
+                actual = methods.get(name)
+                expected = substitute(required, {"Self": own})
+                if actual is None:
+                    raise EllaError(
+                        f"{enum.name} doesn't implement {constraint}: it has no method '{name}'",
+                        implementation.span,
+                    )
+                if finish(actual) != finish(expected):
+                    raise EllaError(
+                        f"{enum.name} doesn't implement {constraint}: its method '{name}' is "
+                        f"{show_type(actual)}, not {show_type(expected)}",
+                        implementation.span,
+                    )
+            if declared_constants and env is not self.globals:
+                first = next(iter(declared_constants.values()))
+                raise EllaError(
+                    f"only a type defined at the top level can have constants, like '{first.name}'", first.span
+                )
+            for name, constant_type in required_constants.items():
+                constant = declared_constants[name]
+                self.check_writable(substitute(constant_type, {"Self": own}), name, constant.span)
+                # Checked once every top-level name has its type, as function bodies are.
+                self.pending_constants.append((constant, substitute(constant_type, {"Self": own})))
+                self.implementation_constants[enum.name, constraint, name] = constant.value
+            for builtin in closure & CONSTRAINTS.keys():
+                if not satisfies(own, builtin, self.enums):
+                    raise EllaError(
+                        f"{enum.name} doesn't meet the built-in constraint {builtin} required by {constraint}",
+                        implementation.span,
+                    )
+        self.type_implementations[enum.name] = frozenset(implemented)
+
+    def check_constant(self, const: AssociatedConst, expected: Type) -> None:
+        """The value an implementation gives a constant. It is computed while compiling (ella.staging), like
+        a splice outside quotes: it can call top-level functions, but not use the program's variables."""
+        if const.written:  # its value, written in while compiling: a literal, or a global of the program
+            actual = self.check(const.value, self.globals)
+        else:
+            actual = self.at_stage(self.level - 1, const.value, self.globals, -1)
+        self.expect(actual, expected, const.span, f"constant '{const.name}'")
+
+    def check_writable(self, t: Type, name: str, span: Span) -> None:
+        """A constant's value is computed while compiling and written into the code, so it can only hold
+        values that can be written as code: not functions, arrays, or nocopy values (pools, ...)."""
+        found: list[Type] = []
+
+        def unwritable(part: Type) -> bool:
+            bad = (
+                isinstance(part, FuncTy)
+                or array_item(part) is not None
+                or (isinstance(part, BuiltinTy) and part.name in ("Pool", "Arena", "Gen"))
+                or (isinstance(part, EnumTy) and part.name in self.enums and self.enums[part.name].nocopy)
+            )
+            if bad:
+                found.append(part)
+            return bad
+
+        if any_part(t, self.enums, unwritable):
+            match found[0]:
+                case FuncTy():
+                    what = "functions"
+                case EnumTy(enum):
+                    what = f"nocopy values ({enum})"
+                case BuiltinTy("Pool" | "Arena" | "Gen", _) as builtin:
+                    what = f"nocopy values ({show_type(builtin)})"
+                case _:
+                    what = "arrays"
+            raise EllaError(
+                f"constant '{name}' can't hold {what}: it is computed while compiling and written into the code, "
+                "which can only hold numbers, bools, strings, tuples, lists, structs and enums",
+                span,
+            )
 
     def define_method(self, enum: EnumDef, method: Method) -> tuple[FuncTy, bool]:
         """A method or namespace function, checked with its enum's type parameters."""
@@ -1256,8 +1370,8 @@ class Checker:
         return t, True
 
     def define_constraint(self, constraint: ConstraintDef) -> None:
-        """A user-defined constraint: the methods, with their types, that a type needs to meet it."""
-        if constraint.name in CONSTRAINTS or constraint.name in self.constraints:
+        """Record a constraint's direct method and constant requirements."""
+        if constraint.name in CONSTRAINTS or constraint.name in self.constraint_parents:
             raise EllaError(f"there is already a constraint named {constraint.name}", constraint.span)
         methods: dict[str, FuncTy] = {}
         for method in constraint.methods:
@@ -1269,7 +1383,63 @@ class Checker:
                     method.span,
                 )
             methods[method.name] = t
-        self.constraints[constraint.name] = methods
+        constants: dict[str, Type] = {}
+        for const in constraint.constants:
+            assert const.type is not None
+            if const.name in methods:
+                raise EllaError(f"'{const.name}' is both a method and a constant of {constraint.name}", const.span)
+            constants[const.name] = self.annotation(const.type, {"Self": SELF})
+            self.check_writable(constants[const.name], const.name, const.span)
+        if len(set(constraint.parents)) != len(constraint.parents):
+            raise EllaError(f"{constraint.name} lists a parent constraint more than once", constraint.span)
+        self.constraint_parents[constraint.name] = constraint.parents
+        self.constraint_spans[constraint.name] = constraint.span
+        self.constraint_own_methods[constraint.name] = methods
+        self.constraint_own_constants[constraint.name] = constants
+
+    def resolve_constraint(self, name: str, active: tuple[str, ...] = ()) -> frozenset[str]:
+        """A user-defined constraint's closure: itself and every constraint it requires, directly or not.
+
+        Its methods and constants become its own and its parents' (`constraints`, `constraint_constants`),
+        which must agree on each name's type. `active` has the constraints whose parents are being
+        resolved, to find cycles.
+        """
+        if name in self.constraint_closure:
+            return self.constraint_closure[name]
+        span = self.constraint_spans[name]
+        if name in active:
+            cycle = " -> ".join([*active[active.index(name) :], name])
+            raise EllaError(f"constraint cycle: {cycle}", span)
+        closure = {name}
+        methods = dict(self.constraint_own_methods[name])
+        constants = dict(self.constraint_own_constants[name])
+        origins = dict.fromkeys([*methods, *constants], name)  # the constraint each requirement comes from
+        for parent in self.constraint_parents[name]:
+            if parent in CONSTRAINTS:
+                closure |= {parent, *CONSTRAINTS[parent]}
+                continue
+            if parent not in self.constraint_parents:
+                known = ", ".join([*CONSTRAINTS, *self.constraint_parents])
+                raise EllaError(f"unknown parent constraint '{parent}'; the constraints are {known}", span)
+            closure |= self.resolve_constraint(parent, (*active, name))
+            for method, method_type in self.constraints[parent].items():
+                if methods.setdefault(method, method_type) != method_type:
+                    raise EllaError(
+                        f"constraints {origins[method]} and {parent} have different methods named '{method}'", span
+                    )
+                origins.setdefault(method, parent)
+            for const, const_type in self.constraint_constants[parent].items():
+                if constants.setdefault(const, const_type) != const_type:
+                    raise EllaError(
+                        f"constraints {origins[const]} and {parent} have different constants named '{const}'", span
+                    )
+                origins.setdefault(const, parent)
+        if clash := next((const for const in constants if const in methods), None):
+            raise EllaError(f"'{clash}' is both a method and a constant of {name}", span)
+        self.constraints[name] = methods
+        self.constraint_constants[name] = constants
+        self.constraint_closure[name] = frozenset(closure)
+        return self.constraint_closure[name]
 
     def define_variants(self, enum: EnumInfo, env: Env) -> None:
         for name, fields in enum.variants.items():
@@ -1304,6 +1474,8 @@ class Checker:
         for expr in program.body:
             if isinstance(expr, ConstraintDef):
                 self.attempt(expr, [expr.name], partial(self.define_constraint, expr))
+        for name in list(self.constraint_parents):
+            self.attempt(None, [name], partial(self.resolve_constraint, name))
         for expr in program.body:
             if isinstance(expr, EnumDef):
                 self.attempt(expr, defined_names(expr), partial(self.define_enum, expr, self.globals))
@@ -1337,7 +1509,9 @@ class Checker:
             if not self.attempt(expr, defined_names(expr), partial(self.check, expr, self.globals)):
                 # Give the names it defines unknown types, so that later lines can still be checked.
                 self.bind_unknown(expr, self.globals)
-        # Now every top-level name has its type, so function bodies can be checked.
+        # Now every top-level name has its type, so constants and function bodies can be checked.
+        for const, expected in self.pending_constants:
+            self.attempt(const.value, [], partial(self.check_constant, const, expected))
         while self.pending_bodies:
             pending = self.pending_bodies.pop(0)
             self.attempt(pending.function, [], partial(self.check_body, pending))
@@ -1537,21 +1711,55 @@ class Checker:
     def unmet(self, t: Type, constraint: str) -> str | None:
         """Why a type doesn't meet a constraint (perhaps ""), or None if it does.
 
-        A struct or enum meets a user-defined constraint if it has each of
-        its methods, with the same types (with Self standing for the type).
+        A struct or enum meets a user-defined constraint if it implements it,
+        or a constraint that requires it (`implements`, checked where the type
+        is defined). A type parameter meets the constraints it has, and those
+        they require.
         """
         t = finish(t)
-        if constraint not in self.constraints or not isinstance(t, EnumTy):
+        if constraint not in self.constraint_parents or not isinstance(t, EnumTy):
             return None if satisfies(t, constraint, self.enums) else ""
-        for name, required in self.constraints[constraint].items():
-            wanted = substitute(required, {"Self": t})
-            info = self.enums[t.name]
-            if name not in info.methods:
-                return f": it has no method '{name}'"
-            method = finish(substitute(info.methods[name], dict(zip(info.params, t.args))))
-            if method != wanted:
-                return f": its method '{name}' is {show_type(method)}, not {show_type(wanted)}"
-        return None
+        implementations = self.type_implementations.get(t.name, frozenset())
+        if any(constraint in self.constraint_closure.get(impl, frozenset({impl})) for impl in implementations):
+            return None
+        return f": it doesn't explicitly implement {constraint}"
+
+    def type_param_named(self, name: str, env: Env) -> ParamTy | None:
+        """The type parameter `T` in `T.NAME`, unless a local variable has that name."""
+        param = self.type_params.get(name)
+        local = env.lookup(name)
+        return param if isinstance(param, ParamTy) and (local is None or local.kind != "local") else None
+
+    def constant_type(self, expr: Member, param: ParamTy) -> Type:
+        """`T.NAME`: a constant that T's constraints require, which each type gives in its `implements`."""
+        found = {
+            constraint: self.constraint_constants[constraint][expr.name]
+            for constraint in sorted(param.constraints)
+            if expr.name in self.constraint_constants.get(constraint, {})
+        }
+        if not found:
+            known = sorted({const for c in param.constraints for const in self.constraint_constants.get(c, {})})
+            has = f"its constraints have {', '.join(known)}" if known else "its constraints have none"
+            raise EllaError(f"{param.name} has no constant named '{expr.name}'; {has}", expr.span)
+        if len(set(found.values())) > 1:
+            first, second = list(found)[:2]
+            raise EllaError(
+                f"{param.name}'s constraints {first} and {second} have different constants named '{expr.name}'",
+                expr.span,
+            )
+        constraint, constant_type = next(iter(found.items()))
+        self.associated_constants[id(expr)] = (param.name, constraint, expr.name)
+        return substitute(constant_type, {"Self": param})
+
+    def implementation_of(self, type_name: str, constraint: str) -> str:
+        """The constraint a struct or enum implements that gives it `constraint` (perhaps itself)."""
+        found = [
+            implemented
+            for implemented in self.type_implementations.get(type_name, frozenset())
+            if constraint in self.constraint_closure.get(implemented, frozenset({implemented}))
+        ]
+        assert len(found) == 1, f"{type_name} should implement {constraint} once"
+        return found[0]
 
     # Expressions
 
@@ -1807,6 +2015,9 @@ class Checker:
                         return STR
                 raise EllaError(f"can't index a {show_type(container)}", span)
             case Member(target, name, span):
+                if isinstance(target, Name) and (type_param := self.type_param_named(target.name, env)) is not None:
+                    self.types[id(target)] = type_param
+                    return self.constant_type(expr, type_param)
                 return self.member_type(expr, self.check(target, env))
             case Quote(body, span):
                 # The body is code for the next stage: it can't return or break out of this one.
@@ -1938,7 +2149,8 @@ class Checker:
                     self.define_enum(expr, env)
                 return UNIT
             case ConstraintDef(name, span=span):
-                if env is not self.globals or name not in self.constraints:
+                # Top-level ones are defined before the program is checked (perhaps with an error).
+                if env is not self.globals or (name not in self.constraint_parents and name not in self.failed):
                     raise EllaError("a constraint can only be defined at the top level", span)
                 return UNIT
             case MapLit(span=span) | SetLit(span=span):
@@ -2230,6 +2442,8 @@ class Checker:
         of a longer one: only the last step can store an item with a `set` method.
         """
         match target:
+            case Member(Name(name), member, span) if self.type_param_named(name, env) is not None:
+                raise EllaError(f"can't {verb} {name}.{member}: a constant can't change", span)
             case Name(name, span):
                 self.scopes[id(target)] = env
                 info = self.lookup(name, env, span)
@@ -2305,7 +2519,7 @@ class Checker:
             implied: frozenset[str] = frozenset()
             for constraint in constraints[i] if constraints else ():
                 if constraint in self.constraints:
-                    implied |= {constraint}
+                    implied |= self.constraint_closure[constraint]  # itself, and the constraints it requires
                     continue
                 if constraint not in CONSTRAINTS:
                     known = ", ".join([*CONSTRAINTS, *self.constraints])

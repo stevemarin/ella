@@ -24,7 +24,7 @@ stack traces, errors with causes and locations, and `main` giving a
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met structurally), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
+| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met by `implements`; they can require others, and constants read as `T.NAME`), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, direct calls, inlining, constant folding, CFG simplification, DCE, copy-to-move |
 | Native code | x64 assembly plus a C runtime with real arenas, and SSA register allocation; byte-for-byte the same output and errors as the interpreters |
@@ -135,8 +135,25 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   its keys.
 - The AST interpreter runs each generator on a thread of its own, so
   recursion through thousands of generators is slow there.
-- Constraints can't require other constraints or operators
-  (`constraint Ring: Add`), and `Num` is only met by `i64` and `f64`.
+- Constraints can require other constraints and constants (`constraint
+  Monoid: Semigroup` with `const EMPTY: Self`, read as `T.EMPTY`), but not
+  operators beyond the built-in constraints', associated types, or
+  constants computed at compile time (usable in types: `Array[f64;
+  T.SIZE]`). `Num` is only met by the number types.
+- A struct's or enum's own type parameters can't have a constraint with
+  constants (`struct Acc[T: Monoid]`), since the tree-walking interpreter
+  doesn't know a method's type arguments while it runs (the lowering does:
+  it specializes methods). It would have to carry them from each call's
+  receiver type, through operators, `print`, `for` and `==` too. Only
+  top-level types can give constants.
+- A constant is computed while compiling and written into the code, so
+  its type can't hold functions, arrays or nocopy values (`reify` can't
+  write them), and it can't read top-level variables, which don't exist yet
+  (not even the library's `pi`; a function giving it works). A constant
+  whose type has a generic type's own parameters (`Bag[T]`'s `Bag([])`) is
+  still made at each read, since a global has one type. Using constants in
+  types (`Array[f64; T.SIZE]`) would need the checker
+  to compute them while checking, as it does splices in types.
 - Protocol method names (`get`, `set`, `iter`, `add`, ...) are reserved for
   their meaning, so they can't be ordinary methods.
 - No generic computed types (`new_struct` makes non-generic structs only),
@@ -500,9 +517,9 @@ Small steps that build on the above:
      cleaner way, or the version without a start value gets another name.
    - Not a new `Zero` constraint yet: for user types to meet it they'd need
      a method called on the type, not on a value (`zero: () -> Self`),
-     which constraints can't have. With that (and constraints requiring
-     others, an open question in docs/grammar.md), `Num` could require
-     `Zero`.
+     which constraints can't have (a constant, `const ZERO: Self`, can do
+     it now, but built-in types can't implement user-defined constraints).
+     With that, `Num` could require `Zero`.
    - One function for lists and arrays (and ranges, generators, `iter`
      types) needs a constraint with an item type:
      `let sum[C: Iter[T], T: Num] = (xs: C) -> T`. Only the checker would

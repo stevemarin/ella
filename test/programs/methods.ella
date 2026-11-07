@@ -35,6 +35,7 @@ enum Shape
         match s
             case Circle(_) => "circle"
             case Rect(_, _) => "rect"
+    implements Measured
 
 for s in [Circle(1.0), Rect(2.0, 3.0)]
     print("{{s.name()}}: {{s.area()}}")
@@ -132,8 +133,9 @@ struct Square
     side: f64
     area = (s: Square) -> f64 => s.side * s.side
     name = (_s: Square) -> str => "square"
+    implements Measured
 
-# Any type with those methods meets the constraint: Shape and Square here.
+# Shape and Square explicitly implement the constraint.
 let report[T: Measured] = (xs: [T]) -> str =>
     let mut total = 0.0
     let mut names = ""
@@ -156,6 +158,7 @@ struct Clicks
         c.n += 1
     count = (c: Clicks) -> i64 => c.n
     compare = (a: Clicks, b: Clicks) -> i64 => a.n - b.n
+    implements Counter
 
 let tick_all[T: Counter + Ord] = (mut xs: [T], times: i64) -> T =>
     for i in 0..len(xs)

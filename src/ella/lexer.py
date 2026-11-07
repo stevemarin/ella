@@ -151,7 +151,7 @@ class Token:
 
 KEYWORDS = frozenset({
     "and", "as", "assert", "break", "case", "comptime", "constraint", "continue", "else", "enum", "false", "for",
-    "if", "implements", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return",
+    "const", "if", "implements", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return",
     "struct", "then", "true", "type", "where", "while", "yield",
 })  # fmt: skip
 

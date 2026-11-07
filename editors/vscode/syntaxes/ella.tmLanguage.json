@@ -130,7 +130,7 @@
           "name": "constant.language.boolean.ella"
         },
         {
-          "match": "\\b(?:constraint|enum|implements|let|struct|type)\\b",
+          "match": "\\b(?:const|constraint|enum|implements|let|struct|type)\\b",
           "name": "keyword.declaration.ella"
         },
         {

@@ -872,3 +872,27 @@ print(first(["a"]))
     assert "= pool_new @global" in text and "= alloc %" in text and "free %" in text
     assert "= pool_get %" in text and "set_field %" in text and "@slot" in text
     assert "function first[i64](%" in text and "function first[str](%" in text
+
+
+def test_constants_are_made_once() -> None:
+    # A list constant is a global, made once: reading it in a loop borrows it rather than making it again.
+    source = """\
+constraint Table
+    const ROWS: [i64]
+struct Sq
+    n: i64
+    implements Table
+        const ROWS = [0, 1, 4, 9]
+let total[T: Table] = (_x: T, times: i64) -> i64 =>
+    let mut sum = 0
+    for _ in 0..times
+        sum += T.ROWS[2] + len(T.ROWS)
+    sum
+print(total(Sq(0), 100))
+"""
+    for module in (compile_program(source), optimize(compile_program(source))):
+        out = io.StringIO()
+        interpreter = IRInterpreter(module, out)
+        interpreter.run()
+        assert out.getvalue() == "800\n"
+        assert "1x  6:22 list in top" in interpreter.format_profile()

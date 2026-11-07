@@ -695,7 +695,17 @@ class Resolver:
             case ConstraintDef(name, methods, span):
                 inner = Scope(scope, types={"Self"})
                 methods = tuple(self.declared(m, inner) for m in methods)
-                return ConstraintDef(self.top_name(name), methods, span)
+                return ConstraintDef(
+                    self.top_name(name),
+                    methods,
+                    span,
+                    tuple(self.constraint_name(parent, span) for parent in expr.parents),
+                    tuple(
+                        replace(const, type=self.type(const.type, inner))
+                        for const in expr.constants
+                        if const.type is not None
+                    ),
+                )
             case Quote(body, span):
                 return Quote(self.expr(body, Scope(scope)), span)
             case MapLit(entries, span):
@@ -735,6 +745,7 @@ class Resolver:
                 self.constraint_name(impl.constraint, impl.span),
                 tuple(Method(m.name, self.expr(m.function, inner), m.span) for m in impl.methods),
                 impl.span,
+                tuple(replace(const, value=self.expr(const.value, inner)) for const in impl.constants),
             )
             for impl in enum.implementations
         )
@@ -765,8 +776,10 @@ class Resolver:
         found = self.path_item(path)
         if found is None:
             type_item = self.module.top.get(node.name)
-            if node.name in scope.types or (type_item is not None and type_item.kind == "enum"):
-                result: Expr = Name(type_item.name if type_item is not None else node.name, node.span)
+            if scope.has_type(node.name):  # a local type, or a type parameter: `T.ZERO`
+                result: Expr = Name(node.name, node.span)
+            elif type_item is not None and type_item.kind == "enum":
+                result = Name(type_item.name, node.span)
             else:
                 self.linker.extension_function(members[-1].name, members[-1].span)
                 result = Name(self.value_name(node.name, node.span, scope), node.span)

@@ -609,15 +609,28 @@ constraints ([grammar.md §9](grammar.md#methods)). A
 method is a function of its type's parameters, specialized like a generic
 function (`Stack.push[i64]`), so a method call is a direct call even
 through a constraint: dispatch stays static, as §8 asks. A user-defined
-constraint lists methods, and a type meets it by having them
-(structurally). Methods named `add`, `compare`, `len` and so on give a type
-operators, and so the built-in constraints `Add` and `Ord`; `get`, `set`,
+constraint lists methods, and a type meets it by having them and saying
+`implements` it. Methods named `add`, `compare`, `len` and so on give a
+type operators, and so the built-in constraints `Add` and `Ord`; `get`, `set`,
 `iter` and `contains` give it indexing, loops and `in`. An item `get` gives
 is a copy, so `v[k] = x` is `mut v.set(k, x)` and only the last step of a
 place can be one; `iter` makes a list (or str, or range) to loop over,
 the simplest choice, at the cost of the memory for it. An operator on
 such a type is a call, which may change globals, so the lowering's
 analysis of what changes in place counts it as one.
+
+Constraints can also require **constants**, which are compile-time code:
+after checking, the expander computes each implementation's constant once,
+in the AST interpreter, and writes the value into the program, so the IR
+sees only ordinary code. A number, bool or string becomes a literal, which
+a read of `T.NAME` makes like any literal. Anything bigger becomes a global
+(`Sum.__const_Monoid_EMPTY`), made before any of the program's code runs,
+in the global arena, and a read borrows it like any global: a list constant
+read in a loop is made once, not once per read, and a copy is only made
+where the code would copy a global (a `mut` variable, a store). A constant
+whose type has its generic type's parameters (`Bag[T]`'s `const NONE =
+Bag([])`) stays a literal, since a global has one type. Constants can't
+hold functions, arrays or nocopy values, which can't be written as code.
 
 Type bodies also hold namespace functions: a function whose first
 parameter is not the owning type is called as `Stack.new()`, with no

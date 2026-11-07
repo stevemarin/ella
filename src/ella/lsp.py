@@ -39,6 +39,7 @@ WORD = re.compile(r"[A-Za-z0-9_]+")
 
 COMPLETION_KINDS = {
     "variable": types.CompletionItemKind.Variable,
+    "constant": types.CompletionItemKind.Constant,
     "parameter": types.CompletionItemKind.Variable,
     "function": types.CompletionItemKind.Function,
     "method": types.CompletionItemKind.Method,

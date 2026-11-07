@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 151
+    assert len(program.body) == 155
 
 
 # Precedence (docs/grammar.md §8)
@@ -513,6 +513,32 @@ def test_methods_and_constraints() -> None:
         "(struct MyType value: i64 (implements Lookup (get (lambda (m: MyType, s: str) -> i64 (. m value)))))"
     )
     assert one("p.area()") == "(call (. p area))"
+
+
+def test_composed_constraints_and_constants() -> None:
+    source = "constraint Monoid: Semigroup + Eq\n    const EMPTY: Self\n    combine: (Self, Self) -> Self"
+    assert (
+        one(source) == "(constraint Monoid (requires Semigroup Eq) combine: (Self, Self) -> Self (const EMPTY: Self))"
+    )
+    assert one("constraint Ranked: geo.Ord\n    const WORST: i64") == (
+        "(constraint Ranked (requires geo.Ord) (const WORST: i64))"
+    )
+    source = (
+        "struct Sum\n    n: i64\n    implements Monoid\n"
+        "        const EMPTY = Sum(0)\n        combine = (a: Sum, b: Sum) -> Sum => a"
+    )
+    assert one(source) == (
+        "(struct Sum n: i64 (implements Monoid (combine (lambda (a: Sum, b: Sum) -> Sum a)) (const EMPTY (call Sum 0))))"
+    )
+    # An implementation without a block, of a constraint whose methods the type already has.
+    assert one("struct S\n    n: i64\n    implements Sized\n    m = 1") == "(struct S n: i64 (m 1) (implements Sized))"
+    source = 'enum Light\n    Red\n    implements Named\n        name = (l: Light) -> str => "red"'
+    assert one(source) == '(enum Light Red (implements Named (name (lambda (l: Light) -> str "red"))))'
+    assert one("T.EMPTY") == "(. T EMPTY)"
+    assert error("constraint A\n    const X: i64\n    const X: str").message == "'X' is already a constant of A"
+    source = "struct S\n    n: i64\n    implements A\n        const X = 1\n        const X = 2"
+    assert error(source).message == "'X' is already a constant of A"
+    assert error("constraint A:\n    f: (Self) -> i64").message.startswith("expected a parent constraint")
     # `mut` before a method call marks the value it is called on, wherever the call is.
     assert one("mut s.items[0].push(1, 2)") == "(call (. (mut (index (. s items) 0)) push) 1 2)"
     assert one("mut s.pop() + 1") == "(+ (call (. (mut s) pop)) 1)"

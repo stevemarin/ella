@@ -1004,6 +1004,23 @@ class Lowerer:
 
     # Expressions
 
+    def lower_associated_constant(self, expr: Member, dest: str) -> Value:
+        """`T.NAME` in a specialized generic function: the expression T's implementation gives the constant,
+        computed where it is used."""
+        param, constraint, name = self.checker.associated_constants[id(expr)]
+        actual = self.concrete(self.subst[param])
+        assert isinstance(actual, EnumTy), f"{param}.{name} needs a struct or enum"
+        value = self.checker.implementation_constants[
+            actual.name, self.checker.implementation_of(actual.name, constraint), name
+        ]
+        enum = self.checker.enums[actual.name]
+        old_subst = self.subst
+        self.subst = old_subst | dict(zip(enum.params, actual.args))
+        try:
+            return self.lower(value, dest)
+        finally:
+            self.subst = old_subst
+
     def lower(self, expr: Expr, dest: str = "") -> Value:
         """Emit the instructions that compute `expr`, and return its value.
 
@@ -1116,6 +1133,8 @@ class Lowerer:
                 if isinstance(container.type, BuiltinTy):
                     return self.pool_get(container, self.lower(index), self.type_of(expr), span)
                 return self.lower_index(container, self.lower(index), self.type_of(expr), span, dest)
+            case Member() if id(expr) in self.checker.associated_constants:
+                return self.lower_associated_constant(expr, dest)
             case Member(target):
                 struct = self.lower(target)
                 position = self.checker.members[id(expr)]

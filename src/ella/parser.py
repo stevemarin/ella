@@ -7,6 +7,7 @@ from ella.lexer import EllaError, Span, Token, TokenKind, tokenize
 from ella.syntax import (
     Assert,
     Assign,
+    AssociatedConst,
     Binary,
     Binding,
     Block,
@@ -1029,8 +1030,11 @@ class Parser:
         self.expect_kind(TokenKind.INDENT, "an indented list of variants")
         variants: list[Variant] = []
         methods: list[Method] = []
+        implementations: list[Implementation] = []
         while True:
-            if self.at_kind(TokenKind.NAME) and self.at("=", 1):
+            if self.at("implements"):
+                implementations.append(self.parse_implementation(methods))
+            elif self.at_kind(TokenKind.NAME) and self.at("=", 1):
                 methods.append(self.parse_method(methods))
             else:
                 variants.append(self.parse_variant())
@@ -1047,6 +1051,7 @@ class Parser:
                     methods=tuple(methods),
                     constraints=constraints,
                     size_params=sizes,
+                    implementations=tuple(implementations),
                 )
 
     def parse_struct(self) -> EnumDef:
@@ -1098,18 +1103,31 @@ class Parser:
                 )
 
     def parse_implementation(self, methods: list[Method]) -> Implementation:
-        """`implements Constraint`, then methods implementing it."""
+        """`implements Constraint`, then its methods and associated constants."""
         token = self.advance()
         constraint = self.parse_dotted(self.expect_kind(TokenKind.NAME, "a constraint name"))
+        if self.peek(1).kind is not TokenKind.INDENT:
+            return Implementation(constraint, (), token.span)
         self.expect_kind(TokenKind.NEWLINE, "end of line")
         self.expect_kind(TokenKind.INDENT, "an indented list of methods")
         implementation_methods: list[Method] = []
+        constants: list[AssociatedConst] = []
         while True:
             if self.at_kind(TokenKind.DEDENT):
                 self.advance()
-                return Implementation(constraint, tuple(implementation_methods), token.span)
+                return Implementation(constraint, tuple(implementation_methods), token.span, tuple(constants))
+            if self.accept("const"):
+                name = self.expect_kind(TokenKind.NAME, "a constant name")
+                if any(const.name == name.text for const in constants):
+                    raise EllaError(f"'{name.text}' is already a constant of {constraint}", name.span)
+                self.expect("=")
+                constants.append(AssociatedConst(name.text, self.parse_expr(), name.span))
+                self.end_of_line()
+                continue
             if not (self.at_kind(TokenKind.NAME) and self.at("=", 1)):
-                raise self.unexpected("a method implementation, like 'get = (x: MyType) => ...'")
+                raise self.unexpected(
+                    "a method implementation or constant, like 'get = (x: MyType) => ...' or 'const ZERO = 0'"
+                )
             method = self.parse_method(methods)
             methods.append(method)
             implementation_methods.append(method)
@@ -1167,22 +1185,37 @@ class Parser:
         return Method(name.text, self.parse_expr(), name.span)
 
     def parse_constraint(self) -> ConstraintDef:
-        """`constraint Name`, then an indented list of methods with their types: `area: (Self) -> f64`."""
+        """`constraint Name[: Parent + ...]`, followed by method and constant requirements."""
         token = self.advance()
         name = self.expect_kind(TokenKind.NAME, "a constraint name")
+        parents: list[str] = []
+        if self.accept(":"):
+            while True:
+                parents.append(self.parse_dotted(self.expect_kind(TokenKind.NAME, "a parent constraint")))
+                if not self.accept("+"):
+                    break
         self.expect_kind(TokenKind.NEWLINE, "end of line")
-        self.expect_kind(TokenKind.INDENT, "an indented list of methods, like 'area: (Self) -> f64'")
+        self.expect_kind(TokenKind.INDENT, "an indented list of requirements")
         methods: list[Param] = []
+        constants: list[Param] = []
         while True:
+            if self.at_kind(TokenKind.DEDENT):
+                self.advance()
+                return ConstraintDef(name.text, tuple(methods), token.span, tuple(parents), tuple(constants))
+            if self.accept("const"):
+                constant = self.expect_kind(TokenKind.NAME, "a constant name")
+                if any(item.name == constant.text for item in constants):
+                    raise EllaError(f"'{constant.text}' is already a constant of {name.text}", constant.span)
+                self.expect(":")
+                constants.append(Param(constant.text, self.parse_type(), constant.span))
+                self.end_of_line()
+                continue
             method = self.expect_kind(TokenKind.NAME, "a method name")
             if any(m.name == method.text for m in methods):
                 raise EllaError(f"'{method.text}' is already a method of {name.text}", method.span)
             self.expect(":")
             methods.append(Param(method.text, self.parse_type(), method.span))
             self.end_of_line()
-            if self.at_kind(TokenKind.DEDENT):
-                self.advance()
-                return ConstraintDef(name.text, tuple(methods), token.span)
 
     def parse_variant(self) -> Variant:
         """One variant: `Empty`, or `Rect(f64, f64)` with field types."""

@@ -13,12 +13,20 @@ from ella.checker import (
     LIBRARY,
     OPERATOR_METHODS,
     REFLECTION,
+    BuiltinTy,
     Checker,
+    EnumTy,
+    FuncTy,
+    ListTy,
+    ParamTy,
+    TupleTy,
+    Type,
     array_item,
     check_code,
     finish,
     pattern_names,
     show_type,
+    substitute,
 )
 from ella.lexer import EQ_SITE, FINALIZER_SITE, HASH_SITE, TEXT_SITE, CallSite, EllaError, Span
 from ella.library import Exit, Host, hash_value
@@ -253,6 +261,7 @@ class Interpreter:
         self.tables = tables if tables is not None else Tables().add(checker) if checker is not None else Tables()
         # While compiling, a top-level function's splices are expanded before it runs.
         self.prepare_function: Callable[[Lambda], Lambda] | None = None
+        self.prepare_code: Callable[[Expr], Expr] | None = None  # and a constant's code, before it is computed
         self.structs: dict[str, tuple[str, ...]] = {"Error": BUILTIN_ENUMS["Error"].field_names}  # struct -> fields
         self.nocopy: set[str] = set()  # the nocopy structs
         self.finalizers: dict[str, Value] = {}  # struct -> its finalize function
@@ -263,6 +272,11 @@ class Interpreter:
         self.owners: list[list[Value]] = [[]]
         self.quote_symbols: list[dict[int, int]] = []  # hygienic identities of binders in quotes being built
         self.generator: Generator | None = None  # the generator whose body is running, if any
+        # (generic function, its type arguments) -> the function knowing them (`with_type_args`)
+        self.typed_closures: dict[tuple[int, tuple[Type, ...]], tuple[Closure, Closure]] = {}
+        # (type, constraint it implements, constant) -> the constant's value, and those being computed
+        self.constants: dict[tuple[str, str, str], Value] = {}
+        self.computing: set[tuple[str, str, str]] = set()
 
         # The global scope holds the built-ins and every top-level `let`.
         self.globals = Scope(None)
@@ -399,6 +413,14 @@ class Interpreter:
                     and id(expr) in self.checker.wrappers
                 ):
                     return self.eval(self.checker.wrappers[id(expr)], scope)  # whose call knows the item type
+                if (
+                    isinstance(value, Closure)
+                    and self.checker
+                    and self.checker.associated_constants
+                    and (type_args := self.checker.instances.get(id(expr))) is not None
+                ):
+                    params = self.checker.resolved[id(expr)].type_params
+                    return self.with_type_args(value, params, type_args, scope)
                 return value
             case Let(bindings, value_expr):
                 if isinstance(value_expr, Lambda):
@@ -465,6 +487,8 @@ class Interpreter:
                 # copy just the element.
                 container = self.reference(target, scope, for_assignment=False)
                 return copy_value(self.item(container, self.eval(index, scope), span))
+            case Member() if self.checker and id(expr) in self.checker.associated_constants:
+                return self.associated_constant(expr, scope)
             case Member():
                 return copy_value(self.reference(expr, scope, for_assignment=False))
             case Quote():
@@ -614,6 +638,8 @@ class Interpreter:
             case Name(name, span):
                 var = self.lookup_mutable(name, scope, span) if for_assignment else self.lookup(name, scope, span)
                 return var.value
+            case Member() if self.checker and id(expr) in self.checker.associated_constants:
+                return self.associated_constant(expr, scope)  # `T.NAME[i]`, `T.NAME.x`: a copy, never changed
             case Index(target, index, span):
                 container = self.reference(target, scope, for_assignment)
                 return self.item(container, self.eval(index, scope), span)
@@ -773,6 +799,73 @@ class Interpreter:
             self.write_place(root, indexes, final, scope, place_span)
         return result
 
+    # Associated constants
+
+    def with_type_args(
+        self, closure: Closure, params: tuple[str, ...], type_args: tuple[Type, ...], scope: Scope
+    ) -> Closure:
+        """A generic function that knows its type arguments, for `T.NAME` in it: each is `type T` in its scope.
+
+        Only programs with associated constants need them. The same function
+        with the same types gives the same closure, so that a tail call to
+        itself still reuses its frame.
+        """
+        concrete = tuple(self.bound_type(t, scope) for t in type_args)
+        key = (id(closure), concrete)
+        if (known := self.typed_closures.get(key)) is None:
+            inner = Scope(closure.scope, {f"type {p}": Var(TypeValue(t), False) for p, t in zip(params, concrete)})
+            known = self.typed_closures[key] = (closure, Closure(closure.function, inner))
+        return known[1]
+
+    def bound_type(self, t: Type, scope: Scope) -> Type:
+        """A type the checker found, with the type parameters of the generic functions running filled in."""
+        t = finish(t)
+        bound: dict[str, Type] = {}
+        for name in param_names(t):
+            if (var := scope.lookup(f"type {name}")) is not None and isinstance(var.value, TypeValue):
+                bound[name] = var.value.type
+        return substitute(t, bound) if bound else t
+
+    def associated_constant(self, expr: Member, scope: Scope) -> Value:
+        """`T.NAME`: the constant T's implementation gives, computed here (as the lowering does)."""
+        assert self.checker is not None
+        param, constraint, name = self.checker.associated_constants[id(expr)]
+        var = scope.lookup(f"type {param}")
+        assert var is not None and isinstance(var.value, TypeValue), f"{param} has no type argument"
+        t = var.value.type
+        assert isinstance(t, EnumTy), f"{param}.{name} needs a struct or enum"
+        return self.constant_value(t.name, self.checker.implementation_of(t.name, constraint), name)
+
+    def constant_value(self, type_name: str, constraint: str, name: str) -> Value:
+        """The value a type's implementation of a constraint gives a constant, computed the first time it is
+        needed. While compiling (ella.staging) that is when the constant is written into the code, which
+        then holds it as a literal."""
+        assert self.checker is not None
+        key = (type_name, constraint, name)
+        if key not in self.constants:
+            expr = self.checker.implementation_constants[key]
+            if key in self.computing:
+                raise EllaError(f"constant {type_name}.{name} needs its own value to be computed", expr.span)
+            self.computing.add(key)
+            try:
+                if self.prepare_code is not None:
+                    expr = self.prepare_code(expr)
+                self.constants[key] = self.eval(expr, Scope(self.globals))
+            finally:
+                self.computing.discard(key)
+        return copy_value(self.constants[key])
+
+    def compute_constant(self, type_name: str, constraint: str, name: str) -> Value:
+        """A constant's value, computed while compiling."""
+
+        def run() -> Value:
+            self.owners.append([])
+            result = self.constant_value(type_name, constraint, name)
+            self.close_owner(result)
+            return result
+
+        return self.compile_time(run)
+
     # Methods
 
     def call_member(self, callee: Member, args: tuple[Expr, ...], scope: Scope, span: Span) -> Value:
@@ -791,6 +884,10 @@ class Interpreter:
             if (function_name := self.checker.extension_methods.get(id(callee))) is not None:
                 extension_function = self.lookup(function_name, scope, callee.span).value
                 assert extension_function is not None
+                type_args = self.checker.instances.get(id(callee))
+                if isinstance(extension_function, Closure) and type_args and self.checker.associated_constants:
+                    params = self.checker.globals.vars[function_name].type_params
+                    extension_function = self.with_type_args(extension_function, params, type_args, scope)
                 return self.call_with_args(extension_function, (callee.target, *args), scope, span)
         receiver, name = callee.target, callee.name
         if isinstance(receiver, MutArg):
@@ -1427,8 +1524,11 @@ class Interpreter:
 
     def run_compile_time(self, expr: Expr) -> Value:
         """Run the code of a splice outside quotes, while compiling (see ella.staging)."""
+        return self.compile_time(lambda: self.run_code(expr))
+
+    def compile_time(self, run: Callable[[], Value]) -> Value:
         try:
-            return run_deep(lambda: self.run_code(expr), self.max_depth, PYTHON_FRAMES_PER_CALL)
+            return run_deep(run, self.max_depth, PYTHON_FRAMES_PER_CALL)
         except Exit as stop:
             raise EllaError("exit() can't stop the program while it is being compiled", stop.span) from None
 
@@ -1676,6 +1776,21 @@ class Interpreter:
         if not isinstance(value, list | str | range):
             raise EllaError(f"len() needs a list, str, range, Array, Pool or Arena, not {type_name(value)}", span)
         return len(value)
+
+
+def param_names(t: Type) -> set[str]:
+    """The type parameters a type mentions."""
+    match t:
+        case ParamTy(name):
+            return {name}
+        case ListTy(part):
+            return param_names(part)
+        case TupleTy(parts) | EnumTy(_, parts) | BuiltinTy(_, parts):
+            return set().union(*map(param_names, parts))
+        case FuncTy(params, result):
+            return set().union(*map(param_names, params), param_names(result))
+        case _:
+            return set()
 
 
 def mutable_names(pattern: Pattern) -> set[str]:

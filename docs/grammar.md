@@ -51,11 +51,11 @@ identifiers, not keywords.
 
 ```text
 and         as          assert      break       case        comptime
-constraint  continue    else        enum        false       for
-if          implements  import      in          let         loop        match
-mut         nocopy      not         or          quote       return
-struct      then        true        type        where       while
-yield
+const       constraint  continue    else        enum        false
+for         if          implements  import      in          let
+loop        match       mut         nocopy      not         or
+quote       return      struct      then        true        type
+where       while       yield
 ```
 
 Reserved for later, not yet given a grammar: `comptime`.
@@ -1352,8 +1352,9 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 
 ### User-defined constraints **(provisional syntax)**
 
-A program can define its own constraints, as the methods a type must have,
-with `Self` standing for the type:
+A program can define its own constraints: the methods a type must have, with
+`Self` standing for the type, and constants it must give. A type meets one by
+saying so, with `implements`:
 
 ```ella
 constraint Shape
@@ -1364,7 +1365,7 @@ struct Square
     side: f64
     implements Shape
         area = (s: Square) -> f64 => s.side * s.side
-        name = (s: Square) -> str => "square"
+        name = (_s: Square) -> str => "square"
 
 let total[T: Shape] = (xs: [T]) -> f64 =>
     let mut sum = 0.0
@@ -1375,20 +1376,109 @@ let total[T: Shape] = (xs: [T]) -> f64 =>
 print(total([Square(2.0), Square(1.0)]))     # 5.0
 ```
 
-* A struct can declare `implements Shape` and define the required methods
-  inside that block. The checker verifies at the declaration that each
+* A struct or enum meets a user-defined constraint only if it declares
+  `implements Shape`: having the methods isn't enough. Its methods can be in
+  the `implements` block, or among its other methods (then the line is just
+  `implements Shape`). The checker verifies at the declaration that each
   required method exists and has the right type (with `Self` replaced by the
-  struct type). A struct or enum with matching methods still meets a
-  constraint structurally even without an `implements` block.
+  type).
 * In a generic function, a value of a type parameter has the methods of its
   constraints: `x.area()`. A method can be `mut` (`tick: (mut Self) -> ()`),
   and is then called as `mut x.tick()`. Two constraints of one type
   parameter can't have different methods with the same name.
-* User-defined and built-in constraints combine: `[T: Shape + Ord]`.
+* User-defined and built-in constraints combine: `[T: Shape + Ord]`. The
+  built-in ones are still met as their table says, without `implements`.
 * A constraint's method named `len` gives `len(x)` in the generic function;
   operators still need the built-in constraints.
 * Each use is still compiled for its own types, so a method call is a
   direct call: there is no dynamic dispatch.
+
+**Composition.** A constraint can require others, user-defined or built-in,
+after `:`, combined with `+`. It then has their methods and constants too, and
+a type that implements it implements them:
+
+```ella
+constraint Named
+    name: (Self) -> str
+
+constraint Ranked: Named + Ord
+    score: (Self) -> i64
+
+struct Player
+    nick: str
+    points: i64
+    compare = (a: Player, b: Player) -> i64 => a.points - b.points
+    implements Ranked
+        name = (p: Player) -> str => p.nick
+        score = (p: Player) -> i64 => p.points
+
+let label[T: Named] = (x: T) -> str => "<{{x.name()}}>"
+let best[T: Ranked] = (a: T, b: T) -> str => label(if a > b then a else b)
+
+print(best(Player("ann", 3), Player("bob", 5)))     # <bob>
+```
+
+* A `Ranked` type parameter is also `Named` and `Ord`, so `best` can use
+  `>` and pass its `T` to `label`.
+* The `implements Ranked` block gives the methods of `Ranked` and of
+  `Named`. The type must also meet the built-in constraints `Ranked`
+  requires, as their table says (`Player` has `compare`, so it is `Ord`).
+* The constraints required, directly or not, can't include the constraint
+  itself, and must agree: two with a method (or constant) of the same name
+  must give it the same type.
+* A type implements each user-defined constraint once: after
+  `implements Ranked` it can't also say `implements Named`.
+
+**Constants.** A constraint can require typed constants, `const NAME: Type`
+(`Self` may be in the type). Each implementation gives their values, as
+`const NAME = expression`, and generic code reads them as `T.NAME`:
+
+```ella
+constraint Monoid
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+
+struct Sum
+    n: i64
+    implements Monoid
+        combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n)
+        const EMPTY = Sum(0)
+
+let fold_all[T: Monoid] = (xs: [T]) -> T =>
+    let mut acc = T.EMPTY
+    for x in xs
+        acc = acc.combine(x)
+    acc
+
+let none: [Sum] = []
+print(fold_all([Sum(2), Sum(3)]))     # Sum(5)
+print(fold_all(none))                 # Sum(0)
+```
+
+* `T.NAME` is the constant of the type `T` stands for: each use of the
+  function is compiled for its own types, so it is that type's value.
+* A constant is computed once, while compiling, and the program holds its
+  value, made before the program's code runs (so reading a list constant
+  in a loop doesn't make it again). Its expression is compile-time code,
+  like a splice outside quotes ([§11](#11-stages)). It can call top-level
+  functions (defined before or after it), make values of any type, and
+  read other constants through generic functions, but it can't use the
+  program's variables (`let g = 5` then `const N = g` is an error), since
+  they don't exist yet. What it prints comes out while compiling. An error
+  in it, a constant that needs its own value, and `exit()` stop the
+  compilation; editors show them too.
+* So a constant's type can only hold values that can be written as code:
+  numbers, `bool`s, strings, tuples, lists, structs and enums (`Optional`,
+  `Map`, ...), but not functions, arrays, or nocopy values.
+* A constant is an ordinary value in the program: it can't change
+  (`T.NAME = x` is an error), and it can't be used in a type
+  (`Array[f64; T.SIZE]`) yet.
+* A local variable named `T` hides the type parameter in `T.NAME`.
+* For now, only a top-level struct or enum can give constants, and a
+  struct's or enum's own type parameters can't have a constraint with
+  constants (`struct Acc[T: Monoid]` is an error); a generic function's can.
+  A generic type can still implement such a constraint
+  (`struct Bag[T]` with `implements Monoid`).
 
 ### Pools **(provisional syntax)**
 
@@ -1888,6 +1978,10 @@ print(run(power(2, quote 5)))     # 25
   than its own is an error: it doesn't exist yet.
 * Top-level variables other than functions belong to stage 0, so
   compile-time code can't read them.
+* The constants a type's `implements` gives
+  ([§9](#user-defined-constraints-provisional-syntax)) are compile-time
+  code too: each is computed once while compiling, and `ella --expanded`
+  shows its value written in.
 * Variables bound inside quoted code get fresh identities when the code is
   built, so spliced code cannot capture them accidentally. The compiler
   preserves readable source names and uses collision-free internal names
@@ -2030,16 +2124,19 @@ yield       = "yield" expr ;
 assert      = "assert" expr ;
 
 enum        = "enum" IDENT [ "[" type_param { "," type_param } "]" ]
-              NEWLINE INDENT ( variant | method ) { NEWLINE ( variant | method ) } NEWLINE DEDENT ;
+              NEWLINE INDENT ( variant | method | implementation ) { NEWLINE ( variant | method | implementation ) }
+              NEWLINE DEDENT ;
 variant     = IDENT [ "(" type { "," type } ")" ] ;
 struct      = [ "nocopy" ] "struct" IDENT [ "[" type_param { "," type_param } "]" ]
               NEWLINE INDENT ( field | method | implementation ) { NEWLINE ( field | method | implementation) }
               NEWLINE DEDENT ;
 field       = IDENT ":" type ;
 method      = IDENT "=" expr ;                   (* a function; `finalize` for a nocopy struct *)
-implementation = "implements" path NEWLINE INDENT [ method { NEWLINE method } ] NEWLINE DEDENT ;
-constraint  = "constraint" IDENT
-              NEWLINE INDENT IDENT ":" type { NEWLINE IDENT ":" type } NEWLINE DEDENT ;
+implementation = "implements" path [ NEWLINE INDENT impl_item { NEWLINE impl_item } NEWLINE DEDENT ] ;
+impl_item   = method | "const" IDENT "=" expr ;
+constraint  = "constraint" IDENT [ ":" path { "+" path } ]     (* the constraints it requires *)
+              NEWLINE INDENT requirement { NEWLINE requirement } NEWLINE DEDENT ;
+requirement = IDENT ":" type | "const" IDENT ":" type ;
 mut_call    = "mut" operator_expr ;              (* a method call: `mut s.push(3)` *)
 quote       = "quote" body ;
 splice      = "$" ( IDENT | "(" expr ")" | block ) ;
@@ -2127,8 +2224,9 @@ Parsing notes:
   and slices of arrays.
 * Whether iteration should use a stateful iterator (`next`) rather than
   making a list.
-* Whether a constraint should be able to require other constraints, or
-  operators (`constraint Ring: Add` ...).
+* Whether a constraint should be able to require operators beyond the
+  built-in constraints', associated types, and constants usable in types
+  (computed at compile time).
 * Whether `comptime` (still reserved) is worth having as shorthand for a
   splice, now that staging uses `quote` and `$`.
 * Compile-time type parameters checked at each use, for template-style

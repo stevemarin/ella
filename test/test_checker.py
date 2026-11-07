@@ -743,7 +743,8 @@ constraint Shape
     area: (Self) -> f64
 struct Square
     side: f64
-    area = (s: Square) -> f64 => s.side * s.side
+    implements Shape
+        area = (s: Square) -> f64 => s.side * s.side
     compare = (a: Square, b: Square) -> i64 => 0
     add = (a: Square, b: Square) -> Square => a
     mul = (a: Square, k: f64) -> Square => a
@@ -796,7 +797,9 @@ struct Other
 twice(Other(5))
 """
     )
-    assert error(bad_call).message == "twice needs T to be Lookup, and Other isn't: it has no method 'get'"
+    assert error(bad_call).message == (
+        "twice needs T to be Lookup, and Other isn't: it doesn't explicitly implement Lookup"
+    )
 
     missing = """\
 constraint Lookup
@@ -826,9 +829,8 @@ struct MyType
     value: i64
     get = (m: MyType, s: str) -> i64 => m.value
     implements Lookup
-        other = (m: MyType) -> i64 => m.value
 """
-    assert error(outside_block).message == "MyType doesn't implement Lookup: it has no method 'get'"
+    assert type_of(outside_block + "let f[T: Lookup] = (x: T) -> i64 => x.get('x')\nf(MyType(1))") == "i64"
 
     wrong_type = """\
 constraint Lookup
@@ -841,6 +843,217 @@ struct MyType
     assert error(wrong_type).message == (
         "MyType doesn't implement Lookup: its method 'get' is (MyType, str) -> str, not (MyType, str) -> i64"
     )
+
+    structural_only = """\
+constraint Lookup
+    get: (Self, str) -> i64
+struct MyType
+    value: i64
+    get = (m: MyType, s: str) -> i64 => 1
+let twice[T: Lookup] = (t: T) -> i64 => t.get("four")
+twice(MyType(1))
+"""
+    assert error(structural_only).message == (
+        "twice needs T to be Lookup, and MyType isn't: it doesn't explicitly implement Lookup"
+    )
+
+
+def test_composed_constraints_and_constants() -> None:
+    composed = """\
+constraint HasValue
+    value: (Self) -> i64
+constraint Named: HasValue
+    name: (Self) -> str
+struct Tagged
+    id: i64
+    implements Named
+        value = (x: Tagged) -> i64 => 3
+        name = (x: Tagged) -> str => "tag"
+let describe[T: Named] = (x: T) -> str => if x.value() > 0 then x.name() else ""
+describe(Tagged(1))
+"""
+    assert type_of(composed) == "str"
+
+    associated_constant = """\
+constraint Additive
+    add: (Self, Self) -> Self
+    const ZERO: Self
+struct Counter
+    n: i64
+    implements Additive
+        add = (a: Counter, b: Counter) -> Counter => Counter(a.n + b.n)
+        const ZERO = Counter(0)
+let zero[T: Additive] = (x: T) -> T => T.ZERO
+zero(Counter(4))
+"""
+    assert type_of(associated_constant) == "Counter"
+
+    # A parameter's constraint gives it the constraints it requires: a Named T is HasValue.
+    assert (
+        type_of(
+            composed
+            + "let total[T: HasValue] = (x: T) -> i64 => x.value()\nlet f[T: Named] = (x: T) -> i64 => total(x)\nf(Tagged(1))"
+        )
+        == "i64"
+    )
+    # A constraint can require a built-in one, whose operators its parameters then have.
+    ranked = """\
+constraint Ranked: Ord
+    const WORST: Self
+struct Score
+    n: i64
+    compare = (a: Score, b: Score) -> i64 => a.n - b.n
+    implements Ranked
+        const WORST = Score(0)
+let worse[T: Ranked] = (x: T) -> bool => x < T.WORST
+worse(Score(1))
+"""
+    assert type_of(ranked) == "bool"
+    # A constant's value may use top-level names defined later, as function bodies do.
+    later = associated_constant.replace("Counter(0)", "Counter(start())") + "let start = () -> i64 => 0\n"
+    assert type_of(later + "zero(Counter(4))") == "Counter"
+    # A local variable named like a type parameter is that variable.
+    assert (
+        type_of(
+            associated_constant
+            + "let g[T: Additive] = (_x: T) -> i64 =>\n    let T = Counter(2)\n    T.n\ng(Counter(1))"
+        )
+        == "i64"
+    )
+
+
+MONOID = """\
+constraint Monoid
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+"""
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "constraint A: Nope\n    f: (Self) -> i64",
+            "unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Num, A",
+        ),
+        (
+            "constraint A: B\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64",
+            "constraint cycle: A -> B -> A",
+        ),
+        ("constraint A: A\n    f: (Self) -> i64", "constraint cycle: A -> A"),
+        (
+            "constraint A\n    f: (Self) -> i64\nconstraint B: A + A\n    g: (Self) -> i64",
+            "B lists a parent constraint more than once",
+        ),
+        (
+            "constraint A\n    f: (Self) -> i64\nconstraint B\n    f: (Self) -> str\nconstraint C: A + B\n    g: (Self) -> i64",
+            "constraints A and B have different methods named 'f'",
+        ),
+        (
+            "constraint A\n    const X: i64\nconstraint B\n    const X: str\nconstraint C: A + B\n    const Y: i64",
+            "constraints A and B have different constants named 'X'",
+        ),
+        (
+            "constraint A\n    f: (Self) -> i64\nconstraint B: A\n    const f: i64",
+            "'f' is both a method and a constant of B",
+        ),
+        (
+            MONOID + "struct S\n    n: i64\n    implements Monoid\n        combine = (a: S, b: S) -> S => a",
+            "S doesn't implement Monoid: it has no constant 'EMPTY'",
+        ),
+        (
+            MONOID + "struct S\n    n: i64\n    implements Monoid\n        combine = (a: S, b: S) -> S => a\n"
+            "        const EMPTY = S(0)\n        const Z = 1",
+            "Monoid has no constant named 'Z'",
+        ),
+        (
+            MONOID + "struct S\n    n: i64\n    implements Monoid\n        combine = (a: S, b: S) -> S => a\n"
+            "        const EMPTY = 0",
+            "constant 'EMPTY' should be S, not i64",
+        ),
+        (
+            (
+                "constraint A\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64\n"
+                "struct S\n    n: i64\n    implements B\n        g = (s: S) -> i64 => 1"
+            ),
+            "S doesn't implement B: it has no method 'f'",
+        ),
+        (
+            "constraint R: Ord\n    f: (Self) -> i64\nstruct S\n    n: i64\n    implements R\n        f = (s: S) -> i64 => 1",
+            "S doesn't meet the built-in constraint Ord required by R",
+        ),
+        (
+            (
+                "constraint A\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64\nstruct S\n    n: i64\n"
+                "    implements B\n        f = (s: S) -> i64 => 1\n        g = (s: S) -> i64 => 1\n    implements A"
+            ),
+            "S already implements A (through B)",
+        ),
+        (
+            (
+                "constraint A\n    f: (Self) -> i64\nstruct S\n    n: i64\n    f = (s: S) -> i64 => 1\n"
+                "    implements A\n    implements A"
+            ),
+            "S already implements A",
+        ),
+        (MONOID + "let f[T: Monoid] = (x: T) -> T => T.Q", "T has no constant named 'Q'; its constraints have EMPTY"),
+        ("let f[T] = (x: T) -> T => T.Q", "T has no constant named 'Q'; its constraints have none"),
+        (
+            "constraint A\n    const X: i64\nconstraint B\n    const X: str\nlet f[T: A + B] = (x: T) -> i64 => T.X",
+            "T's constraints A and B have different constants named 'X'",
+        ),
+        (
+            MONOID + "let f[T: Monoid] = (x: T) -> T =>\n    T.EMPTY = x\n    x",
+            "can't assign to T.EMPTY: a constant can't change",
+        ),
+        (
+            (
+                "constraint A\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64\nstruct S\n    n: i64\n"
+                "    f = (s: S) -> i64 => 1\n    implements A\nlet h[T: B] = (x: T) -> i64 => x.g()\nh(S(1))"
+            ),
+            "h needs T to be B, and S isn't: it doesn't explicitly implement B",
+        ),
+        (
+            MONOID + "struct Acc[T: Monoid]\n    total: T",
+            (
+                "a type's parameter can't be Monoid yet, since Monoid has constants; a generic function's can "
+                "('let f[T: Monoid] = ...')"
+            ),
+        ),
+        (
+            (
+                "constraint K\n    const X: i64\nlet main = () -> i64 =>\n    struct S\n        n: i64\n"
+                "        implements K\n            const X = 1\n    0"
+            ),
+            "only a type defined at the top level can have constants, like 'X'",
+        ),
+        (
+            "let g = 5\nconstraint K\n    const Z: i64\nstruct R\n    n: i64\n    implements K\n        const Z = g",
+            "'g' belongs to a later stage, so it can't be used while compiling",
+        ),
+        (
+            "constraint K\n    const F: (i64) -> i64",
+            "constant 'F' can't hold functions: it is computed while compiling and written into the code, which can only hold numbers, bools, strings, tuples, lists, structs and enums",
+        ),
+        (
+            "constraint K\n    const A: [Array[f64]]",
+            "constant 'A' can't hold arrays: it is computed while compiling and written into the code, which can only hold numbers, bools, strings, tuples, lists, structs and enums",
+        ),
+        (
+            "constraint K\n    const Z: Self\nnocopy struct R\n    n: i64\n    implements K\n        const Z = R(1)",
+            "constant 'Z' can't hold nocopy values (R): it is computed while compiling and written into the code, which can only hold numbers, bools, strings, tuples, lists, structs and enums",
+        ),
+        (
+            (
+                "constraint K\n    const Z: Self\nstruct R\n    f: (i64) -> i64\n    implements K\n"
+                "        const Z = R((x: i64) => x)"
+            ),
+            "constant 'Z' can't hold functions: it is computed while compiling and written into the code, which can only hold numbers, bools, strings, tuples, lists, structs and enums",
+        ),
+    ],
+)
+def test_constraint_composition_errors(source: str, message: str) -> None:
+    assert error(source).message == message
 
 
 @pytest.mark.parametrize(
@@ -874,11 +1087,11 @@ struct MyType
         (SHAPES + "total([1])", "total needs T to be Shape, and i64 isn't"),
         (
             SHAPES + "struct Circle\n    r: f64\ntotal([Circle(1.0)])",
-            "total needs T to be Shape, and Circle isn't: it has no method 'area'",
+            "total needs T to be Shape, and Circle isn't: it doesn't explicitly implement Shape",
         ),
         (
             SHAPES + "struct Circle\n    r: f64\n    area = (c: Circle) -> i64 => 1\ntotal([Circle(1.0)])",
-            "total needs T to be Shape, and Circle isn't: its method 'area' is (Circle) -> i64, not (Circle) -> f64",
+            "total needs T to be Shape, and Circle isn't: it doesn't explicitly implement Shape",
         ),
         (
             SHAPES + "let f[T: Shape] = (x: T) -> f64 => x.perimeter()",
@@ -938,6 +1151,8 @@ struct Ps
 """
 
 BAG = """\
+constraint Lookup
+    get: (Self, i64) -> str
 struct Bag
     items: [str]
     get = (b: Bag, i: i64) -> str => b.items[i]
@@ -945,6 +1160,7 @@ struct Bag
         b.items[i] = s
     iter = (b: Bag) -> [str] => b.items
     contains = (b: Bag, s: str) -> bool => s in b.items
+    implements Lookup
 let mut bag = Bag(["a"])
 """
 
@@ -957,7 +1173,7 @@ def test_protocols() -> None:
     assert type_of(BAG + "struct Box\n    b: Bag\nlet mut box = Box(bag)\nbox.b[0] = 'x'") == "str"
     assert type_of(BAG + "'a' in bag") == "bool"
     assert type_of(BAG + "let mut n = ''\nfor s in bag\n    n += s\nn") == "str"
-    source = "constraint Seq\n    get: (Self, i64) -> str\nlet first[T: Seq] = (t: T) -> str => t[0]\n"
+    source = "let first[T: Lookup] = (t: T) -> str => t[0]\n"
     assert type_of(BAG + source + "first(bag)") == "str"
 
 

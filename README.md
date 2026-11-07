@@ -187,8 +187,11 @@ The syntax is specified in [docs/grammar.md](docs/grammar.md).
 * Structs and enums have methods (`p.norm()`, `mut s.push(3)`), which can
   give them operators, `len`, indexing (`get`, `set`), iteration (`iter`)
   and `in` (`contains`), and programs can define their own
-  constraints, which any type with the right methods meets
-  (`constraint Shape` with `area: (Self) -> f64`, then `let total[T: Shape]`).
+  constraints, which a type meets by implementing them
+  (`constraint Shape` with `area: (Self) -> f64`, a struct with
+  `implements Shape`, then `let total[T: Shape]`). A constraint can require
+  others (`constraint Monoid: Semigroup + Eq`) and constants that each type
+  gives (`const EMPTY: Self`, read in generic code as `T.EMPTY`).
   Functions in a type's namespace can be called without a receiver
   (`Stack.new()`), and compatible prelude functions can be called on their
   first argument (`xs.map(f)`, `" text ".trim()`). Local `let`-bound

@@ -507,11 +507,27 @@ class Method:
 
 @dataclass(frozen=True, slots=True)
 class Implementation:
-    """A constraint implemented by a struct, with the methods that implement it."""
+    """A constraint implemented by a type, with its methods and constants."""
 
     constraint: str
     methods: tuple[Method, ...]
     span: Span
+    constants: tuple[AssociatedConst, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AssociatedConst:
+    """A constant supplied by a constraint implementation: `const NAME = value`.
+
+    `value` is code that runs while compiling (ella.staging), which then
+    writes the value in its place: a literal, or a global holding it, read
+    by the program (`written`).
+    """
+
+    name: str
+    value: Expr
+    span: Span
+    written: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,11 +559,13 @@ class EnumDef:
 
 @dataclass(frozen=True, slots=True)
 class ConstraintDef:
-    """`constraint Name` followed by the methods a type needs to meet it: `area: (Self) -> f64`."""
+    """A constraint's superconstraints, method signatures, and typed constants."""
 
     name: str
     methods: tuple[Param, ...]
     span: Span
+    parents: tuple[str, ...] = ()
+    constants: tuple[Param, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +752,22 @@ def is_generator(function: Lambda) -> bool:
 # Printing
 
 
+def show_methods(node: EnumDef) -> list[str]:
+    """A struct's or enum's methods, those of each implementation in its own `implements` group."""
+    implemented = {(m.name, m.span) for impl in node.implementations for m in impl.methods}
+    functions = [sexpr(m.name, show(m.function)) for m in node.methods if (m.name, m.span) not in implemented]
+    functions.extend(
+        sexpr(
+            "implements",
+            impl.constraint,
+            *(sexpr(m.name, show(m.function)) for m in impl.methods),
+            *(sexpr("const", const.name, show(const.value)) for const in impl.constants),
+        )
+        for impl in node.implementations
+    )
+    return functions
+
+
 def show(node: Expr | Pattern | TypeExpr) -> str:
     """Render a node compactly: expressions and patterns as S-expressions, types as Ella syntax."""
     match node:
@@ -845,26 +879,24 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
             struct=True,
             field_names=names,
             nocopy=nocopy,
-            methods=methods,
-            implementations=implementations,
         ):
             fields = (f"{n}: {show(t)}" for n, t in zip(names, variants[0].fields))
-            implemented = {(m.name, m.span) for impl in implementations for m in impl.methods}
-            functions = [sexpr(m.name, show(m.function)) for m in methods if (m.name, m.span) not in implemented]
-            functions.extend(
-                sexpr("implements", impl.constraint, *(sexpr(m.name, show(m.function)) for m in impl.methods))
-                for impl in implementations
-            )
-            return sexpr("nocopy struct" if nocopy else "struct", show_head(node), *fields, *functions)
-        case EnumDef(variants=variants, methods=methods):
+            return sexpr("nocopy struct" if nocopy else "struct", show_head(node), *fields, *show_methods(node))
+        case EnumDef(variants=variants):
             return sexpr(
                 "enum",
                 show_head(node),
                 *(sexpr(v.name, *map(show, v.fields)) if v.fields else v.name for v in variants),
-                *(sexpr(m.name, show(m.function)) for m in methods),
+                *show_methods(node),
             )
-        case ConstraintDef(name, methods):
-            return sexpr("constraint", name, *map(show_param, methods))
+        case ConstraintDef(name, methods, parents=parents, constants=constants):
+            return sexpr(
+                "constraint",
+                name,
+                *([sexpr("requires", *parents)] if parents else []),
+                *map(show_param, methods),
+                *(sexpr("const", show_param(item)) for item in constants),
+            )
         case Quote(body):
             return sexpr("quote", show(body))
         case Splice(code):

@@ -1,0 +1,14 @@
+import alg
+
+struct Sum
+    n: i64
+    implements alg.Monoid
+        combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n)
+        const EMPTY = Sum(0)
+        const NAME = "sum"
+
+let twice[T: alg.Semigroup] = (x: T) -> T => x.combine(x)
+
+print(alg.fold_all([Sum(1), Sum(2)]), alg.describe(Sum(0)), alg.describe(Sum(4)))
+print(alg.fold_all([alg.Max(3), alg.Max(8)]), alg.describe(alg.Max(-1000)))
+print(twice(Sum(5)), twice(alg.Max(2)))

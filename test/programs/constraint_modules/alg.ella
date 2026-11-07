@@ -1,0 +1,23 @@
+constraint Semigroup
+    combine: (Self, Self) -> Self
+
+constraint Monoid: Semigroup + Eq
+    const EMPTY: Self
+    const NAME: str
+
+let fold_all[T: Monoid] = (xs: [T]) -> T =>
+    let mut acc = T.EMPTY
+    for x in xs
+        acc = acc.combine(x)
+    acc
+
+let describe[T: Monoid] = (x: T) -> str => if x == T.EMPTY then "empty {{T.NAME}}" else "a {{T.NAME}}"
+
+struct Max
+    n: i64
+    implements Monoid
+        combine = (a: Max, b: Max) -> Max => if a.n > b.n then a else b
+        const EMPTY = Max(_lowest())
+        const NAME = "max"
+
+let _lowest = () -> i64 => -1000

@@ -100,6 +100,13 @@ constraint Lookup
     iter: (Self) -> [str]
     contains: (Self, str) -> bool
 
+struct IntTable
+    table: Table[i64]
+    implements Lookup
+        get = (t: IntTable, key: str) -> i64 => t.table[key]
+        iter = (t: IntTable) -> [str] => t.table.iter()
+        contains = (t: IntTable, key: str) -> bool => key in t.table
+
 let sum_of[T: Lookup] = (t: T, keys: [str]) -> i64 =>
     let mut sum = 0
     for key in keys
@@ -110,8 +117,8 @@ let all_of[T: Lookup] = (t: T) -> [str] =>
     for key in t
         out += [key]
     out
-print(sum_of(ages, ["ann", "zed", "bob"]))
-print(all_of(ages))
+print(sum_of(IntTable(ages), ["ann", "zed", "bob"]))
+print(all_of(IntTable(ages)))
 
 # An item is read with `get`, which is a call: it may change a global that
 # an earlier operand still holds, which keeps its old value.

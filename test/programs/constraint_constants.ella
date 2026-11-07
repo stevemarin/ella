@@ -1,0 +1,144 @@
+# Constraints can require other constraints, and typed constants that each
+# implementation supplies.
+constraint HasValue
+    value: (Self) -> i64
+
+constraint Named: HasValue
+    name: (Self) -> str
+
+struct Tagged
+    id: i64
+    implements Named
+        value = (t: Tagged) -> i64 => t.id * 10
+        name = (t: Tagged) -> str => "tag {{t.id}}"
+
+enum Light
+    Red
+    Green
+    implements Named
+        value = (l: Light) -> i64 => if l == Red then 1 else 2
+        name = (l: Light) -> str => if l == Red then "red" else "green"
+
+# Implementing Named also implements HasValue, so this works on both types.
+let total[T: HasValue] = (xs: [T]) -> i64 =>
+    let mut sum = 0
+    for x in xs
+        sum += x.value()
+    sum
+
+let describe[T: Named] = (xs: [T]) -> str =>
+    let mut out = ""
+    for x in xs
+        out += "{{x.name()}}={{x.value()}} "
+    out + "total {{total(xs)}}"
+
+print(describe([Tagged(1), Tagged(2)]))
+print(describe([Red, Green, Green]))
+
+# Associated constants are read as `T.NAME` in generic code, and each type
+# gives its own.
+constraint Monoid
+    combine: (Self, Self) -> Self
+    const EMPTY: Self
+    const LABEL: str
+
+struct Sum
+    n: i64
+    implements Monoid
+        combine = (a: Sum, b: Sum) -> Sum => Sum(a.n + b.n)
+        const EMPTY = Sum(0)
+        const LABEL = "sum"
+
+struct Product
+    n: i64
+    implements Monoid
+        combine = (a: Product, b: Product) -> Product => Product(a.n * b.n)
+        const EMPTY = Product(1)
+        const LABEL = "product"
+
+let fold_all[T: Monoid] = (xs: [T]) -> T =>
+    let mut acc = T.EMPTY
+    for x in xs
+        acc = acc.combine(x)
+    acc
+
+let report[T: Monoid] = (xs: [T]) -> str => "{{T.LABEL}} of {{len(xs)}}: {{fold_all(xs)}}"
+
+print(report([Sum(2), Sum(3), Sum(4)]))
+print(report([Product(2), Product(3), Product(4)]))
+let no_sums: [Sum] = []
+print(fold_all(no_sums))
+
+# A constraint can build on a built-in one; its implementations must meet it.
+constraint Ranked: Ord
+    const WORST: Self
+
+struct Score
+    points: i64
+    compare = (a: Score, b: Score) -> i64 => a.points - b.points
+    implements Ranked
+        const WORST = Score(-1)
+
+let best[T: Ranked] = (xs: [T]) -> T =>
+    let mut top = T.WORST
+    for x in xs
+        if x > top then
+            top = x
+    top
+
+print(best([Score(3), Score(9), Score(5)]))
+let no_scores: [Score] = []
+print(best(no_scores))
+
+# Constants inherited from a parent constraint are read the same way.
+constraint Bounded: Ranked
+    const BEST: Self
+
+struct Grade
+    level: i64
+    compare = (a: Grade, b: Grade) -> i64 => a.level - b.level
+    implements Bounded
+        const WORST = Grade(0)
+        const BEST = Grade(5)
+
+let clamp[T: Bounded] = (x: T) -> T =>
+    if x < T.WORST then T.WORST else if x > T.BEST then T.BEST else x
+
+print(clamp(Grade(7)), clamp(Grade(-2)), clamp(Grade(3)))
+print(best([Grade(1), Grade(4)]))
+
+# A constant is computed once, while compiling, and the code holds its
+# value. It may call top-level functions, which may read other constants,
+# but can't use the program's variables.
+let squares = (n: i64) -> [i64] =>
+    let mut out: [i64] = []
+    for i in 0..n
+        out += [i * i]
+    out
+
+struct Table
+    rows: [i64]
+    implements Monoid
+        combine = (a: Table, b: Table) -> Table => Table(a.rows + b.rows)
+        const EMPTY = Table(squares(4))
+        const LABEL = "table after {{fold_all([Sum(1), Sum(2)])}}"
+
+let doubled[T: Monoid] = () -> T => T.EMPTY.combine(T.EMPTY)
+let table: Table = doubled()
+print(table, report([table]))
+
+# Constants of every number type are written into the code exactly.
+constraint Sized
+    const BYTES: i32
+    const SCALE: f32
+    const RATIO: f64
+
+struct Pixel
+    v: i64
+    implements Sized
+        const BYTES = to_i32(2 + 2)
+        const SCALE = to_f32(0.1)
+        const RATIO = 1.0 / 3.0
+
+let describe_size[T: Sized] = (_x: T) -> str => "{{T.BYTES}} {{T.SCALE}} {{T.RATIO}} {{T.BYTES + to_i32(1)}}"
+print(describe_size(Pixel(0)))

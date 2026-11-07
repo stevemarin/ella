@@ -33,7 +33,7 @@ from ella.checker import (
 from ella.lexer import KEYWORDS, STD, EllaError, Span, Token, TokenKind, tokenize
 from ella.modules import LIBRARY_DIR, Linker, Module, find_root, package_path, prelude, read_file
 from ella.parser import parse_partial
-from ella.staging import Expander, has_splices, uses_staging
+from ella.staging import Expander, has_constants, has_splices, uses_staging
 from ella.syntax import (
     Binary,
     Binding,
@@ -318,7 +318,9 @@ class Checked:
             for error in self.checker.errors
             if error.span.file or bisect_right(lines, error.span.line) not in broken
         ]
-        if expand and not errors and expander is not None and has_splices(self.linked):
+        # Splices outside quotes, and types' constants, run while compiling: that may fail too.
+        staged = has_splices(self.linked) or has_constants(self.linked)
+        if expand and not errors and expander is not None and staged:
             try:
                 check(expander.expand_program())
             except EllaError as error:
@@ -486,11 +488,28 @@ class Checked:
                 ]
                 assert value_type is not None
                 return found + self.extension_members(value_type, {item.label for item in found})
+            case ParamTy(_, constraints) as param if (
+                isinstance(member.target, Name) and id(member.target) not in self.checker.resolved
+            ):
+                # `T.`: the constants T's constraints require (a constraint has its parents' too)
+                constants = {
+                    constant: constant_type
+                    for constraint in sorted(constraints)
+                    for constant, constant_type in self.checker.constraint_constants.get(constraint, {}).items()
+                }
+                return [
+                    Completion(constant, "constant", show_type(substitute(constant_type, {"Self": param})))
+                    for constant, constant_type in constants.items()
+                ]
             case ParamTy(_, constraints) as param:
-                found = [
-                    Completion(method, "method", show_type(substitute(method_type, {"Self": param})))
+                methods = {
+                    method: method_type
                     for constraint in sorted(constraints)
                     for method, method_type in self.checker.constraints.get(constraint, {}).items()
+                }
+                found = [
+                    Completion(method, "method", show_type(substitute(method_type, {"Self": param})))
+                    for method, method_type in methods.items()
                 ]
                 assert value_type is not None
                 return found + self.extension_members(value_type, {item.label for item in found})
@@ -690,6 +709,10 @@ class Symbols:
                 for method in methods:
                     hover = f"{name}.{method.name}: {self.show_annotation(method)}"
                     self.add(checked.token_at(method.span), hover, "method", ("declaration",))
+                for constant in node.constants:
+                    assert constant.type is not None
+                    hover = f"{name}.{constant.name}: {show(constant.type)}"
+                    self.add(checked.token_at(constant.span), hover, "variable", ("declaration", "readonly"))
 
     def enum_of(self, pattern: object) -> str:
         """The enum a variant's pattern matches."""
@@ -808,6 +831,11 @@ class Symbols:
             t = info.methods.get(method.name) if info is not None else None
             hover = f"{enum.name}.{method.name}: {'?' if t is None else show_type(t)}"
             self.add(checked.token_at(method.span), hover, "method", ("declaration",))
+        for implementation in enum.implementations:
+            for constant in implementation.constants:
+                hover = f"{enum.name}.{constant.name}: {self.show(constant.value)}"
+                where = self.constant_location(implementation.constraint, constant.name)
+                self.add(checked.token_at(constant.span), hover, "variable", ("declaration", "readonly"), where)
 
     def field_type(self, enum: str, field: str) -> str:
         info = self.checker.enums.get(enum)
@@ -816,12 +844,17 @@ class Symbols:
         return show_type(info.variants[enum][info.field_names.index(field)])
 
     def member(self, node: Member, target: Expr, name: str, span: Span) -> None:
-        """`.name`: a field or a method, shown at the name."""
+        """`.name`: a field, a method, or a type parameter's constant, shown at the name."""
         checked = self.checked
         token = checked.after(span)
         t = checked.type_of(target)
         owner = resolve(t) if t is not None else None
-        if id(node) in self.checker.methods:
+        if (constant := self.checker.associated_constants.get(id(node))) is not None:
+            param, constraint, _ = constant
+            self.add(checked.token_at(target.span), f"{param}: type parameter", "typeParameter")
+            hover = f"{param}.{name}: {self.show(node)}"
+            self.add(token, hover, "variable", ("readonly",), self.constant_location(constraint, name))
+        elif id(node) in self.checker.methods:
             owner_text = owner.name if isinstance(owner, EnumTy) else "?" if owner is None else show_type(owner)
             hover = f"{owner_text}.{name}: {self.show(node)}"
             self.add(token, hover, "method", (), self.method_location(owner, name))
@@ -840,6 +873,15 @@ class Symbols:
                     for param in self.constraints[constraint].methods if constraint in self.constraints else ():
                         if param.name == name:
                             return self.checked.locate(param.span, name)
+        return None
+
+    def constant_location(self, constraint: str, name: str) -> Location | None:
+        """Where a constraint's constant is declared: in it, or in the parent it comes from."""
+        for required in sorted(self.checker.constraint_closure.get(constraint, ())):
+            if name in self.checker.constraint_own_constants.get(required, {}) and required in self.constraints:
+                for param in self.constraints[required].constants:
+                    if param.name == name:
+                        return self.checked.locate(param.span, name)
         return None
 
     def field_location(self, enum: str, field: str) -> Location | None:
