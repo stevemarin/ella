@@ -1012,7 +1012,7 @@ class Verifier:
         if enum is None or variant not in enum.variants:
             raise self.fail(f"{show_type(enum_type)} has no variant {variant}", block)
         params = dict(zip(enum.params, enum_type.args))
-        return tuple(substitute(f, params) for f in enum.variants[variant])
+        return tuple(finish(substitute(f, params)) for f in enum.variants[variant])  # (without array shapes)
 
 
 def constant_type(const: Constant) -> Type:

@@ -209,6 +209,26 @@ ANY_SIZE = SizeTy("_")
 
 
 @dataclass(frozen=True, slots=True)
+class ShapeCheck:
+    """A run-time check that an array has the shape its type names (docs/grammar.md §9, "Static shapes"), which
+    defines the size names it introduces as i64 variables.
+
+    `name` is the variable holding the array: a parameter, or a `let`'s
+    binding ("" for a function's result). `expected` has one item per
+    dimension: a size (3), -1 for any, -2 - i for the same size as
+    dimension i, or a size variable's name, whose value it must be. `binds`
+    has the size names it defines, each with the dimension giving it.
+    Backends run it as the hidden library function `match_shape`.
+    """
+
+    name: str
+    expected: tuple[int | str, ...]
+    binds: tuple[tuple[str, int], ...]
+    what: str
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class ParamTy:
     """A type parameter, like the `T` of `enum Optional[T]` or `let sum[T: Add]`.
 
@@ -523,6 +543,7 @@ class PendingBody:
     type_params: dict[str, Type]
     quotes: int
     inferred: bool = False
+    sizes: tuple[str, ...] = ()  # its size parameters
 
 
 # The library: built-in functions with fixed types (see ella.library). A few
@@ -593,7 +614,13 @@ LIBRARY: dict[str, FuncTy] = {
     "transpose": FuncTy(
         (BuiltinTy("Array", (NUM_T, SizeTy("N"), SizeTy("M"))),), BuiltinTy("Array", (NUM_T, SizeTy("M"), SizeTy("N")))
     ),
+    "sums": FuncTy((BuiltinTy("Array", (NUM_T,)), I64), BuiltinTy("Array", (NUM_T,))),
+    # Hidden: the run-time check of a ShapeCheck, which gives the array's shape.
+    "match_shape": FuncTy((BuiltinTy("Array", (NUM_T,)), ListTy(I64), STR), ListTy(I64)),
 }
+
+# Library functions that only the compiler calls, which programs can't name.
+HIDDEN_LIBRARY = frozenset({"match_shape"})
 
 
 def mentions(t: Type, part: Type) -> bool:
@@ -642,7 +669,18 @@ def library_param(name: str, args: Sequence[Type]) -> Type:
 
 NOT_VALUES = frozenset({"exit"})  # library functions that can only be called, since their result is never
 
-BUILTINS = ("print", "eprint", "len", "run", "next", "pool_new", "arena_new", "alloc", "free", *LIBRARY)
+BUILTINS = (
+    "print",
+    "eprint",
+    "len",
+    "run",
+    "next",
+    "pool_new",
+    "arena_new",
+    "alloc",
+    "free",
+    *(name for name in LIBRARY if name not in HIDDEN_LIBRARY),
+)
 WRAPPED = frozenset({"print", "eprint", "len"})  # other built-ins that are values (taking one argument)
 
 
@@ -714,6 +752,8 @@ def check_code(code: Expr, program: Checker) -> Checker:
         "quote_levels",
         "wrappers",
         "updates",
+        "shape_checks",
+        "result_shapes",
     )
     for table in tables:
         setattr(checker, table, dict(getattr(program, table)))
@@ -763,6 +803,13 @@ class Checker:
         self.static_methods: dict[int, tuple[str, str, tuple[Type, ...]]] = {}
         self.wrappers: dict[int, Lambda] = {}  # `print`, `len` or a constructor used as a value -> a lambda calling it
         self.updates: dict[int, Block] = {}  # `v[k] op= x` with v's `update` method -> the code that runs instead
+        # Run-time checks of array shapes (ShapeCheck): a function's (by Lambda) for its parameters, run on
+        # entry, and for its result; a `let`'s (by Let), run once it has bound its names.
+        self.shape_checks: dict[int, tuple[ShapeCheck, ...]] = {}
+        self.result_shapes: dict[int, ShapeCheck] = {}
+        self.sizes_read: set[int] = set()  # the size variables (by binder) that shape checks compare with
+        self.size_holders: dict[int, int] = {}  # a dimension defining a size variable -> its parameter or binding
+        self.result_unsure = False  # whether a `return` in the function being checked may give the wrong shape
         self.lines: set[int] = set()  # assignments that are lines of blocks, whose values aren't used
         self.defined: set[int] = set()  # top-level enums already defined
         self.item_sets: set[int] = set()  # `v[k]` places stored with v's `set` method
@@ -969,6 +1016,12 @@ class Checker:
             if self.level < 0:
                 raise EllaError(f"'{name}' belongs to a later stage, so it can't be used while compiling", span)
             raise EllaError(f"'{name}' is used before its 'let' has run", span)
+        if name in self.type_params and is_size(self.type_params[name]):
+            raise EllaError(
+                f"the size '{name}' isn't known when the program runs: only a dimension of a parameter's array, "
+                "or of the array a 'let' gives a type, can be used as a number",
+                span,
+            )
         raise EllaError(f"undefined name '{name}'", span)
 
     def bind_name(
@@ -1524,6 +1577,8 @@ class Checker:
         modules. A function's uses in its own body don't count.
         """
         used = {id(info.binder) for info in self.resolved.values()}
+        used |= self.sizes_read
+        used |= {holder for dim, holder in self.size_holders.items() if dim in used}  # used for its sizes
         hint = "start its name with '_' if that is on purpose"
         for node in self.declared.values():
             if node.name.startswith("_"):
@@ -1908,12 +1963,20 @@ class Checker:
                     self.types[id(value_expr)] = t
                 else:
                     t = self.check(value_expr, env)
+                checks: list[ShapeCheck] = []
                 for binding in bindings:
                     binding_type = t
                     if binding.type is not None:
+                        known = set(self.type_params)
                         binding_type = self.let_type(
                             binding.type, t, value_expr.span, f"the value of '{binding.name}'"
                         )
+                        new = self.type_params.keys() - known
+                        defined = {size for check in checks for size, _ in check.binds}
+                        what = f"the value of '{binding.name}'"
+                        check = self.shape_check(binding.type, binding.name, new, defined, env, what, t, binding_type)
+                        if check is not None:
+                            checks.append(check)
                     self.types[id(binding)] = binding_type
                     function = isinstance(value_expr, Lambda)
                     self.bind_name(
@@ -1927,6 +1990,10 @@ class Checker:
                         type_params,
                         bindings[0].constraints,
                     )
+                if checks:
+                    self.shape_checks[id(expr)] = tuple(checks)
+                    self.bind_sizes(checks, bindings, env)
+                    self.read_sizes(checks, env)
                 return UNIT if type_params and env is not self.globals else t
             case LetPattern(pattern, value_expr, span, mutable, type_expr):
                 t = self.check(value_expr, env)
@@ -2065,6 +2132,8 @@ class Checker:
                     raise EllaError("a generator's 'return' can't have a value: it just ends the generator", span)
                 value_type = UNIT if value is None else self.check(value, env)
                 self.expect(value_type, self.return_type, span, "the returned value")
+                if not self.sure_shape(value_type, self.return_type):
+                    self.result_unsure = True
                 return NEVER
 
             case Yield(value, span):
@@ -2613,7 +2682,9 @@ class Checker:
         params = self.type_params | self.param_types(type_params, constraints, function.span, sizes)
         if id(function) not in self.checked:
             inferred = any(param.type is None for param in function.params) or function.return_type is None
-            self.pending_bodies.append(PendingBody(function, captured, t, self.level, params, self.quotes, inferred))
+            self.pending_bodies.append(
+                PendingBody(function, captured, t, self.level, params, self.quotes, inferred, sizes)
+            )
         return t
 
     def capture(self, env: Env) -> Env:
@@ -2641,8 +2712,9 @@ class Checker:
         function, t = pending.function, pending.type
         self.checked.add(id(function))
         outer = self.return_type, self.loops, self.level, self.type_params, self.quotes
-        outer_yield = self.yield_type, self.yield_quotes
+        outer_yield = self.yield_type, self.yield_quotes, self.result_unsure
         self.return_type, self.loops = t.result, []  # `break` can't leave a function
+        self.result_unsure = False
         self.level, self.type_params, self.quotes = pending.level, pending.type_params, pending.quotes
         generator = is_generator(function)
         self.yield_type = None
@@ -2665,6 +2737,7 @@ class Checker:
             mutable = param.mutable or generator
             local.vars[param.name] = VarInfo(param_type, mutable, "local", level=self.level, binder=param)
             self.declared[id(param)] = param
+        self.param_shapes(function, pending.sizes, local)
         for cond in function.where:
             if mentions_return(cond.expr) and generator:
                 raise EllaError("a generator can't have postconditions, since it returns nothing", cond.span)
@@ -2677,9 +2750,109 @@ class Checker:
         body_type = self.check(function.body, local)
         if not generator:
             self.expect(body_type, t.result, function.body.span, "the function's result")
+            if function.return_type is not None and not (
+                self.sure_shape(body_type, t.result) and not self.result_unsure
+            ):
+                check = self.shape_check(function.return_type, "", set(), set(), local, "the function's result")
+                if check is not None:
+                    self.result_shapes[id(function)] = check
+                    self.read_sizes([check], local)
 
         self.return_type, self.loops, self.level, self.type_params, self.quotes = outer
-        self.yield_type, self.yield_quotes = outer_yield
+        self.yield_type, self.yield_quotes, self.result_unsure = outer_yield
+
+    # Run-time shape checks (ShapeCheck)
+
+    def param_shapes(self, function: Lambda, sizes: tuple[str, ...], local: Env) -> None:
+        """The checks of a function's parameters whose types have shapes, which run when it is called, and the
+        size parameters they define as variables (those that some parameter's array has as a dimension)."""
+        checks: list[ShapeCheck] = []
+        for param in function.params:
+            if param.type is None:
+                continue
+            if param.name in sizes:
+                raise EllaError(f"'{param.name}' is both a parameter and a size parameter", param.span)
+            bound = {size for check in checks for size, _ in check.binds}
+            check = self.shape_check(param.type, param.name, set(sizes), bound, local, f"argument '{param.name}'")
+            if check is not None:
+                checks.append(check)
+        if checks:
+            self.shape_checks[id(function)] = tuple(checks)
+            self.bind_sizes(checks, function.params, local)
+            self.read_sizes(checks, local)
+
+    def bind_sizes(self, checks: list[ShapeCheck], holders: Sequence[Binding | Param], env: Env) -> None:
+        """Make the size names the checks define i64 variables (their binder is the dimension that gives each)."""
+        types = {holder.name: holder.type for holder in holders}
+        for check in checks:
+            texpr = types[check.name]
+            assert isinstance(texpr, NamedType) and texpr.dims is not None
+            holder = next(holder for holder in holders if holder.name == check.name)
+            for size, i in check.binds:
+                self.bind_name(env, size, I64, False, texpr.dims[i].span, texpr.dims[i])
+                self.size_holders[id(texpr.dims[i])] = id(holder)
+
+    def read_sizes(self, checks: list[ShapeCheck], env: Env) -> None:
+        """Count the size variables the checks compare with as used (for `warn_unused`)."""
+        for check in checks:
+            for size in check.expected:
+                if isinstance(size, str) and (info := env.lookup(size)) is not None:
+                    self.sizes_read.add(id(info.binder))
+
+    def size_variable(self, name: str, env: Env) -> bool:
+        """Whether a size name is also an i64 variable here (and not hidden by another variable of that name)."""
+        info = env.lookup(name)
+        return info is not None and isinstance(info.binder, Dim)
+
+    def shape_check(
+        self,
+        texpr: TypeExpr,
+        name: str,
+        new: set[str],
+        bound: set[str],
+        env: Env,
+        what: str,
+        value: Type | None = None,
+        declared: Type | None = None,
+    ) -> ShapeCheck | None:
+        """The run-time check of an array whose type is `texpr`, if it is an Array with dimensions. Of the size
+        names, those in `new` are defined by it, and those in `bound` (or variables in `env`) compared with.
+
+        For a `let`, `value` and `declared` are its value's type and the type it is given: a check that
+        defines nothing is only needed if the value's shape isn't sure to be right."""
+        if not (isinstance(texpr, NamedType) and texpr.dims is not None):
+            return None
+        expected: list[int | str] = []
+        binds: list[tuple[str, int]] = []
+        first: dict[str, int] = {}
+        for i, dim in enumerate(texpr.dims):
+            match dim.value:
+                case int(size):
+                    expected.append(size)
+                case str(size) if size in first:
+                    expected.append(-2 - first[size])
+                case str(size) if size in new and size not in bound:
+                    first[size] = i
+                    binds.append((size, i))
+                    expected.append(-1)
+                case str(size) if size != "_" and (size in bound or self.size_variable(size, env)):
+                    expected.append(size)
+                case _:
+                    expected.append(-1)  # `_`, or a size known only while checking
+        if value is not None and declared is not None and not binds and self.sure_shape(value, declared):
+            return None
+        return ShapeCheck(name, tuple(expected), tuple(binds), what, texpr.span)
+
+    def sure_shape(self, value: Type, declared: Type) -> bool:
+        """Whether a value of one array type (once unified with another) is sure to have the other's shape:
+        whether the other names no rank or size that it leaves untracked (`_`)."""
+        dims = array_dims(declared)
+        if dims is None or resolve(value) is NEVER:
+            return True
+        found = array_dims(value)
+        if found is None or len(found) != len(dims):
+            return False
+        return all(resolve(d) == ANY_SIZE or resolve(v) != ANY_SIZE for v, d in zip(found, dims))
 
     def check_call(self, callee: Expr, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
         """A call. Built-ins and variant constructors are only ever called directly, and checked here."""
@@ -3023,6 +3196,22 @@ class Checker:
         self.expect(index_type, BuiltinTy("Ref", (item,)), span, "an arena's index")
         return item
 
+    def sums_type(self, array: Type, axis: Expr, result: Type) -> Type:
+        """`sums(a, axis)`: an array without dimension `axis`, if it is a number written in the call (which a
+        known rank must have, other than the only one); otherwise one whose rank isn't tracked."""
+        dims = array_dims(array)
+        if dims is None or not isinstance(axis, IntLit):
+            return result
+        if len(dims) == 1:
+            raise EllaError(
+                f"sums() needs an array of 2 or more dimensions, not {show_type(array)}; use total()", axis.span
+            )
+        if not 0 <= axis.value < len(dims):
+            raise EllaError(f"sums() can't add along axis {axis.value} of {show_type(array)}", axis.span)
+        item = array_item(array)
+        assert item is not None
+        return BuiltinTy("Array", (item, *dims[: axis.value], *dims[axis.value + 1 :]))
+
     def check_builtin(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
         """`print`, `len`, `run`, the pool and arena functions, reflection, and the library.
 
@@ -3039,6 +3228,8 @@ class Checker:
             if name == "dot":  # the two arrays must have the same shape
                 first, second = (self.types[id(arg)] for arg in args)
                 self.array_shapes(first, second, False, "dot()", span)
+            if name == "sums":
+                return self.sums_type(self.types[id(args[0])], args[1], function.result)
             return function.result
         if name in REFLECTION:
             params, reflected = REFLECTION[name]

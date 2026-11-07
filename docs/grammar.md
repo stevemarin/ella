@@ -1217,9 +1217,9 @@ print(matmul(m, transpose(m)))
 
 #### Static shapes
 
-**(provisional; partly implemented)** An array type can also give its
-shape after a `;`, so that the checker finds mismatched shapes while
-compiling:
+**(provisional)** An array type can also give its shape after a `;`, so
+that the checker finds mismatched shapes while compiling, and the
+program checks the rest when it runs:
 
 ```ella
 Array[f64]              # any rank, any sizes
@@ -1227,7 +1227,7 @@ Array[f64; _, _]        # rank 2, sizes not tracked
 Array[f64; N, 3]        # rank 2: N rows (a size name), exactly 3 columns
 
 let mm[T: Num; N, K, M] = (a: Array[T; N, K], b: Array[T; K, M]) -> Array[T; N, M] => matmul(a, b)
-let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / to_f64(len(xs))
+let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / to_f64(N)
 ```
 
 * A dimension is a size (`3`), a size name (`N`) or `_`, which fits any
@@ -1243,21 +1243,51 @@ let mean[; N] = (xs: Array[f64; N]) -> f64 => total(xs) / to_f64(len(xs))
   `let a: Array[f64; N, M] = ...` then `let b: Array[f64; M, N] = transpose(a)`.
 * The checker knows the shapes the library gives: `transpose` swaps two
   dimensions, `matmul` needs the inner sizes to agree, `dot` needs equal
-  shapes, `array(xs)` has one dimension of a size not tracked (`_`), and
-  `fill` and `reshape` give an array whose rank isn't tracked.
+  shapes, `array(xs)` has one dimension of a size not tracked (`_`),
+  `sums(a, axis)` drops dimension `axis` when the axis is a number written
+  in the call, and `fill` and `reshape` give an array whose rank isn't
+  tracked.
 * Indexing checks the number of indexes when the rank is known (`a[0]` on
   an `Array[f64; N, M]` is an error). In a slice, an `i64` drops its
   dimension, a range gives `_`, and dimensions left out keep their sizes.
 * Arithmetic broadcasts shapes as at run time, lined up from the right:
   each two sizes must agree, or one be the size 1; `_` gives `_`, and a
   rank not tracked on either side gives a rank not tracked.
+* **Run-time checks.** Where the checker can't be sure of a shape, the
+  program checks it when it runs:
+  * A function checks each parameter whose type is an array with
+    dimensions when it is called, before its `where` conditions: its rank,
+    each size it names, and that a size name used twice has one size.
+  * A function whose result's type has dimensions checks it as it
+    returns, unless every value it can return is sure to have that shape.
+  * A `let` whose variable's type has dimensions checks the value, unless
+    its shape is sure to be right (or it defines size names, below).
+
+  A wrong shape stops the program with an error naming what was expected,
+  `_` for any size: `argument 'm' should have shape [_, 2], not [2, 3]`,
+  `the value of 'v' should have shape [3], not [4]`, `the function's result
+  should have shape [2], not [5]`.
+* **Size names are numbers.** A size name that a parameter's array has as
+  a dimension is an `i64` variable in the function (in its `where`
+  conditions too), and so is one that a `let`'s array introduces, after
+  the `let`: `for i in 0..N`. A size the program can't know when it runs
+  (one only inside a list's or tuple's type, or only in the result's) is
+  an error to use as a number. A parameter that is only there for its
+  sizes counts as used.
+
+  ```ella
+  let rows[; N, M] = (a: Array[f64; N, M]) -> [f64] =>
+      let mut result = []
+      for i in 0..N
+          result = result + [total(a[i, 0..M])]
+      result
+  ```
 * Shapes are erased after checking: they never make separate copies of a
   function, and the run-time checks of the operations themselves stay.
-  **Not yet implemented:** where a `_` (or an array whose rank isn't
-  tracked) reaches a place that names a size, the size is trusted rather
-  than checked at run time, so a wrong shape shows up later, as the
-  operation's own run-time error. Size names can't be used as numbers
-  (`for i in 0..N`) yet, and structs and enums can't have size parameters.
+  Only the arrays themselves are checked, not arrays inside lists, tuples,
+  structs or functions' types (`[Array[f64; 3]]`), whose shapes are
+  trusted, nor values assigned to a `mut` variable later. Structs and
+  enums can't have size parameters yet.
 
 ### Errors
 
@@ -1742,6 +1772,7 @@ are, so `apply(trim, s)`, `let ops: [(i64, i64) -> i64] = [min, max]` and
 | `dot(a, b)` | `[T: Num] (Array[T], Array[T]) -> T` | the sum of the products of the items of two arrays of the same shape, in four sums |
 | `matmul(a, b)` | `[T: Num] (Array[T], Array[T]) -> Array[T]` | the matrix product of a `[n, k]` and a `[k, m]` array: item (i, j) is the sum of `a[i, p] * b[p, j]` |
 | `transpose(a)` | `[T: Num] (Array[T]) -> Array[T]` | a two-dimensional array with its rows as columns |
+| `sums(a, axis)` | `[T: Num] (Array[T], i64) -> Array[T]` | the items added up along dimension `axis` (from 0), which the result doesn't have: `sums(m, 0)` adds up an `[n, m]` array's columns, `sums(m, 1)` its rows. Each sum starts at 0 and adds in order, so it is the same in every backend. `a` needs 2 or more dimensions |
 
 * `hash` is 64-bit FNV-1a: over the code points of a string, and over
   the hashes of the parts of other values (the items of a list or tuple;

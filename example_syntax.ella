@@ -384,6 +384,16 @@ assert shape(scaled) == [2, 2] and scaled[0, 1] == 15.0
 assert flat(board) == [1.0, 5.0, 3.0, 4.0] and dot(board, board) == 51.0
 assert matmul(board, transpose(board))[1, 1] == 25.0
 
+# types can give an array's shape after a `;`; size names are checked while
+# compiling (and when running, where that can't be sure), and are numbers
+let trace[; N] = (m: Array[f64; N, N]) -> f64 =>
+    let mut sum = 0.0
+    for i in 0..N
+        sum += m[i, i]
+    sum
+let ones: Array[f64; Rows, Columns] = fill([2, 3], 1.0)
+assert trace(board) == 5.0 and Rows * Columns == 6 and sums(ones, 0) == fill([3], 2.0)
+
 # print takes any number of values; eprint writes to standard error
 print("low", low, "high", high)
 

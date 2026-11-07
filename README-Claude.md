@@ -176,11 +176,14 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   leave out their types (`xs |> map(n => n * 2)`); `print`, `len` and
   constructors are values (`map(xs, Some)`).
 * **Arrays.** `Array[T]` of `i64`, `i32`, `f64` or `f32`, any rank,
-  broadcasting, slices (copies), `matmul`, `transpose`, `total`, `dot`;
-  AVX2 loops natively, fused with `-O`. Static shapes
-  (`Array[f64; N, 3]`, size parameters `[; N]`) are checked by the checker
-  only; run-time shape checks and size names as values are in progress
-  (TODO-Claude.md, "arrays typed by shape").
+  broadcasting, slices (copies), `matmul`, `transpose`, `total`, `dot`,
+  `sums` (along one axis); AVX2 loops natively, fused with `-O`. Shapes in
+  types (`Array[f64; N, 3]`, size parameters `[; N]`) are checked by the
+  checker, and at run time where it can't be sure (parameters on entry,
+  results, `let`s: the checker's `shape_checks`, run through the hidden
+  library function `match_shape`); size names are `i64` variables
+  (`for i in 0..N`). Arrays inside other values are trusted
+  (grammar.md §9, "Static shapes").
 * **Generators.** A function with `yield` gives a `Gen[T]`; `for` and
   `next(mut g)` drive it; its frame and arenas live in the `Gen`
   (memory-model.md §17). `import iters` gives lazy `map`, `filter`, `take`, ...

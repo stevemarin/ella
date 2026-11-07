@@ -363,6 +363,38 @@ let f = () -> () =>
         print(row)
 f()
 """,
+    "two arguments of one size": """\
+let pair[; N] = (a: Array[f64; N], b: Array[f64; N]) -> f64 => dot(a, b) + to_f64(N)
+print(pair(fill([2], 1.0), fill([2], 3.0)))
+print(pair(fill([2], 1.0), fill([3], 3.0)))
+""",
+    "a lambda's parameter of a captured size": """\
+let f[; N] = (a: Array[i64; N]) -> i64 =>
+    let g = (b: Array[i64; N]) -> i64 => total(b) * N
+    g(a) + g(fill([N], 1))
+print(f(array([1, 2, 3])))
+let h[; N] = (a: Array[i64; N]) -> i64 =>
+    let g = (b: Array[i64; N]) -> i64 => total(b)
+    g(fill([N + 1], 1))
+print(h(array([1])))
+""",
+    "top-level sizes in functions": """\
+let grid: Array[i64; Rows, Columns] = fill([2, 4], 7)
+let cells = () -> i64 => Rows * Columns
+print(cells())
+let mut count = 0
+for r in 0..Rows
+    count += r + Columns
+print(count, grid[Rows - 1, Columns - 1])
+""",
+    "a generator's sizes": """\
+let steps[; N] = (v: Array[f64; N]) -> Gen[f64] =>
+    for i in 0..N
+        yield v[i] * to_f64(N)
+for x in steps(array([1.0, 2.0]))
+    print(x)
+let ys: Array[f64; 3] = fill([1, 3], 0.0)
+""",
 }
 
 

@@ -276,6 +276,10 @@ def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
             rows, columns = a.shape
             items = [a.items[i * columns + j] for j in range(columns) for i in range(rows)]
             return ArrayValue((columns, rows), items, a.item)
+        case "sums", [ArrayValue() as a, int() as axis]:
+            return sums(a, axis, span)
+        case "match_shape", [ArrayValue() as a, list() as expected, str() as what]:
+            return match_shape(a, expected, what, span)
     raise AssertionError(f"no library function {name} for {args}")
 
 
@@ -290,6 +294,35 @@ def check_shape(shape: list[int], span: Span) -> int:
     if math.prod(max(size, 1) for size in shape) >= MAX_ITEMS:
         raise EllaError(f"an array of shape {shape_text(shape)} is too big", span)
     return math.prod(shape)
+
+
+def sums(a: ArrayValue, axis: int, span: Span) -> ArrayValue:
+    """`sums(a, axis)`: the items added up along one dimension, which the result doesn't have. Each sum starts at 0
+    and adds the items in order, so that every backend gives the same bits."""
+    if len(a.shape) < 2:
+        raise EllaError(f"sums() needs an array of 2 or more dimensions, not one of shape {shape_text(a.shape)}", span)
+    if not 0 <= axis < len(a.shape):
+        raise EllaError(f"sums() can't add along axis {axis} of an array of shape {shape_text(a.shape)}", span)
+    outer, n, inner = math.prod(a.shape[:axis]), a.shape[axis], math.prod(a.shape[axis + 1 :])
+    items: list[Value] = []
+    for o in range(outer):
+        for i in range(inner):
+            total = a.zero
+            for k in range(n):
+                total = binary("+", total, a.items[(o * n + k) * inner + i], span)
+            items.append(total)
+    return ArrayValue(a.shape[:axis] + a.shape[axis + 1 :], items, a.item)
+
+
+def match_shape(a: ArrayValue, expected: list[int], what: str, span: Span) -> list[Value]:
+    """The run-time check of a ShapeCheck (ella.checker): that `a` has the shape `expected` describes, each size
+    a size, -1 for any, or -2 - i for the same as dimension i. Gives a's shape."""
+    rank = len(a.shape)
+    wanted = [a.shape[-2 - size] if size <= -2 and -2 - size < rank else max(size, -1) for size in expected]
+    if rank != len(expected) or any(size >= 0 and size != real for size, real in zip(wanted, a.shape)):
+        shown = "[" + ", ".join("_" if size < 0 else str(size) for size in wanted) + "]"
+        raise EllaError(f"{what} should have shape {shown}, not {shape_text(a.shape)}", span)
+    return list(a.shape)
 
 
 def lane_sum(items: list[Value], zero: Value, span: Span) -> Value:

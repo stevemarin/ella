@@ -47,6 +47,8 @@ from ella.syntax import (
     VariantPattern,
     bare_name,
     rebuild,
+    rename_sizes,
+    size_names,
 )
 
 LIBRARY_DIR = Path(__file__).parent / "lib"
@@ -186,6 +188,8 @@ def top_level(body: tuple[Expr, ...], prefix: str, module: str, file: str) -> di
                 kind = "function" if isinstance(value, Lambda) else "variable"
                 for binding in bindings:
                     found[binding.name] = Item(prefix + binding.name, kind, module, file)
+                    for size in size_names(binding.type):  # a size name a `let` defines is an i64 variable
+                        found.setdefault(size, Item(prefix + size, "variable", module, file))
             case EnumDef(name, variants=variants, struct=True, field_names=names):
                 sealed = any(n.startswith("_") for n in names)
                 found[name] = Item(prefix + name, "struct", module, file, (name,), sealed)
@@ -680,7 +684,10 @@ class Resolver:
             case Member():
                 return self.member(expr, scope)
             case Let(bindings, value, span):
-                inner = Scope(scope, types=set(bindings[0].type_params))
+                # A function's size parameters are i64 variables in it, as are the size names a `let`'s types
+                # have after it (at the top level, top-level names).
+                inner = Scope(scope, set(bindings[0].size_params), types=set(bindings[0].type_params))
+                sizes = [size for b in bindings for size in size_names(b.type)]
                 bindings = tuple(
                     replace(
                         self.declared(b, inner),
@@ -689,11 +696,14 @@ class Resolver:
                     )
                     for b in bindings
                 )
+                if top:
+                    bindings = tuple(rename_sizes(b, self.top_name) for b in bindings)  # type: ignore[misc]
                 if isinstance(value, Lambda) and not top:  # a local function can call itself
                     scope.values.update(b.name for b in bindings)
                 value = self.expr(value, inner)
                 if not top:
                     scope.values.update(b.name for b in bindings)
+                    scope.values.update(sizes)
                 return Let(bindings, value, span)
             case LetPattern(pattern, value, span, mutable, texpr):
                 value = self.expr(value, scope)

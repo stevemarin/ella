@@ -25,6 +25,7 @@ from ella.checker import (
     FuncTy,
     ListTy,
     ParamTy,
+    ShapeCheck,
     TupleTy,
     Type,
     finish,
@@ -77,6 +78,7 @@ from ella.syntax import (
     Compare,
     ConstraintDef,
     Continue,
+    Dim,
     EnumDef,
     Expr,
     FieldSplice,
@@ -886,6 +888,7 @@ class Lowerer:
             else:
                 self.info[param.id] = Info(frozenset(), "0")
                 self.bind(declared.name, param, declared.span, region="0", kind="param", binding=id(declared))
+        self.lower_shape_checks(function)
 
         self.exit = self.new_block("exit")
         result = self.new_value(t.result)
@@ -898,6 +901,8 @@ class Lowerer:
         self.jump(self.exit, [self.place_return(self.lower(function.body, "result"), function.span)])
 
         self.block = self.exit
+        if (check := self.checker.result_shapes.get(id(function))) is not None:
+            self.lower_shape_check(check, result)
         postconditions = [cond for cond in function.where if mentions_return(cond.expr)]
         if postconditions:
             self.scopes.append({})
@@ -929,6 +934,7 @@ class Lowerer:
         self.function.captures = len(pending.captures)
         self.scopes = [{}]
         values = self.generator_params(pending, function.span, "param")
+        self.lower_shape_checks(function)
         for cond in function.where:
             self.lower_condition(cond, "precondition")
         made = self.emit("gen_new", t.result, values, function.span, body_name, region="result")
@@ -942,6 +948,7 @@ class Lowerer:
         self.returned = set()  # its variables live on: nothing is built in the caller's region
         self.scopes = [{}]
         self.generator_params(pending, function.span, "local")
+        self.lower_shape_checks(function)  # (which passed when it was called) for its size variables
         self.exit = self.new_block("exit")
         self.lower(function.body)  # its value is unused
         self.jump(self.exit)
@@ -997,6 +1004,28 @@ class Lowerer:
         self.block.terminator = Yield(some, after)
         self.block = after
         return self.const((), span)
+
+    def lower_shape_checks(self, node: Lambda | Let) -> None:
+        """Check the shapes of a function's parameters, or of a `let`'s variables, which are bound, and define the
+        size names they give (docs/grammar.md §9, "Static shapes")."""
+        for check in self.checker.shape_checks.get(id(node), ()):
+            self.lower_shape_check(check, self.read_size(check.name, check.span))
+
+    def read_size(self, name: str, span: Span) -> Value:
+        """A variable a shape check reads: a local one, or a global one."""
+        local = any(name in scope for scope in self.scopes)
+        return self.read_name(name, "local" if local else "global", span)
+
+    def lower_shape_check(self, check: ShapeCheck, array: Value) -> None:
+        span, region = check.span, self.here() if self.scopes else "global"
+        sizes = [
+            self.read_size(size, span) if isinstance(size, str) else self.const(size, span) for size in check.expected
+        ]
+        expected = self.build("list", ListTy(I64), sizes, span, region)
+        args = [array, expected, self.const(check.what, span)]
+        shape = self.emit("builtin", ListTy(I64), args, span, "match_shape", region=region)
+        for name, i in check.binds:
+            self.bind(name, self.emit("index", I64, [shape, self.const(i, span)], span), span)
 
     def lower_condition(self, cond: Assert, kind: str) -> None:
         value = self.lower(cond.expr)
@@ -1088,6 +1117,7 @@ class Lowerer:
                 for binding in bindings:
                     home = self.home(binding.name, t, id(binding))
                     value = self.bind(binding.name, value, binding.span, binding.mutable, home, binding=id(binding))
+                self.lower_shape_checks(expr)
                 return value
             case LetPattern(pattern, value_expr, _, mutable):
                 value = self.lower(value_expr, self.here() if self.scopes else "global")
@@ -1784,7 +1814,7 @@ class Lowerer:
                 case EnumTy(name, args):
                     info = self.module.enums[name]
                     mapping = dict(zip(info.params, args))
-                    work += [substitute(f, mapping) for fields in info.variants.values() for f in fields]
+                    work += [finish(substitute(f, mapping)) for fields in info.variants.values() for f in fields]
 
     def method(self, t: Type, name: str, span: Span) -> Value:
         """A closure of the method `name` of a struct or enum type, specialized for its type arguments."""
@@ -2522,9 +2552,11 @@ def returned_bindings(body: Expr | tuple[Expr, ...], checker: Checker) -> set[in
 
 
 def names_in(node: object) -> set[str]:
-    """Every name some code uses, anywhere in it."""
+    """Every name some code uses, anywhere in it (and the size names in its types, which shape checks read)."""
     if isinstance(node, Name):
         return {node.name}
+    if isinstance(node, Dim) and isinstance(node.value, str):
+        return {node.value}
     return set().union(*(names_in(child) for child in children(node)))
 
 

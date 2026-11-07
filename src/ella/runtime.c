@@ -1284,6 +1284,56 @@ static Array *transpose(const Array *a, word line, word column, word depth) {
     return result;
 }
 
+// sums(a, axis): the items added up along one dimension, which the result doesn't have, each sum from 0 in
+// order (ella.library.sums), so that every backend gives the same bits.
+static Array *sums(const Array *a, word axis, word line, word column, word depth) {
+    if (a->ndim < 2)
+        fail(line, column, "sums() needs an array of 2 or more dimensions, not one of shape %s", shape_text(a).text);
+    if (axis < 0 || axis >= a->ndim)
+        fail(line, column, "sums() can't add along axis %" PRId64 " of an array of shape %s", axis, shape_text(a).text);
+    word dims[MAX_DIMS], outer = 1, inner = 1, n = a->dims[axis];
+    for (word i = 0; i < a->ndim; i++) {
+        if (i < axis) outer *= a->dims[i];
+        if (i > axis) inner *= a->dims[i];
+        if (i != axis) dims[i < axis ? i : i - 1] = a->dims[i];
+    }
+    Array *result = array_alloc(a->ndim - 1, dims, outer * inner, a->kind, depth);
+    word zero = a->kind == F64_ITEMS ? f64_bits(0.0) : a->kind == F32_ITEMS ? f32_bits(0.0f) : 0;
+    for (word o = 0; o < outer; o++) {
+        for (word i = 0; i < inner; i++) {
+            word total = zero;
+            for (word k = 0; k < n; k++) total = item_op('+', total, get_item(a, (o * n + k) * inner + i), a->kind, line, column);
+            set_item(result, o * inner + i, total);
+        }
+    }
+    return result;
+}
+
+static char *encode(const Str *s);
+
+// The run-time check of a shape (ella.library.match_shape): `expected` has a size, -1 for any, or -2 - i for the
+// same size as dimension i, for each dimension. Gives a's shape.
+static List *match_shape(const Array *a, const List *expected, const Str *what, word line, word column, word depth) {
+    word wanted[MAX_DIMS + 1];
+    int ok = expected->len == a->ndim;
+    word shown = expected->len < MAX_DIMS ? expected->len : MAX_DIMS;
+    for (word i = 0; i < shown; i++) {
+        word size = expected->items[i];
+        wanted[i] = size <= -2 && -2 - size < a->ndim ? a->dims[-2 - size] : size < -1 ? -1 : size;
+        if (wanted[i] >= 0 && i < a->ndim && wanted[i] != a->dims[i]) ok = 0;
+    }
+    if (!ok) {
+        char text[24 * MAX_DIMS + 4], *p = text + sprintf(text, "[");
+        for (word i = 0; i < shown; i++) {
+            if (i) p += sprintf(p, ", ");
+            p += wanted[i] < 0 ? sprintf(p, "_") : sprintf(p, "%" PRId64, wanted[i]);
+        }
+        sprintf(p, "]");
+        fail(line, column, "%s should have shape %s, not %s", encode(what), text, shape_text(a).text);
+    }
+    return shape(a, depth);
+}
+
 // matmul(a, b): the result, of shape [n, m], for a of shape [n, k] and b of [k, m].
 static Array *matmul_result(const Array *a, const Array *b, word line, word column, word depth) {
     if (a->ndim != 2 || b->ndim != 2) {
@@ -1473,6 +1523,12 @@ __attribute__((aligned(32))) const uint32_t ella_tail_masks32[8][8] = {
     }                                                                                                         \
     Array *ella_lib_transpose_##T(const Array *a, word line, word column, word depth) {                       \
         return transpose(a, line, column, depth);                                                             \
+    }                                                                                                         \
+    Array *ella_lib_sums_##T(const Array *a, word axis, word line, word column, word depth) {                 \
+        return sums(a, axis, line, column, depth);                                                            \
+    }                                                                                                         \
+    List *ella_lib_match_shape_##T(const Array *a, const List *e, const Str *w, word l, word c, word depth) { \
+        return match_shape(a, e, w, l, c, depth);                                                             \
     }
 
 ARRAY_FUNCTIONS(i64, I64_ITEMS)

@@ -37,7 +37,10 @@ let main = () -> () =>
   it back in. A splice outside a quote runs while compiling, so a program
   can generate specialized functions or even new types.
 * **Built-in number arrays.** `Array[f64]` and friends, with broadcasting,
-  which native code runs with AVX2 SIMD instructions.
+  which native code runs with AVX2 SIMD instructions. Types can give an
+  array's shape (`Array[f64; N, 3]`): mismatches are caught while compiling
+  where possible and when running otherwise, and `N` is a number you can
+  loop to.
 * **A familiar feel.** Indentation-based syntax, everything is an
   expression, exhaustive `match`, generics with constraints, methods,
   generators, modules, and a standard library written in Ella.

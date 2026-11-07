@@ -321,3 +321,11 @@ print(f())
     assert definition is not None and (definition.line, definition.column) == (2, 12)
     assert "Spot" in names(source, 5, 5)
     assert not [name for name in names(source, 7, 7) if "Spot" in name]
+
+
+def test_size_names() -> None:
+    # A size name used as a number is an i64 variable, defined by the dimension that gives it.
+    found = symbols("let f[; N] = (a: Array[f64; N]) -> i64 => N + 1\nlet b: Array[f64; M] = array([1.0])\nprint(M)\n")
+    assert (found[1, 43].hover, found[1, 43].definition) == ("N: i64", Location(1, 29, 1))
+    assert (found[3, 7].hover, found[3, 7].definition) == ("M: i64", Location(2, 19, 1))
+    assert "match_shape" not in names("let a = array([1.0])\na.\n", 2, 3)

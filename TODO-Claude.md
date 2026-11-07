@@ -23,18 +23,19 @@ direct calls, inlining and register allocation; stack traces, errors with
 causes and locations, and `main` giving a `Result`; sets and more of the
 standard library, `text`/`eq`/`hash` methods and map/set literals;
 packages; arrays with SIMD, then f32, i32, broadcasting, slices and more
-fusion; direct self tail calls; static array shapes (checker only, see
-"In progress"); type-namespace functions and local generic functions;
+fusion; direct self tail calls; arrays typed by shape (checked while
+compiling and, where that can't be sure, when running; size names as
+numbers; `sums`); type-namespace functions and local generic functions;
 `implements` (constraints are no longer met structurally), constraints
 requiring others, and constants (`const EMPTY: Self`, read as `T.EMPTY`,
 computed at compile time), also through a type's own parameters and for
-types defined inside functions. `make check` passes (1493 tests, ruff,
+types defined inside functions. `make check` passes (1535 tests, ruff,
 strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met by `implements`; they can require others, and constants read as `T.NAME`), static array shapes (`Array[f64; N, 3]`, size parameters `[; N]`), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
+| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met by `implements`; they can require others, and constants read as `T.NAME`), array shapes (`Array[f64; N, 3]`, size parameters `[; N]`; checked at run time where not sure, size names as `i64`s), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, direct calls, inlining, constant folding, CFG simplification, DCE, copy-to-move, array fusion (`fuse`); direct self tail calls reuse the frame |
 | Native code | x64 assembly plus a C runtime with real arenas, and SSA register allocation; byte-for-byte the same output and errors as the interpreters |
@@ -386,12 +387,11 @@ runtime; new functions with fixed types are cheap to add that way.
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
 
-### In progress: arrays typed by shape
+### Done (2026-11-06, third round): arrays typed by shape
 
-Steps 1 to 3 are done: shapes are checked statically, and a `_` (or
-an array whose rank isn't tracked) is trusted where a size is named.
-Steps 4 to 6 are open. grammar.md §9 ("Static shapes") documents what
-works now.
+All six steps are done; grammar.md §9 ("Static shapes") documents the
+result. What is still open is listed under "Loose ends" at the end of
+this section.
 
 Plan (agreed 2026-11-03; modelled on Futhark's size types). Static
 shapes only *add* checks: the runtime keeps every shape check it has, so
@@ -497,10 +497,65 @@ a generic's brackets, so their kind is declared, not inferred.
    `N` (harmless unless an inferred lambda type carries it out); an
    undecided size prints as `?6` in errors.)*
 4. Run-time `check_shape` at the boundaries, size names as values.
-   *(open)*
-5. `sums(a, axis)`. *(open)*
-6. Docs, editor grammar, test programs. *(partly: grammar.md §9 describes
-   steps 1 to 3; no test programs use shapes yet)*
+   *(done, a little differently from the plan: no new IR op. The checker
+   records `ShapeCheck`s (name of the variable holding the array,
+   `expected`: a size, -1 for any, -2 - i for "same as dimension i", or a
+   size variable's name; `binds`: (size name, dimension) pairs; `what`
+   for the message) in `shape_checks` (by Lambda: its parameters, run on
+   entry after binding them and before `where`, and again on a self tail
+   call; by Let: after it binds its names) and `result_shapes` (by
+   Lambda, run on the result before postconditions). Backends build the
+   expected list and call the hidden library function `match_shape(a,
+   expected, what) -> [i64]` (`HIDDEN_LIBRARY`: in LIBRARY, so every
+   backend has it through `builtin`/`ella_lib_match_shape_T`, but not in
+   BUILTINS, so programs can't name it), then bind each size name to an
+   item of the shape it gives. Parameters are checked in the callee on
+   every call (simplest; a pass could drop checks every caller makes
+   sure of). A `let` is checked unless `sure_shape` (value's dims vs the
+   declared ones) holds and it defines no names; a result unless the body
+   and every `return` (`result_unsure`) are sure. Size names are `i64`
+   variables (`VarInfo` whose binder is the `Dim`, `size_variable`): a
+   function's size parameters that some parameter's array has as a
+   dimension (in `check_body`, `param_shapes`), and the new names of a
+   `let`'s array annotation after it (`bind_sizes`; globals at the top
+   level). Other sizes are static only: using one as a number is "the
+   size 'N' isn't known when the program runs", and checks treat it as
+   `_`. The linker makes size parameters values in a function and a
+   let's size names values after it; at the top level they are top-level
+   names (`top_level`, and `rename_sizes` gives them the module's prefix
+   in the let's types). Lowering's `names_in` includes `Dim` names so
+   lambdas capture the size variables their parameters' checks read. A
+   parameter or variable only there for its sizes counts as used
+   (`size_holders`, `sizes_read`). Error: `argument 'm' should have shape
+   [_, 2], not [2, 3]`, `the value of 'b' ...`, `the function's result
+   ...`. Found on the way: a struct field typed `Array[f64; 3]` kept its
+   dims in the IR's struct info (the verifier rejected the constructor);
+   `field_types` in ir.py, and lowering's walk over field types, now
+   `finish` them.)*
+5. `sums(a, axis)`. *(done: library.py `sums`, runtime.c `sums`, adding
+   each sum in order from 0 with `item_op`, so floats are bit-identical
+   in every backend; errors for rank < 2 and an axis out of range. The
+   checker drops the dimension when the axis is an `IntLit`
+   (`sums_type`), else gives an untracked rank.)*
+6. Docs, editor grammar, test programs. *(done: grammar.md §9 and §10,
+   `sums` in the VS Code grammar, test/programs `array_shapes`,
+   `array_shape_argument`, `array_shape_result`, `array_shape_let` and
+   `array_shapes_module/`, differential programs in test_ir.py, and
+   test_checker.py `test_shape_checks`, `test_sizes_as_numbers`,
+   `test_sums_shapes`.)*
+
+Loose ends:
+
+- Arrays inside other values (`[Array[f64; 3]]`, tuples, struct fields,
+  function types) aren't checked at run time, and neither are values
+  assigned to a `mut` variable whose type has a shape: those are trusted
+  (memory safety never depends on shapes).
+- Structs and enums can't have size parameters.
+- A `let`'s rigid `SizeTy("N")` equals another function's `N` (harmless
+  unless an inferred lambda type carries it out); an undecided size
+  prints as `?6` in errors.
+- `fill((N, M), x)` with a tuple shape, to keep a shape statically.
+- Parameter checks run on every call, even where the caller is sure.
 
 ### Next
 

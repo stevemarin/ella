@@ -8,18 +8,10 @@ finished work) are in [TODO-Claude.md](TODO-Claude.md).
 
 ## In progress
 
-**Arrays typed by shape.** Array types can say their shape:
-`Array[f64; N, 3]` is a matrix with `N` rows and 3 columns, and
-`let mean[; N] = (xs: Array[f64; N]) -> f64` takes size parameters. The
-checker already catches mismatched shapes at compile time (transposing,
-`matmul`, broadcasting, wrong number of indexes). Still to do:
-
-- [ ] Check shapes at run time where they can't be known while
-      compiling (an `Array[f64; _]` passed where `Array[f64; 3]` is
-      expected is trusted today).
-- [ ] Let size names be used as numbers: `for i in 0..N`.
-- [ ] `sums(a, axis)`: add up along one dimension.
-- [ ] Test programs that use shapes.
+Nothing right now. The last piece finished was arrays typed by shape:
+`Array[f64; N, 3]` is checked while compiling and, where that can't be
+sure, when the program runs; size names are numbers (`for i in 0..N`);
+and `sums(a, axis)` adds up along one dimension.
 
 ## Next up
 
@@ -37,6 +29,10 @@ Small steps that build on what's there:
 
 - No `i8` or `i16`, no `f32` literals (write `to_f32(1.5)`), no
   negative indexing.
+- Array shapes are only checked on arrays themselves: arrays inside
+  lists, tuples or structs (`[Array[f64; 3]]`), and values assigned to a
+  `mut` variable later, are trusted. Structs and enums can't have size
+  parameters.
 - Constraints can't require operators beyond the built-in ones, or
   associated types, and their constants can't be used in types
   (`Array[f64; T.SIZE]`). Built-in types can't implement user-defined

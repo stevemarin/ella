@@ -709,6 +709,20 @@ def rebuild(node: object, walk: Callable[[object], object]) -> object:
     return node
 
 
+def size_names(node: object) -> list[str]:
+    """The size names in a type's (or any node's) dimensions, in order: `Array[f64; N, 3, _]` has N."""
+    if isinstance(node, Dim):
+        return [node.value] if isinstance(node.value, str) and node.value != "_" else []
+    return [name for part in parts(node) for name in size_names(part)]
+
+
+def rename_sizes(node: object, rename: Callable[[str], str]) -> object:
+    """A type with its size names renamed (other dimensions stay)."""
+    if isinstance(node, Dim):
+        return replace(node, value=rename(node.value)) if isinstance(node.value, str) and node.value != "_" else node
+    return rebuild(node, lambda part: rename_sizes(part, rename))
+
+
 def mentions_return(node: object) -> bool:
     """Does a `where` condition use `return`, making it a postcondition?
 

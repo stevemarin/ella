@@ -19,6 +19,7 @@ from ella.checker import (
     FuncTy,
     ListTy,
     ParamTy,
+    ShapeCheck,
     TupleTy,
     Type,
     array_item,
@@ -101,6 +102,7 @@ from ella.syntax import (
     Yield,
     is_generator,
     mentions_return,
+    size_names,
 )
 from ella.values import (
     F32,
@@ -371,8 +373,11 @@ class Interpreter:
                         self.globals.define(binding.name, closure, binding.mutable)
                 case Let(bindings):
                     for binding in bindings:
-                        if binding.name not in self.globals.vars:
-                            self.globals.vars[binding.name] = Var(UNIT, binding.mutable, ready=False)
+                        for name in (binding.name, *size_names(binding.type)):
+                            if name not in self.globals.vars:
+                                self.globals.vars[name] = Var(
+                                    UNIT, binding.mutable and name == binding.name, ready=False
+                                )
                 case LetPattern(pattern):
                     for node in pattern_names(pattern):
                         if node.name not in self.globals.vars:
@@ -441,6 +446,7 @@ class Interpreter:
                     self.adopt(value, -1, 0)  # a global's values live as long as the program
                 for binding in bindings:
                     scope.define(binding.name, copy_value(value), binding.mutable)
+                self.check_shapes(expr, scope)
                 # A function bound with `let` can call itself by name. Its
                 # captured scope was made before the `let` bound the name, so
                 # add the name there too.
@@ -1151,6 +1157,7 @@ class Interpreter:
         local = Scope(captured)
         for param, arg in zip(lambda_.params, args):
             local.define(param.name, arg, param.mutable)
+        self.check_shapes(lambda_, local)
 
         postconditions = [cond for cond in lambda_.where if mentions_return(cond.expr)]
         self.owners.append([])
@@ -1176,6 +1183,7 @@ class Interpreter:
                     self.owners.append([])
                     for param, param_value in zip(lambda_.params, signal.call_args):
                         local.vars[param.name].value = param_value
+                    self.check_shapes(lambda_, local)
                     if self.calls and self.calls[-1] is not None:
                         self.calls[-1] = CallSite(signal.span, self.running or "")
                     for cond in lambda_.where:
@@ -1189,6 +1197,8 @@ class Interpreter:
         finally:
             self.depth -= 1
 
+        if self.checker and (check := self.checker.result_shapes.get(id(lambda_))) is not None:
+            self.check_shape(check, result, local)
         # Postconditions see the result as `return`.
         if postconditions:
             result_scope = Scope(local)
@@ -1280,6 +1290,7 @@ class Interpreter:
         local = Scope(captured)
         for param, arg in zip(function.params, args):
             local.define(param.name, arg, True)
+        self.check_shapes(function, local)
         for cond in function.where:
             self.check_condition(cond, local, "precondition")
         generator = Generator(function, local, self.running or "lambda")
@@ -1566,6 +1577,26 @@ class Interpreter:
             return run_deep(run, self.max_depth, PYTHON_FRAMES_PER_CALL)
         except Exit as stop:
             raise EllaError("exit() can't stop the program while it is being compiled", stop.span) from None
+
+    def check_shapes(self, node: Lambda | Let, scope: Scope) -> None:
+        """Check the shapes of a function's parameters (with `scope` its call's) or of a `let`'s variables, and
+        define the size names they give (docs/grammar.md §9, "Static shapes")."""
+        if self.checker is None:
+            return
+        for check in self.checker.shape_checks.get(id(node), ()):
+            var = scope.lookup(check.name)
+            assert var is not None
+            self.check_shape(check, var.value, scope)
+
+    def check_shape(self, check: ShapeCheck, array: Value, scope: Scope) -> None:
+        expected: list[Value] = []
+        for size in check.expected:
+            var = scope.lookup(size) if isinstance(size, str) else None
+            expected.append(var.value if var is not None else size)
+        shape = call_library("match_shape", [array, expected, check.what], check.span, self.host)
+        assert isinstance(shape, list)
+        for name, i in check.binds:
+            scope.define(name, shape[i])
 
     def check_condition(self, cond: Assert, scope: Scope, kind: str) -> None:
         """Check an `assert` or `where` condition, reporting its source if it is false."""

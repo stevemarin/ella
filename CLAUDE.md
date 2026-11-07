@@ -91,7 +91,12 @@ plain:
   generators (a lambda with `yield`,
   `syntax.is_generator`; how each `for` loops is in `iterations`), and the
   rules for `nocopy` values (`check_copies`; a call giving a `Gen` takes
-  its nocopy arguments, which must be new values). Splices in types run while checking, through
+  its nocopy arguments, which must be new values), and array shapes
+  (`Array[f64; N, 3]`: `SizeTy`, `array_dims`; `finish` erases them):
+  where it can't be sure of one, a `ShapeCheck` (`shape_checks` by
+  Lambda for its parameters and by Let, `result_shapes`) that the
+  backends run through the hidden library function `match_shape`
+  (`HIDDEN_LIBRARY`), defining size names as `i64` variables. Splices in types run while checking, through
   `compile_time` (set by `staging.Expander`). `LIBRARY` has the types of
   the library functions. `Checker.warnings` has the problems that don't
   stop a program: unused local variables, parameters and top-level
@@ -122,7 +127,8 @@ plain:
 * `src/ella/library.py`: the library functions (`split`, `read_line`,
   `parse_i64`, ...) on run-time values, shared by both interpreters; the
   runtime's `ella_lib_NAME` functions must match them exactly (`abs`,
-  `min` and `max` have one per number type: `ella_lib_abs_i64`). `Host` has
+  `min` and `max` have one per number type: `ella_lib_abs_i64`, as do the
+  array functions, `sums` and `match_shape`). `Host` has
   a program's standard input, arguments and standard error. `exit` raises
   `Exit`, which the interpreters catch at the top (finalizers don't run).
   A library function used as a value becomes a small IR function

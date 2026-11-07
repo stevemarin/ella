@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 155
+    assert len(program.body) == 158
 
 
 # Precedence (docs/grammar.md §8)

@@ -1899,3 +1899,76 @@ def test_size_parameters() -> None:
     assert error("let g = () -> i64 =>\n    let f[; N] = 1\n    f\nprint(g())").message == (
         "only a top-level function can have size parameters"
     )
+
+
+def shape_checks(source: str) -> list[tuple[str, tuple[int | str, ...], tuple[tuple[str, int], ...], str]]:
+    """The run-time shape checks of a program's functions and `let`s, in the order they were made."""
+    checker = check(parse(source))
+    found = [*checker.shape_checks.values(), *((check,) for check in checker.result_shapes.values())]
+    return [(c.name, c.expected, c.binds, c.what) for checks in found for c in checks]
+
+
+def test_shape_checks() -> None:
+    # A parameter is checked on every call, defining its size names; a repeated name must have one size.
+    assert shape_checks("let f[; N] = (xs: Array[f64; N]) -> i64 => N") == [
+        ("xs", (-1,), (("N", 0),), "argument 'xs'")
+    ]
+    assert shape_checks("let f[; N] = (m: Array[f64; N, N, 3, _]) -> i64 => N") == [
+        ("m", (-1, -2, 3, -1), (("N", 0),), "argument 'm'")
+    ]
+    two = "let f[; N] = (a: Array[f64; N], b: Array[f64; 2, N]) -> i64 => N"
+    assert shape_checks(two) == [("a", (-1,), (("N", 0),), "argument 'a'"), ("b", (2, "N"), (), "argument 'b'")]
+    # A `let` is checked unless its value is sure to have the shape, or it defines size names.
+    assert shape_checks("let a: Array[f64; 2] = fill([2], 1.0)") == [("a", (2,), (), "the value of 'a'")]
+    assert shape_checks("let a: Array[f64; 2] = fill([2], 1.0)\nlet b: Array[f64; 2] = a")[1:] == []
+    assert shape_checks("let a: Array[f64; N] = array([1.0])\nlet b: Array[f64; N] = a * 2.0")[1:] == []
+    assert shape_checks("let a: Array[f64; N] = array([1.0])\nlet b: Array[f64; N] = array([2.0])")[1:] == [
+        ("b", ("N",), (), "the value of 'b'")
+    ]
+    assert shape_checks("let a = array([1.0])\nlet b: Array[f64] = a") == []
+    # A result is checked unless every value the function gives is sure to have its shape.
+    sure = "let f[; N] = (a: Array[f64; N]) -> Array[f64; N] => a * 2.0"
+    assert [c[0] for c in shape_checks(sure)] == ["a"]
+    unsure = "let f[; N] = (a: Array[f64; N]) -> Array[f64; N] => fill([3], 1.0)"
+    assert shape_checks(unsure)[1:] == [("", ("N",), (), "the function's result")]
+    returned = "let f[; N] = (a: Array[f64; N]) -> Array[f64; N] =>\n    if N > 1 then return array([1.0])\n    a\n"
+    assert shape_checks(returned)[1:] == [("", ("N",), (), "the function's result")]
+    # A size known only while checking isn't compared with at run time.
+    nested = "let f[; N] = (xs: [Array[f64; N]], a: Array[f64; N]) -> i64 => 1"
+    assert shape_checks(nested) == [("a", (-1,), (("N", 0),), "argument 'a'")]
+
+
+def test_sizes_as_numbers() -> None:
+    assert type_of("let f[; N, M] = (a: Array[f64; N, M]) -> i64 => N * M\nf") == "(Array[f64]) -> i64"
+    assert type_of("let a: Array[f64; N] = array([1.0])\nN") == "i64"
+    assert type_of("let f = () -> i64 =>\n    let a: Array[f64; N] = array([1.0])\n    N + 1\nf()") == "i64"
+    assert type_of("let f[; N] = (a: Array[f64; N]) -> i64 =>\n    let g = (x: i64) => x * N\n    g(2)\nf") == (
+        "(Array[f64]) -> i64"
+    )
+    assert type_of("let f[; N] = (a: Array[f64; N]) -> i64 =>\n    where\n        N > 0\n    N\nf") == (
+        "(Array[f64]) -> i64"
+    )
+    assert error("let f[; N] = (xs: [Array[f64; N]]) -> i64 => N").message.startswith(
+        "the size 'N' isn't known when the program runs"
+    )
+    assert error("let f[; N] = (N: Array[f64; N]) -> i64 => 1").message == (
+        "'N' is both a parameter and a size parameter"
+    )
+    assert error("let f[; N] = (a: Array[f64; N]) -> () =>\n    N = 2").message.startswith("can't assign")
+    assert error('match_shape(array([1.0]), [1], "")').message == "undefined name 'match_shape'"
+    # A parameter (or variable) that is only there for its sizes is used.
+    assert warnings("let f[; N] = (a: Array[f64; N]) -> i64 => N\nprint(f(array([1.0])))") == []
+    assert warnings("let f[; N] = (a: Array[f64; N], b: Array[f64; N]) -> f64 => total(b)\nprint(f)") == []
+    assert warnings("let main = () -> () =>\n    let a: Array[f64; N] = array([1.0])\n    print(N)") == []
+
+
+def test_sums_shapes() -> None:
+    m = "let m: Array[f64; A, B] = fill([2, 3], 1.0)\n"
+    assert shape_of(m + "sums(m, 0)") == "Array[f64; B]"
+    assert shape_of(m + "sums(m, 1)") == "Array[f64; A]"
+    assert shape_of(m + "let axis = 1\nsums(m, axis)") == "Array[f64]"
+    assert shape_of("sums(fill([2, 3], 1), 0)") == "Array[i64]"
+    assert error(m + "sums(m, 2)").message == "sums() can't add along axis 2 of Array[f64; A, B]"
+    assert error("sums(array([1.0]), 0)").message == (
+        "sums() needs an array of 2 or more dimensions, not Array[f64; _]; use total()"
+    )

@@ -11,6 +11,7 @@ from pathlib import Path
 from ella.checker import (
     BUILTIN_TYPES,
     GENERIC_LIBRARY,
+    HIDDEN_LIBRARY,
     LIBRARY,
     PRIMITIVE_NAMES,
     RANGE,
@@ -39,6 +40,7 @@ from ella.syntax import (
     Binding,
     Compare,
     ConstraintDef,
+    Dim,
     EnumDef,
     Expr,
     If,
@@ -537,7 +539,7 @@ class Checked:
     def extension_members(self, receiver: Type, seen: set[str]) -> list[Completion]:
         """Receiver-first built-in and standard-library functions applicable to a value."""
         found = []
-        names = set(self.checker.extension_functions) | set(LIBRARY) | {"len"}
+        names = set(self.checker.extension_functions) | (set(LIBRARY) - HIDDEN_LIBRARY) | {"len"}
         for name in sorted(names - seen):
             if name == "len":
                 value_type = resolve(receiver)
@@ -770,6 +772,8 @@ class Symbols:
             return self.variant_location(info.enum, name)
         if isinstance(info.binder, Binding | Param | NamePattern):
             return self.checked.locate(info.binder.span, info.binder.name)
+        if isinstance(info.binder, Dim):  # a size name, defined by the dimension of an array that gives it
+            return self.checked.locate(info.binder.span, name)
         return None
 
     def variant_text(self, enum: str, variant: str) -> str:
