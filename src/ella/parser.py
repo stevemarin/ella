@@ -1,4 +1,44 @@
-"""Pratt parser: turns tokens into the syntax tree defined in ella.syntax."""
+"""Pratt parser: turns tokens into the syntax tree defined in ella.syntax.
+
+This follows docs/grammar.md: operator precedence from §8, and the grammar
+summary and parsing notes from §12.
+
+Most of the parser is "recursive descent": one method per kind of thing
+(`parse_if`, `parse_let`, `parse_type`, ...), each consuming its tokens and
+calling the others for the parts inside it.
+
+Expressions with operators use Pratt parsing (also called top-down operator
+precedence). `parse_expr(min_prec)` works in two steps:
+
+1. Parse one operand with `parse_prefix`: a literal, a name, `(...)`, a prefix
+   operator such as `-x`, or a keyword form such as `if ...`.
+2. Loop: while the next token is an infix or postfix operator whose
+   precedence is at least `min_prec`, consume it and combine it with the
+   operand so far. For a binary operator, the right operand is parsed by a
+   recursive `parse_expr` with a higher `min_prec`, so it only takes
+   operators that bind tighter.
+
+For example, `1 + 2 * 3 - 4`: we parse `1` and see `+` (13). The right operand
+is `parse_expr(14)`, which reads `2`, sees `*` (14, allowed), and reads `3`.
+It then sees `-` (13, below 14) and stops, giving `2 * 3`. Back at the top,
+`-` (13) is allowed, so the result is `(1 + (2 * 3)) - 4`.
+
+Precedence lives in the `self.infix` and `self.prefix` tables.
+
+The first error normally stops the parser. For editors, `parse_partial`
+keeps going: a line of the program or of a block with an error becomes `()`,
+and parsing goes on with the next line of the same block (`parse_line`).
+
+
+Rewrites the parser makes beyond the grammar:
+
+* A file's `import` lines come first (`Program.imports`); paths in types and
+  patterns are dotted names (`parse_dotted`).
+* A lambda's pattern parameter becomes a hidden parameter `#i` and a `let`
+  first in its body (`PatternParam`, `take_apart`), and each `Iter[T]`
+  parameter of a `let`'s function a hidden type parameter `Iter#i`
+  (`with_iter_params`). `syntax.is_hidden` tells such names apart.
+"""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace

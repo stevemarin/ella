@@ -1,4 +1,17 @@
-"""Simplify the control-flow graph: fewer, bigger blocks, with no detours."""
+"""Simplify the control-flow graph: fewer, bigger blocks, with no detours.
+
+The lowering makes many small blocks, and the other passes leave behind
+blocks that do nothing but jump on. This pass repeats four tidy-ups until
+none applies:
+
+1. A branch on a constant becomes a jump to the side it always takes (and a
+   branch with the same block on both sides becomes a jump).
+2. Blocks that can no longer be reached are removed.
+3. A jump or branch to a block that only jumps on goes straight to where
+   that block goes.
+4. A block reached only by a jump from one other block is merged into it.
+   Its parameters are replaced by the values the jump passed.
+"""
 
 from ella.ir import (
     Block,

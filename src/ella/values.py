@@ -1,4 +1,59 @@
-"""Run-time values, shared by the interpreters."""
+"""Run-time values, shared by the interpreters.
+
+Ella values are represented by plain Python values where one fits:
+
+    Ella            Python
+    i64             int (checked to stay in the i64 range)
+    f64             float
+    f32             F32, a float an f32 can hold
+    i32             I32, an int an i32 can hold
+    bool            bool
+    str             str
+    ()              () (the empty tuple: unit is the tuple with no items)
+    (T, U)          tuple
+    [T]             list
+    Array[T]        ArrayValue: its shape and its items, in one flat list
+    a..b, a..=b     range
+    enum variants   VariantValue, or Constructor for a variant with fields
+    structs         VariantValue too (a struct is an enum with one variant),
+                    whose fields can change
+    functions       Closure (written in Ella) or Builtin (written in Python)
+                    in the AST interpreter; FunctionRef in the IR interpreter
+    Pool[T]         PoolValue, and Handle[T] is HandleValue
+    Arena           ArenaValue, and Ref[T] is RefValue
+    Gen[T]          GenValue, whose state belongs to the interpreter running it
+    Code[T]         CodeValue, holding the code's syntax tree
+
+Python's `bool` is a subclass of `int`, so code that tells values apart must
+test for `bool` before `int`. `type_name` does that, and the interpreter uses
+it for every type check.
+
+Ella has value semantics: binding, passing and returning all copy. Lists are
+mutable Python lists, so the AST interpreter calls `copy_value` whenever it
+reads a value out of a variable or a list. The copies cost memory and time,
+but they make the rules easy to see. The compiler copies only where a
+program could tell (see ella.lower), and the IR interpreter runs its `copy`
+instructions with `copy_value` too.
+
+
+Map
+---
+
+* The value classes in the table above, and `Scope` (the AST interpreter's variables).
+* `copy_value`; `equal`, which calls `eq` methods through `custom` (patterns
+  leave it out); `to_text`, which calls `text` methods through `custom`, for
+  `print` (error messages leave it out).
+* `make_error`: a built-in `Error`, whose `error` flag makes `==` and the text
+  form leave out its `at`. `main_error`: the error of an `Err` that `main` returns.
+* `MAX_CALL_DEPTH`: every backend's default call depth limit. `run_deep` runs
+  an interpreter on a thread with a big stack.
+* `BUILTIN_CONSTANT_VALUES`: `i64.MAX` and the like (their types are
+  ella.checker.BUILTIN_CONSTANTS).
+
+Must match runtime.c exactly: `to_text` (`put_value`; floats as Python's
+`repr`, `put_f64`; `f32_text`, `put_f32`), `nested_text` (`put_nested`),
+`equal` (`ella_equal`) and `main_error`.
+"""
 
 import itertools
 import json
@@ -117,7 +172,8 @@ BUILTIN_CONSTANT_VALUES: dict[tuple[str, str], int | float | str] = {
 
 
 def f32_text(x: F32) -> str:
-    """The shortest decimal that is nearest to x of all f32s, written as `repr` writes an f64: `0.1`, `1e-05`."""
+    """The shortest decimal that is nearest to x of all f32s, written as `repr` writes an f64: `0.1`, `1e-05`.
+    runtime.c's `put_f32` must match it."""
     if not math.isfinite(x):
         return repr(float(x))
     for digits in range(1, 10):
@@ -422,7 +478,7 @@ def copy_value(value: Value) -> Value:
 def equal(a: Value, b: Value, custom: Callable[[VariantValue, VariantValue], bool | None] | None = None) -> bool:
     """Structural equality: lists, tuples and variants are equal if their parts are.
 
-    Values of different types are never equal. (Python would say `1 == True`.)
+    Values of different types are never equal. (Python would say `1 == True`.) runtime.c's `ella_equal` must match it.
     `custom` compares two struct or enum values whose type has an `eq` method
     (by calling it), or gives None; without it, as in patterns, equality is
     always structural.
@@ -445,7 +501,7 @@ def equal(a: Value, b: Value, custom: Callable[[VariantValue, VariantValue], boo
 
 
 def to_text(value: Value, nested: bool = False, custom: Callable[[VariantValue], str | None] | None = None) -> str:
-    """The text form of a value, used by `print` and string interpolation.
+    """The text form of a value, used by `print` and string interpolation. runtime.c's `put_value` must match it.
 
     A string is its own text, but inside a list or other value it is quoted, so
     that `["a, b"]` and `["a", "b"]` print differently. `custom` gives the text

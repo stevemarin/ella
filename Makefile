@@ -7,7 +7,7 @@ FILE ?= example_syntax.ella
 VSCODE_EXTENSIONS ?= $(if $(wildcard $(HOME)/.vscode-server),$(HOME)/.vscode-server/extensions,$(HOME)/.vscode/extensions)
 
 .DEFAULT_GOAL := help
-.PHONY: help sync test lint format format-check typecheck check bench run tree native asm ir \
+.PHONY: help sync test program outline lint format format-check typecheck check bench run tree native asm ir \
 	lsp extension install-extension uninstall-extension package clean
 
 help: ## List the recipes
@@ -20,6 +20,12 @@ sync: ## Install Python dependencies, the language server's too
 
 test: ## Run the tests
 	uv run pytest
+
+program: ## Run one test program (NAME=arithmetic) all six ways
+	uv run pytest -q test/test_programs.py -k "[$(NAME)-"
+
+outline: ## Print FILE's classes and functions with their lines (FILE=src/ella/checker.py)
+	uv run python tools/outline.py $(FILE)
 
 lint: ## Lint
 	uv run ruff check

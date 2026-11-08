@@ -1,4 +1,232 @@
-"""The intermediate representation (IR): a typed control-flow graph."""
+"""The intermediate representation (IR): a typed control-flow graph.
+
+The lowering (ella.lower) turns a checked syntax tree into this IR, and
+ella.ir_interpreter runs it. The passes in ella.passes optimize it, and
+ella.codegen compiles it to x64.
+
+Structure
+---------
+
+A `Module` holds functions. Each `Function` is a list of basic blocks, the
+first being its entry. A `Block` is a straight-line list of instructions with
+no jumps in or out of the middle, ended by exactly one *terminator* that says
+where control goes next:
+
+    jump target(args)         continue in another block
+    branch cond, then, else   continue in one of two blocks, by a bool
+    return value              leave the function
+    yield value, target       (in a generator function) give value to `resume`'s
+                              caller; the next `resume` carries on at target
+    trap "message", value     stop the program with a run-time error
+    trap error e              stop the program with the Error e that `main` returned
+
+Instructions are *three-address code*: each does one small thing to
+operands that are already computed, like `%3: i64 = add %1, %2`.
+
+Values
+------
+
+Each instruction that produces something defines a new `Value`, written `%n`,
+which has a type and is never changed afterwards. Values flow between blocks
+in two ways:
+
+* A value can be used in any block that the defining block *dominates*
+  (every path from the entry to it passes through the definer).
+* Where paths join, such as after an `if`, the result arrives as a *block
+  parameter*: `jump join(%4)` passes `%4` to `join(%5: i64)`. Block
+  parameters do the job of SSA "phi" nodes.
+
+Variables
+---------
+
+Ella variables can change, but values can't. For now, each variable lives
+in a named, typed *local slot* of its function, read with `load` and written
+with `store`. The mem2reg pass (ella.passes.mem2reg) promotes slots to
+values, which is what "SSA form" means; that is easier to do as an
+optimization than in the lowering.
+Top-level variables are *globals*, read and written by name. Reading a
+global before it is set is a run-time error.
+
+Memory
+------
+
+Lists, arrays, strings, tuples, ranges, enum values and closures are *boxed*: a
+value is a reference to an object in memory. (i64, f64, bool and () are
+not.) Ella has value semantics, so no two variables may share an object
+that can change; the only objects that ever change are lists, through
+`set_index` and `append`, arrays, through `set_index`, and structs, through `set_field`. The lowering makes this safe with explicit `copy`
+instructions wherever a value gets a second owner (docs/memory-model.md §3).
+
+Every boxed object lives in an *arena*, and every instruction that makes
+one names the arena, its *region*, written after an `@`:
+
+    @0, @1, ...    the function's scope levels: 0 is the function body, and
+                   each loop nested in it adds a level for its iterations
+    @carry1, ...   (for variables only) the arena that holds the values a
+                   loop at level 1 carries from its last iteration
+    @result        where the caller wants the function's result
+    @mut0, ...     where the variable passed to `mut` parameter 0 lives
+    @global        the program's global arena, freed when the program ends
+    @slot          (for changing an object) the arena it is in: a pool's
+                   value, in its slot's own arena, or an arena's value, in
+                   the arena's slot arena; the arena gets a copy
+
+`reset k` frees levels k and up when control leaves a loop iteration, and
+returning frees all of the function's levels.
+
+Generators
+----------
+
+A generator becomes two functions (docs/memory-model.md §17). The one the
+program calls makes a `Gen` with `gen_new`, taking the generator's captured
+values and arguments. The other is the body, a *generator function*
+(`Function.generator`), whose parameters are those values: `resume g`
+runs it from where it last stopped until a `yield` terminator, which gives
+`resume` its result, an Optional made in @result. Its values and slots
+live in the Gen between resumes, and so do its scope levels, which are
+arenas the Gen owns rather than depths of the call: they outlive each
+`resume`. A generator function never returns: at its end, it frees its
+levels (`reset 0`) and yields None, from a block that yields to itself.
+
+A loop that assigns new values to variables declared outside it *carries*
+them from one iteration to the next (docs/memory-model.md §6). Such a loop
+at level k has two arenas, level k and a spare (level k+1; loops inside it
+start at k+2), and they take turns: new objects go in @k, and the values
+carried from the last iteration are in @carryk. Where a plain loop frees
+level k after each iteration, `swap k` frees the carried arena and makes
+the iteration's arena the carried one. The loop's variables are copied
+into the iteration's arena first if they still hold values from the
+carried one (`carry`), and copied out when the loop ends. So a loop that
+rebuilds a value keeps at most two versions, not one per iteration. A value must never be used
+after its arena is freed, and an object must never be stored where it would
+outlive its arena; the IR interpreter checks both at run time. Freeing an
+arena first runs the finalizers of the values in it that have them (nocopy
+structs with `finalize`, pools and arenas), newest first.
+
+Operations
+----------
+
+    const c                      a literal: i64, f64, bool, str or () (strings are static)
+    load slot, store slot, v     read or write a local variable
+    global_get name, global_set name, v
+    add sub mul div floordiv mod pow    arithmetic (`div` always gives f64;
+                                 `add` also joins strings and lists). `add`, `sub`,
+                                 `mul`, `div` and `neg` also work on arrays item by item
+                                 (two of the same shape, or an array and a number on
+                                 either side), giving a new array in the instruction's
+                                 region; native code runs them as AVX2 loops
+    bitand bitor bitxor shl shr  bitwise operations, on i64
+    neg not bitnot               unary operations
+    eq ne lt le gt ge            comparisons, giving bool
+    contains item, container     `in` for lists, strings and ranges
+    range lo, hi                 `lo..hi`; `range_incl` for `lo..=hi`
+    tuple a, b, ...              build a tuple; `tuple_get t, n` reads item n
+    list a, b, ...               build a list
+    index c, i                   item i of a list, string (a 1-char string) or range, or
+                                 item i of an array's items (in row-major order),
+                                 which must be in range: `array_offset` or a loop
+                                 over the array gives i
+    array_offset a, i, j, ...    where item (i, j, ...) is in array a's items, checking
+                                 that there is an index for each dimension, in range
+    array_slice a, i, r, ... @r  a new array of a's items at the indexes, an i64 or a range
+                                 for each dimension (a range keeps its dimension)
+    fused a, b, ... [steps] @r   several of `add`, `sub`, `mul`, `div` and `neg` on arrays
+                                 (and numbers) in a row, as one (made by ella.passes.fuse),
+                                 maybe ending with `total` or `dot` (then giving a number,
+                                 and @r is for arrays the steps one by one would make):
+                                 each step works on the operands (a, b, ...: 0, 1, ...)
+                                 and the results of earlier steps (s0, s1, ...), and has
+                                 the span of the operation it was; the last step's array
+                                 is the result. Natively one loop goes over all the items,
+                                 with no arrays in between; it gives what the steps one by
+                                 one would give, errors and all. A step marked `keep`
+                                 gives its array too, as an extra result (`outs`, in its
+                                 region of `out_regions`), for code after it
+    slice c, r @r                a view of items r.start up to r.stop of a list or string:
+                                 a new header in @r that shares c's items (or characters)
+    set_index xs, i, v @r        replace item i of list xs in place; xs lives in region r
+                                 (or of an array's items, i given by `array_offset`)
+    append xs, ys @r             xs with copies of ys's items added, growing xs in place
+                                 if it can; xs lives in region r and isn't used again
+    copy v @r                    a deep copy of v in region r
+    move v @r                    v, which can't be copied, moved to region r with
+                                 its finalizers (a returned local variable)
+    reset k                      free the function's scope levels k and up, putting the
+                                 two arenas of each loop there that carries values back
+                                 in order (`swap` exchanges them)
+    swap k                       end an iteration of a loop at level k that carries values:
+                                 free levels k+2 and up, run the finalizers of @k's
+                                 values, free @carryk, and swap the two arenas
+    carry v @k                   v, or a copy of it in @k if it is in @carryk (index k)
+    pool_new @r                  a new, empty pool
+    alloc pool, v                put v in a new slot of the pool, in the slot's own
+                                 arena; gives its handle
+    pool_get pool, h             the value a handle refers to (checking it isn't stale)
+    pool_set pool, h, v          replace that value, with v in a new arena
+    free pool, h                 free that value, with its arena
+    arena_new @r                 a new, empty Arena, with a slot arena of its own
+    alloc arena, v               put a copy of v in the arena; gives its ref
+    pool_get arena, r            the value a ref refers to (checking it isn't stale,
+                                 and is this arena's)
+    pool_set arena, r, v         replace that value, with a copy of v in the arena (the
+                                 old one stays there until the arena is freed)
+    free arena                   free all the arena's values at once
+    gen_new a, ... @r            a new Gen running generator function f (in `name`), with
+                                 arenas of its own for f's levels; copies of the values
+                                 a, ... (moved, if they can't be copied) in its level 0
+                                 are f's parameters
+    resume g @r                  run generator g until it yields: its Optional result
+    quote_begin                  start building the code of quote n (in `index`),
+                                 choosing fresh names for its variables
+    quote begin, outer..., v...  the code of quote n: its splices' code and the
+                                 values it carries are the operands (after the
+                                 `quote_begin`s of the quotes it is spliced into)
+    run c @r                     check code made by `quote`, lower it, and run it
+    type_value t...               type n (in `index`) of the module's types, as a value,
+                                 with the types t... spliced into it (`type [$t]`)
+    reflect t, ... @r            a reflection built-in (in `name`) on a type: fields(t), ...
+    len c                        length of a list, string or range, an array's number of
+                                 items, or a pool's or arena's count
+    builtin a, ... @r            a library function (in `name`), such as split(a, b),
+                                 whose result is new objects in @r (ella.library), or
+                                 for those in VIEWS views of a's characters; abs, min,
+                                 max and the array functions take i64s, f64s or f32s (or
+                                 arrays of them), and `array` its result's item type
+    to_text v                    the text form of any value
+    print v                      write the text form of v and a newline
+    eprint v                     the same, to standard error
+    variant Name(a, ...)         make an enum value or struct (registering its finalizer)
+    is_variant v, Name           does v hold that variant?
+    variant_field v, Name.n      field n of v, which holds that variant
+    set_field v, x @r            change field n (in `index`) of struct v in place
+    closure f(a, ...)            a function value: IR function f with captured values;
+                                 one that captures nothing is static, with no region
+    call f(a, mut b @r, ...)     call a function value; the result goes in the call's
+                                 region. A `mut` argument b, which lives in region r,
+                                 is passed in and its new value comes back as an extra
+                                 result: `%5: (), %6: [i64] = call %1(mut %2 @0) @0`.
+    call_direct f(a, ...)        the same for IR function f (in `name`), which captures
+                                 nothing: `call_direct fib(%3) @0`
+    enter                        an inlined call starts: it counts toward the call depth,
+                                 and stops the program if that is too deep, as `call` does
+    leave                        an inlined call ends
+    assert c, "message"          stop with the message if c is false
+
+A function with `mut` parameters returns their final values along with its
+result: `return %9, mut %7`.
+
+Inlining (ella.passes.inline) puts a copy of a function's body where it is
+called. Its scope levels become levels of the caller above all of the
+caller's own, so they are freed first, as a callee's arenas are; a `reset`
+frees them where the copy returns, and `enter` and `leave` keep counting
+the call toward the call depth limit.
+
+Operations that fail at run time (overflow, an index out of range, a failed
+assert, ...) carry the source span to report. A run-time error also reports
+the calls in progress, each from its instruction's span and `within`. One
+at Span(0, 0) (in the function made for a library function used as a
+value) is reported at the innermost call instead (`EllaError.traced`).
+"""
 
 from collections import Counter
 from collections.abc import Callable

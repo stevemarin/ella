@@ -1,4 +1,156 @@
-"""Lowering: turns a type-checked syntax tree into IR (see ella.ir)."""
+"""Lowering: turns a type-checked syntax tree into IR (see ella.ir).
+
+The syntax tree is nested: an `if` contains expressions, which contain other
+expressions. The IR is flat: blocks of simple instructions, connected by
+jumps. Lowering walks the tree and emits instructions into the *current
+block*, starting new blocks wherever control can go more than one way.
+
+For example, `let y = if x > 0 then x else -x` becomes:
+
+    entry:
+        %1: i64 = load x
+        %2: i64 = const 0
+        %3: bool = gt %1, %2
+        branch %3, then1, else2
+    then1:
+        %4: i64 = load x
+        jump join3(%4)
+    else2:
+        %5: i64 = load x
+        %6: i64 = neg %5
+        jump join3(%6)
+    join3(%7: i64):
+        store y, %7
+
+A few ideas recur:
+
+* After `return`, `break`, `continue` or a failed `?`, nothing more runs in
+  that block. Lowering carries on in a fresh "dead" block that nothing jumps
+  to, and dead blocks are removed when the function is finished.
+* Every Ella function becomes an IR function. A lambda is *closure
+  converted*: the IR function takes the captured variables as extra leading
+  parameters, and the `closure` instruction packs them with it into a
+  function value.
+* `return` jumps to the function's exit block rather than returning
+  directly, so that postconditions are checked however the function ends.
+* A generator becomes two functions: one that makes the `Gen` (`gen_new`),
+  and its body, a generator function, which `resume` runs (see "Generators"
+  in ella.ir). A `yield` ends a block, and the body carries on in the next.
+
+Memory
+------
+
+The lowering also decides where every object lives and when values are
+copied (docs/memory-model.md §3, §5, §6). Each function body is scope level
+0, and each loop adds a level for its iterations: the loop frees that level
+(`reset`) when an iteration ends. Every expression is lowered with a
+*destination*, the region its value will end up in, and objects are built
+directly there: `let xs = [1, 2]` makes the list in the region of `xs`, and a
+returned list is made in the caller's region (`@result`).
+
+Values are references to objects, and reading a variable doesn't copy. So
+for each boxed value, the lowering tracks two things (`Info`):
+
+* what it *borrows*: the variables whose objects it may share. A value read
+  from `xs`, an item of it, or a slice of it (a *view* that shares its
+  items, docs/memory-model.md §18) borrows `xs`. A new object borrows nothing.
+* how long it *lives*: a region that every object in it outlives.
+
+A value is copied when it is stored (in a variable, a list, a returned
+value, ...) if either check fails:
+
+* Sharing would be visible. Only lists (and arrays and structs, which
+  work alike) ever change, and only in place, through `xs[i] = v` and
+  `xs += ys`. A value with lists in it is copied
+  if it borrows from a variable that is changed in place, or is stored into
+  a `mut` variable, which may change it in place itself.
+* It would outlive its objects: it lives in a region that doesn't outlive
+  the one it is stored in. A value built inside a loop and stored in a
+  variable declared outside it is an example.
+
+One more case needs a copy. Reading `xs` and then changing it in place
+before the read value is used, as in `xs + [(xs[0] = 5)]`, would show the
+change. Ella's semantics are that a read gives the value at the time of
+reading, so `protect` copies a read value if a later part of the same
+expression changes its variable in place.
+
+And one case needs none: `x = y`, where y is a variable of the same block
+that nothing reads afterwards, moves y's value into x instead of copying
+it, since no one can see the sharing.
+
+Loops that carry values
+-----------------------
+
+A loop that gives a variable declared outside it a new value on every
+iteration would pile up one version per iteration in the variable's arena
+("region bloat", docs/memory-model.md §6). Instead, such a loop *carries*
+the variable (`carried_by` decides which): inside the loop it lives in a
+slot of its own, whose values are in the loop's arenas. New values are made
+in the iteration's level, @k. At the end of an iteration (the *latch*),
+a variable that still holds a value from the last iteration, in @carryk,
+is copied into @k (`carry`), and `swap k` frees @carryk and makes @k the
+carried arena. When the loop ends, each variable is copied back to its own
+region. So the loop holds at most two versions of each variable.
+
+`for i in 0..n: s = s + "x"` becomes, roughly:
+
+    store s.1, (load s)                 # the loop's slot for s
+  for:
+    swap 1
+    ...
+  body:
+    %1 = add (load s.1), "x" @1         # the new value, in the iteration's arena
+    store s.1, %1
+  next:
+    store s.1, (carry (load s.1) @1)    # copied only if it is still in @carry1
+    jump for
+  exit:
+    store s, (copy (load s.1) @0)
+    reset 1
+
+
+Map
+---
+
+`compile_program` parses, prepares (ella.staging), lowers and verifies.
+`Lowerer`, by concern (method names to search for):
+
+* Building IR: `start_function`, `finish_function`, `new_value`,
+  `new_block`, `emit`, `const`, `jump`, `branch`, `join_block`.
+* Memory (above): `info_of`, `needs_copy`, `copy`, `place`, `place_return`,
+  `protect`, `view_of`, `merge`, `var_region`, `build_region`; at module
+  level `changed_in_place`, `changed_bindings`, `returned_bindings`.
+* Variables: `new_slot`, `home`, `bind`, `find_slot`, `read_local`,
+  `read_name`, `write_name`.
+* Functions: `lower_program`, `lower_lambda`, `lower_local_generic`,
+  `lower_function`, `specialize` (generic functions and methods, per type
+  arguments), `lower_generator`, `lower_yield`, `lower_shape_checks`.
+* Expressions: `lower` (one `match` over every node), `lower_binary`,
+  `lower_index`, `lower_compare`, `lower_logic`, `lower_try`,
+  `lower_string`, `lower_quote`, `lower_code`, `lower_associated_constant`,
+  `lower_builtin_constant`.
+* Assignments: `lower_assign_name` (`x = y` moves y at its last use in its
+  block: `last_uses`), `lower_append`, `lower_assign_place`, `step_into`,
+  `store_step`, `lower_assign_set` (the `update` protocol).
+* Calls: `lower_call`, `emit_call`, `lower_builtin`, `library_function` (a
+  library function used as a value: a small IR function, `trim(str)`),
+  `call_method` (also operators on structs with methods like `add`),
+  `mut_place`, `write_back`.
+* Protocols: `emit_text`, `need_texts`, `need_methods`. Printing a value
+  makes the `text` methods of the types it may hold (`Module.texts`), and
+  `==`, `in` and `hash` their `eq` and `hash` methods (`Module.eqs`,
+  `hashes`), which the IR interpreter and the runtime (through type
+  descriptors, `ella_call1` and `ella_call2`) call.
+* Control flow: `lower_if`, `lower_match`, `lower_pattern`, `test`.
+* Loops: `enter_loop`, `leave_loop`, `lower_for`, `lower_for_iterator`,
+  `lower_loop_body`; carrying (above): `carried_by`, `begin_carrying`,
+  `latch`, `keep_carried`, `end_iteration`, `end_carrying`.
+
+A slice (and `trim`, `split`: `VIEWS` in ella.ir) is a view sharing its
+list's items, borrowing what the list borrows (docs/memory-model.md §18).
+`a[i, j]` on an array becomes `array_offset` (checking the indexes) and
+`index` or `set_index` at that offset (`array_indexes`).
+"""
 
 from collections import Counter
 from collections.abc import Sequence

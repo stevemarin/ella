@@ -1,4 +1,31 @@
-"""The library: built-in functions with fixed types, such as `split` and `read_line`."""
+"""The library: built-in functions with fixed types, such as `split` and `read_line`.
+
+Their types are in ella.checker.LIBRARY. Both interpreters call `call` here,
+and native code calls the runtime's `ella_lib_NAME` functions (runtime.c),
+which must behave exactly the same, error messages included.
+
+Strings are sequences of code points. Text from outside (standard input,
+files) must be valid UTF-8. Whitespace, digits and the grammar of numbers
+are ASCII only, so that C and Python agree on them exactly.
+
+
+Map
+---
+
+* `call(name, args, span, host)` runs one library function. `Host` has a
+  program's standard input, arguments and standard error. `exit` raises
+  `Exit`, which the interpreters catch at the top (finalizers don't run).
+* `hash_value` (runtime: `ella_lib_hash`); `lane_sum`: `total` and `dot` add
+  in LANES sums, in the order native code does (ella.codegen's `reduction`,
+  `fused_sum`); `match_shape`, hidden: the run-time check of a checker
+  `ShapeCheck`.
+
+Must match: each function and runtime.c's `ella_lib_NAME`, exactly. `abs`,
+`min` and `max` have one per number type there (`ella_lib_abs_i64`), as do
+the array functions, `sums` and `match_shape`. Their types are
+ella.checker.LIBRARY. A library function used as a value becomes a small IR
+function (`trim(str)`) made by the lowering.
+"""
 
 import errno
 import math
@@ -94,7 +121,9 @@ def quoted(text: str) -> str:
 
 
 def call(name: str, args: list[Value], span: Span, host: Host) -> Value:
-    """Run the library function `name`. The checker has made sure the arguments have its types."""
+    """Run the library function `name`. The checker has made sure the arguments have its types.
+
+    runtime.c's `ella_lib_NAME` must behave exactly the same, error messages included."""
     match name, args:
         case "to_f64", [int() | float() as n]:
             return float(n)  # (an f32 as the f64 it is)
@@ -327,7 +356,8 @@ def match_shape(a: ArrayValue, expected: list[int], what: str, span: Span) -> li
 
 def lane_sum(items: list[Value], zero: Value, span: Span) -> Value:
     """`total(a)`: the items added up in LANES sums starting at 0, item i into sum i % LANES, which are then added
-    as `(s0 + s2) + (s1 + s3)`, as AVX2 code adds them. (`dot` gives it its products.)
+    as `(s0 + s2) + (s1 + s3)`, as AVX2 code adds them (ella.codegen's `reduction`, `fused_sum`: keep them in
+    step). (`dot` gives it its products.)
 
     For i64, an overflow is reported at the first addition that doesn't fit.
     """

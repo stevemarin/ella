@@ -1,4 +1,69 @@
-"""Multi-stage programming: code as values, made with `quote` and combined with `$`."""
+"""Multi-stage programming: code as values, made with `quote` and combined with `$`.
+
+`quote e` doesn't evaluate `e`: it gives the code of `e` as a value of type
+`Code[T]`, to run at a later stage. Inside a quote, `$c` (a *splice*)
+inserts the code `c` that is computed now, while the quote is built:
+
+    let power = (n: i64, x: Code[i64]) -> Code[i64] =>
+        if n == 0 then quote 1 else quote $x * $(power(n - 1, x))
+
+    power(2, quote y)      # the code  y * (y * 1)
+
+Code is numbered in *stages* (or levels): the program is stage 0, the body
+of a quote is one stage later, and a splice is one stage earlier. Quotes
+and splices nest without limit, in both directions:
+
+* `run(c)` runs code at the stage it is used in. In a running program,
+  that is how code built at run time runs (in the interpreters).
+* A splice outside any quote is stage -1: it runs *while compiling*, and
+  the code it gives becomes part of the program. `let cube = (x: i64) ->
+  i64 => $(power(3, quote x))` compiles to `x * (x * (x * 1))`. A splice
+  inside that splice runs earlier still, generating the compile-time code.
+
+A variable belongs to the stage it is bound in. It can be used in a later
+stage, where its value is carried along as a constant in the code
+("cross-stage persistence"): with `let n = 3`, `quote n + 1` is the code
+`3 + 1`. Only data can be carried, not functions (except top-level ones,
+which every stage can use) or values that can't be copied. Using a
+variable in an earlier stage than its own is an error: it doesn't exist
+yet. The checker enforces all of this (ella.checker).
+
+Building code (`build_code`) walks the quoted syntax tree. Variables bound
+inside the quote get fresh names (`x.4`), so that code spliced into other
+code can never capture the wrong variable ("hygiene"). Variables from
+earlier stages become constants (`reify`). Splices are replaced by the
+code they compute.
+
+Types are values too, for code that generates code from them: `type
+Point` is a `Type[Point]`. Inside a quote, `$t` in a type splices in the
+type `t` holds, and `v.$f` the field named by the string `f`; built-ins
+such as `fields(t)` look at a type (`reflect`). So a function can generate
+an equality test for any struct:
+
+    let derive_eq[T] = (t: Type[T]) -> Code[(T, T) -> bool] =>
+        quote (a: $t, b: $t) -> bool => $(all_equal(fields(t), quote a, quote b))
+
+Compiling a program with splices outside quotes first *expands* them
+(`expand`): it runs each with the AST interpreter, and replaces it with
+the syntax tree of the code it gives. The expanded program is then checked
+again and compiled like any other; `ella --expanded` shows it.
+
+
+Map
+---
+
+* `Tables`: the checker's tables, for code made at run time too.
+* Building code: `build_code`, `start_code`, `CodeBuilder` (fresh names,
+  constants, and splices of code, types and field names), `reify`,
+  `reify_type`, `splice_value`.
+* Reflection: `reflect` (`fields(t)`, ...), `new_struct`, `type_kind`, `type_from`.
+* `Expander`: `expand_program` (splices outside quotes), `run_while_checking`
+  (the checker's `compile_time`, for splices in types), and `write_constant`,
+  which computes a type's constant (`T.NAME`) once: a literal, or a global
+  made first (`constant_globals`). Editors compute them too.
+* `prepare`: check, expand, check again. Use it, not `checker.check`, to run
+  a program.
+"""
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace

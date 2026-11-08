@@ -1,4 +1,16 @@
-"""Building and running native executables."""
+"""Building and running native executables.
+
+    source --compile_program--> IR --optimize--> IR --codegen--> assembly
+    assembly + runtime.c --gcc--> executable
+
+gcc does the assembling and linking. The runtime is compiled once and the
+object file kept in the temporary directory, named by a hash of its source,
+so that building many programs (as the tests do) stays quick.
+
+
+`run_native` sets `ELLA_POISON`, so the runtime overwrites freed arena
+memory and a use after free shows up in the output.
+"""
 
 import hashlib
 import os

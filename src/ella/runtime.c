@@ -63,6 +63,18 @@
 // All values are 64-bit words. Numbers and bools are the word itself (an f64
 // is its raw bits); everything else is a pointer to one of the structs
 // below, which live in arenas (see "Arenas" below, and docs/memory-model.md).
+//
+// Map (search for the heading comments): Errors (`fail`, stack traces from
+// `ella_trace`, where each call puts its site at its call depth), Arenas (all
+// in one reserved address range, so an object's arena follows from its
+// address; bump allocated, freed by scope or pool slot, with finalization
+// lists), Strings, Lists and tuples (a list's or string's header points at its
+// items: right after it, or another's in a view; a tuple's are in it), Ranges,
+// Enums and closures, Generators, Equality (`ella_equal`), Text form
+// (`put_value`; both call a type's `text`, `eq`, `hash` methods through its
+// type descriptor and the generated `ella_call1`, `ella_call2`), and the
+// library (`ella_lib_NAME`,
+// which must match ella/library.py exactly).
 
 #include <errno.h>
 #include <fcntl.h>

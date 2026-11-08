@@ -1,4 +1,140 @@
-"""Static type checker: works out the type of every expression before the program runs."""
+"""Static type checker: works out the type of every expression before the program runs.
+
+Ella is statically typed. Function parameters and results are annotated, and
+the checker infers everything else, mostly by reading types off values: in
+`let x = 1 + 2`, `x` is an `i64` because `1 + 2` is.
+
+Some types can't be read off right away. An empty list `[]` is a list of
+something, and `None` is an `Optional` of something. For these the checker
+uses a *type variable*, a placeholder to be filled in later. Using the value
+then decides it:
+
+    let mut seen = []        # seen: [?1]
+    seen = seen + [5]        # [?1] must equal [i64], so ?1 is i64
+
+Making two types equal, filling in type variables as needed, is called
+*unification*, and it is the heart of the checker (`unify` below). A type
+variable that is never decided defaults to `()`.
+
+The checker doesn't change the syntax tree. It records what it learns in
+tables keyed by node, which the lowering to IR reads:
+
+* `types`: the type of every expression, binding, parameter and pattern.
+* `kinds`: what each name refers to: a "local" or "global" variable, a
+  "variant" without fields, a "constructor" of a variant with fields, or a
+  "builtin" function.
+
+The tables are keyed by `id(node)` (the node's identity) rather than by the
+node itself, since two separate nodes can be equal as values.
+
+Function bodies are checked last. A function may use top-level names defined
+after it, as long as it is called after they are defined, so its body is only
+checked once every top-level name's type is known. See `check_program`.
+
+The first error normally stops the check. Editors want every error, and the
+types of everything that could be checked, so they set `errors` to a list:
+each step of `check_program` (defining an enum, checking a top-level line or
+a function body, ...) then records its error and the check goes on. See
+`attempt`.
+
+
+Map
+---
+
+Types: `PrimTy`, `ListTy`, `TupleTy`, `FuncTy`, `EnumTy`, `BuiltinTy`
+(`Array`, `Code`, `Pool`, `Gen`, ...), `ParamTy` (a type parameter; one with
+an `item` is the "any" of an `Iter[T]` parameter), `TyVar` (not known yet),
+`SizeTy` (an array dimension), `DeferredTy` (known once quoted code is
+built). `finish` fills in decided type variables (and erases array shapes);
+`show_type` writes a type as Ella does.
+
+Tables, all keyed by `id(node)`: `types`, `kinds`, and more for the lowering
+and the interpreters (`iterations`, `updates`, `shape_checks`,
+`result_shapes`, `wrappers`, ...: see `Checker.__init__`).
+
+`Checker`, by concern (method names to search for):
+
+* Unification: `fresh`, `unify`, `bind`, `occurs`, `expect`, `join`, `known`.
+* Names: `lookup`, `bind_name`, `private`, `visible` (code of a module other
+  than the entry file gets the built-ins even if the entry file defines the
+  names, by the span's file).
+* Definitions: `annotation`, `declare_enum`, `define_enum`, `define_method`,
+  `define_constraint`, `resolve_constraint`, `check_required_fields`.
+* The program: `check_program` (the order of everything), `check_line`,
+  `attempt` (records an error and goes on, for editors), `finish_checks`,
+  `warn_unused`, `check_main`.
+* Expressions: `check_expr` (one `match` over every node), `binary_type`,
+  `compare_type`, `member_type`, `check_try`, `check_place`, `item_update`.
+* Functions: `lambda_type`, `check_lambda`, `capture`, `check_body`.
+* Calls: `check_call`, `check_function_call`, `check_args`,
+  `check_member_call`, `check_namespace_call`, `extension_method`,
+  `method_type`, `operator_method`, `check_exclusive` (`mut` arguments),
+  `check_builtin`, `library_call`, `check_alloc`, `wrap`.
+* Generics and constraints: `instantiate`, `unmet`, `implementation_of`,
+  `constant_type`, `needs_type_args`, `require_constraint`; `satisfies`
+  (module level).
+* Arrays and shapes: `array_operation`, `array_shapes`, `array_index`,
+  `param_shapes`, `shape_check`, `sure_shape`, `bind_sizes`.
+* Stages: `at_stage`, `check_stage`, `splice_now`, `check_now`.
+* Loops: `loop_item`, `iterator_item`, `iteration`, `expect_iterables`,
+  `settle_iterable`, `find_loop`. Patterns: `check_pattern`.
+
+After the class: `check_copies` and `CopyChecker` (nocopy values), and small
+helpers on syntax (`names_used`, `pattern_names`, ...) and on types
+(`has_mutable`, `is_nocopy`, ...).
+
+Features
+--------
+
+* Lambdas other than top-level functions and methods may leave out types:
+  they get type variables, and their bodies (checked later, like every
+  function's) are checked early when `known` needs a type they may decide.
+* `print`, `len` and constructors used as values get a small lambda calling
+  them (`wrappers`), which the lowering makes into a function.
+* `mut` arguments: their rules, and their exclusivity check.
+* Stages: each variable's level. Splices in types run while checking,
+  through `compile_time` (set by `staging.Expander`).
+* Constraints. Built-in ones (`CONSTRAINTS`), some with constants: `T.ZERO`,
+  `T.ONE`, `T.MIN`, `T.MAX` of `Zero`, `One`, `Bounded`
+  (`BUILTIN_CONSTANTS`), which built-in types have built in
+  (`values.BUILTIN_CONSTANT_VALUES`) and other types implement.
+  User-defined ones are met by `implements`, can require others
+  (`constraint_closure`), and have constants, read as `T.NAME`
+  (`associated_constants`), whose value each type's implementation gives
+  (`implementation_constants`): compile-time code computed once by
+  `staging.Expander.write_constant` and written in as a literal. The
+  lowering inlines it in each specialization; the interpreter binds a
+  generic function's type arguments (`with_type_args`) to find it. They
+  also have fields (`constraint_fields`), read on a type parameter's value
+  by name (`param_fields`), whose position the lowering finds per type.
+  Default methods: ella.defaults.
+* Protocols: `update` (an assignment line through an item of such a type
+  becomes code that calls it, `updates`, which the interpreters and the
+  lowering run instead); `text`, `eq` and `hash` (a type's text form for
+  `print`, its `==`, and its hash; `eq` needs `hash`).
+* Generators: a lambda with `yield` (`syntax.is_generator`). How each `for`
+  loops is in `iterations`. "Any" over an `Iter[T]` parameter is a
+  `ParamTy` with an `item`, whose uses `settle_iterable` checks and whose
+  loops the lowering decides per specialization (`iteration`).
+* nocopy values (`check_copies`). A call giving a `Gen`, an `Iter[T]`
+  parameter and a `for` without `mut` take their nocopy arguments: new
+  values, or variables given away at their last use (`give_away`).
+* Array shapes (`Array[f64; N, 3]`: `SizeTy`, `array_dims`). Where the
+  checker can't be sure of one, a `ShapeCheck` (`shape_checks`, by Lambda
+  for its parameters and by Let; `result_shapes`), which the backends run
+  through the hidden library function `match_shape` (`HIDDEN_LIBRARY`),
+  defining size names as `i64` variables.
+* `LIBRARY`: the library functions' types (`GENERIC_LIBRARY`: those generic
+  over Num or Eq). `REFLECTION`: the built-ins on types.
+* `warnings`: problems that don't stop a program: unused local variables,
+  parameters and top-level functions, `mut` variables that never change
+  (`warn_unused`, skipped after an error), code after a line of type never,
+  and cases that never match (ella.exhaustive).
+
+Must match: a library function needs its type in `LIBRARY`, its code in
+`library.call`, `ella_lib_NAME` in runtime.c, and its name in the VS Code
+grammar (test/test_vscode.py checks the built-in functions).
+"""
 
 import dataclasses
 from collections.abc import Callable, Iterable, Sequence
@@ -595,6 +731,7 @@ class PendingBody:
 ERROR = EnumTy("Error")
 NUM_T = ParamTy("T", CONSTRAINTS["Num"])
 EQ_T = ParamTy("T", CONSTRAINTS["Eq"])
+# Each one also needs its code in library.call, `ella_lib_NAME` in runtime.c, and its name in the VS Code grammar.
 LIBRARY: dict[str, FuncTy] = {
     "to_f64": FuncTy((NUM_T,), F64),
     "to_f32": FuncTy((NUM_T,), F32),

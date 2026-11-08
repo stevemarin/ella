@@ -1,4 +1,58 @@
-"""Modules and imports: a program's files, linked into one program (docs/grammar.md §3)."""
+"""Modules and imports: a program's files, linked into one program (docs/grammar.md §3).
+
+A file is a module, named by its path from the *root*, the entry file's
+directory: `geo/poly.ella` is the module `geo.poly`. Imports not found
+from the root are found from each directory of the *package path* in turn
+(`--path` and the ELLA_PATH environment variable, `package_path`), as if
+it were the root: a *package* is a module found there, with the modules
+below it. The standard library's modules are files in src/ella/lib, found
+last; their public names are the *prelude*, which every module sees
+without importing them.
+
+Linking (`link`) loads the modules the entry file uses, directly or not:
+the ones it imports, and the library modules whose prelude names it uses.
+It makes them one program, in the order their code runs (a module's
+imports first), so the later stages don't need to know about modules. For
+that, every top-level name in the program is made different:
+
+* A module's top-level names get its name in front: `area` in `geo.ella`
+  is `geo.area`, and so are its variants (`geo.Circle`) and types
+  (`geo.Shape`). The entry file's names stay as they are, so a program of
+  one file is unchanged.
+* Every name that refers to a top-level name becomes that name, whichever
+  way it is written: `area` in `geo.ella` itself, `geo.area` (parsed as a
+  member of `geo`), `p.area` with `import geo as p`, or `map` from the
+  prelude (`lists.map`). The linker keeps track of local variables, which
+  hide top-level names, as the checker does.
+
+Each module's spans have its file (`geo/poly.ella`, `<std>/maps.ella`, and
+a package's module by its path from the root, `../libs/json.ella`), so
+that errors say where they are. A bare name left in a module other than
+the entry file is a built-in (the linker reports any other name it doesn't
+know), so the checker and the interpreter give such code the built-ins
+even if the entry file has a top-level name like `len` (see their
+`lookup`). This is also where privacy (names starting with `_`) and
+read-only imported variables are checked; private fields and methods are
+checked by the checker, which knows the types of values.
+
+
+Map
+---
+
+* `link`: the entry point; `staging.prepare` and the interpreter's `run`
+  call it. `Linker` takes more options, for editors (ella.analysis).
+* `Linker`: finds and loads modules (`package_path`, `library_module`,
+  `prelude`, `find_root` for editors).
+* `Resolver`: one module's code. It gives top-level names their linked names
+  (`top_name`), tracks local scopes (`Scope`), and checks privacy
+  (`check_private`) and read-only imports (`check_changeable`). A type
+  defined inside a function gets a name of its own (`f#S`; `bare_name`
+  prints `S`) and is moved to the top level in front of it (`local_name`).
+* Map and set literals (`syntax.MapLit`, `SetLit`) become calls of the
+  library's `map_of` and `set_of` here.
+* `visible`: which private names one module may use of another. Values print
+  with bare type names (`bare_name`).
+"""
 
 import os
 from collections.abc import Callable, Sequence

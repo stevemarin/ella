@@ -1,4 +1,40 @@
-"""mem2reg: promote local slots to SSA values."""
+"""mem2reg: promote local slots to SSA values.
+
+The lowering keeps every variable in a slot, so `x = x + 1` reads and writes
+memory:
+
+    %1: i64 = load x
+    %2: i64 = add %1, %3
+    store x, %2
+
+After this pass, slots are gone. Each `load` is replaced by the value last
+stored to the slot, and nothing else needs to change: `%2` simply *is* the
+new value of x. That form, where every value is defined once and variables
+are just names for a series of values, is SSA ("static single assignment").
+
+The interesting part is where paths join. In
+
+    let mut x = 0
+    while x < 10
+        x += 1
+
+the loop header can be reached with x = 0 (from before the loop) or with
+x = %2 (from the end of the body). The header gets a block parameter for x,
+and each jump into it passes the value x has on that path:
+
+    entry:      jump while(%zero)
+    while(%x):  ... lt %x, %ten ...
+    body:       %2 = add %x, %one
+                jump while(%2)
+
+To find a slot's value at the start of a block, look at its predecessors:
+with one predecessor, it's the value at that predecessor's end; with
+several, add a block parameter and ask each predecessor for its value. This
+is the algorithm of Braun et al., "Simple and Efficient Construction of
+Static Single Assignment Form" (2013), on a complete control-flow graph.
+It can add parameters that turn out to receive the same value on every
+path; `remove_trivial_params` takes those away again.
+"""
 
 from itertools import count
 

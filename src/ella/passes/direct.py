@@ -1,4 +1,26 @@
-"""Direct calls: call a known function by name instead of through a function value."""
+"""Direct calls: call a known function by name instead of through a function value.
+
+The lowering calls every function through a value: a top-level function is
+a global holding a closure, read with `global_get`, and a function's own
+name (for recursion) makes a closure of it:
+
+    %4: (i64) -> i64 = global_get fib
+    %6: i64 = call %4(%5)
+
+When the value is known to be a closure that captures nothing, the call can
+name its function instead, which needs no closure and lets inlining
+(ella.passes.inline) see what is called:
+
+    %6: i64 = call_direct fib(%5)
+
+A global is known to hold a function when the program sets it exactly once,
+to a closure that captures nothing, before any of the program's code runs:
+the top-level functions are set first thing in the entry function
+(docs/grammar.md §3), and one that can be assigned to, or is bound by more
+than one `let`, is set again later. Its `global_get`s then can't fail, and
+become the closure itself, which is static data. The `closure` and
+`global_get` instructions the calls no longer use are left for dce.
+"""
 
 from collections import Counter
 

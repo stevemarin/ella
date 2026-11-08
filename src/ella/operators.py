@@ -1,4 +1,22 @@
-"""Ella's operators on run-time values, shared by every interpreter."""
+"""Ella's operators on run-time values, shared by every interpreter.
+
+The AST interpreter and the IR interpreter both call these functions, so that
+`7 // -2`, an out-of-range index or an i64 overflow behave (and fail, with the
+same message) identically however a program is run.
+
+Each function takes the operator's source span, used for the error message
+if the operation fails.
+
+
+Arrays (`ArrayValue`) work item by item here: broadcasting shapes, slices,
+and `array_offset` for `a[i, j]`. Their library functions are in
+ella.library; `total` and `dot` add in four sums (`library.lane_sum`). `f32`
+and `i32` values are `F32` and `I32` (ella.values).
+
+Must match runtime.c exactly, error messages included. Only float results of
+arrays may differ, in their last bits, natively (FMA, other orders:
+docs/grammar.md §9); i64 and i32 results and errors may not.
+"""
 
 import math
 from collections.abc import Callable

@@ -1,4 +1,23 @@
-"""Syntax tree for Ella, as produced by the parser."""
+"""Syntax tree for Ella, as produced by the parser.
+
+Nodes are frozen dataclasses grouped into three unions: `Expr`, `Pattern` and
+`TypeExpr` (type annotations as written, not checked types). Later stages
+`match` over them. Every node has a `span`: where it starts, or for infix and
+postfix nodes, where the operator is.
+
+Nodes keep only what later stages need. Punctuation, keywords and layout are
+gone, and a few conveniences are already rewritten: `x |> f(a)` arrives here
+as the call `f(x, a)`, and `-5` as the literal -5.
+
+`show` renders any node as a compact S-expression, for tests and the CLI.
+For example, `let x = 1 + 2 * 3` is shown as `(let [x] (+ 1 (* 2 3)))`.
+
+
+`MapLit` and `SetLit` (`{k: v}`, `{x}`) only live until linking, which makes
+them calls of the library's `map_of` and `set_of`. `is_hidden` tells apart the
+names the parser makes up (`#i`, `Iter#i`); `is_generator` says whether a
+lambda has a `yield`.
+"""
 
 import json
 from collections.abc import Callable

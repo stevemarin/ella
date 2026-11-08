@@ -1,4 +1,41 @@
-"""Exhaustiveness: do a `match`'s cases cover every value of its subject's type?"""
+"""Exhaustiveness: do a `match`'s cases cover every value of its subject's type?
+
+The checker calls `missing` once all types are known. It returns an example
+of a value that no pattern matches, written like a pattern (`Some(None)`,
+`(false, _)`), or None if every value is matched. The same check makes sure
+that the patterns of `let` and `for` match every value.
+
+This is the classic algorithm for ML-style patterns (Maranget, "Warnings
+for pattern matching", 2007), simplified. The patterns are rows of a
+matrix, with a column for each value still to be matched; at first there
+is one column, the subject. Looking at the first column:
+
+* If its type has a fixed set of *constructors* (an enum's variants, the
+  one shape of a struct or tuple, `true` and `false`) and the patterns name
+  every one of them, each constructor is tried in turn: keep the rows that
+  can match it, with its fields' patterns in place of the column.
+  Wildcards match every constructor, with wildcards for the fields.
+* Otherwise (some constructor isn't named, or the type has no fixed set,
+  like `i64` or `str`), only the rows starting with a wildcard can match
+  the values that aren't named. The example is one of those values,
+  followed by whatever those rows miss in the other columns.
+
+With no columns left, a value is missed if no rows are left either. Cases
+with a guard don't count, since the guard may be false; literals other
+than `true` and `false`, and ranges, never cover their whole type.
+
+`redundant` uses the same matrix the other way round, to find the cases
+that can never match: a case is *useful* if some value it matches isn't
+matched by the unguarded cases before it. A wildcard is tried against
+each constructor when the rows name them all, and otherwise against the
+values they don't name. A literal is only covered by a wildcard or the
+same literal, and a range only by a wildcard, so a case they cover in some
+other way (`case 1` after `case 0..5`) isn't reported.
+
+
+Never-matching cases become warnings (`Checker.warnings`), which the CLI
+prints and editors show.
+"""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass

@@ -1,4 +1,47 @@
-"""What an editor needs to know about a program: its errors, what each name in it is, and what could be typed next."""
+"""What an editor needs to know about a program: its errors, what each name in it is, and what could be typed next.
+
+The language server (ella.lsp) runs these functions in a worker process, so
+they take source text and give plain data: `analyze` gives the errors and
+the symbols, `complete` the completions at a position. Positions are lines
+and columns from 1, counting characters, as in spans.
+
+Unlike `ella FILE`, which stops at the first error, an analysis keeps going:
+
+* The lexer stops at its first error, so `tokenize_leniently` patches the
+  text and tries again: it closes unclosed brackets and strings at the end
+  of their line, and blanks out a stray `)` or bad character. The patches
+  never move the program's own text, so positions stay right.
+* The parser makes `()` of each line with an error (`parse_partial`).
+* The checker records the error of each top-level line, enum or function
+  body, and goes on (`Checker.errors`). Errors in a top-level line the
+  parser had trouble with aren't shown: they likely follow from the parse error.
+
+Splices outside quotes are expanded only when everything else is right, as
+`prepare` would, to find errors in the code they make.
+
+A file is analyzed as the entry file of a program, linked with the modules
+it imports (ella.modules), found from its root: the directory between the
+file's and the editor's workspace folder they are found from
+(`find_root`). Their files are read from the editor's open documents if they are
+open, so that a change shows in the files that import it before it is
+saved. An error in an imported module is shown at the import line that
+leads to it. A file without `main` or other top-level code than
+definitions is taken to be a module, so its unused public functions, which
+other modules may use, aren't reported.
+
+A *symbol* is a name in the source (or an operator), with what the checker
+knows of it: text to show on hover (its type), where it is defined, and its
+kind for highlighting (a semantic token type, as LSP names them). Each comes
+from a syntax tree node, at the token its span points to.
+
+
+Map: `analyze` and `complete` are the entry points; `Place` says where the
+source is (its path, the workspace root, the open documents' text).
+`Checked` parses and checks as far as possible; `Symbols` finds the symbols;
+`follow_edits` moves them to follow edits between analyses (for ella.lsp).
+`Checker.scopes` gives each name's scope, for completions. Editors skip the
+methods that only call a constraint's default (`defaults.calls_default`).
+"""
 
 import io
 import re

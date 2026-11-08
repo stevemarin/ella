@@ -1,4 +1,34 @@
-"""Moves: remove copies of values that nothing else uses."""
+"""Moves: remove copies of values that nothing else uses.
+
+Copying is Ella's semantics (docs/memory-model.md §3): `let mut b = a`
+gives b its own copy of a's list, so that changing b can't change a. The
+lowering inserts a `copy` wherever a value might otherwise be shared:
+
+    %1: [i64] = list %a, %b @0      # let a = [x, y]
+    %2: [i64] = copy %1 @0          # let mut b = a
+    set_index %2, %i, %v @0         # b[0] = 5
+
+If nothing uses the original after the copy, nobody can tell the copy from
+the original, so the copy can be dropped and the original *moved* into
+its place. Here, once mem2reg has turned the variables into values, `%1`
+has no other use, and `%2` can simply be `%1`.
+
+This pass does that in the simplest safe case:
+
+* the copy is the original's only use,
+* it is in the same block after the source, or control flow proves that the
+  source dominates the copy and the copy postdominates the source; cross-block
+  cases that can cross a loop are excluded, and
+* the original is made entirely of new objects, so no part of it is shared
+  with anything else. A list of numbers or strings, a call's result, or an
+  earlier copy qualifies; a list of lists built from variables doesn't,
+  since its items may belong to those variables. Constants count as new:
+  they are static, so a tuple of a number and a string constant can be
+  made where its copy would be, and still share the constant.
+
+The original is then made in the copy's region. The copy must still be its
+only use, so this optimization does not need general liveness analysis.
+"""
 
 from ella.checker import ListTy
 from ella.ir import (

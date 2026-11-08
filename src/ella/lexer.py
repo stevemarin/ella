@@ -1,4 +1,48 @@
-"""Tokenizer: turns Ella source text into a flat list of tokens."""
+"""Tokenizer: turns Ella source text into a flat list of tokens.
+
+The tokenizer (or lexer) is the first stage of the compiler. It reads the
+source one character at a time and groups characters into tokens: names,
+keywords, numbers, operators and so on. The parser then works on tokens and
+never has to think about characters, spaces or comments.
+
+Two parts of Ella need more than grouping characters:
+
+* **Layout.** Indentation defines blocks, as in Python. The tokenizer turns
+  line structure into three extra tokens: NEWLINE at the end of each line,
+  INDENT when a line is indented deeper than the one before, and DEDENT for
+  each level it moves back out. For example:
+
+      if x then          KEYWORD NAME KEYWORD NEWLINE
+          print(x)       INDENT NAME OP NAME OP NEWLINE
+      done()             DEDENT NAME OP OP NEWLINE
+
+  To the parser, INDENT and DEDENT act like the `{` and `}` of other languages.
+  Inside `(` and `[` brackets, line breaks are ignored, which is how a long
+  expression continues over several lines.
+
+* **String interpolation.** A string like `"Hi, {{name}}!"` contains an
+  expression. Instead of one token, the tokenizer produces pieces, with
+  ordinary tokens for the expression in the middle:
+
+      STRING_START  STRING_TEXT("Hi, ")  INTERP_START  NAME(name)  INTERP_END
+      STRING_TEXT("!")  STRING_END
+
+See docs/grammar.md §1 (lexical structure) and §2 (layout).
+
+
+Map
+---
+
+* `Span`: line, column, and a file: "" for the entry file, else the module's
+  path from it (`geo/poly.ella`), or `<std>/NAME.ella` for the standard library.
+* `EllaError`: the one exception type, a message and a span. A run-time one
+  also has its stack trace, a list of `CallSite`s set by `traced`; `format`
+  prints it with the trace.
+* `TokenKind`, `Token`, `tokenize(source, file)`.
+
+Must match: `KEYWORDS` and the keywords of
+editors/vscode/syntaxes/ella.tmLanguage.json (test/test_vscode.py checks).
+"""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -149,6 +193,7 @@ class Token:
     value: TokenValue = None
 
 
+# Must match the keywords of editors/vscode/syntaxes/ella.tmLanguage.json (test/test_vscode.py checks).
 KEYWORDS = frozenset({
     "and", "as", "assert", "break", "case", "comptime", "constraint", "continue", "else", "enum", "false", "for",
     "const", "if", "implements", "import", "in", "let", "loop", "match", "mut", "nocopy", "not", "or", "quote", "return",

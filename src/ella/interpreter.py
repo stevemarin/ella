@@ -1,4 +1,56 @@
-"""Tree-walking interpreter: runs a program by evaluating its syntax tree directly."""
+"""Tree-walking interpreter: runs a program by evaluating its syntax tree directly.
+
+This is stage 2 of the roadmap. It defines what Ella programs mean: it is
+the reference for the language's behavior, and the other backends must give
+the same output and errors (test/test_programs.py runs every program through
+all of them). It is also the compile-time evaluator for splices
+(`run_compile_time`, `compile_time`).
+
+The core is `Interpreter.eval(expr, scope)`, one `match` over every kind of
+expression. Each case evaluates the parts of the node (recursively, with
+`eval`) and combines them. Variables live in `Scope`s (see ella.values),
+chained from the innermost block out to the global scope.
+
+Control flow that jumps out of the middle of an evaluation (`break`,
+`continue`, `return` and `?`) is done with Python exceptions. For example,
+`break` raises BreakSignal, which unwinds through any nested `eval` calls
+until the loop it belongs to catches it.
+
+A generator's body runs on a thread of its own (`Generator`), so that it
+can stop at a `yield` in the middle of any expression and carry on later.
+Only one thread runs at a time: `next` hands control to the body's thread
+and waits until it yields or finishes, and `yield` hands it back. The body
+has an owner stack of its own (see "Finalizers"), which `next` puts in
+place while it runs.
+
+It copies eagerly (`copy_value` on every read), passes `mut` arguments in
+and out (value-result: `evaluate_place`, `read_place`, `write_place`), and
+finalizes values through owners, one per call and loop iteration (`adopt`,
+`close_owner`, `finalize`; the "Finalizers" section).
+
+Map
+---
+
+Methods of `Interpreter`:
+
+* Running: `run`, `run_program`, `declare_top_level`.
+* Expressions: `eval`, `eval_block`, `binary`, `compare`, `eval_try`,
+  `eval_assign`, `item`, `set_item`.
+* Names: `lookup`, `lookup_mutable`, `visible`, `capture`.
+* Calls: `call`, `call_with_args`, `call_closure`, `run_closure`,
+  `call_member`, `find_method`, `trace` (stack traces). Generics:
+  `with_type_args`, `bound_type`, `associated_constant`, `constant_value`,
+  `compute_constant`.
+* Protocols: `text`, `custom_equal`, `custom_hash`.
+* Generators: `make_generator`, `resume`, `run_generator`, `yield_value`,
+  `close_generator`, `call_next`, `advance`.
+* Pools and arenas: `new_pool`, `pool_slot`, `new_arena`, `arena_slot`, `call_pool`.
+* Staging: `quote`, `builtin_reflect`, `builtin_run`, `run_code`, `run_compile_time`.
+* Shapes: `check_shapes`, `check_shape`. Patterns: `match_pattern`,
+  `eval_match`. Loops: `eval_for`, `run_loop_body`, `items_of`.
+* Built-ins: `builtin_print`, `builtin_eprint`, `builtin_len`,
+  `builtin_library`, `make_array`.
+"""
 
 import sys
 import threading
