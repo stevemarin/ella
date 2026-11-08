@@ -4,11 +4,17 @@ What's being worked on, what's next, and the known rough edges. The
 detailed notes (implementation plans, design reasoning, and a log of
 finished work) are in [TODO-Claude.md](TODO-Claude.md).
 
-*Last reviewed 2026-11-07.*
+*Last reviewed 2026-11-08.*
 
 ## In progress
 
 Nothing right now. The last pieces finished:
+
+- Default methods in constraints: a constraint's method can have a body,
+  which every type implementing it gets unless it defines its own, so
+  types share behavior without inheritance.
+- Fields in constraints: a constraint can require fields (`x: f64`),
+  which each implementing struct has and its defaults can use.
 
 - A built-in `Zero` constraint: generic code reads `T.ZERO` (`0`, `""`,
   `[]`, or a type's own `const ZERO`), so `sum(xs)` needs no start value

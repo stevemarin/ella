@@ -1,0 +1,12 @@
+# A constraint with defaults, which can use the module's private names.
+
+constraint Shape
+    area: (Self) -> f64
+    describe = (s: Self) -> str => "area {{_rounded(s.area())}}"
+
+struct Unit
+    n: i64
+    implements Shape
+        area = (_u: Unit) -> f64 => 1.0
+
+let _rounded = (x: f64) -> i64 => to_i64(x)

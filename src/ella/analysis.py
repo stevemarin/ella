@@ -31,6 +31,7 @@ from ella.checker import (
     show_type,
     substitute,
 )
+from ella.defaults import calls_default, is_default
 from ella.lexer import KEYWORDS, STD, EllaError, Span, Token, TokenKind, tokenize
 from ella.modules import LIBRARY_DIR, Linker, Module, find_root, package_path, prelude, read_file
 from ella.parser import parse_partial
@@ -49,6 +50,7 @@ from ella.syntax import (
     Loop,
     Match,
     Member,
+    Method,
     Name,
     NamedType,
     NamePattern,
@@ -614,7 +616,12 @@ LOCAL_TYPE = re.compile(r"[\w.]+#(?:\d+#)?(\w+)")
 
 
 def walk(node: object) -> Iterator[object]:
-    """A syntax tree node and every node inside it, parents first."""
+    """A syntax tree node and every node inside it, parents first.
+
+    Leaves out the methods that call a constraint's default (ella.defaults), which the program doesn't write.
+    """
+    if isinstance(node, Method) and calls_default(node):
+        return
     yield node
     for part in parts(node):
         yield from walk(part)
@@ -697,6 +704,10 @@ class Symbols:
         match node:
             case Name(name) | Param(name) if is_hidden(name):
                 pass  # a pattern parameter's (`#0`), which the program doesn't write
+            case Name(name, span) if is_default(name):
+                self.default_call(name, span)
+            case Binding(name) if is_default(name):
+                pass  # a default method's function: its constraint shows the method
             case Name(name, span) if id(node) in self.checker.resolved:
                 info = self.checker.resolved[id(node)]
                 kind = "" if name == "return" else name_kind(info, self.checker)  # `return` in `where` is a keyword
@@ -743,6 +754,13 @@ class Symbols:
                 for method in methods:
                     hover = f"{name}.{method.name}: {self.show_annotation(method)}"
                     self.add(checked.token_at(method.span), hover, "method", ("declaration",))
+                for field_param in node.fields:
+                    hover = f"{name}.{field_param.name}: {self.show_annotation(field_param)}"
+                    self.add(checked.token_at(field_param.span), hover, "property", ("declaration",))
+                for default in node.defaults:
+                    t = self.checker.constraint_own_methods.get(name, {}).get(default.name)
+                    hover = f"{name}.{default.name}: {'?' if t is None else show_type(t)}"
+                    self.add(checked.token_at(default.span), hover, "method", ("declaration",))
                 for constant in node.constants:
                     assert constant.type is not None
                     hover = f"{name}.{constant.name}: {show(constant.type)}"
@@ -866,6 +884,8 @@ class Symbols:
                     ("declaration",),
                 )
         for method in enum.methods:
+            if calls_default(method):
+                continue
             t = info.methods.get(method.name) if info is not None else None
             hover = f"{enum.name}.{method.name}: {'?' if t is None else show_type(t)}"
             self.add(checked.token_at(method.span), hover, "method", ("declaration",))
@@ -899,6 +919,9 @@ class Symbols:
         elif id(node) in self.checker.members and isinstance(owner, EnumTy):
             hover = f"{owner.name}.{name}: {self.show(node)}"
             self.add(token, hover, "property", (), self.field_location(owner.name, name))
+        elif id(node) in self.checker.param_fields and isinstance(owner, ParamTy):
+            hover = f"{show_type(owner)}.{name}: {self.show(node)}"
+            self.add(token, hover, "property", (), self.constraint_field_location(owner, name))
 
     def method_location(self, owner: Type | None, name: str) -> Location | None:
         match owner:
@@ -908,10 +931,42 @@ class Symbols:
                         return self.checked.locate(method.span, name)
             case ParamTy(_, constraints):
                 for constraint in sorted(constraints):
-                    for param in self.constraints[constraint].methods if constraint in self.constraints else ():
-                        if param.name == name:
-                            return self.checked.locate(param.span, name)
+                    for required in sorted(self.checker.constraint_closure.get(constraint, {constraint})):
+                        if (where := self.constraint_method_location(required, name)) is not None:
+                            return where
         return None
+
+    def constraint_method_location(self, constraint: str, name: str) -> Location | None:
+        """Where a constraint's own method is: a requirement, or a default."""
+        definition = self.constraints.get(constraint)
+        if definition is None:
+            return None
+        spans = [m.span for m in definition.methods if m.name == name] + [
+            m.span for m in definition.defaults if m.name == name
+        ]
+        return self.checked.locate(spans[0], name) if spans else None
+
+    def constraint_field_location(self, owner: ParamTy, name: str) -> Location | None:
+        """Where a type parameter's field is required: in one of its constraints, or a parent of one."""
+        for constraint in sorted(owner.constraints):
+            for required in sorted(self.checker.constraint_closure.get(constraint, {constraint})):
+                definition = self.constraints.get(required)
+                for field_param in definition.fields if definition is not None else ():
+                    if field_param.name == name:
+                        return self.checked.locate(field_param.span, name)
+        return None
+
+    def default_call(self, name: str, span: Span) -> None:
+        """`Shape.describe`, a constraint's default method called as a function: the constraint, then the method."""
+        checked = self.checked
+        constraint, _, method = name.rpartition("#.")
+        token = checked.token_at(span)
+        self.add(token, f"constraint {constraint}", "interface")
+        dot = None if token is None else checked.after(token.span)
+        method_token = None if dot is None else checked.after(dot.span)
+        t = self.checker.constraint_own_methods.get(constraint, {}).get(method)
+        hover = f"{constraint}.{method}: {'?' if t is None else show_type(t)}"
+        self.add(method_token, hover, "method", (), self.constraint_method_location(constraint, method))
 
     def constant_location(self, constraint: str, name: str) -> Location | None:
         """Where a constraint's constant is declared: in it, or in the parent it comes from."""

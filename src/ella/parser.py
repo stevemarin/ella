@@ -72,6 +72,7 @@ from ella.syntax import (
     While,
     WildcardPattern,
     Yield,
+    is_method_type,
     iter_param,
     parts,
 )
@@ -1331,7 +1332,9 @@ class Parser:
         return Method(name.text, self.parse_expr(), name.span)
 
     def parse_constraint(self) -> ConstraintDef:
-        """`constraint Name[: Parent + ...]`, followed by method and constant requirements."""
+        """`constraint Name[: Parent + ...]`, followed by method, field and constant requirements, and default methods.
+
+        A requirement whose type is a function taking Self first is a method; any other is a field."""
         token = self.advance()
         name = self.expect_kind(TokenKind.NAME, "a constraint name")
         parents: list[str] = []
@@ -1344,10 +1347,20 @@ class Parser:
         self.expect_kind(TokenKind.INDENT, "an indented list of requirements")
         methods: list[Param] = []
         constants: list[Param] = []
+        defaults: list[Method] = []
+        fields: list[Param] = []
         while True:
             if self.at_kind(TokenKind.DEDENT):
                 self.advance()
-                return ConstraintDef(name.text, tuple(methods), token.span, tuple(parents), tuple(constants))
+                return ConstraintDef(
+                    name.text,
+                    tuple(methods),
+                    token.span,
+                    tuple(parents),
+                    tuple(constants),
+                    tuple(defaults),
+                    tuple(fields),
+                )
             if self.accept("const"):
                 constant = self.expect_kind(TokenKind.NAME, "a constant name")
                 if any(item.name == constant.text for item in constants):
@@ -1356,11 +1369,18 @@ class Parser:
                 constants.append(Param(constant.text, self.parse_type(), constant.span))
                 self.end_of_line()
                 continue
-            method = self.expect_kind(TokenKind.NAME, "a method name")
-            if any(m.name == method.text for m in methods):
+            method = self.expect_kind(TokenKind.NAME, "a method or field name")
+            if any(m.name == method.text for m in methods) or any(m.name == method.text for m in defaults):
                 raise EllaError(f"'{method.text}' is already a method of {name.text}", method.span)
+            if any(f.name == method.text for f in fields):
+                raise EllaError(f"'{method.text}' is already a field of {name.text}", method.span)
+            if self.accept("="):
+                defaults.append(Method(method.text, self.parse_expr(), method.span))
+                self.end_of_line()
+                continue
             self.expect(":")
-            methods.append(Param(method.text, self.parse_type(), method.span))
+            requirement = Param(method.text, self.parse_type(), method.span)
+            (methods if is_method_type(requirement.type) else fields).append(requirement)
             self.end_of_line()
 
     def parse_variant(self) -> Variant:

@@ -2,7 +2,7 @@
 
 The working notes behind [TODO.md](TODO.md), which is the short,
 human-readable version: keep the two in step. This file records where
-Ella stands (as of 2026-11-06), the gaps found, plans in progress with
+Ella stands (as of 2026-11-08), the gaps found, plans in progress with
 their implementation notes, and a log of finished rounds of work. It
 complements [README-Claude.md](README-Claude.md) (design and feature
 status), the open questions in
@@ -34,7 +34,9 @@ types defined inside functions, and the built-in `Zero` (`T.ZERO`, so
 for generic arithmetic on structs; pattern parameters, and `Iter[T]`
 parameters (anything a loop can go through, also for `map` and
 `filter`); `iters` in the prelude for lazy chains (`iters.map`, `take`,
-`collect`), and giving away non-copyable variables at their last use.
+`collect`), and giving away non-copyable variables at their last use;
+default methods and fields in constraints (types share behavior and data
+without inheritance).
 `make check` passes (1602 tests, ruff, strict mypy).
 
 | Area | State |
@@ -150,7 +152,8 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 - The AST interpreter runs each generator on a thread of its own, so
   recursion through thousands of generators is slow there.
 - Constraints can require other constraints and constants (`constraint
-  Monoid: Semigroup` with `const EMPTY: Self`, read as `T.EMPTY`), but not
+  Monoid: Semigroup` with `const EMPTY: Self`, read as `T.EMPTY`), fields,
+  and give default methods, but not
   operators beyond the built-in constraints', or associated types, and
   constants can't be used in types (`Array[f64; T.SIZE]`). Built-in types
   can't implement user-defined constraints, and `Num` is only met by the
@@ -397,6 +400,80 @@ runtime; new functions with fixed types are cheap to add that way.
    errors from imports at the import line, finds definitions in other
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
+
+### Done (2026-11-08): default methods in constraints
+
+A way to write a base type and start other types from it, without
+inheritance (grammar.md §9, "Default methods"). Extension by copying a
+struct's definition (`struct Circle extends Shape`, re-checked with
+`Circle` for `Shape`) was considered first and dropped: private fields of a
+base in another module, copied methods that build or match a `Shape` by its
+constructor (which can't fit a type with more fields), and enums gaining
+variants (copied `match`es no longer exhaustive, or silently falling into
+`case _`) each needed rules of their own. A default sees only its
+constraint's interface, so none of that comes up.
+
+1. **Syntax.** A constraint's line `name = lambda` is a default
+   (`ConstraintDef.defaults`, Methods); the linker resolves them with
+   `Self` a type, and `Shape.describe` (also `geo.Shape.describe`) as a
+   path to the constraint.
+2. **Expansion** (src/ella/defaults.py, `expand_defaults`, run at the end
+   of linking and by `checker.check` for unlinked programs; idempotent):
+   each default becomes a generic top-level function `Shape#.describe[Self:
+   Shape]` right after its constraint (`default_function`), and each type
+   implementing the constraint (or one requiring it) without its own method
+   gets one calling it (`calling_default`: `Self` replaced by the type in
+   the signature). `Shape.describe` becomes the function's name. Errors
+   here: two defaults of one name for a type that doesn't define it, an
+   ambiguous `C.name`, a constraint without that default, local types.
+   The linker gives each module its expanded body, which editors use.
+3. **Checker.** `define_constraint` takes a default's type from its
+   annotations (`default_type`; all needed, `Self` first) as one of the
+   constraint's methods, so `implements` checks overrides, and type
+   parameters have it (`method_type`). `resolve_constraint` rejects a
+   default for a parent's method (`constraint_defaults`). The function is
+   checked once, as a generic function, so it can use only what the
+   constraint gives; it isn't reported as unused (`is_default`).
+4. Nothing else changed: the interpreters, lowering and backends see a
+   generic function and ordinary methods. A run-time error in a default
+   shows `called at <default's line> in Type.name` in its trace.
+5. Editors: hover and definition for defaults, for `x.describe()` on a type
+   parameter (through the constraint's closure) and for `Shape.describe`;
+   the methods calling defaults are left out of symbols (`calls_default`).
+6. Tests: test programs `constraint_defaults`, `constraint_default_error`
+   and `constraint_default_modules/`, and test_parser, test_checker and
+   test_analysis cases.
+
+Open: defaults for a parent's methods.
+
+### Done (2026-11-08, second round): fields in constraints
+
+So defaults can read and change shared data without an accessor method in
+each type (grammar.md §9, "Fields"). Adding the constraint's fields to each
+implementing struct by themselves was considered and dropped: constructors
+and patterns are positional, so they would depend on fields the struct
+doesn't show. The struct writes them; the constraint checks them.
+
+1. **Syntax.** A requirement whose type is a function taking `Self` first
+   is a method, any other a field (`syntax.is_method_type`, in the parser:
+   `ConstraintDef.fields`). Before, the other kinds were an error, so no
+   program changes meaning.
+2. **Checker.** `constraint_own_fields`, flattened with the parents' into
+   `constraint_fields` by `resolve_constraint` (same type for one name; not
+   also a method or constant; not private). `implements` checks them
+   (`check_required_fields`: structs only, the field by name, its exact
+   type with `Self` the struct; a missing field with a function type hints
+   that a method takes `Self` first). `member_type` gives a type
+   parameter's field (and so `check_place` lets `mut` code change it),
+   recording its name in `param_fields`, since its position depends on the
+   type.
+3. **Lowering.** `field_position`: a `param_fields` member's position is
+   found in the concrete struct of the specialization. The tree
+   interpreter reads fields by name, so needed nothing.
+4. Editors: hover for a constraint's fields and for `p.x` on a type
+   parameter, with its definition in the constraint (or a parent).
+5. Tests: test program `constraint_fields`, and test_parser, test_checker
+   and test_analysis cases.
 
 ### Done (2026-11-07, fourth round): `Sub`, `Mul`, `Neg`, `One` and `Bounded`
 

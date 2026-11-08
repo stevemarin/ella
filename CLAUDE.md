@@ -89,7 +89,9 @@ plain:
   `implementation_constants`, compile-time code computed once by
   `staging.Expander.write_constant` and written in as a literal; the
   lowering inlines it in each specialization, and the interpreter binds a
-  generic function's type arguments, `with_type_args`, to find it), the
+  generic function's type arguments, `with_type_args`, to find it; and
+  fields, `constraint_fields`, read on a type parameter's value by name,
+  `param_fields`, whose position the lowering finds per type), the
   `update` protocol (an assignment
   line through an item of such a type becomes code that calls it,
   `updates`, which the interpreters and lowering run instead), the `text`, `eq` and `hash` protocols (a type's text form
@@ -114,6 +116,13 @@ plain:
   functions, and `mut` variables that never change (`warn_unused`, skipped
   after an error), code after a line of type never, and cases that never
   match.
+* `src/ella/defaults.py`: constraints' default methods. `expand_defaults`
+  (run at the end of linking, and by `checker.check`; idempotent) makes each
+  a generic function (`Shape#.describe[Self: Shape]`, `default_name`, after
+  its constraint), gives each implementing type without its own method one
+  calling it (`calling_default`; editors skip those, `calls_default`), and
+  turns `Shape.describe` into the function's name. The checker types a
+  default from its annotations as one of the constraint's methods.
 * `src/ella/exhaustive.py`: whether patterns cover every value of a type
   (`match` cases, and `let`/`for` patterns), with an example of one they
   miss, and which `match` cases can never match. The checker runs it once

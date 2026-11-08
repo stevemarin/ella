@@ -1185,7 +1185,7 @@ class Lowerer:
                 return self.lower_associated_constant(expr, dest)
             case Member(target):
                 struct = self.lower(target)
-                position = self.checker.members[id(expr)]
+                position = self.field_position(expr, struct.type)
                 if isinstance(struct.type, TupleTy):
                     item = self.emit("tuple_get", self.type_of(expr), [struct], span, index=position)
                     self.info[item.id] = self.info_of(struct)
@@ -1469,7 +1469,7 @@ class Lowerer:
         t = self.type_of(node)
         where = span or node.span
         if isinstance(node, Member):
-            return self.field(container, self.checker.members[id(node)], t, where), region
+            return self.field(container, self.field_position(node, container.type), t, where), region
         assert key is not None
         if isinstance(key, list):
             return self.array_item(container, key, t, where), region
@@ -1499,13 +1499,21 @@ class Lowerer:
         if isinstance(node, Member):
             enum = container.type
             assert isinstance(enum, EnumTy)
-            index = self.checker.members[id(node)]
+            index = self.field_position(node, enum)
             self.block.instrs.append(
                 Instr("set_field", None, [container, value], where, enum.name, index, region=region)
             )
         else:
             assert key is not None and not isinstance(key, list)
             self.emit_effect("set_index", [container, key, value], where, region=region)
+
+    def field_position(self, member: Member, struct: Type) -> int:
+        """Which field (or tuple item) `.name` is. On a type parameter's value (a constraint's field), that
+        depends on the type it stands for here."""
+        if (name := self.checker.param_fields.get(id(member))) is not None:
+            assert isinstance(struct, EnumTy)
+            return self.module.enums[struct.name].field_names.index(name)
+        return self.checker.members[id(member)]
 
     def field(self, struct: Value, index: int, t: Type, span: Span) -> Value:
         """A struct's field, borrowed."""

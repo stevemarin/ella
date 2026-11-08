@@ -166,7 +166,13 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
 * **Generics and constraints.** Generic functions with built-in
   constraints (`Eq`, `Ord`, `Add`, `Num`, ...) and user-defined ones
   (`constraint Shape`), which a type meets only by declaring
-  `implements Shape`. Constraints can require others
+  `implements Shape`. A constraint can require fields (`x: f64`, which
+  each implementing struct has; generic code reads them by name, its
+  position found per specialization, `param_fields`), and give default
+  methods, which each
+  implementing type gets unless it has its own (src/ella/defaults.py makes
+  each a generic function, `Shape#.describe`, and gives types methods
+  calling it). Constraints can require others
   (`constraint Ranked: Named + Ord`) and constants (`const EMPTY: Self`,
   read in generic code as `T.EMPTY`, computed once at compile time), also
   through a struct's own type parameters (`struct Acc[T: Monoid]`). The

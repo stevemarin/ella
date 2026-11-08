@@ -1,0 +1,13 @@
+# A run-time error in a default method, called through a type's method.
+
+constraint Listed
+    items: (Self) -> [i64]
+    first = (x: Self) -> i64 => x.items()[0]
+
+struct Empty
+    n: i64
+    implements Listed
+        items = (_e: Empty) -> [i64] => []
+
+let main = () -> () =>
+    print(Empty(1).first())

@@ -312,6 +312,16 @@ struct Meters
         const UNIT = Meters(1.0)
 assert to_unit(Meters(3.0)) == 9.0 and to_unit(Meters(0.5)) == 1.0
 
+# a constraint's method can have a body, a default, which each type that
+# implements it gets unless it has its own; Self is the type
+constraint Scaled: Sized
+    length = (x: Self) -> f64 => x.length2() ** 0.5
+struct Feet
+    ft: f64
+    implements Scaled
+        length2 = (f: Feet) -> f64 => f.ft * f.ft
+assert Feet(-2.0).length() == 2.0 and Scaled.length(Feet(3.0)) == 3.0
+
 # protocol methods: get and set give v[k], iter gives `for`, contains gives `in`
 struct Row
     cells: [str]

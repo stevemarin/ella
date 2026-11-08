@@ -1,0 +1,109 @@
+# Default methods in constraints (docs/grammar.md §9, "Default methods").
+
+constraint Shape
+    area: (Self) -> f64
+    name: (Self) -> str
+    describe = (s: Self) -> str => "{{s.name()}} of area {{s.area()}}"
+    bigger = (a: Self, b: Self) -> bool => a.area() > b.area()
+
+struct Square
+    side: f64
+    implements Shape
+        area = (s: Square) -> f64 => s.side * s.side
+        name = (_s: Square) -> str => "square"
+
+# Circle's own describe replaces the default, and adds to it.
+struct Circle
+    r: f64
+    implements Shape
+        area = (c: Circle) -> f64 => 3.0 * c.r * c.r
+        name = (_c: Circle) -> str => "circle"
+        describe = (c: Circle) -> str => "circle with r = {{c.r}}, {{Shape.describe(c)}}"
+
+# Generic code calls each type's method: its own, or the default.
+let largest[T: Shape] = (xs: [T]) -> str =>
+    let mut best = xs[0]
+    for x in xs
+        if x.bigger(best) then
+            best = x
+    best.describe()
+
+print(Square(2.0).describe())
+print(Circle(1.0).describe())
+print(Circle(1.0).bigger(Circle(2.0)))
+print(largest([Square(1.0), Square(3.0), Square(2.0)]))
+print(largest([Circle(1.0), Circle(0.5)]))
+
+# A default can be mut, and read the constraint's constants.
+constraint Counter
+    count: (Self) -> i64
+    bump: (mut Self, i64) -> ()
+    const START: i64
+    twice = (mut c: Self) -> () =>
+        mut c.bump(1)
+        mut c.bump(1)
+    since_start = (c: Self) -> i64 => c.count() - Self.START
+
+struct Tally
+    n: i64
+    implements Counter
+        count = (t: Tally) -> i64 => t.n
+        bump = (mut t: Tally, by: i64) -> () =>
+            t.n += by
+        const START = 10
+
+struct Bag[T]
+    items: [T]
+    implements Counter
+        count = (b: Bag[T]) -> i64 => len(b.items)
+        bump = (mut _b: Bag[T], _by: i64) -> () => ()
+        const START = 0
+
+let mut t = Tally(10)
+mut t.twice()
+print(t, t.since_start())
+let mut bag = Bag(["x", "y"])
+mut bag.twice()
+print(bag, bag.since_start())
+
+# Defaults use what the constraints they come with give (here Ord's `>`), and come along with them.
+constraint Ranked: Ord
+    score: (Self) -> i64
+    best = (a: Self, b: Self) -> Self => if a > b then a else b
+
+constraint Labeled: Ranked
+    label: (Self) -> str
+    show = (x: Self) -> str => "{{x.label()}} ({{x.score()}})"
+
+struct Player
+    nick: str
+    points: i64
+    compare = (a: Player, b: Player) -> i64 => a.points - b.points
+    implements Labeled
+        score = (p: Player) -> i64 => p.points
+        label = (p: Player) -> str => p.nick
+
+let ann = Player("ann", 3)
+let bob = Player("bob", 5)
+print(ann.best(bob).show())
+print(Ranked.best(ann, bob), Labeled.best(bob, ann))
+print(Labeled.show(ann))
+
+# Two constraints with defaults of one name: the type defines it, and can call either.
+constraint Loud
+    shout = (_x: Self) -> str => "HEY"
+
+constraint Polite
+    shout = (_x: Self) -> str => "excuse me"
+
+enum Voice
+    Low
+    High
+    implements Loud
+    implements Polite
+    shout = (v: Voice) -> str =>
+        match v
+            case Low => Polite.shout(v)
+            case High => Loud.shout(v)
+
+print(Low.shout(), High.shout())

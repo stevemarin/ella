@@ -1,0 +1,13 @@
+import shapes
+
+# A type in another module gets the defaults of the constraint it implements.
+struct Sq
+    side: f64
+    implements shapes.Shape
+        area = (s: Sq) -> f64 => s.side * s.side
+
+let total[T: shapes.Shape] = (xs: [T]) -> str => xs.map((x) => x.describe()).join(", ")
+
+print(Sq(3.0).describe(), shapes.Unit(0).describe())
+print(shapes.Shape.describe(Sq(2.0)))
+print(total([Sq(1.0), Sq(1.5)]))

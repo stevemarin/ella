@@ -1,0 +1,97 @@
+# Fields in constraints (docs/grammar.md §9, "Fields"): each struct that implements the
+# constraint has them, wherever they are among its fields, and generic code reads and changes them.
+
+constraint Shape
+    x: f64
+    y: f64
+    area: (Self) -> f64
+    move = (mut s: Self, dx: f64, dy: f64) -> () =>
+        s.x += dx
+        s.y += dy
+    describe = (s: Self) -> str => "area {{s.area()}} at ({{s.x}}, {{s.y}})"
+
+struct Circle
+    r: f64
+    x: f64
+    y: f64
+    implements Shape
+        area = (c: Circle) -> f64 => 3.0 * c.r * c.r
+
+struct Rect
+    x: f64
+    y: f64
+    w: f64
+    h: f64
+    implements Shape
+        area = (r: Rect) -> f64 => r.w * r.h
+
+let leftmost[T: Shape] = (xs: [T]) -> f64 =>
+    let mut best = xs[0].x
+    for s in xs
+        if s.x < best then
+            best = s.x
+    best
+
+let shift_all[T: Shape] = (mut xs: [T], dx: f64) -> () =>
+    for i in 0..len(xs)
+        xs[i].x += dx
+
+let mut c = Circle(2.0, 0.0, 0.0)
+mut c.move(1.0, 1.0)
+print(c.describe())
+let mut rs = [Rect(5.0, 0.0, 1.0, 1.0), Rect(-2.0, 3.0, 2.0, 2.0)]
+print(leftmost(rs))
+shift_all(mut rs, 10.0)
+print(rs)
+print(rs[1].describe())
+
+# Shared data grouped in a struct, required as one field; fields come with a parent constraint.
+struct Pos
+    x: f64
+    y: f64
+
+constraint Placed
+    at: Pos
+    nudge = (mut s: Self, dx: f64) -> () =>
+        s.at.x += dx
+
+constraint Named: Placed
+    name: str
+    tag = (s: Self) -> str => "{{s.name}}@{{s.at.x}}"
+
+struct Ship
+    name: str
+    fuel: f64
+    at: Pos
+    implements Named
+
+struct Crate[T]
+    at: Pos
+    name: str
+    items: [T]
+    implements Named
+
+let mut ship = Ship("argo", 1.0, Pos(0.0, 0.0))
+mut ship.nudge(2.5)
+print(ship.tag(), ship)
+let mut crate = Crate(Pos(1.0, 1.0), "box", [1, 2])
+mut crate.nudge(1.0)
+print(crate.tag())
+let names[T: Named] = (xs: [T]) -> [str] => xs.map((x) => x.name)
+print(names([ship, Ship("b", 0.0, Pos(9.0, 9.0))]))
+
+# A field can hold the type itself.
+constraint Linked
+    value: i64
+    next: Optional[Self]
+    total = (x: Self) -> i64 =>
+        match x.next
+            case Some(rest) => x.value + rest.total()
+            case None => x.value
+
+struct Node
+    value: i64
+    next: Optional[Node]
+    implements Linked
+
+print(Node(1, Some(Node(2, Some(Node(3, None))))).total())

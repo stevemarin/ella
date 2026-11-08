@@ -29,7 +29,7 @@ def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
     assert [".".join(line.path) for line in program.imports] == ["lists", "iters", "maps.new_map"]
-    assert len(program.body) == 163
+    assert len(program.body) == 166
 
 
 # Precedence (docs/grammar.md §8)
@@ -513,6 +513,31 @@ def test_methods_and_constraints() -> None:
         "(struct MyType value: i64 (implements Lookup (get (lambda (m: MyType, s: str) -> i64 (. m value)))))"
     )
     assert one("p.area()") == "(call (. p area))"
+
+
+def test_default_methods() -> None:
+    source = 'constraint Shape\n    area: (Self) -> f64\n    describe = (s: Self) -> str => "x"'
+    assert one(source) == '(constraint Shape area: (Self) -> f64 (default describe (lambda (s: Self) -> str "x")))'
+    source = "constraint C: Ord\n    twice = (mut c: Self) -> () =>\n        mut c.tick()\n    tick: (mut Self) -> ()"
+    assert one(source) == (
+        "(constraint C (requires Ord) tick: (mut Self) -> () "
+        "(default twice (lambda (mut c: Self) -> () (block (call (. (mut c) tick))))))"
+    )
+    assert error("constraint A\n    f: (Self) -> i64\n    f = (s: Self) -> i64 => 1").message == (
+        "'f' is already a method of A"
+    )
+    assert error("constraint A\n    f = (s: Self) -> i64 => 1\n    f: (Self) -> i64").message == (
+        "'f' is already a method of A"
+    )
+
+
+def test_constraint_fields() -> None:
+    # A requirement is a method if its type is a function taking Self first, and a field otherwise.
+    source = "constraint S\n    x: f64\n    f: (i64) -> i64\n    area: (Self) -> f64\n    grow: (mut Self) -> ()"
+    assert (
+        one(source)
+        == "(constraint S (field x: f64) (field f: (i64) -> i64) area: (Self) -> f64 grow: (mut Self) -> ())"
+    )
 
 
 def test_composed_constraints_and_constants() -> None:

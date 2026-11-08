@@ -42,7 +42,9 @@ let main = () -> () =>
   where possible and when running otherwise, and `N` is a number you can
   loop to.
 * **A familiar feel.** Indentation-based syntax, everything is an
-  expression, exhaustive `match`, generics with constraints, methods,
+  expression, exhaustive `match`, generics with constraints (which can
+  require fields and give default methods, so types share data and
+  behavior without inheritance), methods,
   generators, modules, and a standard library written in Ella. Functions
   can take apart their arguments with patterns (`((a, b)) => a + b`), and
   `map` and `filter` go through anything a `for` loop can (lists, ranges,

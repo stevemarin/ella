@@ -201,6 +201,43 @@ def test_symbols_of_constants() -> None:
     assert found[5, 11].hover == "Monoid.EMPTY: Self"
 
 
+def test_symbols_of_default_methods() -> None:
+    source = (
+        "constraint Shape\n"  # 1
+        "    area: (Self) -> f64\n"  # 2
+        '    describe = (s: Self) -> str => "{{s.area()}}"\n'  # 3
+        "struct Sq\n"  # 4
+        "    side: f64\n"  # 5
+        "    implements Shape\n"  # 6
+        "        area = (s: Sq) -> f64 => s.side\n"  # 7
+        "let f[T: Shape] = (x: T) -> str => x.describe()\n"  # 8
+        "print(Sq(1.0).describe(), f(Sq(2.0)), Shape.describe(Sq(3.0)))\n"  # 9
+    )
+    assert problems(source) == []
+    found = symbols(source)
+    assert (found[3, 5].hover, found[3, 5].kind) == ("Shape.describe: (Self) -> str", "method")
+    assert (found[3, 17].hover, found[3, 17].kind) == ("s: Self", "parameter")
+    describe = Location(3, 5, 8)
+    assert (found[8, 38].hover, found[8, 38].definition) == ("T.describe: (T) -> str", describe)
+    assert (found[9, 15].hover, found[9, 15].definition) == ("Sq.describe: (Sq) -> str", describe)
+    assert (found[9, 39].hover, found[9, 39].kind) == ("constraint Shape", "interface")
+    assert (found[9, 45].hover, found[9, 45].definition) == ("Shape.describe: (Self) -> str", describe)
+
+
+def test_symbols_of_constraint_fields() -> None:
+    source = (
+        "constraint Placed\n"  # 1
+        "    x: f64\n"  # 2
+        "let f[T: Placed] = (p: T) -> f64 => p.x\n"  # 3
+        "struct Dot\n    x: f64\n    implements Placed\n"
+        "print(f(Dot(1.0)))\n"
+    )
+    assert problems(source) == []
+    found = symbols(source)
+    assert (found[2, 5].hover, found[2, 5].kind) == ("Placed.x: f64", "property")
+    assert (found[3, 39].hover, found[3, 39].definition) == ("T.x: f64", Location(2, 5, 1))
+
+
 def test_constraint_errors_dont_stop_analysis() -> None:
     source = "constraint A: Nope\n    f: (Self) -> i64\nconstraint B: B\n    g: (Self) -> i64\nlet x: i64 = 'a'\n"
     assert problems(source) == [

@@ -559,13 +559,20 @@ class EnumDef:
 
 @dataclass(frozen=True, slots=True)
 class ConstraintDef:
-    """A constraint's superconstraints, method signatures, and typed constants."""
+    """A constraint's superconstraints, method signatures, typed constants, default methods and fields.
+
+    A default (`describe = (s: Self) -> str => ...`) is given to each type that implements the
+    constraint and doesn't define the method itself (ella.defaults). A field (`x: f64`) is one that
+    each struct implementing it must have.
+    """
 
     name: str
     methods: tuple[Param, ...]
     span: Span
     parents: tuple[str, ...] = ()
     constants: tuple[Param, ...] = ()
+    defaults: tuple[Method, ...] = ()
+    fields: tuple[Param, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +678,15 @@ class Program:
 
 
 # Helpers
+
+
+def is_method_type(t: TypeExpr | None) -> bool:
+    """Whether a constraint's requirement of this type is a method, a function taking Self first; otherwise
+    it is a field."""
+    match t:
+        case FunctionType((NamedType("Self", ()), *_)):
+            return True
+    return False
 
 
 def bare_name(name: str) -> str:
@@ -921,13 +937,15 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
                 *(sexpr(v.name, *map(show, v.fields)) if v.fields else v.name for v in variants),
                 *show_methods(node),
             )
-        case ConstraintDef(name, methods, parents=parents, constants=constants):
+        case ConstraintDef(name, methods, parents=parents, constants=constants, defaults=defaults, fields=fields):
             return sexpr(
                 "constraint",
                 name,
                 *([sexpr("requires", *parents)] if parents else []),
+                *(sexpr("field", show_param(item)) for item in fields),
                 *map(show_param, methods),
                 *(sexpr("const", show_param(item)) for item in constants),
+                *(sexpr("default", m.name, show(m.function)) for m in defaults),
             )
         case Quote(body):
             return sexpr("quote", show(body))

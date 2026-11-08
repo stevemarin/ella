@@ -15,6 +15,7 @@ from ella.checker import (
     PRIMITIVE_NAMES,
     REFLECTION,
 )
+from ella.defaults import expand_defaults
 from ella.lexer import STD, EllaError, Span
 from ella.parser import parse
 from ella.syntax import (
@@ -272,7 +273,12 @@ class Linker:
         self.load(self.entry)
         body = tuple(expr for module in self.order for expr in module.body)
         modules = tuple((module.file, module.name) for module in self.order)
-        return replace(program, body=body, modules=modules, warnings=tuple(self.warnings))
+        linked = replace(program, body=body, modules=modules, warnings=tuple(self.warnings))
+        expanded = self.attempt(partial(expand_defaults, linked), linked)
+        if expanded is not linked:
+            for module in self.order:  # each module's code, with what expanding defaults changed or added
+                module.body = tuple(expr for expr in expanded.body if expr.span.file == module.file)
+        return expanded
 
     def attempt[T](self, step: Callable[[], T], otherwise: T) -> T:
         """Take a step of linking. When collecting errors, an error is recorded, and gives `otherwise`."""
@@ -767,6 +773,8 @@ class Resolver:
                         for const in expr.constants
                         if const.type is not None
                     ),
+                    tuple(Method(m.name, self.expr(m.function, inner), m.span) for m in expr.defaults),
+                    tuple(self.declared(f, inner) for f in expr.fields),
                 )
             case Quote(body, span):
                 self.quotes += 1
@@ -877,7 +885,7 @@ class Resolver:
             type_item = self.module.top.get(node.name)
             if (local := scope.type_name(node.name)) is not None:  # a local type, or a type parameter: `T.ZERO`
                 result: Expr = Name(local, node.span)
-            elif type_item is not None and type_item.kind == "enum":
+            elif type_item is not None and type_item.kind in ("enum", "constraint"):  # `Shape.describe(x)`
                 result = Name(type_item.name, node.span)
             else:
                 self.linker.extension_function(members[-1].name, members[-1].span)
@@ -886,7 +894,9 @@ class Resolver:
         else:
             item, taken = found
             value = (
-                item.name if item.kind == "enum" and taken < len(path) else self.use_value(item, path[taken - 1][1])
+                item.name
+                if item.kind in ("enum", "constraint") and taken < len(path)
+                else self.use_value(item, path[taken - 1][1])
             )
             result = Name(value, path[taken - 1][1])
         for member in members[taken - 1 :]:

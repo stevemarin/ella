@@ -1557,8 +1557,8 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 ### User-defined constraints **(provisional syntax)**
 
 A program can define its own constraints: the methods a type must have, with
-`Self` standing for the type, and constants it must give. A type meets one by
-saying so, with `implements`:
+`Self` standing for the type, the fields it must have, and constants it must
+give. A type meets one by saying so, with `implements`:
 
 ```ella
 constraint Shape
@@ -1687,6 +1687,125 @@ print(fold_all(none))                 # Sum(0)
   (`struct Bag[T]` with `implements Monoid`).
 * A struct or enum defined inside a function can give constants too, as
   long as the constraint has no methods it would have to give.
+
+**Default methods (provisional).** A constraint's method can have a body: a
+*default*, which every type that implements the constraint gets unless it
+defines that method itself. Defaults are how types share behavior; there
+is no inheritance, and a type is never another type.
+
+```ella
+constraint Shape
+    area: (Self) -> f64
+    name: (Self) -> str
+    describe = (s: Self) -> str => "{{s.name()}} of area {{s.area()}}"
+    bigger = (a: Self, b: Self) -> bool => a.area() > b.area()
+
+struct Square
+    side: f64
+    implements Shape
+        area = (s: Square) -> f64 => s.side * s.side
+        name = (_s: Square) -> str => "square"
+
+struct Circle
+    r: f64
+    implements Shape
+        area = (c: Circle) -> f64 => 3.14159 * c.r * c.r
+        name = (_c: Circle) -> str => "circle"
+        describe = (c: Circle) -> str => "circle, r = {{c.r}}"
+
+print(Square(2.0).describe())              # square of area 4.0
+print(Circle(1.0).describe())              # circle, r = 1.0
+print(Circle(1.0).bigger(Circle(2.0)))     # false
+```
+
+* A default is written with `Self` for the type, and is checked once,
+  where it is written, as a generic function of a `Self` that meets the
+  constraint. So it can use only what the constraint gives: its methods
+  (required or default), its constants (`Self.EMPTY`), and what the
+  constraints it requires give (`>` in a default of `constraint Ranked:
+  Ord`), including its fields (below). It can't make a `Self` with a
+  constructor, or match one, since it doesn't know the type.
+* A type that implements the constraint has the default as a method of its
+  own, `x.describe()`, and so does a type parameter with the constraint in
+  generic code. Each use is compiled for its type, like any generic
+  method, so a call in a default (`s.area()`) is a direct call of that
+  type's method: a type's own `describe` replaces the default everywhere,
+  including in other defaults that call it.
+* A type's own method of that name must have the default's type, with
+  `Self` replaced by the type. Anywhere, `Shape.describe(c)` calls the
+  default itself, so a type's own method can add to it rather than
+  replace it.
+* A constraint gives defaults only for its own methods, not for those of
+  the constraints it requires. A constraint that requires others has their
+  defaults too; if two of them give a default of the same name, a type
+  that implements both must define that method itself (and can call either:
+  `A.name(x)`), as must a type implementing two constraints that each give
+  one.
+* A type defined inside a function can't have methods, so it can't
+  implement a constraint with defaults.
+* A run-time error in a default shows the type's method in its stack
+  trace, called from the default's line: `called at 5:5 in Empty.first`.
+* A default can be `mut` (`(mut s: Self, ...) -> ()`), and is called as
+  `mut x.name(...)`, changing the value through the constraint's `mut`
+  methods.
+
+**Fields (provisional).** A constraint can require fields, written as in a
+struct. Each struct that implements it must have them, and generic code and
+defaults read and change them like any field:
+
+```ella
+constraint Shape
+    x: f64
+    y: f64
+    area: (Self) -> f64
+    move = (mut s: Self, dx: f64, dy: f64) -> () =>
+        s.x += dx
+        s.y += dy
+
+struct Circle
+    r: f64
+    x: f64
+    y: f64
+    implements Shape
+        area = (c: Circle) -> f64 => 3.14159 * c.r * c.r
+
+let mut c = Circle(2.0, 0.0, 0.0)
+mut c.move(1.0, 1.0)
+print(c)                                   # Circle(2.0, 1.0, 1.0)
+```
+
+* A requirement whose type is a function taking `Self` first
+  (`area: (Self) -> f64`, `grow: (mut Self) -> ()`) is a method; any other
+  (`x: f64`, `next: Optional[Self]`, `f: (i64) -> i64`) is a field.
+* A type implementing the constraint must be a struct, and have each field,
+  of that type (with `Self` replaced by the struct). The struct writes the
+  fields itself, so its definition still shows everything it holds and
+  its constructor takes; they can be anywhere among its fields, since they
+  are matched by name.
+* A required field can't be private (`_x`), since generic code anywhere
+  reads it.
+* Fields come along with the constraints that require their constraint, as
+  methods do; two constraints with a field of one name must give it the
+  same type.
+* Each use of generic code is compiled for its type, so `s.x` is that
+  struct's field, wherever it is in it.
+* To share more data, group it in a struct and require one field of it:
+
+  ```ella
+  struct Pos
+      x: f64
+      y: f64
+
+  constraint Placed
+      at: Pos
+      nudge = (mut s: Self, dx: f64) -> () =>
+          s.at.x += dx
+
+  struct Ship
+      name: str
+      at: Pos
+      implements Placed
+  ```
 
 ### Pools **(provisional syntax)**
 
@@ -2376,7 +2495,10 @@ implementation = "implements" path [ NEWLINE INDENT impl_item { NEWLINE impl_ite
 impl_item   = method | "const" IDENT "=" expr ;
 constraint  = "constraint" IDENT [ ":" path { "+" path } ]     (* the constraints it requires *)
               NEWLINE INDENT requirement { NEWLINE requirement } NEWLINE DEDENT ;
-requirement = IDENT ":" type | "const" IDENT ":" type ;
+requirement = IDENT ":" type                     (* a method if the type is a function taking Self first,
+                                                    else a field *)
+            | "const" IDENT ":" type
+            | method ;                           (* a default method *)
 mut_call    = "mut" operator_expr ;              (* a method call: `mut s.push(3)` *)
 quote       = "quote" body ;
 splice      = "$" ( IDENT | "(" expr ")" | block ) ;

@@ -1053,6 +1053,165 @@ def test_constraint_composition_errors(source: str, message: str) -> None:
     assert error(source).message == message
 
 
+DESCRIBED = """\
+constraint Shape
+    area: (Self) -> f64
+    describe = (s: Self) -> str => "area {{s.area()}}"
+    twice = (s: Self) -> f64 => s.area() * 2.0
+struct Square
+    side: f64
+    implements Shape
+        area = (s: Square) -> f64 => s.side * s.side
+struct Dot
+    n: i64
+    implements Shape
+        area = (_d: Dot) -> f64 => 0.0
+        describe = (_d: Dot) -> str => "a dot"
+"""
+
+
+def test_default_methods() -> None:
+    assert type_of(DESCRIBED + "Square(1.0).describe()") == "str"
+    assert type_of(DESCRIBED + "Dot(1).twice()") == "f64"
+    assert type_of(DESCRIBED + "let f[T: Shape] = (x: T) -> str => x.describe()\nf(Dot(1))") == "str"
+    assert binding_type(DESCRIBED + "let r = Shape.describe(Dot(1))", "r") == "str"
+    # A default comes with the constraints that require its constraint.
+    assert (
+        type_of(
+            DESCRIBED + "constraint Big: Shape\n    size: (Self) -> i64\nstruct B\n    n: i64\n    implements Big\n"
+            "        area = (_b: B) -> f64 => 9.0\n        size = (b: B) -> i64 => b.n\nB(1).twice()"
+        )
+        == "f64"
+    )
+    # Its function isn't reported as unused when no type uses it.
+    assert check(parse("constraint A\n    f = (_s: Self) -> i64 => 1\n")).warnings == []
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            DESCRIBED + "constraint A\n    d = (s: Self) -> f64 => s.side",
+            "Self has no field 'side' (its constraints don't have one)",
+        ),
+        (
+            (
+                "constraint A\n    d = (s: Self) -> i64 => 1\nstruct P\n    y: f64\n    implements A\n"
+                '        d = (p: P) -> str => "x"'
+            ),
+            "P doesn't implement A: its method 'd' is (P) -> str, not (P) -> i64",
+        ),
+        (
+            (
+                "constraint A\n    d = (_s: Self) -> i64 => 1\nconstraint B\n    d = (_s: Self) -> i64 => 2\n"
+                "struct P\n    y: f64\n    implements A\n    implements B"
+            ),
+            "P must define 'd' itself: A and B each give a default for it",
+        ),
+        (
+            (
+                "constraint A\n    d = (_s: Self) -> i64 => 1\nconstraint B\n    d = (_s: Self) -> i64 => 2\n"
+                "constraint C: A + B\n    e: (Self) -> i64\nC.d(1)"
+            ),
+            "A and B each give a default 'd': say which",
+        ),
+        (
+            "constraint A\n    d: (Self) -> i64\nconstraint B: A\n    d = (_s: Self) -> i64 => 2",
+            "'d' is a method of A, so only A can give it a default",
+        ),
+        ("constraint A\n    d = (s) => 1", "parameter 's' of a default method needs a type"),
+        ("constraint A\n    d = (_s: Self) => 1", "default method 'd' needs a result type: '-> T'"),
+        ("constraint A\n    d = 5", "a default method is a function, like 'd = (x: Self) -> i64 => ...'"),
+        (
+            "constraint A\n    d = (x: i64) -> i64 => x",
+            "a default method takes Self first, like 'd = (x: Self) -> i64 => ...'",
+        ),
+        ("constraint A\n    d = (_s: Self) -> i64 => 1\nA.e(1)", "A has no default method 'e'"),
+        (
+            (
+                "constraint A\n    d = (_s: Self) -> i64 => 1\nlet f = () -> i64 =>\n    struct L\n        v: i64\n"
+                "        implements A\n    L(1).d()"
+            ),
+            "a type defined inside a function can't have methods, so it can't get A's default 'd'",
+        ),
+    ],
+)
+def test_default_method_errors(source: str, message: str) -> None:
+    with pytest.raises(EllaError) as info:
+        prepare(parse(source))
+    assert info.value.message == message
+    if "inside a function" not in message:  # local types are moved to the top level only by linking
+        assert error(source).message == message
+
+
+PLACED = """\
+constraint Placed
+    x: f64
+    y: f64
+    norm = (p: Self) -> f64 => p.x * p.x + p.y * p.y
+struct Dot
+    y: f64
+    x: f64
+    implements Placed
+"""
+
+
+def test_constraint_fields() -> None:
+    assert type_of(PLACED + "let f[T: Placed] = (p: T) -> f64 => p.x\nf(Dot(1.0, 2.0))") == "f64"
+    assert type_of(PLACED + "Dot(1.0, 2.0).norm()") == "f64"
+    source = (
+        PLACED + "let move[T: Placed] = (mut p: T) -> () =>\n    p.x += 1.0\nlet mut d = Dot(0.0, 0.0)\nmove(mut d)"
+    )
+    assert type_of(source) == "()"
+    # Fields come with the constraints that require their constraint, and may hold Self.
+    source = (
+        "constraint Linked\n    next: Optional[Self]\nconstraint Named: Linked\n    name: str\n"
+        "struct L\n    name: str\n    next: Optional[L]\n    implements Named\n"
+        "let second[T: Named] = (x: T) -> Optional[T] => x.next\nsecond(L('a', None))"
+    )
+    assert type_of(source) == "Optional[L]"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "constraint A\n    x: f64\nstruct P\n    y: f64\n    implements A",
+            "P doesn't implement A: it has no field 'x'",
+        ),
+        (
+            "constraint A\n    x: f64\nstruct P\n    x: i64\n    implements A",
+            "P doesn't implement A: its field 'x' is i64, not f64",
+        ),
+        (
+            "constraint A\n    x: f64\nenum E\n    One\n    implements A",
+            "E can't implement A: it requires a field 'x', and only structs have fields",
+        ),
+        (
+            "constraint A\n    _x: f64",
+            "a constraint's field can't be private, since generic code anywhere reads it: '_x'",
+        ),
+        (
+            "constraint A\n    x: f64\nconstraint B\n    x: i64\nlet f[T: A + B] = (v: T) -> f64 => v.x",
+            "the constraints A and B have different fields named 'x'",
+        ),
+        (
+            "constraint A\n    x: f64\nlet f[T: A] = (v: T) -> f64 => v.y",
+            "T has no field 'y' (its constraints don't have one)",
+        ),
+        (
+            "constraint A\n    x: f64\nconstraint B: A\n    x: i64",
+            "constraints B and A have different fields named 'x'",
+        ),
+        ("constraint A\n    x: f64\n    const x: i64", "'x' is both a field and a constant of A"),
+        ("constraint A\n    x: f64\n    x: i64", "'x' is already a field of A"),
+        ("constraint A\n    x: f64\n    x = (s: Self) -> f64 => 1.0", "'x' is already a field of A"),
+    ],
+)
+def test_constraint_field_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
 ADD_UP = "let add_up[T: Add + Zero] = (xs: [T]) -> T =>\n    let mut total = T.ZERO\n    for x in xs\n        total += x\n    total\n"
 MONEY = "struct M\n    c: i64\n    add = (a: M, b: M) -> M => M(a.c + b.c)\n"
 
@@ -1199,8 +1358,8 @@ def test_arithmetic_constraint_errors(source: str, message: str) -> None:
         (SHAPES + "let f[T: Shape] = (x: T) -> T => x + x", "'+' on T needs the constraint Add, like [T: Add]"),
         (SHAPES + "constraint Shape\n    area: (Self) -> i64", "there is already a constraint named Shape"),
         (
-            "constraint Bad\n    area: (i64) -> f64",
-            "a constraint's method is a function taking Self first, like 'area: (Self) -> i64'",
+            "constraint Bad\n    area: (i64) -> f64\nstruct S\n    n: i64\n    implements Bad",
+            "S doesn't implement Bad: it has no field 'area' (a method would take Self first: 'area: (Self, ...) -> ...')",
         ),
         (
             "let f = () -> () =>\n    constraint Bad\n        area: (Self) -> f64\n    ()",

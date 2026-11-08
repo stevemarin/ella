@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import count
 
+from ella.defaults import expand_defaults, is_default
 from ella.exhaustive import missing, redundant
 from ella.lexer import STD, EllaError, Span
 from ella.syntax import (
@@ -748,7 +749,7 @@ REFLECTION: dict[str, tuple[tuple[Type, ...], Type]] = {
 def check(program: Program) -> Checker:
     """Type check a program, returning the checker with its tables. Raises EllaError."""
     checker = Checker()
-    checker.check_program(program)
+    checker.check_program(expand_defaults(program))
     return checker
 
 
@@ -768,6 +769,7 @@ def check_code(code: Expr, program: Checker) -> Checker:
     checker.constraint_own_methods = dict(program.constraint_own_methods)
     checker.constraint_constants = dict(program.constraint_constants)
     checker.constraint_own_constants = dict(program.constraint_own_constants)
+    checker.constraint_fields = dict(program.constraint_fields)
     checker.constraint_closure = dict(program.constraint_closure)
     checker.type_implementations = dict(program.type_implementations)
     checker.implementation_constants = dict(program.implementation_constants)
@@ -785,6 +787,7 @@ def check_code(code: Expr, program: Checker) -> Checker:
         "kinds",
         "resolved",
         "members",
+        "param_fields",
         "methods",
         "extension_methods",
         "builtin_methods",
@@ -841,6 +844,11 @@ class Checker:
             name: dict(constants) for name, constants in BUILTIN_CONSTANTS.items()
         }
         self.constraint_own_constants: dict[str, dict[str, Type]] = {}
+        self.constraint_defaults: dict[str, frozenset[str]] = {}  # each constraint's own default methods
+        self.constraint_own_fields: dict[str, dict[str, Type]] = {}  # each constraint's own fields, with SELF
+        self.constraint_fields: dict[str, dict[str, Type]] = {}  # its fields and its parents', flattened
+        # `x.field` on a value of a type parameter -> the field's name; its position depends on the type.
+        self.param_fields: dict[int, str] = {}
         self.constraint_closure: dict[str, frozenset[str]] = {}
         self.type_implementations: dict[str, frozenset[str]] = {}
         self.implementation_constants: dict[tuple[str, str, str], Expr] = {}
@@ -1338,6 +1346,7 @@ class Checker:
                     f"{enum.name} doesn't implement {constraint}: it has no constant '{missing_constant}'",
                     implementation.span,
                 )
+            self.check_required_fields(enum, own, constraint, implementation.span)
             for name, required in required_methods.items():
                 actual = methods.get(name)
                 expected = substitute(required, {"Self": own})
@@ -1488,11 +1497,28 @@ class Checker:
                     method.span,
                 )
             methods[method.name] = t
+        for default in constraint.defaults:
+            methods[default.name] = self.default_type(default)
+        fields: dict[str, Type] = {}
+        for field_param in constraint.fields:
+            assert field_param.type is not None
+            if field_param.name.startswith("_"):
+                raise EllaError(
+                    f"a constraint's field can't be private, since generic code anywhere reads it: "
+                    f"'{field_param.name}'",
+                    field_param.span,
+                )
+            if field_param.name in methods:
+                raise EllaError(
+                    f"'{field_param.name}' is both a method and a field of {constraint.name}", field_param.span
+                )
+            fields[field_param.name] = self.annotation(field_param.type, {"Self": SELF})
         constants: dict[str, Type] = {}
         for const in constraint.constants:
             assert const.type is not None
-            if const.name in methods:
-                raise EllaError(f"'{const.name}' is both a method and a constant of {constraint.name}", const.span)
+            if const.name in methods or const.name in fields:
+                what = "method" if const.name in methods else "field"
+                raise EllaError(f"'{const.name}' is both a {what} and a constant of {constraint.name}", const.span)
             constants[const.name] = self.annotation(const.type, {"Self": SELF})
             self.check_writable(constants[const.name], const.name, const.span)
         if len(set(constraint.parents)) != len(constraint.parents):
@@ -1501,6 +1527,60 @@ class Checker:
         self.constraint_spans[constraint.name] = constraint.span
         self.constraint_own_methods[constraint.name] = methods
         self.constraint_own_constants[constraint.name] = constants
+        self.constraint_own_fields[constraint.name] = fields
+        self.constraint_defaults[constraint.name] = frozenset(default.name for default in constraint.defaults)
+
+    def default_type(self, default: Method) -> FuncTy:
+        """The type of a constraint's default method, from its annotations, with Self as SELF."""
+        function = default.function
+        if not isinstance(function, Lambda):
+            raise EllaError(
+                f"a default method is a function, like '{default.name} = (x: Self) -> i64 => ...'", default.span
+            )
+        untyped = next((param for param in function.params if param.type is None), None)
+        if untyped is not None:
+            raise EllaError(f"parameter '{untyped.name}' of a default method needs a type", untyped.span)
+        if function.return_type is None:
+            raise EllaError(f"default method '{default.name}' needs a result type: '-> T'", function.span)
+        written = FunctionType(
+            tuple(param.type for param in function.params if param.type is not None),
+            function.return_type,
+            function.span,
+            tuple(i for i, param in enumerate(function.params) if param.mutable),
+        )
+        t = self.annotation(written, {"Self": SELF})
+        if not isinstance(t, FuncTy) or not t.params or t.params[0] != SELF:
+            raise EllaError(
+                f"a default method takes Self first, like '{default.name} = (x: Self) -> i64 => ...'",
+                function.span,
+            )
+        return t
+
+    def check_required_fields(self, enum: EnumDef, own: EnumTy, constraint: str, span: Span) -> None:
+        """A struct implementing a constraint has each field it requires, of that type (with Self the struct)."""
+        required = self.constraint_fields.get(constraint, {})
+        if not required:
+            return
+        if not enum.struct:
+            first = next(iter(required))
+            raise EllaError(
+                f"{enum.name} can't implement {constraint}: it requires a field '{first}', and only structs have fields",
+                span,
+            )
+        actual = dict(zip(enum.field_names, self.variant_fields(own, enum.name)))
+        for name, required_type in required.items():
+            expected = substitute(required_type, {"Self": own})
+            if name not in actual:
+                hint = ""
+                if isinstance(required_type, FuncTy):
+                    hint = f" (a method would take Self first: '{name}: (Self, ...) -> ...')"
+                raise EllaError(f"{enum.name} doesn't implement {constraint}: it has no field '{name}'{hint}", span)
+            if finish(actual[name]) != finish(expected):
+                raise EllaError(
+                    f"{enum.name} doesn't implement {constraint}: its field '{name}' is "
+                    f"{show_type(actual[name])}, not {show_type(expected)}",
+                    span,
+                )
 
     def resolve_constraint(self, name: str, active: tuple[str, ...] = ()) -> frozenset[str]:
         """A user-defined constraint's closure: itself and every constraint it requires, directly or not.
@@ -1518,7 +1598,8 @@ class Checker:
         closure = {name}
         methods = dict(self.constraint_own_methods[name])
         constants = dict(self.constraint_own_constants[name])
-        origins = dict.fromkeys([*methods, *constants], name)  # the constraint each requirement comes from
+        fields = dict(self.constraint_own_fields[name])
+        origins = dict.fromkeys([*methods, *constants, *fields], name)  # the constraint each requirement comes from
         for parent in self.constraint_parents[name]:
             if parent in CONSTRAINTS:
                 closure |= {parent, *CONSTRAINTS[parent]}
@@ -1535,6 +1616,11 @@ class Checker:
                 known = ", ".join([*CONSTRAINTS, *self.constraint_parents])
                 raise EllaError(f"unknown parent constraint '{parent}'; the constraints are {known}", span)
             closure |= self.resolve_constraint(parent, (*active, name))
+            for method in sorted(self.constraint_defaults[name] & self.constraints[parent].keys()):
+                raise EllaError(
+                    f"'{method}' is a method of {bare_name(parent)}, so only {bare_name(parent)} can give it a default",
+                    span,
+                )
             for method, method_type in self.constraints[parent].items():
                 if methods.setdefault(method, method_type) != method_type:
                     raise EllaError(
@@ -1547,10 +1633,21 @@ class Checker:
                         f"constraints {origins[const]} and {parent} have different constants named '{const}'", span
                     )
                 origins.setdefault(const, parent)
+            for field_name, field_type in self.constraint_fields[parent].items():
+                if fields.setdefault(field_name, field_type) != field_type:
+                    raise EllaError(
+                        f"constraints {origins[field_name]} and {parent} have different fields named '{field_name}'",
+                        span,
+                    )
+                origins.setdefault(field_name, parent)
         if clash := next((const for const in constants if const in methods), None):
             raise EllaError(f"'{clash}' is both a method and a constant of {name}", span)
+        if clash := next((f for f in fields if f in methods or f in constants), None):
+            what = "method" if clash in methods else "constant"
+            raise EllaError(f"'{clash}' is both a {what} and a field of {name}", span)
         self.constraints[name] = methods
         self.constraint_constants[name] = constants
+        self.constraint_fields[name] = fields
         self.constraint_closure[name] = frozenset(closure)
         return self.constraint_closure[name]
 
@@ -1671,7 +1768,7 @@ class Checker:
             for binding in let.bindings:
                 name = binding.name.rpartition(".")[2]
                 reported = (not binding.span.file and not self.library) or name.startswith("_")
-                if id(binding) not in outside and binding.name != "main" and reported:
+                if id(binding) not in outside and binding.name != "main" and reported and not is_default(binding.name):
                     self.warnings.append(EllaError(f"function '{name}' is never used", binding.span))
 
     def declare_function(self, let: Let) -> None:
@@ -2416,6 +2513,22 @@ class Checker:
                 self.members[id(expr)] = index
                 return self.variant_fields(struct, struct.name)[index]
             raise EllaError(f"{struct.name} has no field '{expr.name}'", expr.span)
+        if isinstance(struct, ParamTy):
+            found = {
+                c: self.constraint_fields[c][expr.name]
+                for c in sorted(struct.constraints)
+                if expr.name in self.constraint_fields.get(c, {})
+            }
+            if len(set(found.values())) > 1:
+                raise EllaError(
+                    f"the constraints {' and '.join(found)} have different fields named '{expr.name}'", expr.span
+                )
+            if found:
+                self.param_fields[id(expr)] = expr.name
+                return substitute(next(iter(found.values())), {"Self": struct})
+            raise EllaError(
+                f"{show_type(struct)} has no field '{expr.name}' (its constraints don't have one)", expr.span
+            )
         raise EllaError(f"a {show_type(struct)} has no fields", expr.span)
 
     # Operators
