@@ -172,7 +172,7 @@ let squares = [3, 1, 2] |> map((n: i64) -> i64 => n * n)
 assert sort(squares) == [1, 4, 9] and reverse(squares) == [4, 1, 9]
 assert filter(squares, (n: i64) -> bool => n > 3) == [9, 4]
 let no_ages: Map[str, i64] = empty_map()
-assert lists.sum(squares, 0) == 14 and len(no_ages) == 0
+assert lists.sum(squares) == 14 and len(no_ages) == 0
 # map and filter go through anything a for loop can: lists, ranges, strings, generators
 assert map(0..3, n => n * 2) == [0, 2, 4] and filter("ella", c => c != "l") == ["e", "a"]
 # iters has lazy ones, which give generators; collect makes a list

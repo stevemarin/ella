@@ -259,7 +259,8 @@ CONSTRAINTS = {
     "Eq": frozenset({"Eq"}),  # `==`, `!=`, `in`
     "Ord": frozenset({"Ord", "Eq"}),  # `<`, `<=`, `>`, `>=`
     "Add": frozenset({"Add"}),  # `+`: numbers, strings and lists
-    "Num": frozenset({"Num", "Add", "Ord", "Eq"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: i64, f64 and f32
+    "Zero": frozenset({"Zero"}),  # `T.ZERO`: numbers, strings, lists, and types that implement it
+    "Num": frozenset({"Num", "Add", "Ord", "Eq", "Zero"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: the numbers
 }
 
 # The constraint each operator needs of a type parameter.
@@ -471,6 +472,10 @@ class EnumInfo:
 
 # `Self` in a constraint's methods: the type that meets it.
 SELF = ParamTy("Self")
+
+# The built-in constraints with constants (docs/grammar.md §9): a struct or enum meets one by implementing it,
+# giving the constants, and the built-in types that meet it have their values built in (`builtin_constant`).
+BUILTIN_CONSTANTS: dict[str, dict[str, Type]] = {"Zero": {"ZERO": SELF}}
 
 # The built-in enums, and the built-in struct `Error`. Variants' fields refer
 # to the type parameters. An Error's `at` is where it was made (docs/grammar.md
@@ -822,7 +827,9 @@ class Checker:
         self.constraint_parents: dict[str, tuple[str, ...]] = {}
         self.constraint_spans: dict[str, Span] = {}
         self.constraint_own_methods: dict[str, dict[str, FuncTy]] = {}
-        self.constraint_constants: dict[str, dict[str, Type]] = {}
+        self.constraint_constants: dict[str, dict[str, Type]] = {
+            name: dict(constants) for name, constants in BUILTIN_CONSTANTS.items()
+        }
         self.constraint_own_constants: dict[str, dict[str, Type]] = {}
         self.constraint_closure: dict[str, frozenset[str]] = {}
         self.type_implementations: dict[str, frozenset[str]] = {}
@@ -1302,7 +1309,7 @@ class Checker:
             for previous in implemented:
                 # Each constraint has one implementation, so its constants have one value.
                 shared = closure & self.constraint_closure.get(previous, frozenset({previous}))
-                if repeated := sorted(shared & self.constraint_parents.keys()):
+                if repeated := sorted(shared & (self.constraint_parents.keys() | BUILTIN_CONSTANTS.keys())):
                     via = "" if previous == repeated[0] else f" (through {previous})"
                     raise EllaError(f"{enum.name} already implements {repeated[0]}{via}", implementation.span)
             implemented.add(constraint)
@@ -1346,7 +1353,7 @@ class Checker:
                 # Checked once every top-level name has its type, as function bodies are.
                 self.pending_constants.append((constant, substitute(constant_type, {"Self": own})))
                 self.implementation_constants[enum.name, constraint, name] = constant.value
-            for builtin in closure & CONSTRAINTS.keys():
+            for builtin in closure & CONSTRAINTS.keys() - BUILTIN_CONSTANTS.keys():
                 if not satisfies(own, builtin, self.enums):
                     raise EllaError(
                         f"{enum.name} doesn't meet the built-in constraint {builtin} required by {constraint}",
@@ -1504,6 +1511,14 @@ class Checker:
         for parent in self.constraint_parents[name]:
             if parent in CONSTRAINTS:
                 closure |= {parent, *CONSTRAINTS[parent]}
+                for builtin in sorted(CONSTRAINTS[parent] & BUILTIN_CONSTANTS.keys()):
+                    for const, const_type in BUILTIN_CONSTANTS[builtin].items():
+                        if constants.setdefault(const, const_type) != const_type:
+                            raise EllaError(
+                                f"constraints {origins[const]} and {builtin} have different constants named '{const}'",
+                                span,
+                            )
+                        origins.setdefault(const, builtin)
                 continue
             if parent not in self.constraint_parents:
                 known = ", ".join([*CONSTRAINTS, *self.constraint_parents])
@@ -1825,11 +1840,20 @@ class Checker:
         they require.
         """
         t = finish(t)
-        if constraint not in self.constraint_parents or not isinstance(t, EnumTy):
-            return None if satisfies(t, constraint, self.enums) else ""
+        if (constraint not in self.constraint_parents and constraint not in BUILTIN_CONSTANTS) or not isinstance(
+            t, EnumTy
+        ):
+            if satisfies(t, constraint, self.enums):
+                return None
+            if constraint == "Zero" and array_item(t) is not None:
+                return ": an array's zero depends on its shape (total() adds an array's items, fold() adds arrays)"
+            return ""
         implementations = self.type_implementations.get(t.name, frozenset())
         if any(constraint in self.constraint_closure.get(impl, frozenset({impl})) for impl in implementations):
             return None
+        if constraint in BUILTIN_CONSTANTS:
+            consts = ", ".join(f"'const {name} = ...'" for name in BUILTIN_CONSTANTS[constraint])
+            return f": it doesn't implement {constraint}, which needs 'implements {constraint}' with {consts}"
         return f": it doesn't explicitly implement {constraint}"
 
     def type_param_named(self, name: str, env: Env) -> ParamTy | None:
@@ -4279,6 +4303,9 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
                 info = enums[t.name]
                 return finish(substitute(info.methods["add"], dict(zip(info.params, t.args)))) == FuncTy((t, t), t)
             return t in (*NUMBERS, STR) or isinstance(t, ListTy) or array_item(t) is not None
+        case "Zero":
+            # Structs and enums that implement it are found by Checker.unmet.
+            return t in (*NUMBERS, STR) or isinstance(t, ListTy)
         case "Num":
             return t in NUMBERS
         case _:  # user-defined constraints are checked by Checker.unmet

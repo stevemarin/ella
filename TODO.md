@@ -10,6 +10,10 @@ finished work) are in [TODO-Claude.md](TODO-Claude.md).
 
 Nothing right now. The last pieces finished:
 
+- A built-in `Zero` constraint: generic code reads `T.ZERO` (`0`, `""`,
+  `[]`, or a type's own `const ZERO`), so `sum(xs)` needs no start value
+  and takes any iterable.
+
 - Lambda parameters that are patterns (`((a, b)) => a + b`), also usable
   in `where` conditions.
 - `Iter[T]` parameters, which take anything a `for` loop can go through.
@@ -26,10 +30,8 @@ Small steps that build on what's there:
 
 - [ ] Let a top-level function take its parameter types from a declared
       type: `let inc: (i64) -> i64 = (x) => x + 1`.
-- [ ] A way for generic code to make the zero of a number type, so
-      `sum(xs)` doesn't need a start value.
 - [ ] Warnings for unused methods, enum variants and top-level variables.
-- [ ] More list functions taking `Iter[T]` (`sum`, `any`, `all`, `fold`,
+- [ ] More list functions taking `Iter[T]` (`any`, `all`, `fold`,
       ...), and a lazy `iters.flat_map`.
 
 ## Known gaps

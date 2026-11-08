@@ -720,7 +720,7 @@ def test_builtin_receiver_methods() -> None:
         ("let neg[T: Add] = (a: T) -> T => -a", "'-' on T needs the constraint Num, like [T: Num]"),
         ("let f[T: Num] = (a: T) -> T => a // a", "'//' doesn't work on T"),
         ("let has[T] = (xs: [T], x: T) -> bool => x in xs", "'in' on T needs the constraint Eq, like [T: Eq]"),
-        ("let f[T: Big] = (a: T) -> T => a", "unknown constraint 'Big'; the constraints are Eq, Ord, Add, Num"),
+        ("let f[T: Big] = (a: T) -> T => a", "unknown constraint 'Big'; the constraints are Eq, Ord, Add, Zero, Num"),
         ("let sum[T: Add] = (a: T, b: T) -> T => a + b\nsum(true, false)", "sum needs T to be Add, and bool isn't"),
         ("let max[T: Ord] = (a: T, b: T) -> T => a\nmax([1], [2])", "max needs T to be Ord, and [i64] isn't"),
         (
@@ -935,7 +935,7 @@ constraint Monoid
     [
         (
             "constraint A: Nope\n    f: (Self) -> i64",
-            "unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Num, A",
+            "unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Zero, Num, A",
         ),
         (
             "constraint A: B\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64",
@@ -1047,6 +1047,61 @@ constraint Monoid
     ],
 )
 def test_constraint_composition_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+ADD_UP = "let add_up[T: Add + Zero] = (xs: [T]) -> T =>\n    let mut total = T.ZERO\n    for x in xs\n        total += x\n    total\n"
+MONEY = "struct M\n    c: i64\n    add = (a: M, b: M) -> M => M(a.c + b.c)\n"
+
+
+def test_zero_constraint() -> None:
+    zero = "    implements Zero\n        const ZERO = M(0)\n"
+    for source in (
+        ADD_UP + "let a = add_up([1])\nlet b = add_up([to_f32(1.5)])\nlet c = add_up([''])\nlet d = add_up([[1]])",
+        ADD_UP + MONEY + zero + "let m = add_up([M(1)])",
+        "let f[T: Num] = (_x: T) -> T => T.ZERO\nlet n = f(to_i32(2))",
+        # A constraint requiring Zero has its constant, which a type implementing it gives.
+        "constraint Monoid: Add + Zero\n    twice: (Self) -> Self\n" + MONEY + "    implements Monoid\n"
+        "        twice = (m: M) -> M => m + m\n        const ZERO = M(0)\n"
+        "let g[T: Monoid] = (_x: T) -> T => T.ZERO.twice()\nlet m = g(M(1))",
+    ):
+        check(parse(source))
+    assert type_of(ADD_UP + "add_up([to_i32(2)])") == "i32"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            ADD_UP + MONEY + "let m = add_up([M(1)])",
+            (
+                "add_up needs T to be Zero, and M isn't: it doesn't implement Zero, which needs 'implements Zero' with "
+                "'const ZERO = ...'"
+            ),
+        ),
+        (
+            ADD_UP + "let a = add_up([array([1])])",
+            (
+                "add_up needs T to be Zero, and Array[i64] isn't: an array's zero depends on its shape (total() adds an "
+                "array's items, fold() adds arrays)"
+            ),
+        ),
+        (MONEY + "    implements Zero", "M doesn't implement Zero: it has no constant 'ZERO'"),
+        (MONEY + "    implements Zero\n        const ZERO = 0", "constant 'ZERO' should be M, not i64"),
+        (MONEY + "    implements Zero\n        const ONE = M(1)", "Zero has no constant named 'ONE'"),
+        (
+            "constraint Monoid: Zero\n    twice: (Self) -> Self\n" + MONEY + "    implements Zero\n"
+            "        const ZERO = M(0)\n    implements Monoid\n        twice = (m: M) -> M => m",
+            "M already implements Zero",
+        ),
+        ("let f[T: Add] = (_x: T) -> T => T.ZERO", "T has no constant named 'ZERO'; its constraints have none"),
+        (
+            "constraint K\n    const ZERO: i64\nlet f[T: K + Zero] = (_x: T) -> i64 => T.ZERO",
+            "T's constraints K and Zero have different constants named 'ZERO'",
+        ),
+    ],
+)
+def test_zero_constraint_errors(source: str, message: str) -> None:
     assert error(source).message == message
 
 

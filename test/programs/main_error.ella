@@ -12,7 +12,7 @@ let total = (rows: [str]) -> Result[i64, Error] =>
     let mut result = 0
     for i in 0..len(rows)
         match parse_row(rows[i])
-            case Ok(numbers) => result += sum(numbers, 0)
+            case Ok(numbers) => result += sum(numbers)
             case Err(e) => return Err(Error("bad row {{i + 1}}", e))
     Ok(result)
 

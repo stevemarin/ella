@@ -106,6 +106,7 @@ from ella.syntax import (
 )
 from ella.values import (
     F32,
+    I32,
     MAX_CALL_DEPTH,
     MAX_HANDLE_GENERATION,
     MAX_POOL_SLOTS,
@@ -852,7 +853,12 @@ class Interpreter:
         var = scope.lookup(f"type {param}")
         assert var is not None and isinstance(var.value, TypeValue), f"{param} has no type argument"
         t = var.value.type
-        assert isinstance(t, EnumTy), f"{param}.{name} needs a struct or enum"
+        if not isinstance(t, EnumTy):  # a built-in type's (checker.BUILTIN_CONSTANTS)
+            assert name == "ZERO", f"{show_type(t)} has no constant {name}"
+            if isinstance(t, ListTy):
+                return []
+            zeros: dict[str, Value] = {"i64": 0, "i32": I32(0), "f64": 0.0, "f32": F32(0.0), "str": ""}
+            return zeros[show_type(t)]
         return self.constant_value(t.name, self.checker.implementation_of(t.name, constraint), name)
 
     def constant_value(self, type_name: str, constraint: str, name: str) -> Value:

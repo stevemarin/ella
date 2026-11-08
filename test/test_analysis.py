@@ -204,7 +204,7 @@ def test_symbols_of_constants() -> None:
 def test_constraint_errors_dont_stop_analysis() -> None:
     source = "constraint A: Nope\n    f: (Self) -> i64\nconstraint B: B\n    g: (Self) -> i64\nlet x: i64 = 'a'\n"
     assert problems(source) == [
-        "1:1: unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Num, A, B",
+        "1:1: unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Zero, Num, A, B",
         "3:1: constraint cycle: B -> B",
         "5:14: the value of 'x' should be i64, not str",
     ]

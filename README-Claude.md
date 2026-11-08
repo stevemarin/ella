@@ -169,7 +169,11 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   `implements Shape`. Constraints can require others
   (`constraint Ranked: Named + Ord`) and constants (`const EMPTY: Self`,
   read in generic code as `T.EMPTY`, computed once at compile time), also
-  through a struct's own type parameters (`struct Acc[T: Monoid]`).
+  through a struct's own type parameters (`struct Acc[T: Monoid]`). The
+  built-in `Zero` (implied by `Num`) has one, `T.ZERO`: built in for
+  numbers, `str` and lists (`checker.BUILTIN_CONSTANTS`, made where read by
+  `lower_builtin_constant`), and given by a struct or enum that implements
+  it; `sum(xs)` starts from it.
   Generic code is specialized per use: no dynamic dispatch. Local
   `let`-bound generic functions can capture local values. A parameter of
   type `Iter[T]` takes anything a `for` loop can go through (list, str,

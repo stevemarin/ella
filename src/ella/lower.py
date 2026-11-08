@@ -12,6 +12,7 @@ from ella.checker import (
     ERROR,
     F32,
     F64,
+    I32,
     I64,
     LIBRARY,
     NEVER,
@@ -1038,7 +1039,8 @@ class Lowerer:
         computed where it is used."""
         param, constraint, name = self.checker.associated_constants[id(expr)]
         actual = self.concrete(self.subst[param])
-        assert isinstance(actual, EnumTy), f"{param}.{name} needs a struct or enum"
+        if not isinstance(actual, EnumTy):
+            return self.lower_builtin_constant(actual, name, expr.span, dest)
         value = self.checker.implementation_constants[
             actual.name, self.checker.implementation_of(actual.name, constraint), name
         ]
@@ -1049,6 +1051,24 @@ class Lowerer:
             return self.lower(value, dest)
         finally:
             self.subst = old_subst
+
+    def lower_builtin_constant(self, t: Type, name: str, span: Span, dest: str) -> Value:
+        """A built-in type's constant (checker.BUILTIN_CONSTANTS): `ZERO` of a number, a string or a list."""
+        assert name == "ZERO", f"{show_type(t)} has no constant {name}"
+        match t:
+            case ListTy():
+                return self.build("list", t, [], span, dest)
+            case _ if t == I32:
+                return self.emit("builtin", I32, [self.const(0, span)], span, "to_i32")
+            case _ if t == F32:
+                return self.emit("builtin", F32, [self.const(0.0, span)], span, "to_f32")
+            case _ if t == I64:
+                return self.const(0, span)
+            case _ if t == F64:
+                return self.const(0.0, span)
+            case _:
+                assert t == STR, f"{show_type(t)} has no ZERO"
+                return self.const("", span)
 
     def lower(self, expr: Expr, dest: str = "") -> Value:
         """Emit the instructions that compute `expr`, and return its value.

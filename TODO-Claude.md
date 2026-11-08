@@ -29,11 +29,12 @@ numbers; `sums`); type-namespace functions and local generic functions;
 `implements` (constraints are no longer met structurally), constraints
 requiring others, and constants (`const EMPTY: Self`, read as `T.EMPTY`,
 computed at compile time), also through a type's own parameters and for
-types defined inside functions; pattern parameters, and `Iter[T]`
+types defined inside functions, and the built-in `Zero` (`T.ZERO`, so
+`sum(xs)` needs no start); pattern parameters, and `Iter[T]`
 parameters (anything a loop can go through, also for `map` and
 `filter`); `iters` in the prelude for lazy chains (`iters.map`, `take`,
 `collect`), and giving away non-copyable variables at their last use.
-`make check` passes (1568 tests, ruff, strict mypy).
+`make check` passes (1584 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -391,6 +392,34 @@ runtime; new functions with fixed types are cheap to add that way.
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
 
+### Done (2026-11-07, third round): the `Zero` constraint
+
+`sum(xs)` needs no start value. Instead of the planned `zero[T: Num]()`
+function, `Zero` is a built-in constraint with a constant (grammar.md §9,
+"Constraints"), now that constraints can have them:
+
+1. **Checker.** `CONSTRAINTS["Zero"]`, implied by `Num`, and
+   `BUILTIN_CONSTANTS` (`{"Zero": {"ZERO": SELF}}`), which seeds
+   `constraint_constants`, so `T.ZERO` checks as a user constraint's
+   constant does. `satisfies` gives the numbers, `str` and lists; a
+   struct or enum meets it only by implementing it (`unmet` takes it the
+   user-defined way), giving `const ZERO`, and the built-in check after an
+   `implements` skips it. A user constraint requiring `Zero` gets its
+   constant (`resolve_constraint`), and a type can't implement both it and
+   `Zero` (one value per constant). Arrays don't meet it (their zero
+   depends on a shape); the error says to use `total` or `fold`.
+2. **Backends.** A built-in type's `T.ZERO` is made where it is read: the
+   lowering's `lower_builtin_constant` (a `const`, `to_i32`/`to_f32` of
+   one, or an empty list) and the tree interpreter's `associated_constant`.
+   Nothing else changed: the IR interpreter and native code just run it.
+3. **Library.** `lists.sum[T: Add + Zero] = (xs: Iter[T]) -> T`, so it also
+   takes ranges and generators. A sketch of a lazy-module `sum` (calling
+   `T.zero()`) was dropped, as `iters`' names give way to `lists`' anyway.
+   Calls with a start value changed (tests, a benchmark, README); the sum
+   of arrays in `arrays.ella` is a `fold`.
+
+Nothing checks that `x + T.ZERO == x`.
+
 ### Done (2026-11-07, second round): giving away, eager by default, `iters` in the prelude
 
 Lazy-by-default chains were built and then reverted: generators can't be
@@ -667,34 +696,11 @@ Small steps that build on the above:
 
 1. Take a top-level function's missing types from its `let`'s declared
    type: `let inc: (i64) -> i64 = (x) => x + 1`.
-2. A way for generic code to make the zero of a `Num` type, so that
-   `sum(xs)` needs no start value. The plan:
-   - Put it in `Num`, not `Add`. `Add` is met by arrays, whose zero
-     depends on a shape the type doesn't know, and by any type with an
-     `add` method, which would all have to give a zero too (and those
-     that meet `Add` today would stop). Only the four number types meet
-     `Num`, so each has an obvious zero and no code changes.
-   - A library function `zero[T: Num]() -> T`, with `T` from where the
-     result goes (`let mut total: T = zero()`): the checker already infers
-     a type argument from the result alone. Nothing deciding it
-     (`print(zero())`) is an error. Each use is specialized, so the
-     lowering and backends need nothing new.
-   - `sum` can't be both: there is no overloading, and `sum(xs, start)` is
-     used on strings, lists, arrays and structs with `add` (prelude,
-     constraints and methods test programs). Either `sum(xs)` takes only
-     numbers (strings use `join`, lists `flatten`, the rest `fold`), the
-     cleaner way, or the version without a start value gets another name.
-   - Not a new `Zero` constraint yet: for user types to meet it they'd need
-     a method called on the type, not on a value (`zero: () -> Self`),
-     which constraints can't have (a constant, `const ZERO: Self`, can do
-     it now, but built-in types can't implement user-defined constraints).
-     With that, `Num` could require `Zero`.
-   - One function for lists and arrays (and ranges, generators, `iter`
-     types) needs a constraint with an item type:
-     `let sum[C: Iter[T], T: Num] = (xs: C) -> T`. Only the checker would
-     change (working out `T` from `C`); `for` already compiles for each
-     concrete type. `map`, `any`, `all` and `fold` could then take any of
-     them. Arrays keep `total`, which fuses and runs as AVX2 loops.
+2. One function for lists and arrays (and ranges, generators, `iter`
+   types) still needs arrays to meet `Zero`, whose zero depends on a
+   shape (`sum(xs)` takes `Iter[T]` now, but arrays keep `total`, which
+   fuses and runs as AVX2 loops). `any`, `all` and `fold` could take
+   `Iter[T]` as `sum` does.
 3. Warnings for unused methods, enum variants and top-level variables.
 
 ### Done (2026-11-03): arrays and SIMD
@@ -1175,4 +1181,3 @@ this: adapters are small structs that are iterators themselves.
 
 Worth it only if lazy chains get used enough; eager `map` and `filter`
 cover most code.
-

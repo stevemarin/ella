@@ -3,6 +3,8 @@
 struct Money
     cents: i64
     add = (a: Money, b: Money) -> Money => Money(a.cents + b.cents)
+    implements Zero
+        const ZERO = Money(0)
 
 struct Person
     name: str
@@ -10,8 +12,9 @@ struct Person
 
 let main = () -> () =>
     let xs = [3, 1, 2]
-    print(sum(xs, 0), sum([0.5, 0.25], 0.0), sum(["a", "b", "c"], ""), sum([[1], [2, 3]], []))
-    print(sum([Money(5), Money(7)], Money(0)), sum([], 10))
+    let empty: [Money] = []
+    print(sum(xs), sum([0.5, 0.25]), sum(["a", "b", "c"]), sum([[1], [2, 3]]))
+    print(sum([Money(5), Money(7)]), sum(empty), sum(0..4))
     print(any(xs, (n) => n > 2), all(xs, (n) => n > 2))
     print(any([], (_n: i64) -> bool => true), all([], (_n: i64) -> bool => false))
     # any and all stop as soon as they know.

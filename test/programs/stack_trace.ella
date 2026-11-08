@@ -8,7 +8,7 @@ let first[T] = (xs: [T]) -> T => xs[0]
 
 let total = (grid: Grid, picks: [i64]) -> i64 =>
     let pick = (i: i64) -> i64 => grid.cell(i)
-    sum(map(picks, pick), 0) + first(picks)
+    sum(map(picks, pick)) + first(picks)
 
 let letters = (codes: [i64]) -> [str] => map(codes, chr)
 

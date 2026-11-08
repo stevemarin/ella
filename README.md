@@ -17,7 +17,7 @@ let area = (s: Shape) -> f64 =>
 let main = () -> () =>
     let shapes = [Circle(1.0), Rect(2.0, 3.0)]
     let areas = shapes |> map(area)
-    print("total area: {{sum(areas, 0.0)}}")
+    print("total area: {{sum(areas)}}")
     let counts = {"circle": 1, "rect": 1}
     for name in counts
         print(name, counts[name])

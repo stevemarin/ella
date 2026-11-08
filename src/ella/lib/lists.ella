@@ -73,8 +73,9 @@ let sort_by[T, K: Ord] = (xs: [T], key: (T) -> K) -> [T] =>
         result += [xs[i]]
     result
 
-let sum[T: Add] = (xs: [T], start: T) -> T =>
-    let mut total = start
+# The items added up, starting from T's zero: 0, "", [] or a type's own ZERO.
+let sum[T: Add + Zero] = (xs: Iter[T]) -> T =>
+    let mut total = T.ZERO
     for x in xs
         total += x
     total

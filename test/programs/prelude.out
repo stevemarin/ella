@@ -1,5 +1,5 @@
 6 0.75 abc [1, 2, 3]
-Money(12) 10
+Money(12) Money(0) 6
 true false
 false true
 true

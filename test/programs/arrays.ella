@@ -108,7 +108,7 @@ let main = () -> () =>
     let k = 2.0
     let twice = (v: Array[f64]) => v * k
     print(twice(vel), map([vel, -vel], twice))
-    print(sum([array([1, 2]), array([3, 4]), array([5, 6])], fill([2], 0)))
+    print(fold([array([1, 2]), array([3, 4]), array([5, 6])], fill([2], 0), (a, b) => a + b))
     print(map([[1.0], [2.0, 3.0]], array), map([fill([2], 1)], total))
 
     # Three dimensions, and an index from a tuple
