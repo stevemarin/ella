@@ -1,0 +1,79 @@
+# The built-in constraints for operators (Sub, Mul, Neg) and constants (One, Bounded): docs/grammar.md §9,
+# "Constraints". Zero is in zero.ella.
+
+struct V
+    x: f64
+    y: f64
+    add = (a: V, b: V) -> V => V(a.x + b.x, a.y + b.y)
+    sub = (a: V, b: V) -> V => V(a.x - b.x, a.y - b.y)
+    mul = (a: V, b: V) -> V => V(a.x * b.x, a.y * b.y)
+    neg = (a: V) -> V => V(-a.x, -a.y)
+    implements One
+        const ONE = V(1.0, 1.0)
+
+# Bounded needs Ord: a compare method.
+struct Rank
+    n: i64
+    compare = (a: Rank, b: Rank) -> i64 => a.n - b.n
+    implements Bounded
+        const MIN = Rank(0)
+        const MAX = Rank(10)
+
+# A user-defined constraint requiring them gives their constants in its implementation.
+constraint Ring: Add + Sub + Mul + Zero + One
+    name: (Self) -> str
+
+struct Mod7
+    n: i64
+    add = (a: Mod7, b: Mod7) -> Mod7 => Mod7((a.n + b.n) % 7)
+    sub = (a: Mod7, b: Mod7) -> Mod7 => Mod7((a.n - b.n) % 7)
+    mul = (a: Mod7, b: Mod7) -> Mod7 => Mod7(a.n * b.n % 7)
+    implements Ring
+        name = (m: Mod7) -> str => "{{m.n}} mod 7"
+        const ZERO = Mod7(0)
+        const ONE = Mod7(1)
+
+let lerp[T: Add + Sub + Mul] = (a: T, b: T, t: T) -> T => a + (b - a) * t
+let flip[T: Neg] = (x: T) -> T => -x
+let bounds[T: Bounded] = (_x: T) -> (T, T) => (T.MIN, T.MAX)
+
+# The smallest item, or T.MAX for none.
+let lowest[T: Bounded] = (xs: Iter[T]) -> T =>
+    let mut best = T.MAX
+    for x in xs
+        if x < best then best = x
+    best
+
+# x to the power n, by squaring.
+let power[T: Mul + One] = (x: T, n: i64) -> T =>
+    let mut result = T.ONE
+    let mut base = x
+    let mut k = n
+    while k > 0
+        if k % 2 == 1 then result *= base
+        base *= base
+        k //= 2
+    result
+
+let describe[T: Ring] = (a: T, b: T) -> str => "{{(a * b + T.ONE - T.ZERO).name()}}"
+
+# Num has all of them.
+let spread[T: Num] = (xs: [T]) -> T =>
+    let mut low = T.MAX
+    let mut high = T.MIN
+    for x in xs
+        if x < low then low = x
+        if x > high then high = x
+    if len(xs) == 0 then T.ZERO else high - low
+
+let main = () -> () =>
+    print(lerp(0.0, 10.0, 0.25), lerp(2, 4, 3), lerp(V(0.0, 0.0), V(2.0, 4.0), V(0.5, 0.5)))
+    print(flip(3), flip(V(1.0, 2.0)), flip(to_f32(1.5)), flip(to_i32(4)))
+    print(product(1..=5), product([V(2.0, 3.0), V(4.0, 5.0)]), product([to_i32(3), to_i32(4)]))
+    let no_floats: [f64] = []
+    print(product(no_floats), product([to_f32(0.5)]), sum(no_floats))
+    print(bounds(1), bounds(to_i32(1)), bounds(1.0), bounds(to_f32(1.0)), bounds(Rank(3)))
+    print(lowest([5, 3, 9]), lowest([Rank(4), Rank(2)]), lowest(no_floats), lowest("hello" |> map(ord)))
+    print(power(3, 4), power(1.5, 2), power(V(2.0, 3.0), 3), power(Mod7(3), 6).name())
+    print(describe(Mod7(3), Mod7(4)))
+    print(spread([3, 9, 4]), spread([2.5, -1.0]), spread([to_i32(7)]), spread(no_floats))

@@ -1,0 +1,63 @@
+# The built-in constraint Zero: T.ZERO, which sum starts from (docs/grammar.md §9, "Constraints").
+
+struct Money
+    cents: i64
+    add = (a: Money, b: Money) -> Money => Money(a.cents + b.cents)
+    implements Zero
+        const ZERO = Money(0)
+
+# A user-defined constraint requiring Zero: its implementation gives ZERO.
+constraint Monoid: Add + Zero
+    name: (Self) -> str
+
+struct Len
+    n: i64
+    add = (a: Len, b: Len) -> Len => Len(a.n + b.n)
+    implements Monoid
+        name = (l: Len) -> str => "len {{l.n}}"
+        const ZERO = Len(0)
+
+let total_name[T: Monoid] = (xs: [T]) -> str => sum(xs).name()
+
+# Num implies Zero.
+let zero_like[T: Num] = (_x: T) -> T => T.ZERO
+
+# A struct's own type parameter can be Zero too.
+struct Tally[T: Add + Zero]
+    total: T
+    count: i64
+    push = (mut self: Tally[T], x: T) -> () =>
+        self.total += x
+        self.count += 1
+    reset = (mut self: Tally[T]) -> () =>
+        self.total = T.ZERO
+        self.count = 0
+
+let squares = (n: i64) -> Gen[i64] =>
+    for i in 0..n
+        yield i * i
+
+let main = () -> () =>
+    print(sum([1, 2, 3]), sum([0.5, 0.25]), sum(["a", "b", "c"]), sum([[1], [2, 3]]))
+    print(sum([to_i32(2), to_i32(3)]), sum([to_f32(1.5), to_f32(0.25)]))
+    let no_ints: [i64] = []
+    let no_strs: [str] = []
+    let no_lists: [[i64]] = []
+    let no_money: [Money] = []
+    print(sum(no_ints), sum(no_strs) == "", sum(no_lists), sum(no_money))
+    print(sum([Money(5), Money(7)]))
+    print(sum(0..5), sum(squares(4)), sum("abc" |> map(ord)), sum(count(1, 1) |> take(4)))
+    print(total_name([Len(2), Len(3)]))
+    print(zero_like(7), zero_like(2.5), zero_like(to_i32(1)), zero_like(to_f32(1.0)))
+    let mut tally = Tally(Money(0), 0)
+    mut tally.push(Money(4))
+    mut tally.push(Money(6))
+    print(tally)
+    mut tally.reset()
+    print(tally)
+    let mut words = Tally("", 0)
+    mut words.push("ab")
+    mut words.push("c")
+    print(words)
+    mut words.reset()
+    print(words)
