@@ -130,7 +130,9 @@ from ella.syntax import (
 from ella.syntax import (
     Yield as YieldExpr,
 )
-from ella.values import STATUS_ERROR
+from ella.values import BUILTIN_CONSTANT_VALUES, STATUS_ERROR
+from ella.values import F32 as F32Value
+from ella.values import I32 as I32Value
 
 # Ella operators and the IR operations that implement them.
 BINARY_OPS = {
@@ -1053,22 +1055,18 @@ class Lowerer:
             self.subst = old_subst
 
     def lower_builtin_constant(self, t: Type, name: str, span: Span, dest: str) -> Value:
-        """A built-in type's constant (checker.BUILTIN_CONSTANTS): `ZERO` of a number, a string or a list."""
-        assert name == "ZERO", f"{show_type(t)} has no constant {name}"
-        match t:
-            case ListTy():
-                return self.build("list", t, [], span, dest)
-            case _ if t == I32:
-                return self.emit("builtin", I32, [self.const(0, span)], span, "to_i32")
-            case _ if t == F32:
-                return self.emit("builtin", F32, [self.const(0.0, span)], span, "to_f32")
-            case _ if t == I64:
-                return self.const(0, span)
-            case _ if t == F64:
-                return self.const(0.0, span)
-            case _:
-                assert t == STR, f"{show_type(t)} has no ZERO"
-                return self.const("", span)
+        """A built-in type's constant (checker.BUILTIN_CONSTANTS): `ZERO` of a number, a string or a list, `ONE`,
+        `MIN` and `MAX` of a number."""
+        if isinstance(t, ListTy):
+            assert name == "ZERO", f"a list has no constant {name}"
+            return self.build("list", t, [], span, dest)
+        value = BUILTIN_CONSTANT_VALUES[show_type(t), name]
+        match value:
+            case I32Value():
+                return self.emit("builtin", I32, [self.const(int(value), span)], span, "to_i32")
+            case F32Value():
+                return self.emit("builtin", F32, [self.const(float(value), span)], span, "to_f32")
+        return self.const(value, span)
 
     def lower(self, expr: Expr, dest: str = "") -> Value:
         """Emit the instructions that compute `expr`, and return its value.

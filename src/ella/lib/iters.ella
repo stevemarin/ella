@@ -81,3 +81,9 @@ let collect[T] = (xs: Iter[T]) -> [T] =>
     for x in xs
         items += [x]
     items
+
+let sum[T: Add + Zero] = (xs: Iter[T]) -> T =>
+    let mut total = T.ZERO
+    for x in xs
+        total += x
+    total

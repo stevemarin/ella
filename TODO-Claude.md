@@ -30,11 +30,12 @@ numbers; `sums`); type-namespace functions and local generic functions;
 requiring others, and constants (`const EMPTY: Self`, read as `T.EMPTY`,
 computed at compile time), also through a type's own parameters and for
 types defined inside functions, and the built-in `Zero` (`T.ZERO`, so
-`sum(xs)` needs no start); pattern parameters, and `Iter[T]`
+`sum(xs)` needs no start), `One`, `Bounded`, and `Sub`, `Mul` and `Neg`
+for generic arithmetic on structs; pattern parameters, and `Iter[T]`
 parameters (anything a loop can go through, also for `map` and
 `filter`); `iters` in the prelude for lazy chains (`iters.map`, `take`,
 `collect`), and giving away non-copyable variables at their last use.
-`make check` passes (1584 tests, ruff, strict mypy).
+`make check` passes (1602 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
@@ -162,6 +163,11 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
   still made at each read, since a global has one type. Using constants in
   types (`Array[f64; T.SIZE]`) would need the checker
   to compute them while checking, as it does splices in types.
+- No `Div` constraint: `/` on a `Num` gives an `f64`, which a struct's `div`
+  needn't, so generic `/` (and `**`) still needs `Num`. A `Div` would need
+  `/` on two `i64`s and on a type parameter to agree. `Mul` needs
+  `(Self, Self) -> Self`, so scaling by a number (`(Vec, f64) -> Vec`) can't
+  be generic. `Zero`, `One` and `Bounded` don't check their laws.
 - Protocol method names (`get`, `set`, `iter`, `add`, ...) are reserved for
   their meaning, so they can't be ordinary methods.
 - No generic computed types (`new_struct` makes non-generic structs only),
@@ -391,6 +397,30 @@ runtime; new functions with fixed types are cheap to add that way.
    errors from imports at the import line, finds definitions in other
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
+
+### Done (2026-11-07, fourth round): `Sub`, `Mul`, `Neg`, `One` and `Bounded`
+
+Generic arithmetic for user types (grammar.md §9, "Constraints"):
+
+1. **Operator constraints.** `-`, `*` and unary `-` on a type parameter
+   need `Sub`, `Mul` and `Neg` (`NEEDS`, the `Unary` case) instead of
+   `Num`; `/` and `**` still need `Num` (a `Num`'s `/` gives an `f64`, which
+   a struct's `div` needn't, so there is no `Div`). `satisfies` gives the
+   numbers, arrays, and structs or enums whose method has the type
+   `(Self, Self) -> Self` (`(Self) -> Self` for `neg`), like `Add`; `unmet`
+   says which method is missing or has another type. A struct's
+   `mul = (Vec, f64) -> Vec` still gives it `*`, but not `Mul`.
+2. **Constant constraints.** `One` (`T.ONE`: the numbers) and `Bounded`
+   (`T.MIN`, `T.MAX`: the numbers, floats' being infinities; it implies
+   `Ord`) join `Zero` in `BUILTIN_CONSTANTS`. The built-in types' values
+   are `values.BUILTIN_CONSTANT_VALUES`, shared by the lowering
+   (`lower_builtin_constant`: a `const`, or `to_i32`/`to_f32` of one) and
+   the tree interpreter. `implements` now checks every built-in
+   constraint its closure implies (so `implements Bounded` needs
+   `compare`).
+3. `Num` implies all of them. `lists.product[T: Mul + One]` joins `sum`.
+   The test program `constraint_constants.ella` had a constraint named
+   `Bounded`, now `Clamped`.
 
 ### Done (2026-11-07, third round): the `Zero` constraint
 
@@ -1179,5 +1209,39 @@ this: adapters are small structs that are iterators themselves.
    if the checker checks each specialization's copies rather than the
    body once (or the constraint says whether it can be copied).
 
+5. **As a built-in constraint** (discussed 2026-11-07, with `Sub`/`Mul`/
+   `Neg`, `One` and `Bounded`): the natural spelling is `[C: Iter[T]]`, or
+   `Iter[T]` as a type anywhere, meaning "a `for` loop can go through it,
+   giving `T`s". The checker would carry the item type on the constraint
+   (the `ParamTy.item` that `Iter#i` parameters have now, generalized),
+   and settle it from the concrete type at each use (`settle_iterable`).
+   That alone would let `struct Mapped[S: Iter[T], T, U]` hold its
+   source, which step 3 needs; `Iter[T]` parameters would become sugar for
+   it. The hard part is not the checker but copies: whether a `C` can be
+   copied depends on what it is (a `Gen` can't), so either the checker
+   checks copies per specialization or the constraint splits into a
+   copyable and a non-copyable form.
+
 Worth it only if lazy chains get used enough; eager `map` and `filter`
 cover most code.
+
+### 13. Parsing as a protocol: `Parse`, the inverse of `text`
+
+A built-in constraint `Parse` with a function on the type, `parse: (str)
+-> Result[Self, Error]`, met by the numbers (`parse_i64`, `parse_f64`,
+...), `bool` and `str`, and by structs and enums that implement it. It
+would give a generic `parse[T: Parse](s: str) -> Result[T, Error]` with `T`
+from where the result goes (`let n: i64 = parse(line)?`, as `zero()` was
+planned to), typed input helpers (`read_all[T: Parse]() -> [T]`, a line of
+numbers), and, in a struct with `Parse` fields, a derived parser later.
+
+What it needs first: constraints can only require methods taking `Self`
+first and constants, not functions in the type's namespace
+(`Type.name(...)`, `static_methods`). Requiring one (`parse: (str) ->
+Result[Self, Error]` with no `Self` parameter, called as `T.parse(s)`) is
+the general feature; it would also allow `T.new()`-style constructors in
+generic code, and replace `Zero`-like constants where a value needs
+computing at run time. The lowering already specializes per type, so
+`T.parse` would be a direct call; the interpreter finds it through the
+bound type, as it does `T.NAME`. Choose error messages (the type's name
+in "isn't an i64") so the built-in types' and the library's match.

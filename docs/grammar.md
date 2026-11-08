@@ -1502,8 +1502,13 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
 | `Eq` | `==`, `!=`, `in` | every type except functions, pools, arenas, generators and code |
 | `Ord` | `<`, `<=`, `>`, `>=` (and what `Eq` allows) | `i64`, `i32`, `f64`, `f32`, `str`, types with a `compare` method |
 | `Add` | `+` | `i64`, `i32`, `f64`, `f32`, `str`, lists, arrays, types with an `add` method of type `(Self, Self) -> Self` |
+| `Sub` | `a - b` | `i64`, `i32`, `f64`, `f32`, arrays, types with a `sub` method of type `(Self, Self) -> Self` |
+| `Mul` | `*` | `i64`, `i32`, `f64`, `f32`, arrays, types with a `mul` method of type `(Self, Self) -> Self` |
+| `Neg` | unary `-` | `i64`, `i32`, `f64`, `f32`, arrays, types with a `neg` method of type `(Self) -> Self` |
 | `Zero` | `T.ZERO`, the value `+` starts from | `i64`, `i32`, `f64`, `f32` (`0`), `str` (`""`), lists (`[]`), types that implement it |
-| `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what `Ord` and `Zero` allow) | `i64`, `i32`, `f64`, `f32` |
+| `One` | `T.ONE`, the value `*` starts from | `i64`, `i32`, `f64`, `f32` (`1`), types that implement it |
+| `Bounded` | `T.MIN`, `T.MAX`, the smallest and largest values (and what `Ord` allows) | `i64`, `i32` (their smallest and largest), `f64`, `f32` (`-inf`, `inf`), types that implement it |
+| `Num` | `+`, `-`, `*`, `/`, `**`, unary `-` (and what all the others allow) | `i64`, `i32`, `f64`, `f32` |
 
 * The body is checked once, against the constraints: `(a: T, b: T) -> T =>
   a + b` needs `[T: Add]`. `/` on a `Num` gives an `f64`, as it does on
@@ -1512,12 +1517,24 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
   `bool` isn't `Ord`. A type parameter meets the constraints it has, so a
   generic function can call another one with its own `T`.
 * `Num` is only met by numbers: `/` on a `Num` gives an `f64`, which a
-  struct's `div` needn't.
-* `Zero` is the one built-in constraint with a constant
+  struct's `div` needn't. So there is no `Div`, and `/` and `**` need
+  `Num`; `Sub`, `Mul` and `Neg` let generic code that only needs those
+  operators take structs too:
+
+  ```ella
+  let lerp[T: Add + Sub + Mul] = (a: T, b: T, t: T) -> T => a + (b - a) * t
+  ```
+
+  A struct's `mul = (v: Vec, k: f64) -> Vec` still gives it `*`, but not
+  `Mul`, which needs both sides of the same type.
+* `Zero`, `One` and `Bounded` have constants
   ([constants](#user-defined-constraints-provisional-syntax)): `T.ZERO` is
-  the value adding starts from, so `sum(xs)` needs no start value. A
-  struct or enum meets it by implementing it, as it would a user-defined
-  constraint, giving the constant:
+  the value adding starts from, so `sum(xs)` needs no start value, `T.ONE`
+  the value multiplying starts from (`product(xs)`), and `T.MIN` and
+  `T.MAX` the ends of an `Ord` type (a running minimum can start from
+  `T.MAX`). A struct or enum meets them by implementing them, as it would
+  a user-defined constraint, giving the constants (`Bounded` also needs a
+  `compare` method, since it needs `Ord`):
 
   ```ella
   struct Money
@@ -1529,11 +1546,13 @@ let clamp[T: Ord + Add] = (x: T, low: T, high: T) -> T => ...
   print(sum([Money(5), Money(7)]))     # Money(12)
   ```
 
-  Nothing checks that `x + T.ZERO` is `x`. Arrays don't meet it, since
-  their zero depends on a shape their type may not know: `total(a)` adds
-  an array's items, and `fold` adds arrays. A user-defined constraint can
-  require `Zero` (`constraint Monoid: Zero`); a type implementing that
-  gives `ZERO` in its `implements Monoid`, and can't also implement `Zero`.
+  Nothing checks that `x + T.ZERO` and `x * T.ONE` are `x`, or that no
+  value is below `T.MIN` or above `T.MAX`. Arrays don't meet them, since
+  an array's zero depends on a shape its type may not know: `total(a)`
+  adds an array's items, and `fold` adds arrays. A user-defined
+  constraint can require them (`constraint Ring: Add + Mul + Zero +
+  One`); a type implementing that gives `ZERO` and `ONE` in its
+  `implements Ring`, and can't also implement `Zero` or `One`.
 
 ### User-defined constraints **(provisional syntax)**
 
@@ -1573,7 +1592,8 @@ print(total([Square(2.0), Square(1.0)]))     # 5.0
   parameter can't have different methods with the same name.
 * User-defined and built-in constraints combine: `[T: Shape + Ord]`. The
   built-in ones are still met as their table says, without `implements`
-  (except that a struct or enum meets `Zero` by implementing it).
+  (except that a struct or enum meets `Zero`, `One` and `Bounded` by
+  implementing them).
 * A constraint's method named `len` gives `len(x)` in the generic function;
   operators still need the built-in constraints.
 * Each use is still compiled for its own types, so a method call is a
@@ -1987,6 +2007,7 @@ of `lists`, which are the prelude's; they are `iters.map` and so on. They can al
 | `map(xs, f)` | `[T, U] (Iter[T], (T) -> U) -> [U]` | `f` of each item of `xs` (a list, string, range, generator, ...: [§9](#generic-functions)), called in order |
 | `filter(xs, keep)` | `[T] (Iter[T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
 | `sum(xs)` | `[T: Add + Zero] (Iter[T]) -> T` | `T.ZERO + x0 + x1 + ...` for the items of `xs`: `0` (or `0.0`, `""`, `[]`, ...) for none ([§9](#generic-functions)) |
+| `product(xs)` | `[T: Mul + One] (Iter[T]) -> T` | `T.ONE * x0 * x1 * ...` for the items of `xs`: `1` (or `1.0`, ...) for none |
 | `fold(xs, start, f)` | `[T, A] ([T], A, (A, T) -> A) -> A` | `f(... f(f(start, xs[0]), xs[1]) ..., xs[n - 1])`, or `start` for no items |
 | `flatten(xss)` | `[T] ([[T]]) -> [T]` | the items of each list in `xss`, one list after another |
 | `flat_map(xs, f)` | `[T, U] ([T], (T) -> [U]) -> [U]` | the items of `f`'s list for each item of `xs`, called in order |

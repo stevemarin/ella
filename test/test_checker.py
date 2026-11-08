@@ -717,10 +717,13 @@ def test_builtin_receiver_methods() -> None:
         ("let sum[T] = (a: T, b: T) -> T => a + b", "'+' on T needs the constraint Add, like [T: Add]"),
         ("let same[T] = (a: T, b: T) -> bool => a == b", "'==' on T needs the constraint Eq, like [T: Eq]"),
         ("let less[T: Eq] = (a: T, b: T) -> bool => a < b", "'<' on T needs the constraint Ord, like [T: Ord]"),
-        ("let neg[T: Add] = (a: T) -> T => -a", "'-' on T needs the constraint Num, like [T: Num]"),
+        ("let neg[T: Add] = (a: T) -> T => -a", "'-' on T needs the constraint Neg, like [T: Neg]"),
         ("let f[T: Num] = (a: T) -> T => a // a", "'//' doesn't work on T"),
         ("let has[T] = (xs: [T], x: T) -> bool => x in xs", "'in' on T needs the constraint Eq, like [T: Eq]"),
-        ("let f[T: Big] = (a: T) -> T => a", "unknown constraint 'Big'; the constraints are Eq, Ord, Add, Zero, Num"),
+        (
+            "let f[T: Big] = (a: T) -> T => a",
+            "unknown constraint 'Big'; the constraints are Eq, Ord, Add, Sub, Mul, Neg, Zero, One, Bounded, Num",
+        ),
         ("let sum[T: Add] = (a: T, b: T) -> T => a + b\nsum(true, false)", "sum needs T to be Add, and bool isn't"),
         ("let max[T: Ord] = (a: T, b: T) -> T => a\nmax([1], [2])", "max needs T to be Ord, and [i64] isn't"),
         (
@@ -935,7 +938,7 @@ constraint Monoid
     [
         (
             "constraint A: Nope\n    f: (Self) -> i64",
-            "unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Zero, Num, A",
+            "unknown parent constraint 'Nope'; the constraints are Eq, Ord, Add, Sub, Mul, Neg, Zero, One, Bounded, Num, A",
         ),
         (
             "constraint A: B\n    f: (Self) -> i64\nconstraint B: A\n    g: (Self) -> i64",
@@ -1102,6 +1105,53 @@ def test_zero_constraint() -> None:
     ],
 )
 def test_zero_constraint_errors(source: str, message: str) -> None:
+    assert error(source).message == message
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("let f[T: Add] = (a: T, b: T) -> T => a - b", "'-' on T needs the constraint Sub, like [T: Sub]"),
+        ("let f[T: Add] = (a: T, b: T) -> T => a * b", "'*' on T needs the constraint Mul, like [T: Mul]"),
+        ("let f[T: Sub + Mul] = (a: T, b: T) -> f64 => a / b", "'/' on T needs the constraint Num, like [T: Num]"),
+        (
+            (
+                "let f[T: Mul] = (a: T, b: T) -> T => a * b\nstruct M\n    c: i64\n"
+                "    mul = (a: M, n: i64) -> M => M(a.c * n)\nlet m = f(M(1), M(2))"
+            ),
+            "f needs T to be Mul, and M isn't: its method 'mul' is (M, i64) -> M, not (M, M) -> M",
+        ),
+        (
+            "let f[T: Neg] = (a: T) -> T => -a\nstruct M\n    c: i64\nlet m = f(M(1))",
+            "f needs T to be Neg, and M isn't: it has no method 'neg' of type (M) -> M",
+        ),
+        ("let f[T: Neg] = (a: T) -> T => -a\nlet s = f('x')", "f needs T to be Neg, and str isn't"),
+        ("let f[T: One] = (_a: T) -> T => T.ONE\nlet s = f('x')", "f needs T to be One, and str isn't"),
+        (
+            "let f[T: Bounded] = (_a: T) -> T => T.MIN\nlet s = f([1])",
+            "f needs T to be Bounded, and [i64] isn't",
+        ),
+        (
+            "struct R\n    n: i64\n    implements Bounded\n        const MIN = R(0)\n        const MAX = R(1)",
+            "R doesn't meet the built-in constraint Ord required by Bounded",
+        ),
+        (
+            (
+                "struct R\n    n: i64\n    compare = (a: R, b: R) -> i64 => a.n - b.n\n    implements Bounded\n"
+                "        const MIN = R(0)"
+            ),
+            "R doesn't implement Bounded: it has no constant 'MAX'",
+        ),
+        (
+            "struct R\n    n: i64\nlet f[T: One] = (_a: T) -> T => T.ONE\nlet r = f(R(1))",
+            (
+                "f needs T to be One, and R isn't: it doesn't implement One, which needs 'implements One' with "
+                "'const ONE = ...'"
+            ),
+        ),
+    ],
+)
+def test_arithmetic_constraint_errors(source: str, message: str) -> None:
     assert error(source).message == message
 
 

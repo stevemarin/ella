@@ -13,6 +13,9 @@ Nothing right now. The last pieces finished:
 - A built-in `Zero` constraint: generic code reads `T.ZERO` (`0`, `""`,
   `[]`, or a type's own `const ZERO`), so `sum(xs)` needs no start value
   and takes any iterable.
+- Built-in constraints `Sub`, `Mul` and `Neg`, so generic arithmetic
+  works on structs with those methods, and `One` (`T.ONE`, for
+  `product(xs)`) and `Bounded` (`T.MIN`, `T.MAX`).
 
 - Lambda parameters that are patterns (`((a, b)) => a + b`), also usable
   in `where` conditions.
@@ -117,10 +120,15 @@ Roughly in order of how much they'd unlock:
    features.
 10. **Self-hosting** (stretch): the tokenizer or parser rewritten in Ella.
 11. **Symbols and hygienic macros** built on `quote` and `$`.
-12. **Iterators as values**: a named iterator constraint, so generic code
-    can hold "something giving `T`s", and lazy `iters.map` and the like
-    as small copyable structs instead of generators, so a lazy result can
-    be named, copied and used twice.
+12. **Iterators as values**: `Iter[T]` as a constraint usable anywhere
+    (type parameters, struct fields), so generic code can hold "something
+    giving `T`s", and lazy `iters.map` and the like as small copyable
+    structs instead of generators, so a lazy result can be named, copied
+    and used twice.
+13. **A `Parse` protocol**, the inverse of `text`: `parse[T: Parse](s)`
+    giving a `Result[T, Error]` for numbers, `bool`, `str` and types that
+    implement it. Needs constraints that can require functions called on
+    the type (`T.parse(s)`), not just methods and constants.
 
 Other explorations are written up in [docs/ideas/](docs/ideas/):
 compile-time value parameters, a JIT, and SQLite integration.

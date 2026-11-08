@@ -91,17 +91,17 @@ let no_scores: [Score] = []
 print(best(no_scores))
 
 # Constants inherited from a parent constraint are read the same way.
-constraint Bounded: Ranked
+constraint Clamped: Ranked
     const BEST: Self
 
 struct Grade
     level: i64
     compare = (a: Grade, b: Grade) -> i64 => a.level - b.level
-    implements Bounded
+    implements Clamped
         const WORST = Grade(0)
         const BEST = Grade(5)
 
-let clamp[T: Bounded] = (x: T) -> T =>
+let clamp[T: Clamped] = (x: T) -> T =>
     if x < T.WORST then T.WORST else if x > T.BEST then T.BEST else x
 
 print(clamp(Grade(7)), clamp(Grade(-2)), clamp(Grade(3)))

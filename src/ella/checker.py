@@ -258,13 +258,19 @@ NUMBERS = (I64, I32, F64, F32)
 CONSTRAINTS = {
     "Eq": frozenset({"Eq"}),  # `==`, `!=`, `in`
     "Ord": frozenset({"Ord", "Eq"}),  # `<`, `<=`, `>`, `>=`
-    "Add": frozenset({"Add"}),  # `+`: numbers, strings and lists
+    "Add": frozenset({"Add"}),  # `+`: numbers, strings, lists and arrays
+    "Sub": frozenset({"Sub"}),  # `a - b`: numbers and arrays
+    "Mul": frozenset({"Mul"}),  # `*`: numbers and arrays
+    "Neg": frozenset({"Neg"}),  # unary `-`: numbers and arrays
     "Zero": frozenset({"Zero"}),  # `T.ZERO`: numbers, strings, lists, and types that implement it
-    "Num": frozenset({"Num", "Add", "Ord", "Eq", "Zero"}),  # `+`, `-`, `*`, `/`, `**`, unary `-`: the numbers
+    "One": frozenset({"One"}),  # `T.ONE`: numbers, and types that implement it
+    "Bounded": frozenset({"Bounded", "Ord", "Eq"}),  # `T.MIN`, `T.MAX`: numbers, and types that implement it
+    # `+`, `-`, `*`, `/`, `**`, unary `-`, and the constants: the numbers
+    "Num": frozenset({"Num", "Add", "Sub", "Mul", "Neg", "Ord", "Eq", "Zero", "One", "Bounded"}),
 }
 
-# The constraint each operator needs of a type parameter.
-NEEDS = {"+": "Add", "-": "Num", "*": "Num", "/": "Num", "**": "Num"}
+# The constraint each operator needs of a type parameter (unary `-` needs Neg).
+NEEDS = {"+": "Add", "-": "Sub", "*": "Mul", "/": "Num", "**": "Num"}
 
 # The methods that give a struct or enum an operator (docs/grammar.md §9):
 # `a + b` calls `a.add(b)`, `-a` calls `a.neg()`, and `a < b` is `a.compare(b) < 0`.
@@ -475,7 +481,11 @@ SELF = ParamTy("Self")
 
 # The built-in constraints with constants (docs/grammar.md §9): a struct or enum meets one by implementing it,
 # giving the constants, and the built-in types that meet it have their values built in (`builtin_constant`).
-BUILTIN_CONSTANTS: dict[str, dict[str, Type]] = {"Zero": {"ZERO": SELF}}
+BUILTIN_CONSTANTS: dict[str, dict[str, Type]] = {
+    "Zero": {"ZERO": SELF},
+    "One": {"ONE": SELF},
+    "Bounded": {"MIN": SELF, "MAX": SELF},
+}
 
 # The built-in enums, and the built-in struct `Error`. Variants' fields refer
 # to the type parameters. An Error's `at` is where it was made (docs/grammar.md
@@ -1353,7 +1363,8 @@ class Checker:
                 # Checked once every top-level name has its type, as function bodies are.
                 self.pending_constants.append((constant, substitute(constant_type, {"Self": own})))
                 self.implementation_constants[enum.name, constraint, name] = constant.value
-            for builtin in closure & CONSTRAINTS.keys() - BUILTIN_CONSTANTS.keys():
+            implied = frozenset().union(*(CONSTRAINTS[c] for c in closure & CONSTRAINTS.keys()))
+            for builtin in sorted(implied - BUILTIN_CONSTANTS.keys()):
                 if not satisfies(own, builtin, self.enums):
                     raise EllaError(
                         f"{enum.name} doesn't meet the built-in constraint {builtin} required by {constraint}",
@@ -1845,6 +1856,14 @@ class Checker:
         ):
             if satisfies(t, constraint, self.enums):
                 return None
+            operator = {"Add": "add", "Sub": "sub", "Mul": "mul", "Neg": "neg"}.get(constraint)
+            if operator is not None and isinstance(t, EnumTy):
+                info = self.enums[t.name]
+                expected = FuncTy((t,) * (1 if operator == "neg" else 2), t)
+                if operator not in info.methods:
+                    return f": it has no method '{operator}' of type {show_type(expected)}"
+                found = finish(substitute(info.methods[operator], dict(zip(info.params, t.args))))
+                return f": its method '{operator}' is {show_type(found)}, not {show_type(expected)}"
             if constraint == "Zero" and array_item(t) is not None:
                 return ": an array's zero depends on its shape (total() adds an array's items, fold() adds arrays)"
             return ""
@@ -2123,7 +2142,7 @@ class Checker:
                 if op == "-" and (method := self.operator_method(t, "neg", span)) is not None:
                     return method.result
                 if isinstance(param := resolve(t), ParamTy) and op != "not":
-                    self.require_constraint(param, "Num" if op == "-" else None, op, span)
+                    self.require_constraint(param, "Neg" if op == "-" else None, op, span)
                     return t
                 kind = describe_kind(self.known(t, operand.span))
                 if (op == "-" and kind in ("i64", "i32", "f64", "f32", "Array", "?")) or (
@@ -4303,9 +4322,20 @@ def satisfies(t: Type, constraint: str, enums: dict[str, EnumInfo]) -> bool:
                 info = enums[t.name]
                 return finish(substitute(info.methods["add"], dict(zip(info.params, t.args)))) == FuncTy((t, t), t)
             return t in (*NUMBERS, STR) or isinstance(t, ListTy) or array_item(t) is not None
+        case "Sub" | "Mul" | "Neg":
+            # Structs and enums with the operator's method, taking and giving the same type.
+            method = {"Sub": "sub", "Mul": "mul", "Neg": "neg"}[constraint]
+            if isinstance(t, EnumTy) and method in enums[t.name].methods:
+                info = enums[t.name]
+                arity = 1 if constraint == "Neg" else 2
+                found = finish(substitute(info.methods[method], dict(zip(info.params, t.args))))
+                return found == FuncTy((t,) * arity, t)
+            return t in NUMBERS or array_item(t) is not None
+        # Structs and enums that implement these are found by Checker.unmet.
         case "Zero":
-            # Structs and enums that implement it are found by Checker.unmet.
             return t in (*NUMBERS, STR) or isinstance(t, ListTy)
+        case "One" | "Bounded":
+            return t in NUMBERS
         case "Num":
             return t in NUMBERS
         case _:  # user-defined constraints are checked by Checker.unmet

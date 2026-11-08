@@ -99,6 +99,23 @@ def to_f32(x: float) -> F32:
         return F32(math.copysign(math.inf, x))
 
 
+# The constants of built-in types for the built-in constraints that have them (checker.BUILTIN_CONSTANTS), by
+# the type's name and the constant's: `i64.MAX`. A list's ZERO, `[]`, is made at each read instead.
+BUILTIN_CONSTANT_VALUES: dict[tuple[str, str], int | float | str] = {
+    ("str", "ZERO"): "",
+    **{(name, "ZERO"): zero for name, zero in (("i64", 0), ("i32", I32(0)), ("f64", 0.0), ("f32", F32(0.0)))},
+    **{(name, "ONE"): one for name, one in (("i64", 1), ("i32", I32(1)), ("f64", 1.0), ("f32", F32(1.0)))},
+    ("i64", "MIN"): -(2**63),
+    ("i64", "MAX"): 2**63 - 1,
+    ("i32", "MIN"): I32(-(2**31)),
+    ("i32", "MAX"): I32(2**31 - 1),
+    ("f64", "MIN"): -math.inf,
+    ("f64", "MAX"): math.inf,
+    ("f32", "MIN"): F32(-math.inf),
+    ("f32", "MAX"): F32(math.inf),
+}
+
+
 def f32_text(x: F32) -> str:
     """The shortest decimal that is nearest to x of all f32s, written as `repr` writes an f64: `0.1`, `1e-05`."""
     if not math.isfinite(x):

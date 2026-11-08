@@ -170,10 +170,14 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   (`constraint Ranked: Named + Ord`) and constants (`const EMPTY: Self`,
   read in generic code as `T.EMPTY`, computed once at compile time), also
   through a struct's own type parameters (`struct Acc[T: Monoid]`). The
-  built-in `Zero` (implied by `Num`) has one, `T.ZERO`: built in for
-  numbers, `str` and lists (`checker.BUILTIN_CONSTANTS`, made where read by
+  built-in `Zero`, `One` and `Bounded` (implied by `Num`) have them,
+  `T.ZERO`, `T.ONE`, `T.MIN` and `T.MAX`: built in for numbers (and `ZERO`
+  for `str` and lists: `checker.BUILTIN_CONSTANTS`, values in
+  `values.BUILTIN_CONSTANT_VALUES`, made where read by
   `lower_builtin_constant`), and given by a struct or enum that implements
-  it; `sum(xs)` starts from it.
+  them; `sum(xs)` and `product(xs)` start from them. `Sub`, `Mul` and
+  `Neg` give `-`, `*` and unary `-` to generic code, met by structs with
+  those methods (`/` and `**` still need `Num`).
   Generic code is specialized per use: no dynamic dispatch. Local
   `let`-bound generic functions can capture local values. A parameter of
   type `Iter[T]` takes anything a `for` loop can go through (list, str,

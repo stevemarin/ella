@@ -79,9 +79,10 @@ plain:
   `len` and constructors used as values get a small lambda calling them
   (`wrappers`), which the lowering makes into a function. Also the
   `mut` argument rules and their exclusivity check, stages (each variable's
-  level), generic functions, methods and constraints (built-in, one with
-  a constant: `Zero`'s `T.ZERO`, `BUILTIN_CONSTANTS`, which numbers, `str`
-  and lists have built in and other types implement; and
+  level), generic functions, methods and constraints (built-in, some
+  with constants: `T.ZERO`, `T.ONE`, `T.MIN`, `T.MAX` of `Zero`, `One`,
+  `Bounded`, `BUILTIN_CONSTANTS`, which built-in types have built in,
+  `values.BUILTIN_CONSTANT_VALUES`, and other types implement; and
   user-defined ones, met by `implements`, which can require others,
   `constraint_closure`, and constants, read as `T.NAME`:
   `associated_constants`, whose value each type's implementation gives,

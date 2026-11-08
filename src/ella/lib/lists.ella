@@ -80,6 +80,13 @@ let sum[T: Add + Zero] = (xs: Iter[T]) -> T =>
         total += x
     total
 
+# The items multiplied together, starting from T's one: 1, 1.0 or a type's own ONE.
+let product[T: Mul + One] = (xs: Iter[T]) -> T =>
+    let mut result = T.ONE
+    for x in xs
+        result *= x
+    result
+
 let any[T] = (xs: [T], test: (T) -> bool) -> bool =>
     for x in xs
         if test(x) then return true
