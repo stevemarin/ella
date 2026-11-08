@@ -29,20 +29,23 @@ numbers; `sums`); type-namespace functions and local generic functions;
 `implements` (constraints are no longer met structurally), constraints
 requiring others, and constants (`const EMPTY: Self`, read as `T.EMPTY`,
 computed at compile time), also through a type's own parameters and for
-types defined inside functions. `make check` passes (1535 tests, ruff,
-strict mypy).
+types defined inside functions; pattern parameters, and `Iter[T]`
+parameters (anything a loop can go through, also for `map` and
+`filter`); `iters` in the prelude for lazy chains (`iters.map`, `take`,
+`collect`), and giving away non-copyable variables at their last use.
+`make check` passes (1568 tests, ruff, strict mypy).
 
 | Area | State |
 | --- | --- |
 | Front end | Tokenizer and Pratt parser for everything in grammar.md; lenient parsing for editors |
-| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met by `implements`; they can require others, and constants read as `T.NAME`), array shapes (`Array[f64; N, 3]`, size parameters `[; N]`; checked at run time where not sure, size names as `i64`s), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs) |
+| Type checker | Inference by unification (lambdas other than top-level functions can leave out their types), generics with built-in and user-defined constraints (met by `implements`; they can require others, and constants read as `T.NAME`), array shapes (`Array[f64; N, 3]`, size parameters `[; N]`; checked at run time where not sure, size names as `i64`s), methods, `mut` rules and exclusivity, `nocopy` rules, generators, stages, exhaustive `match`, warnings (cases that never match, unused variables, parameters and functions, `mut` that isn't needed, code that never runs, printing a generator from the library, eager functions of generators without end) |
 | Interpreters | AST interpreter (the reference) and IR interpreter (with arena and memory checks); both agree on every test program |
 | IR and optimizer | Typed SSA CFG with a verifier, and generator functions that `yield`; mem2reg, direct calls, inlining, constant folding, CFG simplification, DCE, copy-to-move, array fusion (`fuse`); direct self tail calls reuse the frame |
 | Native code | x64 assembly plus a C runtime with real arenas, and SSA register allocation; byte-for-byte the same output and errors as the interpreters |
 | Memory model | Value semantics without a GC: arenas per call and per loop iteration, compiler-chosen placement, loops that carry values in two arenas taking turns (no region bloat), pools with generation-checked handles, arenas freed as a unit, `nocopy` and finalizers, generators that keep their frame and levels in the `Gen` |
 | Staging | `quote` and `$` at any depth, compile-time splices, types as values, reflection, computed types (`new_struct`) |
 | User types | Structs, enums (also defined inside functions, moved to the top level by linking), instance and type-namespace functions, receiver calls for compatible prelude functions, operators (`add`, `compare`, ...), protocols (`get`, `set`, `update`, `iter`, `next`, `contains`, `len`, `text`, `eq`, `hash`); generators (`yield`, `Gen[T]`, `next`) |
-| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `log10`, `log2`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `maps`, `sets`, `strings`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `fold`, `flatten`, `flat_map`, `position`, `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`, `max_by`, `partition`, `chunks`, `unique`, `map_of`, `group_by`, `counts`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, `tau`, `e`, `inf`, `nan`, `Map[K, V]` and `Set[T]`, and strings (`repeat`, `lines`, `words`, `trim_start`, `trim_end`, `strip_prefix`, `strip_suffix`, `split_once`, `count_of`, `is_digit`, `is_alpha`, `is_space`); lazy versions on generators in `iters` (`import iters`: `each`, `count`, `map`, `filter`, `take`, `skip`, `take_while`, `chain`, `enumerate`, `zip`, `scan`, `collect`) |
+| Library | Conversions and parsing of numbers, math (`sqrt`, `floor`, `ceil`, `round`, `exp`, `ln`, `log10`, `log2`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `abs`, `min`, `max`), `ord`, `chr`, strings (`split`, `join`, `find`, `replace`, `trim`, `chars`, `upper`, `lower`, `starts_with`, `ends_with`, `pad_left`, `pad_right`, `format_f64`), `hash`, slices, `read_line`, `read_file`, `write_file`, `args`, `env`, `exit`; all but `exit` usable as values, as are `print`, `eprint`, `len` and constructors; `print` and `eprint` with any number of values; a standard library in Ella (modules `lists`, `iters`, `maps`, `sets`, `strings`, `math`, whose names are the prelude) with `map`, `filter`, `sort`, `sort_by`, `reverse`, `sum`, `fold`, `flatten`, `flat_map`, `position`, `first`, `last`, `index_of`, `min_of`, `max_of`, `min_by`, `max_by`, `partition`, `chunks`, `unique`, `map_of`, `group_by`, `counts`, `any`, `all`, `zip`, `enumerate`, `range` with a step, `pi`, `tau`, `e`, `inf`, `nan`, `Map[K, V]` and `Set[T]`, and strings (`repeat`, `lines`, `words`, `trim_start`, `trim_end`, `strip_prefix`, `strip_suffix`, `split_once`, `count_of`, `is_digit`, `is_alpha`, `is_space`); and lazy functions on anything a loop can go through in `iters` (`each`, `count`, `take`, `skip`, `take_while`, `chain`, `scan`, `collect`, and `iters.map`, `iters.filter`, `iters.enumerate`, `iters.zip`) |
 | Modules | A file is a module; `import geo.poly`, `as`, imports of one item (an enum's variants come with it); private names (`_x`) for the module and those below it, fields and methods too; other modules' variables are read-only; whole-program compilation, leaving out unused functions of modules; packages found on a package path (`--path`, `ELLA_PATH`) |
 | Tooling | CLI with `--ir`, `--asm`, `--placement`, `--profile`, `--max-depth`, program arguments after `--`, exit status from `main` (or a `Result`), stack traces for run-time errors in every backend, warnings; language server (errors, warnings, hover, go to definition, semantic tokens, completion, all across imported modules, reading open documents); VS Code extension; Makefile; benchmarks with memory bounds (`make bench`) |
 
@@ -130,10 +133,11 @@ whose names are the prelude) add list functions (`map`, `filter`, `sort`,
 - A type with `eq` must also have `hash`, and nothing checks that they
   agree (equal values must hash the same), nor that `eq` is an
   equivalence.
-- A generator takes its nocopy arguments (a `Gen` given to another
-  generator, say) only as new values: `squares(count(4))` works, but
-  `squares(g)` for a variable `g` doesn't. Moving a local variable at its
-  last use, as `return` does, would allow it.
+- A generator or an `Iter[T]` parameter takes its nocopy arguments (a
+  `Gen` given to another generator, say) only as new values or variables
+  given away at their last use (`give_away`): `squares(g)` works for a
+  local `g`, but not inside a loop `g` was declared outside of, and not
+  for a top-level variable a function uses.
 - A function type can't say that a function takes its arguments, so the
   rule goes by the result type: every function that gives a `Gen` takes
   its nocopy arguments, even one that only borrows them.
@@ -386,6 +390,106 @@ runtime; new functions with fixed types are cheap to add that way.
    errors from imports at the import line, finds definitions in other
    files (the standard library's too), and completes a module's names
    after `geo.`. Test programs can be directories (`NAME/main.ella`).
+
+### Done (2026-11-07, second round): giving away, eager by default, `iters` in the prelude
+
+Lazy-by-default chains were built and then reverted: generators can't be
+copied, so a lazy result can't be named and used twice, captured, stored
+or passed to a generic function, and `sum(map(xs, f))` needs `collect`;
+that put moves in front of the most common code, against simplicity
+first. What stayed:
+
+1. **Giving away** (grammar.md §9, "Values that can't be copied"). In
+   `CopyChecker`, a variable that can't be copied may be given away where
+   its value is taken (`walk_taken`: arguments of calls giving a `Gen`;
+   `walk_iterable`: `Iter[T]` arguments; a `for` without `mut` over a
+   generator or iterator): `give_away` allows it if the variable is the
+   function's own (`depths`: binder -> how many loops it is declared in,
+   which must be the current count; a generator's parameters and
+   `Iter[T]` parameters, which take their arguments, count, as do
+   top-level variables no function uses, `used_by_functions`), and
+   records it in `given`; any later read is an error
+   (`check_not_given`, at the top of `walk`). `if`/`match` branches start
+   from what was given before them and are merged after. No lowering
+   change was needed: the IR interpreter's memory checks and native runs
+   with poisoning pass, including a local `Gen`, and a non-generator's
+   `Iter[T]` parameter, given to a generator that the function returns.
+2. **Eager by default, lazy on request.** `lists`' `map`, `filter`, `zip`
+   and `enumerate` take `Iter[T]` and give lists (`zip` steps through
+   `b` with `iters.each`, so `zip(xs, count(0, 1))` works: `lists`
+   imports `iters`). Every `iters` function takes `Iter[T]` (`take` with a
+   counter, asking for no more items), and `collect` takes `Iter[T]` (no
+   `mut`). `iters` is in the prelude, but its names that another library
+   module has give way (`modules.prelude` takes `iters` last;
+   `checker.LAZY`), also for method calls: `xs.map(f)` is always eager,
+   like `xs |> map(f)` (choosing by the receiver's type would have made
+   the two differ). The lazy ones are `iters.map` and so on.
+3. **Hints.** `collect_hint` adds "a Gen gives its items one at a time,
+   and collect() makes a list of them" to type mismatches, indexing,
+   `len`, `in`, `==` and `+` on a `Gen`; printing a library function's
+   `Gen` (`print(count(1, 1))`) warns (`printed`, `from_library`); a
+   variable holding one doesn't, since printing `<gen>` can be meant.
+   Copying an `Iter[T]` parameter's value says collect() gives a list that
+   can be copied (`keep_hint`). An eager `map`, `filter`, `zip` (both
+   sides), `enumerate` or `collect` of a generator that surely has no end
+   (`count(...)`, through lazy functions that keep going: `endless`)
+   warns that it never finishes (`warn_endless`, by linked name:
+   `library_call`).
+
+Measured on the way: `map` then `filter` over 5,000,000 items, native
+`-O`: eager 0.096 s, lazy 0.087 s; the tree interpreter, 20,000 items:
+eager 19 s, lazy 7 s (the eager append in the AST interpreter looks
+quadratic: worth a look).
+
+Open: lazy adapters as copyable structs (needs `Iter[T]` or associated
+types in fields), which would make lazy results ordinary values; more
+list functions on `Iter[T]`; a lazy `iters.flat_map`; the slow eager
+append in the AST interpreter.
+
+### Done (2026-11-07): pattern parameters and `Iter[T]` parameters
+
+Instead of comprehensions (judged to add little over `map`/`filter` with
+lambdas), the two gaps they would have closed:
+
+1. **Pattern parameters** (grammar.md §5): `((a, b)) => a + b`,
+   `(Point(x, y): Point) -> f64 => ...`. The parser looks ahead from `(`
+   to its `)` for `->`/`=>` (`closes_before_arrow`); if so, it parses the
+   items as parameters (`parse_param`), where a pattern (not a literal,
+   range or `|`) is allowed, with a type after it. `parse_lambda` makes
+   each a hidden parameter `#i` (by position) and puts `let pattern = #i`
+   first in the body, so the checker's exhaustiveness check, warnings and
+   every backend need nothing new. `syntax.is_hidden` names; editors skip
+   them. `where` conditions can use the names too (added the same day):
+   each condition using some gets its own new copy of the `let`s, keeping
+   only the names it uses (the rest `_`, none `mut`); the body's keeps the
+   names it uses and those no condition uses (`parser.take_apart`). So no
+   copy warns about a name used elsewhere, a name used nowhere is warned
+   about once, and a variant name (`None`) stays in some copy, which keeps
+   a pattern that misses values an error.
+2. **`Iter[T]` parameters** (grammar.md §9, "Iter parameters"): anything
+   a `for` loop can go through. `parser.with_iter_params` gives each one
+   of a `let`'s function a hidden type parameter `Iter#i` and the type
+   `Iter#i[T]`, which the checker makes `ParamTy("Iter#i", item=T)`. So the
+   function is generic, and the lowering specializes it per source type
+   with no changes, except that a loop over such a value (`iterations`
+   kind "any") decides how it goes from the concrete type
+   (`Checker.iteration`, shared with `loop_item`'s logic); the AST
+   interpreter's `for` already dispatches on the value. At each use,
+   `expect_iterables` records the type argument; `check_args` settles it
+   as soon as the argument is checked (`settle_iterable`: its items must
+   be T, which decides T for lambdas after it; a type not known yet is
+   taken to be a list, as `[T]` would; leftovers, from uses as values, in
+   `finish_checks`). The value may be a `Gen`, so `is_nocopy` is true for
+   it, generic uses skip the nocopy check for `Iter#` parameters, and an
+   argument for one is taken (`iter_args`, `CopyChecker.walk_iterable`):
+   a `Gen` must be a new value, but a function may pass on its own to a
+   function that gives no generator. `lists.map`/`filter` and
+   `iters.map`/`filter` take `Iter[T]`. Method-call syntax now only finds
+   prelude functions, as grammar.md always said (it found `iters`' too
+   once imported, which made `(0..3).map(f)` ambiguous); `UNPRELUDED`
+   moved to ella.checker for that (and later gave way to `LAZY`, in the
+   second round). Open: other list functions, `Iter` in methods and
+   results.
 
 ### Done (2026-11-06, third round): arrays typed by shape
 
@@ -1043,3 +1147,32 @@ unrestricted `eval`.
    runs across those backends. Add focused macro-expansion workloads if
    performance becomes a concern. Keep existing programs and ordinary
    string behavior unchanged.
+
+### 12. Iterators as values: a named iterator constraint and copyable adapters
+
+Today laziness means generators, which can't be copied: a lazy result
+can't be named and used twice, captured, stored, or passed to a type
+parameter, and `Iter[T]` parameters can't be copied inside their function
+(the second-round discussion of 2026-11-07, above). Rust's design avoids
+this: adapters are small structs that are iterators themselves.
+
+1. **A named iterator constraint**, met by a type with `next: (mut Self)
+   -> Optional[T]`. It needs an associated item type (open in grammar.md),
+   or a built-in form like `Iter[T]` that works anywhere a type does
+   (struct fields, type parameters), not only as a parameter's type.
+2. **Iterator structs for the built-in sources**: a list, string or range
+   with a position, which `iter` (or the loop) gives, so every source
+   has a `next`.
+3. **Adapters as structs**: `iters.map` gives `Mapped(source, f)`, whose
+   `next` calls the source's; likewise `filter`, `take`, `zip`, ... They
+   can be copied whenever their source and functions can (lambdas capture
+   by copy), so only chains starting from a real generator stay
+   non-copyable. Copying one gives an independent iterator from the same
+   point (effects in `f` would run again for each copy).
+4. Then `Iter[T]` parameters could be copied when what is passed can be,
+   if the checker checks each specialization's copies rather than the
+   body once (or the constraint says whether it can be copied).
+
+Worth it only if lazy chains get used enough; eager `map` and `filter`
+cover most code.
+

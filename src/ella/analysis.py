@@ -60,6 +60,8 @@ from ella.syntax import (
     Unary,
     VariantPattern,
     bare_name,
+    is_hidden,
+    is_iter_param,
     parts,
     show,
 )
@@ -566,6 +568,12 @@ class Checked:
                 if not isinstance(function, FuncTy) or not function.params:
                     continue
                 receiver_pattern = function.params[0]
+                if isinstance(receiver_pattern, ParamTy) and receiver_pattern.item is not None:
+                    # An Iter[T] parameter: anything a loop can go through.
+                    if self.checker.iteration(receiver, Span(0, 0)) is not None:
+                        found.append(Completion(name, "method"))
+                        break
+                    continue
                 type_args: dict[str, Type] = dict(zip(type_params, (self.checker.fresh() for _ in type_params)))
                 if type_params:
                     specialized = substitute(function, type_args)
@@ -687,6 +695,8 @@ class Symbols:
         """The symbol for a node with a name, if it has one."""
         checked = self.checked
         match node:
+            case Name(name) | Param(name) if is_hidden(name):
+                pass  # a pattern parameter's (`#0`), which the program doesn't write
             case Name(name, span) if id(node) in self.checker.resolved:
                 info = self.checker.resolved[id(node)]
                 kind = "" if name == "return" else name_kind(info, self.checker)  # `return` in `where` is a keyword
@@ -699,7 +709,8 @@ class Symbols:
             case Binding(name, mutable, _, span):
                 t = self.checked.type_of(node)
                 function = t is not None and isinstance(resolve(t), FuncTy)
-                params = f"[{', '.join(node.type_params)}]" if node.type_params else ""
+                shown = [p for p in node.type_params if not is_iter_param(p)]
+                params = f"[{', '.join(shown)}]" if shown else ""
                 modifiers = ("declaration",) if mutable else ("declaration", "readonly")
                 hover = f"let {'mut ' if mutable else ''}{name}{params}: {self.show(node)}"
                 self.add(checked.token_at(span), hover, "function" if function else "variable", modifiers)
@@ -808,7 +819,9 @@ class Symbols:
     def type_name(self, name: str, span: Span) -> None:
         """A type's name in an annotation."""
         token = self.checked.token_at(span)
-        if name in PRIMITIVE_NAMES or name in BUILTIN_TYPES:
+        if is_iter_param(name):  # `Iter[T]` as written (ella.parser.with_iter_params)
+            self.add(token, "Iter: built-in type", "type", ("defaultLibrary",))
+        elif name in PRIMITIVE_NAMES or name in BUILTIN_TYPES:
             self.add(token, f"{name}: built-in type", "type", ("defaultLibrary",))
         elif name in self.checker.enums:
             info = self.checker.enums[name]

@@ -6,7 +6,15 @@ from dataclasses import dataclass, field, replace
 from functools import cache, partial
 from pathlib import Path
 
-from ella.checker import BUILTIN_ENUMS, BUILTIN_TYPES, BUILTINS, CONSTRAINTS, PRIMITIVE_NAMES, REFLECTION
+from ella.checker import (
+    BUILTIN_ENUMS,
+    BUILTIN_TYPES,
+    BUILTINS,
+    CONSTRAINTS,
+    LAZY,
+    PRIMITIVE_NAMES,
+    REFLECTION,
+)
 from ella.lexer import STD, EllaError, Span
 from ella.parser import parse
 from ella.syntax import (
@@ -52,13 +60,10 @@ from ella.syntax import (
 )
 
 LIBRARY_DIR = Path(__file__).parent / "lib"
-# Library modules whose names aren't in the prelude, since they share names with
-# those of other modules: they must be imported (`import iters`, then `iters.map`).
-UNPRELUDED = frozenset({"iters"})
 
 # The names a module can use without defining or importing them.
 BUILTIN_NAMES = frozenset({*BUILTINS, *REFLECTION}) | {v for e in BUILTIN_ENUMS.values() for v in e.variants}
-BUILTIN_TYPE_NAMES = frozenset({*PRIMITIVE_NAMES, *BUILTIN_TYPES, *BUILTIN_ENUMS})
+BUILTIN_TYPE_NAMES = frozenset({*PRIMITIVE_NAMES, *BUILTIN_TYPES, *BUILTIN_ENUMS, "Iter"})
 
 # The environment variable with the package path: directories separated by os.pathsep (':').
 PACKAGE_PATH = "ELLA_PATH"
@@ -166,15 +171,18 @@ def library_module(name: str) -> Program | None:
 
 @cache
 def prelude() -> dict[str, Item]:
-    """The prelude: each public name of the standard library (but UNPRELUDED's), by its name as written."""
+    """The prelude: each public name of the standard library, by its name as written.
+
+    The lazy `map`, `filter`, `zip` and `enumerate` of `iters` share names with the eager ones of `lists`,
+    which the prelude has; they are `iters.map` and so on (`import iters`).
+    """
     names: dict[str, Item] = {}
-    for path in sorted(LIBRARY_DIR.glob("*.ella")):
-        if path.stem in UNPRELUDED:
-            continue
+    paths = sorted(LIBRARY_DIR.glob("*.ella"), key=lambda path: (path.stem == LAZY, path.stem))
+    for path in paths:  # `iters` last, so that the others' names win
         program = library_module(path.stem)
         assert program is not None
         for name, item in top_level(program.body, path.stem + ".", path.stem, f"{STD}/{path.name}").items():
-            if not name.startswith("_"):
+            if not name.startswith("_") and name not in names:
                 names[name] = item
     return names
 

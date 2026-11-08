@@ -2227,6 +2227,11 @@ class Lowerer:
         """
         span = expr.span
         via_iter, kind = self.checker.iterations[id(expr)]
+        if kind == "any":
+            # A loop over an Iter[T] parameter goes through what this specialization is for.
+            found = self.checker.iteration(self.type_of(expr.iterable), span)
+            assert found is not None, "the checker checks what is passed to an Iter[T] parameter"
+            via_iter, kind, _ = found
         if kind != "items":
             return self.lower_for_iterator(expr, via_iter)
         iterable = self.protect(self.lower(expr.iterable), [expr.body], span)

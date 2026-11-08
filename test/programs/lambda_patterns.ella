@@ -1,0 +1,52 @@
+# Lambda parameters that are patterns (docs/grammar.md §5).
+struct Point
+    x: i64
+    y: i64
+
+let pairs = [(1, "one"), (2, "two"), (3, "three")]
+print(map(pairs, ((n, word)) => "{{word}}={{n}}"))
+print(filter(pairs, ((n, _)) => n % 2 == 1))
+
+let manhattan = (Point(x, y): Point) -> i64 => abs(x) + abs(y)
+print(manhattan(Point(3, -4)))
+
+let add = (scale: i64, (a, b): (i64, i64)) -> i64 => scale * (a + b)
+print(add(10, (1, 2)))
+
+# Nested patterns, mut names, and a block body.
+let describe = (((a, b), mut c): ((i64, i64), i64)) -> str =>
+    c += a * b
+    "{{a}} {{b}} {{c}}"
+print(describe(((2, 3), 4)))
+
+# A generator's pattern parameter.
+let both = ((a, b): (str, str)) -> Gen[str] =>
+    yield a
+    yield b
+for s in both(("left", "right"))
+    print(s)
+
+print(map([Point(1, 2), Point(3, 4)], (Point(x, _)) => x))
+
+# `where` conditions can use a pattern parameter's names.
+let span_of = ((low, high): (i64, i64)) -> i64 =>
+    where
+        low <= high
+        return >= 0
+    high - low
+print(span_of((2, 9)))
+
+let countdown = ((n, label): (i64, str)) -> str =>
+    where
+        n >= 0
+    if n == 0 then label else countdown((n - 1, label + "."))
+print(countdown((3, "go")))
+
+let steps = (Point(x, _): Point) -> Gen[i64] =>
+    where
+        x > 0
+    for i in 0..x
+        yield i
+for s in steps(Point(2, 0))
+    print(s)
+print(span_of((5, 1)))

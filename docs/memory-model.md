@@ -905,8 +905,10 @@ yields to itself, so that every later `next` gives `None` too.
   level: after the body's values, which are newer.
 * **Taking arguments.** A function that gives a `Gen` takes its nocopy
   arguments (they move into the generator's first arena), so the checker
-  only allows new values there. A generator's parameters are its own
-  variables, which it may change.
+  only allows new values there, or variables at their last use, which
+  give their values away (grammar.md §9); an `Iter[T]` parameter takes its
+  argument the same way. A generator's parameters are its own variables,
+  which it may change, and give away.
 
 The AST interpreter, which has no frames to keep, runs each generator's
 body on a thread of its own, handing control back and forth at `next` and

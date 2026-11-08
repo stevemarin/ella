@@ -1,0 +1,49 @@
+# Variables holding values that can't be copied, given away at their last
+# use (docs/grammar.md §9, "Values that can't be copied").
+import iters
+
+let naturals = (n: i64) -> Gen[i64] =>
+    let mut i = 0
+    while i < n
+        yield i
+        i += 1
+
+let total = (xs: Iter[i64]) -> i64 =>
+    let mut sum = 0
+    for x in xs
+        sum += x
+    sum
+
+# A local generator given to one that escapes the function.
+let doubled = (n: i64) -> Gen[i64] =>
+    let g = naturals(n)
+    iters.map(g, x => x * 2)
+
+# A generator giving its own parameter away.
+let pairs = (a: Iter[i64], b: Iter[str]) -> Gen[(i64, str)] =>
+    let mut others = each(b)
+    for x in a
+        match next(mut others)
+            case Some(y) => yield (x, y)
+            case None => return
+
+let main = () -> () =>
+    let g = naturals(4)
+    print(total(g))
+    let h = doubled(3)
+    print(h.collect())
+    let mut p = pairs(naturals(3), ["a", "b", "c", "d"])
+    print(next(mut p))
+    print(p.collect())
+    for i in 0..3
+        let k = iters.map(naturals(i), x => x + 100)
+        print(total(k))
+    let squares = iters.map(1..5, n => n * n)
+    for s in squares
+        print(s)
+    let evens = count(0, 2) |> take(3)
+    print(if total(naturals(1)) == 0 then evens.collect() else [])
+
+# At the top level too, when no function uses the variable.
+let words = iters.filter(["a", "bb", "ccc"], w => len(w) > 1)
+print(words.collect())

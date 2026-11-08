@@ -231,10 +231,10 @@ def test_a_programs_names_can_be_its_modules_names(tmp_path: Path) -> None:
 
 def test_a_module_named_like_a_library_module(tmp_path: Path) -> None:
     files = {
-        "lists.ella": "let map = (n: i64) -> i64 => n + 1\n",
-        "main.ella": "import lists\nprint(lists.map(1), map([1], (n) => n * 10))\n",  # the prelude's map is still there
+        "lists.ella": "let sort = (n: i64) -> i64 => n + 1\n",
+        "main.ella": "import lists\nprint(lists.sort(1), sort([2, 1]))\n",  # the prelude's sort is still there
     }
-    assert run(tmp_path, files) == "2 [10]\n"
+    assert run(tmp_path, files) == "2 [1, 2]\n"
     assert warnings(tmp_path, files) == [
         "1:1: 'lists.ella' has the name of a standard library module, and is used instead of it"
     ]

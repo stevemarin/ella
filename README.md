@@ -43,7 +43,11 @@ let main = () -> () =>
   loop to.
 * **A familiar feel.** Indentation-based syntax, everything is an
   expression, exhaustive `match`, generics with constraints, methods,
-  generators, modules, and a standard library written in Ella.
+  generators, modules, and a standard library written in Ella. Functions
+  can take apart their arguments with patterns (`((a, b)) => a + b`), and
+  `map` and `filter` go through anything a `for` loop can (lists, ranges,
+  strings, generators). Lazy versions are there when wanted:
+  `count(1, 1) |> iters.map(square) |> take(3) |> collect`.
 
 Some deliberate choices: no implicit type conversions, only `bool` is
 truthy, integers are signed and trap on overflow, and bindings can't change

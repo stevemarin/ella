@@ -6,6 +6,7 @@
 # name. These are standard library modules, whose names every module sees
 # anyway, without their module's name (the prelude).
 import lists
+import iters
 import maps.new_map as empty_map
 
 # this is a comment
@@ -172,6 +173,12 @@ assert sort(squares) == [1, 4, 9] and reverse(squares) == [4, 1, 9]
 assert filter(squares, (n: i64) -> bool => n > 3) == [9, 4]
 let no_ages: Map[str, i64] = empty_map()
 assert lists.sum(squares, 0) == 14 and len(no_ages) == 0
+# map and filter go through anything a for loop can: lists, ranges, strings, generators
+assert map(0..3, n => n * 2) == [0, 2, 4] and filter("ella", c => c != "l") == ["e", "a"]
+# iters has lazy ones, which give generators; collect makes a list
+assert (iters.map(1..1000000, n => n * n) |> take(3) |> collect) == [1, 4, 9]
+# a parameter can be a pattern that takes its argument apart
+assert map([(1, "one"), (2, "two")], ((n, word)) => "{{n}}:{{word}}") == ["1:one", "2:two"]
 
 # map and set literals: {key: value, ...} is a Map ({} an empty one), {x, ...} a Set
 let mut ages = {"ann": 31, "bob": 40}
@@ -256,6 +263,14 @@ struct Pair[T]
     second: T
 let swap[T] = (p: Pair[T]) -> Pair[T] => Pair(p.second, p.first)
 assert swap(Pair(1, 2)) == Pair(2, 1)
+
+# an Iter[T] parameter takes anything a for loop can go through, with items of type T
+let widest = (words: Iter[str]) -> i64 =>
+    let mut most = 0
+    for w in words
+        if len(w) > most then most = len(w)
+    most
+assert widest(["a", "abc"]) == 3 and widest("xy") == 1
 
 # a constraint says what a generic function does with its type parameter
 let bigger[T: Ord] = (a: T, b: T) -> T => if a > b then a else b

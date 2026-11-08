@@ -1,12 +1,13 @@
-# Lazy versions of the list functions, on generators (docs/grammar.md §9).
-# Not part of the prelude, since they share names with the functions on
-# lists: `import iters`, then `iters.map(g, f)` or `g |> iters.map(f)`.
+# Lazy functions on anything a loop can go through: lists, strings, ranges,
+# arrays, generators and iterators (docs/grammar.md §10). Part of the
+# prelude. Each gives a generator, which asks for items only as its own are
+# asked for; `collect` makes a list of its items.
 #
-# Each takes the generators it is given and gives a new one, which asks
-# them for items only as its own are asked for.
+# Each takes what it is given: a generator passed to one must be a new
+# value, or a variable given away at its last use (docs/grammar.md §9).
 
-# The items of a list, one at a time.
-let each[T] = (xs: [T]) -> Gen[T] =>
+# The items of xs, one at a time, as a generator.
+let each[T] = (xs: Iter[T]) -> Gen[T] =>
     for x in xs
         yield x
 
@@ -16,64 +17,67 @@ let count[T: Num] = (start: T, step: T) -> Gen[T] =>
         yield start
         start += step
 
-let map[T, U] = (g: Gen[T], f: (T) -> U) -> Gen[U] =>
-    for x in mut g
+# f of each item.
+let map[T, U] = (xs: Iter[T], f: (T) -> U) -> Gen[U] =>
+    for x in xs
         yield f(x)
 
-let filter[T] = (g: Gen[T], keep: (T) -> bool) -> Gen[T] =>
-    for x in mut g
+# The items for which `keep` is true.
+let filter[T] = (xs: Iter[T], keep: (T) -> bool) -> Gen[T] =>
+    for x in xs
         if keep(x) then yield x
 
-# The first n items (fewer if there aren't as many).
-let take[T] = (g: Gen[T], n: i64) -> Gen[T] =>
-    while n > 0
-        match next(mut g)
-            case Some(x) => yield x
-            case None => return
+# The first n items (fewer if there aren't as many), asking for no more.
+let take[T] = (xs: Iter[T], n: i64) -> Gen[T] =>
+    if n <= 0 then return
+    for x in xs
+        yield x
         n -= 1
+        if n == 0 then return
 
 # The items after the first n.
-let skip[T] = (g: Gen[T], n: i64) -> Gen[T] =>
-    for x in mut g
+let skip[T] = (xs: Iter[T], n: i64) -> Gen[T] =>
+    for x in xs
         if n > 0 then n -= 1 else yield x
 
 # The items up to the first one for which `keep` is false.
-let take_while[T] = (g: Gen[T], keep: (T) -> bool) -> Gen[T] =>
-    for x in mut g
+let take_while[T] = (xs: Iter[T], keep: (T) -> bool) -> Gen[T] =>
+    for x in xs
         if not keep(x) then return
         yield x
 
 # The items of a, then those of b.
-let chain[T] = (a: Gen[T], b: Gen[T]) -> Gen[T] =>
-    for x in mut a
+let chain[T] = (a: Iter[T], b: Iter[T]) -> Gen[T] =>
+    for x in a
         yield x
-    for x in mut b
+    for x in b
         yield x
 
 # Each item with its position: (0, first), (1, second), ...
-let enumerate[T] = (g: Gen[T]) -> Gen[(i64, T)] =>
+let enumerate[T] = (xs: Iter[T]) -> Gen[(i64, T)] =>
     let mut i = 0
-    for x in mut g
+    for x in xs
         yield (i, x)
         i += 1
 
 # Pairs of the items of a and b, as many as the shorter one has.
-let zip[T, U] = (a: Gen[T], b: Gen[U]) -> Gen[(T, U)] =>
-    for x in mut a
-        match next(mut b)
+let zip[T, U] = (a: Iter[T], b: Iter[U]) -> Gen[(T, U)] =>
+    let mut others = each(b)
+    for x in a
+        match next(mut others)
             case Some(y) => yield (x, y)
             case None => return
 
 # The running results of f: start, f(start, first), f(f(start, first), second), ...
-let scan[T, A] = (g: Gen[T], start: A, f: (A, T) -> A) -> Gen[A] =>
+let scan[T, A] = (xs: Iter[T], start: A, f: (A, T) -> A) -> Gen[A] =>
     yield start
-    for x in mut g
+    for x in xs
         start = f(start, x)
         yield start
 
-# All the items left in a generator, in a list.
-let collect[T] = (mut g: Gen[T]) -> [T] =>
+# All the items, in a list.
+let collect[T] = (xs: Iter[T]) -> [T] =>
     let mut items: [T] = []
-    for x in mut g
+    for x in xs
         items += [x]
     items

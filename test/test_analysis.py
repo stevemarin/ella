@@ -329,3 +329,20 @@ def test_size_names() -> None:
     assert (found[1, 43].hover, found[1, 43].definition) == ("N: i64", Location(1, 29, 1))
     assert (found[3, 7].hover, found[3, 7].definition) == ("M: i64", Location(2, 19, 1))
     assert "match_shape" not in names("let a = array([1.0])\na.\n", 2, 3)
+
+
+def test_iter_and_pattern_parameters() -> None:
+    source = "let total = (xs: Iter[i64]) -> i64 =>\n    let mut s = 0\n    for x in xs\n        s += x\n    s\n"
+    source += "let f = ((a, b): (i64, i64)) -> i64 => a + total([b])\nprint(f((1, 2)))\n"
+    found = symbols(source)
+    assert found[1, 5].hover == "let total: (Iter[i64]) -> i64"
+    assert found[1, 14].hover == "xs: Iter[i64]"
+    assert (found[1, 18].hover, found[1, 18].kind) == ("Iter: built-in type", "type")
+    assert found[6, 11].hover == "a: i64"
+    # The hidden parameter a pattern parameter becomes has no symbol: its `(` is the pattern's.
+    assert (6, 10) not in found
+    assert all("#" not in symbol.hover for symbol in found.values())
+    # Functions with an Iter[T] first parameter are methods of what a loop can go through, and only of that.
+    assert "map" in names("print((0..3).\n", 1, 14)
+    assert "map" in names('print("ab".\n', 1, 12)
+    assert "map" not in names("print((1).\n", 1, 11)

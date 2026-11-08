@@ -1,4 +1,6 @@
 # Functions on lists. Part of the prelude: every module sees these names.
+import iters
+
 
 let reverse[T] = (xs: [T]) -> [T] =>
     let mut result: [T] = []
@@ -6,18 +8,6 @@ let reverse[T] = (xs: [T]) -> [T] =>
     while i > 0
         i -= 1
         result += [xs[i]]
-    result
-
-let map[T, U] = (xs: [T], f: (T) -> U) -> [U] =>
-    let mut result: [U] = []
-    for x in xs
-        result += [f(x)]
-    result
-
-let filter[T] = (xs: [T], keep: (T) -> bool) -> [T] =>
-    let mut result: [T] = []
-    for x in xs
-        if keep(x) then result += [x]
     result
 
 # A merge sort, which is stable and compares items with `<` only: runs of
@@ -188,6 +178,43 @@ let max_by[T, K: Ord] = (xs: [T], key: (T) -> K) -> Optional[T] =>
             best_key = k
     Some(xs[best])
 
+# map, filter, zip and enumerate take anything a loop can go through (a list,
+# str, range, generator, ...: docs/grammar.md §9, "Iter parameters") and give
+# lists. iters has lazy ones, which give generators: iters.map(xs, f).
+
+# f of each item, called in order.
+let map[T, U] = (xs: Iter[T], f: (T) -> U) -> [U] =>
+    let mut result: [U] = []
+    for x in xs
+        result += [f(x)]
+    result
+
+# The items for which `keep` is true, called in order.
+let filter[T] = (xs: Iter[T], keep: (T) -> bool) -> [T] =>
+    let mut result: [T] = []
+    for x in xs
+        if keep(x) then result += [x]
+    result
+
+# Pairs of the items of a and b, as many as the shorter one has.
+let zip[T, U] = (a: Iter[T], b: Iter[U]) -> [(T, U)] =>
+    let mut pairs: [(T, U)] = []
+    let mut others = iters.each(b)
+    for x in a
+        match next(mut others)
+            case Some(y) => pairs += [(x, y)]
+            case None => break
+    pairs
+
+# Each item with its position: [(0, first), (1, second), ...].
+let enumerate[T] = (xs: Iter[T]) -> [(i64, T)] =>
+    let mut pairs: [(i64, T)] = []
+    let mut i = 0
+    for x in xs
+        pairs += [(i, x)]
+        i += 1
+    pairs
+
 # The items for which `test` is true, and those for which it is false, each in order.
 let partition[T] = (xs: [T], test: (T) -> bool) -> ([T], [T]) =>
     let mut yes: [T] = []
@@ -195,19 +222,6 @@ let partition[T] = (xs: [T], test: (T) -> bool) -> ([T], [T]) =>
     for x in xs
         if test(x) then yes += [x] else no += [x]
     (yes, no)
-
-let zip[T, U] = (xs: [T], ys: [U]) -> [(T, U)] =>
-    let n = min(len(xs), len(ys))
-    let mut pairs: [(T, U)] = []
-    for i in 0..n
-        pairs += [(xs[i], ys[i])]
-    pairs
-
-let enumerate[T] = (xs: [T]) -> [(i64, T)] =>
-    let mut pairs: [(i64, T)] = []
-    for i in 0..len(xs)
-        pairs += [(i, xs[i])]
-    pairs
 
 let range = (start: i64, stop: i64, step: i64) -> [i64] =>
     where

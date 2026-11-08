@@ -1,0 +1,57 @@
+# Iter[T] parameters (docs/grammar.md §9): anything a loop can go through.
+import iters
+let total = (xs: Iter[i64]) -> i64 =>
+    let mut sum = 0
+    for x in xs
+        sum += x
+    sum
+
+let count = (n: i64) -> Gen[i64] =>
+    let mut i = 0
+    while i < n
+        yield i
+        i += 1
+
+# An iterator: a struct with a `next` method.
+struct Countdown
+    n: i64
+    next = (mut c: Countdown) -> Optional[i64] =>
+        if c.n == 0 then return None
+        c.n -= 1
+        Some(c.n + 1)
+
+# A struct with an `iter` method.
+struct Bag
+    items: [i64]
+    iter = (b: Bag) -> [i64] => b.items
+
+print(total([1, 2, 3]), total(0..5), total(count(4)), total(Countdown(3)), total(Bag([10, 20])))
+print(total(array([1, 2, 3])))
+
+# A second loop over a list starts again; over a generator, it carries on.
+let twice = (xs: Iter[i64]) -> i64 => total(xs) + total(xs)
+print(twice([1, 2]), twice(count(3)), twice(Countdown(2)))
+
+let first[T] = (xs: Iter[T]) -> Optional[T] =>
+    for x in xs
+        return Some(x)
+    None
+print(first("xyz"), first(count(1000000000)), first([1.5]), first(0..0))
+
+let joined = (xs: Iter[str], sep: str) -> str =>
+    let mut out = ""
+    for x in xs
+        out = if out == "" then x else out + sep + x
+    out
+print(joined("abc", "-"), joined(["to", "be"], " "))
+
+# map and filter in the prelude give lists; iters.map and iters.filter are
+# lazy, giving generators.
+print(map(0..5, x => x * x))
+print(filter("banana", c => c != "a"))
+print(map(count(4), x => x + 1), filter(Countdown(6), x => x % 2 == 0))
+print(count(10) |> filter(x => x % 3 == 0) |> map(x => -x))
+print((1..4).map(x => x * 10), "abc".map(c => c + c))
+print(iters.map(0..1000000000, x => x * 2) |> iters.filter(x => x % 3 == 0) |> take(4) |> collect)
+let letters = iters.filter("a1b2c3", c => c in "123")
+print(collect(letters))

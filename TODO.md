@@ -4,14 +4,21 @@ What's being worked on, what's next, and the known rough edges. The
 detailed notes (implementation plans, design reasoning, and a log of
 finished work) are in [TODO-Claude.md](TODO-Claude.md).
 
-*Last reviewed 2026-11-06.*
+*Last reviewed 2026-11-07.*
 
 ## In progress
 
-Nothing right now. The last piece finished was arrays typed by shape:
-`Array[f64; N, 3]` is checked while compiling and, where that can't be
-sure, when the program runs; size names are numbers (`for i in 0..N`);
-and `sums(a, axis)` adds up along one dimension.
+Nothing right now. The last pieces finished:
+
+- Lambda parameters that are patterns (`((a, b)) => a + b`), also usable
+  in `where` conditions.
+- `Iter[T]` parameters, which take anything a `for` loop can go through.
+- `map`, `filter`, `zip` and `enumerate` stay eager (giving lists) but
+  take any iterable. `iters` is in the prelude for its other lazy
+  functions (`take`, `count`, `collect`, ...); its lazy `map` and the like
+  are `iters.map` and so on.
+- Giving away a generator (or other non-copyable value) held in a
+  variable at its last use: `let g = xs.map(f)` then `g.collect()`.
 
 ## Next up
 
@@ -22,6 +29,8 @@ Small steps that build on what's there:
 - [ ] A way for generic code to make the zero of a number type, so
       `sum(xs)` doesn't need a start value.
 - [ ] Warnings for unused methods, enum variants and top-level variables.
+- [ ] More list functions taking `Iter[T]` (`sum`, `any`, `all`, `fold`,
+      ...), and a lazy `iters.flat_map`.
 
 ## Known gaps
 
@@ -43,9 +52,13 @@ Small steps that build on what's there:
 - The "case never matches" warning doesn't reason about ranges
   (`case 1` after `case 0..5`).
 - Imports: one name per `import` line, no re-exports, no cycles.
-- A generator can only take a non-copyable argument (like another `Gen`)
-  as a brand-new value, not from a variable, and can't yield non-copyable
-  values.
+- A generator, or an `Iter[T]` parameter, takes a non-copyable argument
+  (like another `Gen`) only as a new value or a variable at its last use,
+  not inside a loop the variable was declared outside of. A lazy result
+  can't be used twice (collect it first), and a generator can't yield
+  non-copyable values.
+- `Iter[T]` is only for parameters of `let`-bound functions (not methods
+  or results).
 
 ### Library
 
@@ -102,6 +115,10 @@ Roughly in order of how much they'd unlock:
    features.
 10. **Self-hosting** (stretch): the tokenizer or parser rewritten in Ella.
 11. **Symbols and hygienic macros** built on `quote` and `$`.
+12. **Iterators as values**: a named iterator constraint, so generic code
+    can hold "something giving `T`s", and lazy `iters.map` and the like
+    as small copyable structs instead of generators, so a lazy result can
+    be named, copied and used twice.
 
 Other explorations are written up in [docs/ideas/](docs/ideas/):
 compile-time value parameters, a JIT, and SQLite integration.

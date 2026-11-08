@@ -481,6 +481,15 @@ let fibonacci = (n: i64) -> i64 =>
   parenthesized, even with one parameter.
 * Each parameter is `name: Type`. Parameters are immutable, except `mut`
   ones (below).
+* A parameter can also be a pattern ([§7](#7-patterns)) that takes the
+  argument apart, as a `let` would, with its type after it:
+  `((a, b): (i64, str)) => ...`, `(Point(x, y): Point) -> f64 => ...`, or
+  without one where types can be left out: `map(pairs, ((n, word)) =>
+  word)`. It must match every value, and can be a tuple, a struct's or
+  variant's fields, `_` or names (`mut` ones too), nested; a literal,
+  range or `|` can't be a parameter. Its names can be used in the body
+  and in `where` conditions. The single parameter without parentheses
+  (`n => ...`) is always a name.
 * Functions take multiple arguments; there is no currying.
 * A function bound at the top level, and a method, give their whole type:
   every parameter's, and `-> ReturnType`. Their types are known before
@@ -643,7 +652,8 @@ let found = loop
   `mut` variable (or an element of one), in place: after a `break`, it
   carries on where the loop stopped. Without `mut`, a loop over a struct
   or enum iterator goes through a copy of it, and a generator, which can't
-  be copied, must be a new value (`for x in count(3)`).
+  be copied, must be a new value (`for x in count(3)`) or a variable given
+  away at its last use ([§9](#values-that-cant-be-copied-provisional-syntax)).
 * `while cond` runs while `cond` (a `bool`) is true.
 * `loop` repeats forever until `break`.
 * `for` and `while` have value `()`. `loop` has the value given to the
@@ -864,8 +874,9 @@ let found = None         # Optional of something; used as Optional[str] later
   `let make = Point`) and library functions like `trim`
   ([§10](#10-built-ins)). A prelude function whose first argument accepts
   a value can also be called as `value.function(args)`, for example
-  `" hello ".trim()` or `[1, 2].map(f)`. The other built-ins can only be
-  called.
+  `" hello ".trim()`, `(0..3).map(f)` or `count(0, 1).take(3)` (but not
+  the lazy `iters.map` and the like, which share names with prelude
+  functions). The other built-ins can only be called.
 * Enums and structs can be generic. Top-level and local functions can also
   have type parameters.
 
@@ -1362,6 +1373,24 @@ work()                 # prints: working, closing app
 * It can't be copied: not bound from another variable, assigned, put in a
   list, captured by a closure, returned from a parameter, or used with a
   generic function.
+* **Giving one away.** A parameter that *takes* its argument (a
+  generator's, or an `Iter[T]` one, [§9](#generic-functions)) and a `for`
+  loop without `mut` accept a new value, or a variable at its last use,
+  which gives the value away:
+
+  ```ella
+  let evens = count(0, 2) |> take(3)
+  print(evens.collect())    # gives evens away
+  print(evens)              # error: 'evens' was given away at 2:7
+  ```
+
+  The variable must be the function's own (a local variable, a
+  generator's parameter, or an `Iter[T]` parameter, which takes its
+  argument), or a top-level variable that no function uses,
+  and no loop may come between where it is declared and where it is given
+  away, since the loop's next time round would use it again. After that,
+  nothing may use it; if one branch of an `if` or `match` gives it away,
+  it counts as given away after them.
 * A struct with a nocopy field must be nocopy itself. A nocopy struct needs
   at least one field; one with a `finalize` method can't be generic. Only
   a nocopy struct can have a `finalize` method, of type `(Self) -> ()`,
@@ -1402,6 +1431,58 @@ print(first(["a"]))        # T is str
   matches itself. Values of type `T` can be passed around, stored and
   printed; anything more needs a *constraint*.
 * Type parameters can't be values that can't be copied.
+
+**`Iter` parameters.** A parameter of type `Iter[T]` takes anything a `for`
+loop can go through with items of type `T`: a list, a string (`T` is
+`str`), a range (`i64`), an array, a generator, an iterator (a struct or
+enum with a `next` method), or a value whose `iter` method gives one of
+these ([§9](#methods)):
+
+```ella
+let total = (xs: Iter[i64]) -> i64 =>
+    let mut sum = 0
+    for x in xs
+        sum += x
+    sum
+
+print(total([1, 2]), total(0..10), total(count(5)))   # count gives a Gen[i64]
+```
+
+* A function with one is generic: it is made for each type of value
+  passed, as for a type parameter, with loops over the parameter compiled
+  for that type. Each `Iter[T]` parameter has its own such type; `T` is an
+  ordinary type, or one of the function's type parameters, decided by what
+  is passed (so `map(0..3, x => -x)` knows `x` is an `i64`). Where what is
+  passed has a type not known yet, it is taken to be a list, as it would be
+  for a `[T]` parameter; so is the parameter of a generic function used
+  only as a value.
+* `Iter[T]` can only be the whole type of a parameter of a function bound
+  with `let` (not a method, nor a result, nor part of another type).
+* Inside, the function can loop over the parameter (`for x in xs`, without
+  `mut`) and pass it to another function's `Iter[T]` parameter. Since it
+  may be a generator, it can't be copied: not bound to another variable,
+  captured, returned, or passed to a type parameter.
+* A loop over it goes through it as a loop over the value passed would
+  (`for x in count(5)`). **So a second loop depends on what was passed**:
+  over a generator, it carries on where the first stopped; over a list,
+  range, string or iterator (through a copy), it starts again:
+
+  ```ella
+  let twice = (xs: Iter[i64]) -> i64 => total(xs) + total(xs)
+  twice([1, 2])                  # 6: each loop goes through 1, 2
+  twice(take(count(1, 1), 2))    # 3: the second loop finds the generator done
+  ```
+
+  A function that goes through its argument more than once, and should
+  behave the same for every kind, collects it first:
+  `let items = collect(xs)`. That list can also be copied, which the
+  parameter can't (the checker's error says so).
+* The parameter takes what it is given, as a generator's do: a generator
+  passed must be a new value, like `total(count(5))`, or a variable given
+  away at its last use ([§9](#values-that-cant-be-copied-provisional-syntax)).
+  Since it takes its argument, the parameter is the function's own: it can
+  pass it on to another `Iter[T]` parameter, or give it away, to a
+  generator say.
 
 **Constraints.** A type parameter can name what its function does with it,
 from a fixed set, combined with `+`:
@@ -1680,9 +1761,10 @@ print(next(mut g), next(mut g))  # Some(1) None
 * A `Gen` can't be copied (§9, [values that can't be
   copied](#values-that-cant-be-copied-provisional-syntax)), so a function
   that gives one *takes* its arguments that can't be copied: each must be
-  a new value, such as `squares(count(4))`, never a variable. (Pipes read
-  well with this: `count(4) |> squares`.) The values it yields can't be
-  nocopy.
+  a new value, such as `squares(count(4))`, or a variable given away at its
+  last use ([§9](#values-that-cant-be-copied-provisional-syntax)). (Pipes
+  read well with this: `count(4) |> squares`.) The values it yields can't
+  be nocopy.
 * A generator's variables, and the values with finalizers that it makes,
   live as long as it does: until its body finishes, or the `Gen` dies.
   When a `Gen` dies before its body has finished, those values are
@@ -1866,10 +1948,11 @@ modules of the *standard library* (src/ella/lib/): functions that take
 other functions, or work on lists of any type. Its modules are `lists`
 (the functions in the first table down to `range`), `maps` (`Map`,
 `new_map`, `map_of`, `group_by` and `counts`), `sets` (`Set`, `new_set`, `set_of` and `unique`), `math` (the
-constants), `strings` (the second table) and `iters` (below). Their public names, but those of
-`iters`, are the *prelude*: every module sees
-them without importing them, unless it defines or imports the same name
-itself. They can also be imported like any module
+constants), `strings` (the second table) and `iters` (below). Their
+public names are the *prelude*: every module sees them without importing
+them, unless it defines or imports the same name itself. The lazy `map`,
+`filter`, `zip` and `enumerate` of `iters` share names with the eager ones
+of `lists`, which are the prelude's; they are `iters.map` and so on. They can also be imported like any module
 ([§3](#modules-and-imports-provisional-syntax)): `import maps`, then
 `maps.new_map()`.
 
@@ -1878,8 +1961,8 @@ itself. They can also be imported like any module
 | `reverse(xs)` | `[T] ([T]) -> [T]` | the items of `xs` in the opposite order |
 | `sort(xs)` | `[T: Ord] ([T]) -> [T]` | the items of `xs` from smallest to largest, by `<`; equal items keep their order |
 | `sort_by(xs, key)` | `[T, K: Ord] ([T], (T) -> K) -> [T]` | the items of `xs` sorted by their keys, as `sort` sorts; `key` is called once per item, in order |
-| `map(xs, f)` | `[T, U] ([T], (T) -> U) -> [U]` | `f` of each item of `xs`, called in order |
-| `filter(xs, keep)` | `[T] ([T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
+| `map(xs, f)` | `[T, U] (Iter[T], (T) -> U) -> [U]` | `f` of each item of `xs` (a list, string, range, generator, ...: [§9](#generic-functions)), called in order |
+| `filter(xs, keep)` | `[T] (Iter[T], (T) -> bool) -> [T]` | the items of `xs` for which `keep` is true, called in order |
 | `sum(xs, start)` | `[T: Add] ([T], T) -> T` | `start + xs[0] + xs[1] + ...`: `sum(xs, 0)`, `sum(prices, 0.0)`, `sum(words, "")` |
 | `fold(xs, start, f)` | `[T, A] ([T], A, (A, T) -> A) -> A` | `f(... f(f(start, xs[0]), xs[1]) ..., xs[n - 1])`, or `start` for no items |
 | `flatten(xss)` | `[T] ([[T]]) -> [T]` | the items of each list in `xss`, one list after another |
@@ -1892,8 +1975,6 @@ itself. They can also be imported like any module
 | `chunks(xs, n)` | `[T] ([T], i64) -> [[T]]` | the items in lists of `n`, the last with what is left; `n` must be above 0 |
 | `position(xs, test)` | `[T] ([T], (T) -> bool) -> Optional[i64]` | where the first item for which `test` is true is; `test` is called in order, until it is |
 | `any(xs, test)`, `all(xs, test)` | `[T] ([T], (T) -> bool) -> bool` | whether `test` is true for some (or every) item; it is called in order, until the answer is known |
-| `zip(xs, ys)` | `[T, U] ([T], [U]) -> [(T, U)]` | pairs of the items at each position, as many as the shorter list has |
-| `enumerate(xs)` | `[T] ([T]) -> [(i64, T)]` | each item with its position: `[(0, xs[0]), (1, xs[1]), ...]` |
 | `range(start, stop, step)` | `(i64, i64, i64) -> [i64]` | `start`, `start + step`, ... while before `stop` (below it, or above it if `step` is negative); `step` can't be 0 |
 | `new_map()` | `[K: Eq, V] () -> Map[K, V]` | an empty `Map` (below) |
 | `map_of(pairs)` | `[K: Eq, V] ([(K, V)]) -> Map[K, V]` | a `Map` of each pair's key to its value; a later pair's value replaces an earlier one's |
@@ -1996,23 +2077,50 @@ for n in odd                   # the items, in order
   `==` when they have the same items, in any order, so a set can be an
   item of a set. It prints as `{1, 2, 3}`, and as `{/}` when it is empty.
 
-The module `iters` has lazy versions of the list functions, on generators
-([§9](#generators-provisional-syntax)). They share names with those of
-`lists`, so `iters` isn't part of the prelude: `import iters`, then
-`iters.map(g, f)` or `g |> iters.map(f)`. Each takes the generators it is
-given, and asks them for items only as its own are asked for.
+The module `iters` has lazy functions, for when they are wanted: on
+sources without end, or to make no lists in between. Each takes anything
+a `for` loop can go through (`Iter[T]`, [§9](#generic-functions)): a
+list, string, range, array, generator, iterator, `Map` (its keys) or
+`Set`, and gives a generator ([§9](#generators-provisional-syntax)),
+which asks for items only as its own are asked for. `collect` makes a
+list of the items. Its `map`, `filter`, `zip` and `enumerate` are written
+`iters.map` and so on (`import iters`), since `lists` has eager ones by
+those names; its other names are in the prelude:
+
+```ella
+import iters
+
+print(count(1, 1) |> iters.filter(n => n % 2 == 1) |> take(3) |> collect)   # [1, 3, 5]
+let squares = iters.map(1..1000000, n => n * n)    # a Gen[i64]: nothing computed yet
+print(squares.take(2).collect())                    # [1, 4]
+```
+
+In a lazy chain, the functions run item by item: in
+`iters.map(xs, f) |> iters.filter(g)`, `f` and `g` take turns. A
+generator gives its items once, so a result needed more than once,
+indexed or measured with `len` should be collected first; the checker's
+errors say so where one is used as a list.
+
+The eager `map`, `filter`, `zip`, `enumerate`, and `collect`, go through
+every item, so on a generator without end they never finish:
+`count(0, 1) |> map(f) |> take(3)` runs forever, where
+`count(0, 1) |> take(3) |> map(f)` doesn't. The checker warns where it
+can see that a source has no end (`count(...)`, and lazy functions of it
+that no `take` or `take_while` ends).
 
 | Name | Type | Gives |
 | --- | --- | --- |
-| `each(xs)` | `[T] ([T]) -> Gen[T]` | the items of `xs` |
+| `each(xs)` | `[T] (Iter[T]) -> Gen[T]` | the items of `xs` |
 | `count(start, step)` | `[T: Num] (T, T) -> Gen[T]` | `start`, `start + step`, ... without end |
-| `map(g, f)`, `filter(g, keep)` | as for lists, on a `Gen[T]` | `f` of each item; the items for which `keep` is true |
-| `take(g, n)`, `skip(g, n)` | `[T] (Gen[T], i64) -> Gen[T]` | the first `n` items; the items after them |
-| `take_while(g, keep)` | `[T] (Gen[T], (T) -> bool) -> Gen[T]` | the items before the first one for which `keep` is false |
-| `chain(a, b)` | `[T] (Gen[T], Gen[T]) -> Gen[T]` | the items of `a`, then those of `b` |
-| `enumerate(g)`, `zip(a, b)` | as for lists, on generators | items with their positions; pairs of items |
-| `scan(g, start, f)` | `[T, A] (Gen[T], A, (A, T) -> A) -> Gen[A]` | `start`, `f(start, first)`, ...: each running result |
-| `collect(mut g)` | `[T] (mut Gen[T]) -> [T]` | the items left in `g`, in a list |
+| `iters.map(xs, f)` | `[T, U] (Iter[T], (T) -> U) -> Gen[U]` | `f` of each item |
+| `iters.filter(xs, keep)` | `[T] (Iter[T], (T) -> bool) -> Gen[T]` | the items for which `keep` is true |
+| `take(xs, n)`, `skip(xs, n)` | `[T] (Iter[T], i64) -> Gen[T]` | the first `n` items (asking for no more); the items after them |
+| `take_while(xs, keep)` | `[T] (Iter[T], (T) -> bool) -> Gen[T]` | the items before the first one for which `keep` is false |
+| `chain(a, b)` | `[T] (Iter[T], Iter[T]) -> Gen[T]` | the items of `a`, then those of `b` |
+| `iters.enumerate(xs)` | `[T] (Iter[T]) -> Gen[(i64, T)]` | each item with its position: `(0, first)`, `(1, second)`, ... |
+| `iters.zip(a, b)` | `[T, U] (Iter[T], Iter[U]) -> Gen[(T, U)]` | pairs of the items at each position, as many as the shorter has |
+| `scan(xs, start, f)` | `[T, A] (Iter[T], A, (A, T) -> A) -> Gen[A]` | `start`, `f(start, first)`, ...: each running result |
+| `collect(xs)` | `[T] (Iter[T]) -> [T]` | the items, in a list |
 
 Library modules are modules like the program's own, so the program's
 names (its own `len`, or a variant `i`) don't change what their code
@@ -2191,7 +2299,8 @@ target      = IDENT | operator_expr index | operator_expr "." IDENT ;
 
 lambda      = "(" [ param { "," param } [ "," ] ] ")" [ "->" type ] "=>" lambda_body
             | IDENT "=>" body ;                  (* one parameter, of an inferred type *)
-param       = "mut" IDENT ":" type | IDENT [ ":" type ] ;  (* types inferred (§5) *)
+param       = "mut" IDENT ":" type | IDENT [ ":" type ]   (* types inferred (§5); `Iter[T]` only here (§9) *)
+            | pattern [ ":" type ] ;             (* not a literal, range or "|" *)
 lambda_body = expr
             | NEWLINE INDENT [ where NEWLINE ] expr { NEWLINE expr } NEWLINE DEDENT ;
 where       = "where" block ;
@@ -2269,7 +2378,15 @@ Parsing notes:
   lambda parameter list. Parse the parenthesized contents as expressions,
   allowing `name: type` items; if `->` or `=>` follows the `)`, convert the
   items into parameters (each must be `name: type` or `mut name: type`),
-  otherwise reject any such items. No backtracking needed.
+  otherwise reject any such items. No backtracking needed. (To allow
+  patterns as parameters, the parser first looks ahead for the matching
+  `)` followed by `->` or `=>`; if so, it parses the items as parameters
+  instead. A pattern parameter becomes a hidden parameter named by its
+  position (`#0` for the first), which a `let` at the start of the body
+  takes apart (so does each `where` condition using its names, with a
+  copy of the `let` keeping only those), and each `Iter[T]` parameter of a
+  `let`'s function a hidden type parameter, likewise `Iter#0`, so later
+  stages need nothing new for either.)
 * **`let` chains.** After `let binding =`, another target follows if the next
   tokens are `mut`, or `IDENT` followed by `=` or `:` (but not a labeled loop,
   `IDENT ":" for`).
@@ -2306,6 +2423,13 @@ Parsing notes:
   `mut` followed by such a call means the same.
 
 ## Open questions
+
+* Which other list functions should take `Iter[T]` (`sum`, `any`, `all`,
+  `fold`, ...), whether `iters` should have a lazy `flat_map`, and whether
+  `Iter[T]` should be allowed in methods and results.
+* Lazy adapters as copyable structs rather than generators (as Rust's
+  are), so that a lazy result can be named and used twice; it needs
+  `Iter[T]` (or associated types) in struct fields.
 
 * Fixed-size SIMD vector types (`f32x4`?) beside `Array[T]`, item types
   narrower than 32 bits, slices of arrays that are views (and can be

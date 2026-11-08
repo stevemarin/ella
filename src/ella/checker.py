@@ -2,7 +2,7 @@
 
 import dataclasses
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import count
 
@@ -74,6 +74,8 @@ from ella.syntax import (
     Yield,
     bare_name,
     is_generator,
+    is_hidden,
+    is_iter_param,
     mentions_return,
     parts,
 )
@@ -142,6 +144,10 @@ class BuiltinTy:
     name: str
     args: tuple[Type, ...]
 
+
+# The library module whose names give way to the others' in the prelude, and for method calls: its lazy
+# `map`, `filter`, `zip` and `enumerate` are `iters.map` and so on.
+LAZY = "iters"
 
 # The built-in types, and how many type arguments each takes.
 BUILTIN_TYPES = {"Array": 1, "Code": 1, "Pool": 1, "Handle": 1, "Arena": 0, "Ref": 1, "Gen": 1, "Type": 1}
@@ -239,6 +245,9 @@ class ParamTy:
 
     name: str
     constraints: frozenset[str] = frozenset()
+    # The items of an `Iter[T]` parameter's hidden type parameter (`Iter#0`): T. Its values are anything a
+    # `for` loop can go through with items of type T.
+    item: Type | None = None
 
 
 # The number types: what `Num` stands for, and an Array's items can be.
@@ -329,6 +338,8 @@ def show_type(t: Type) -> str:
             return f"{name}[" + ", ".join(map(show_type, args)) + "]"
         case EnumTy(name) | BuiltinTy(name):
             return name
+        case ParamTy(_, _, item) if item is not None:
+            return f"Iter[{show_type(item)}]"
         case ParamTy(name):
             return name
         case TyVar(id):
@@ -340,6 +351,8 @@ def show_type(t: Type) -> str:
 def substitute(t: Type, params: dict[str, Type]) -> Type:
     """Replace the type parameters in `t`: `Some(T)` with T = i64 has a field of type i64."""
     match t:
+        case ParamTy(name, _, item) if name not in params and item is not None:
+            return replace(t, item=substitute(item, params))
         case ParamTy(name):
             return params.get(name, t)
         case ListTy(element):
@@ -406,6 +419,8 @@ def describe_kind(t: Type) -> str:
             return "function"
         case EnumTy(name) | BuiltinTy(name):
             return name
+        case ParamTy(_, _, item) if item is not None:
+            return "Iter"
         case ParamTy(name):
             return name
         case TyVar():
@@ -414,6 +429,18 @@ def describe_kind(t: Type) -> str:
             return "?"
         case SizeTy():
             return "size"
+
+
+@dataclass(frozen=True, slots=True)
+class IterableUse:
+    """A use of a function with an `Iter[T]` parameter: the type argument `source` of the parameter at `position`
+    must be something a loop can go through, with items of type `item`."""
+
+    source: Type
+    item: Type
+    name: str
+    position: int
+    span: Span
 
 
 @dataclass(frozen=True, slots=True)
@@ -785,6 +812,12 @@ class Checker:
         self.quotes = 0  # how many quotes the code being checked is in (minus splices)
         self.env = Env(None)  # the scope of the expression being checked, for splices in its types
         self.instances: dict[int, tuple[Type, ...]] = {}  # use of a generic function -> its type arguments
+        # The type arguments of `Iter[T]` parameters not checked yet (`expect_iterables`), by identity, and the
+        # arguments passed to such parameters, which they take (CopyChecker.walk_iterable).
+        self.iterables: dict[int, IterableUse] = {}
+        self.iter_args: set[int] = set()
+        # What `print` and `eprint` are given by calls of library functions, for `finish_checks`.
+        self.printed: list[tuple[Type, Span]] = []
         self.constraints: dict[str, dict[str, FuncTy]] = {}  # flattened user constraint methods, with SELF
         self.constraint_parents: dict[str, tuple[str, ...]] = {}
         self.constraint_spans: dict[str, Span] = {}
@@ -951,7 +984,9 @@ class Checker:
     def expect(self, actual: Type, expected: Type, span: Span, what: str) -> None:
         """Require `actual` to be (or become) `expected`; `what` describes it for the error."""
         if not self.unify(actual, expected):
-            raise EllaError(f"{what} should be {show_type(expected)}, not {show_type(actual)}", span)
+            raise EllaError(
+                f"{what} should be {show_type(expected)}, not {show_type(actual)}{collect_hint(actual)}", span
+            )
 
     def join(self, a: Type, b: Type, span: Span, what: str) -> Type:
         """The type of a value that comes from either of two places, like the two sides of an `if`."""
@@ -1083,6 +1118,14 @@ class Checker:
                 t = self.annotation(NamedType(name, args, span), params)
                 assert isinstance(t, BuiltinTy)
                 return BuiltinTy("Array", (*t.args, *(self.dim(dim, params) for dim in dims)))
+            case NamedType(name, (items,), span) if is_iter_param(name):
+                return ParamTy(name, item=self.annotation(items, params))
+            case NamedType("Iter", _, span):
+                raise EllaError(
+                    "Iter[T] can only be the type of a parameter of a function bound by 'let', like "
+                    "'let total = (xs: Iter[i64]) -> i64 => ...'",
+                    span,
+                )
             case NamedType(name, (), span) if name in params and is_size(params[name]):
                 raise EllaError(f"'{name}' is a size, not a type", span)
             case NamedType(name, (), span) if name in params:
@@ -1540,12 +1583,20 @@ class Checker:
                     names = (n.name for n in pattern_names(pattern))
                     self.pending_globals.update(name for name in names if name not in self.globals.vars)
 
+        # The prelude's functions can be called as methods: `xs.map(f)`. (Not the lazy ones of `iters` that
+        # share a name with another module's, as in the prelude: ella.modules.prelude.)
         standard_files = {file for file, _ in program.modules if file.startswith(f"{STD}/")}
+        lazy = f"{STD}/{LAZY}.ella"
+        others = {
+            bare_name(b.name) for let in functions if let.span.file in standard_files - {lazy} for b in let.bindings
+        }
         for let in functions:
             if let.span.file not in standard_files:
                 continue
             for binding in let.bindings:
                 name = bare_name(binding.name)
+                if let.span.file == lazy and name in others:
+                    continue
                 if not name.startswith("_"):
                     self.extension_functions.setdefault(name, []).append(binding.name)
 
@@ -1719,6 +1770,11 @@ class Checker:
             raise EllaError(
                 f"'{what}' needs a pattern that matches every value, and this one doesn't match {example}", span
             )
+        for printed, span in self.printed:
+            if describe_kind(printed) == "Gen":
+                self.warnings.append(
+                    EllaError("this prints a generator as <gen>, not its items; collect() makes a list of them", span)
+                )
         for item, span in self.generators:
             item = finish(item)
             if is_nocopy(item, self.enums):
@@ -1729,11 +1785,17 @@ class Checker:
                 raise EllaError(
                     f"'{name}' is a {show_type(t)}, which can't be carried into a later stage (only data can)", span
                 )
+        for use in list(self.iterables.values()):
+            self.settle_iterable(use, use.source, use.span)
         for name, args, constraints, span in self.generic_uses:
             for arg, (param, needs) in zip(args, constraints):
+                if is_iter_param(param):
+                    continue  # anything a loop can go through, even a generator (`settle_iterable`)
                 arg = finish(arg)
                 if is_nocopy(arg, self.enums):
-                    raise EllaError(f"{name} can't be used with {show_type(arg)}, which can't be copied", span)
+                    raise EllaError(
+                        f"{name} can't be used with {show_type(arg)}, which can't be copied{keep_hint(arg)}", span
+                    )
                 for constraint in needs:
                     reason = self.unmet(arg, constraint)
                     if reason is not None:
@@ -1933,6 +1995,7 @@ class Checker:
                             # Each use of a generic function gets its own type arguments.
                             type_args: dict[str, Type] = {param: self.fresh() for param in info.type_params}
                             self.instances[id(expr)] = tuple(type_args.values())
+                            self.expect_iterables(info.type, type_args, name, span)
                             needs = info.constraints or tuple(() for _ in info.type_params)
                             self.generic_uses.append(
                                 (name, tuple(type_args.values()), tuple(zip(info.type_params, needs)), span)
@@ -2080,7 +2143,7 @@ class Checker:
                         return element
                     case PrimTy("str"):
                         return STR
-                raise EllaError(f"can't index a {show_type(container)}", span)
+                raise EllaError(f"can't index a {show_type(container)}{collect_hint(container)}", span)
             case Member(target, name, span):
                 if isinstance(target, Name) and (type_param := self.type_param_named(target.name, env)) is not None:
                     self.types[id(target)] = type_param
@@ -2124,7 +2187,9 @@ class Checker:
             case Lambda():
                 return self.check_lambda(expr, env, [], infer=True)
             case Call(callee, args, span):
-                return self.check_call(callee, args, env, span)
+                result = self.check_call(callee, args, env, span)
+                self.warn_endless(expr)
+                return result
             case Return(value, span):
                 if self.return_type is None:
                     raise EllaError("'return' outside of a function", span)
@@ -2320,7 +2385,11 @@ class Checker:
         if array_item(a) is not None or array_item(b) is not None:
             return self.array_operation(op, a, b, span)
         if not self.unify(a, b):
-            raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
+            raise EllaError(
+                f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}"
+                f"{collect_hint(a) or collect_hint(b)}",
+                span,
+            )
         if isinstance(resolve(a), DeferredTy) or isinstance(resolve(b), DeferredTy):
             return DEFERRED if op not in ("/", "..", "..=") else (F64 if op == "/" else RANGE)
         if isinstance(param := resolve(a), ParamTy):
@@ -2454,10 +2523,17 @@ class Checker:
                 case PrimTy("range"):
                     self.expect(a, I64, span, f"the value looked for with '{op}'")
                 case other:
-                    raise EllaError(f"'in' needs a list, str or range on the right, not {show_type(other)}", span)
+                    raise EllaError(
+                        f"'in' needs a list, str or range on the right, not {show_type(other)}{collect_hint(other)}",
+                        span,
+                    )
             return
         if not self.unify(a, b):
-            raise EllaError(f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}", span)
+            raise EllaError(
+                f"'{op}' needs two values of the same type, not {show_type(a)} and {show_type(b)}"
+                f"{collect_hint(a) or collect_hint(b)}",
+                span,
+            )
         if isinstance(param := resolve(a), ParamTy):
             self.require_constraint(param, "Eq" if op in ("==", "!=") else "Ord", op, span)
             return
@@ -2625,6 +2701,12 @@ class Checker:
                     params.append(self.annotation(param.type))
                 elif infer:
                     params.append(self.fresh())
+                elif is_hidden(param.name):
+                    raise EllaError(
+                        "a pattern parameter needs a type, like '(a, b): (i64, i64)', as a top-level function's "
+                        "or a method's parameters always do",
+                        param.span,
+                    )
                 else:
                     raise EllaError(
                         f"parameter '{param.name}' needs a type, like '{param.name}: i64', as a top-level "
@@ -2927,6 +3009,9 @@ class Checker:
                     raise EllaError(f"argument {i + 1} isn't for a 'mut' parameter, so it can't be 'mut'", arg.span)
                 arg_type = known if known is not None else self.check(arg, env)
                 self.expect(arg_type, param_type, arg.span, f"argument {i + 1}")
+                if (use := self.iterables.get(id(param_type))) is not None:
+                    self.iter_args.add(id(arg))
+                    self.settle_iterable(use, arg_type, arg.span)
 
     # Methods
 
@@ -3037,6 +3122,9 @@ class Checker:
             type_args = tuple(self.fresh() for _ in info.type_params)
             specialized = substitute(info.type, dict(zip(info.type_params, type_args)))
             assert isinstance(specialized, FuncTy)
+            if not self.can_unify(receiver, specialized.params[0]):
+                continue
+            self.expect_iterables(info.type, dict(zip(info.type_params, type_args)), function_name, span)
             fresh_method = self.fresh_sizes(specialized)
             assert isinstance(fresh_method, FuncTy)
             method = fresh_method
@@ -3244,7 +3332,9 @@ class Checker:
             for arg in args:
                 if isinstance(arg, MutArg):
                     raise EllaError(f"{name}() has no 'mut' parameter", arg.span)
-                self.check(arg, env)
+                arg_type = self.check(arg, env)
+                if self.from_library(arg):
+                    self.printed.append((arg_type, arg.span))
             return UNIT
         if name in ("alloc", "free"):
             return self.check_alloc(name, args, env, span)
@@ -3289,10 +3379,69 @@ class Checker:
                 return I64
             if describe_kind(arg_type) not in ("list", "str", "range", "Array", "Pool", "Arena", "?"):
                 raise EllaError(
-                    f"len() needs a list, str, range, Array, Pool or Arena, not {show_type(arg_type)}", args[0].span
+                    f"len() needs a list, str, range, Array, Pool or Arena, not {show_type(arg_type)}"
+                    f"{collect_hint(arg_type)}",
+                    args[0].span,
                 )
             return I64
         return UNIT
+
+    def library_call(self, expr: Expr) -> tuple[str, tuple[Expr, ...]] | None:
+        """For a call of a standard library function, its linked name (`lists.map`) and arguments (the value
+        it is called on first, for `xs.map(f)`)."""
+        match expr:
+            case Call(Name(name) as callee, args):
+                info = self.resolved.get(id(callee))
+                if info is not None and isinstance(info.binder, Binding) and info.binder.span.file.startswith(STD):
+                    return name, args
+            case Call(Member(target) as callee, args) if id(callee) in self.extension_methods:
+                return self.extension_methods[id(callee)], (target, *args)
+        return None
+
+    def endless(self, expr: Expr) -> bool:
+        """Whether an expression surely gives a generator without end: `count(...)`, or a lazy function of one
+        that keeps going as long as it does (`iters.map(count(0, 1), f)`). Not one ended by `take`."""
+        call = self.library_call(expr)
+        if call is None or not call[1]:
+            return False
+        name, args = call
+        if name == f"{LAZY}.count":
+            return True
+        if name in {f"{LAZY}.{lazy}" for lazy in ("each", "map", "filter", "enumerate", "skip", "scan")}:
+            return self.endless(args[0])
+        if name == f"{LAZY}.chain":
+            return any(self.endless(arg) for arg in args)
+        if name == f"{LAZY}.zip":
+            return all(self.endless(arg) for arg in args)
+        return False
+
+    def warn_endless(self, call: Call) -> None:
+        """Warn about an eager function going through a generator without end: it never finishes."""
+        found = self.library_call(call)
+        if found is None or not found[1]:
+            return
+        name, args = found
+        bare = bare_name(name)
+        endless = all(self.endless(arg) for arg in args[:2]) if name == "lists.zip" else self.endless(args[0])
+        if name in ("lists.map", "lists.filter", "lists.enumerate", "lists.zip", f"{LAZY}.collect") and endless:
+            instead = "" if bare == "collect" else f", or the lazy iters.{bare}"
+            self.warnings.append(
+                EllaError(
+                    f"{bare} goes through every item of a generator without end, so it never finishes; take(n) "
+                    f"first{instead}",
+                    call.span,
+                )
+            )
+
+    def from_library(self, expr: Expr) -> bool:
+        """Whether an expression calls a function of the standard library, like `map(xs, f)` or `xs.map(f)`."""
+        match expr:
+            case Call(Name() as callee):
+                info = self.resolved.get(id(callee))
+                return info is not None and isinstance(info.binder, Binding) and info.binder.span.file.startswith(STD)
+            case Call(Member() as callee):
+                return id(callee) in self.extension_methods
+        return False
 
     def check_alloc(self, name: str, args: tuple[Expr, ...], env: Env, span: Span) -> Type:
         """`alloc(mut pool, value) -> Handle[T]`, `free(mut pool, handle)`, `alloc(mut arena, value) -> Ref[T]`
@@ -3374,6 +3523,9 @@ class Checker:
         gives. `for x in mut it` advances an iterator or generator in place.
         """
         if isinstance(iterable, MutArg):
+            info = self.visible(iterable.target.name, env, span) if isinstance(iterable.target, Name) else None
+            if info is not None and isinstance(info.type, ParamTy) and info.type.item is not None:
+                raise EllaError("a loop goes through an Iter parameter without 'mut'", iterable.span)
             t = self.known(self.check_place(iterable.target, env, "pass"), iterable.span)
             self.types[id(iterable)] = t
             found = self.iterator_item(t, span)
@@ -3386,6 +3538,10 @@ class Checker:
             self.iterations[id(loop)] = (False, found[1])
             return found[0]
         t = self.known(self.check(iterable, env), iterable.span)
+        if isinstance(t, ParamTy) and t.item is not None:
+            # An Iter[T] parameter: how it loops depends on what each use passes (lower.Lowerer.lower_for).
+            self.iterations[id(loop)] = (False, "any")
+            return t.item
         via_iter = False
         if (iterator := self.method_type(t, "iter", span)) is not None:
             # `for x in v` loops over what `v.iter()` gives.
@@ -3424,6 +3580,60 @@ class Checker:
             case EnumTy("Optional", (item,)):
                 return item, "next"
         return None
+
+    def iteration(self, t: Type, span: Span) -> tuple[bool, str, Type] | None:
+        """How a `for` loop goes through a value of type `t`, if it can: whether through its `iter` method, its
+        kind ("items", "gen" or "next", as in `iterations`), and the type of its items."""
+        t = resolve(t)
+        if isinstance(t, ParamTy) and t.item is not None:
+            return False, "any", t.item
+        if isinstance(t, DeferredTy):
+            return False, "items", DEFERRED
+        via_iter = False
+        if (iterator := self.method_type(t, "iter", span)) is not None:
+            t, via_iter = resolve(iterator.result), True
+        if (found := self.iterator_item(t, span)) is not None:
+            return via_iter, found[1], found[0]
+        match t:
+            case ListTy(element) | BuiltinTy("Array", (element, *_)):
+                return via_iter, "items", element
+            case PrimTy("str"):
+                return via_iter, "items", STR
+            case PrimTy("range"):
+                return via_iter, "items", I64
+        return None
+
+    def expect_iterables(self, function: Type, type_args: dict[str, Type], name: str, span: Span) -> None:
+        """At a use of a generic function: its `Iter[T]` parameters' type arguments must be types a `for` loop can
+        go through, with items of type T (`settle_iterable`, once each is known)."""
+        if not isinstance(function, FuncTy):
+            return
+        for position, param in enumerate(function.params):
+            if isinstance(param, ParamTy) and param.item is not None and param.name in type_args:
+                source = type_args[param.name]
+                item = substitute(param.item, type_args)
+                self.iterables[id(source)] = IterableUse(source, item, bare_name(name), position, span)
+
+    def settle_iterable(self, use: IterableUse, given: Type, span: Span) -> None:
+        """Check what is passed to an `Iter[T]` parameter: something a loop can go through, giving T's.
+
+        A value whose type isn't known yet is taken to be a list, as it would be if the parameter were `[T]`:
+        then `ys => map(ys, f)` still decides the type of ys. So is the parameter of a function that is never
+        called, only used as a value.
+        """
+        source = resolve(given)
+        if isinstance(source, TyVar):
+            self.unify(source, ListTy(use.item))
+            source = resolve(source)
+        self.iterables.pop(id(use.source), None)
+        found = self.iteration(source, span)
+        if found is None:
+            raise EllaError(
+                f"argument {use.position + 1} of {use.name} must be something a 'for' loop can go through (a list, "
+                f"str, range, generator or iterator), not {a_or_an(show_type(source))} {show_type(source)}",
+                span,
+            )
+        self.expect(found[2], use.item, span, f"the items of argument {use.position + 1} of {use.name}")
 
     def check_loop_body(self, info: LoopInfo, body: Expr, env: Env) -> None:
         self.loops.append(info)
@@ -3504,6 +3714,23 @@ class Checker:
                 self.expect(TupleTy(item_types), t, span, "this tuple pattern")
                 for item, item_type in zip(items, item_types):
                     self.check_pattern(item, item_type, env)
+
+
+def keep_hint(t: Type) -> str:
+    """For an error about copying an `Iter[T]` parameter's value, how to get one that can be copied."""
+    shown = resolve(t)
+    if isinstance(shown, ParamTy) and shown.item is not None:
+        return "; it may be a generator, and collect() makes a list of its items, which can be copied"
+    return ""
+
+
+def collect_hint(t: Type) -> str:
+    """For an error about a generator used as a list, how to make one."""
+    return (
+        "; a Gen gives its items one at a time, and collect() makes a list of them"
+        if describe_kind(t) == "Gen"
+        else ""
+    )
 
 
 def literal_type(value: LiteralValue) -> Type:
@@ -3661,6 +3888,8 @@ def is_nocopy(t: Type, enums: dict[str, EnumInfo]) -> bool:
         match t:
             case BuiltinTy("Pool" | "Arena" | "Gen"):
                 return True
+            case ParamTy(_, _, item) if item is not None:
+                return True  # it may be a generator
             case EnumTy(name) if name in enums:
                 return enums[name].nocopy
         return False
@@ -3714,21 +3943,38 @@ class CopyChecker:
         self.movable: set[int] = set()  # binders of the current function's local variables outside loops
         self.function_binders: set[int] = set()  # binders of the current function's variables
         self.loop_depth = 0
+        # The current function's variables that can be given away (`give_away`), by binder: how many loops in
+        # each is declared. And those given away, with where.
+        self.depths: dict[int, int] = {}
+        self.given: dict[int, Span] = {}
+        self.used_by_functions: set[int] = set()
 
     def nocopy(self, expr: Expr) -> bool:
         t = self.checker.types.get(id(expr))
         return t is not None and is_nocopy(finish(t), self.checker.enums)
 
     def check_all(self, exprs: tuple[Expr, ...]) -> None:
+        # The top-level variables some function uses, which can't be given away: it could run after that.
+        self.used_by_functions = {
+            id(info.binder)
+            for expr in exprs
+            for function in nodes(expr)
+            if isinstance(function, Lambda)
+            for name in nodes(function.body)
+            if isinstance(name, Name) and (info := self.checker.resolved.get(id(name))) and info.kind == "global"
+        }
         for expr in exprs:
             self.walk(expr, "copy")
 
     def error(self, expr: Expr, what: str) -> EllaError:
-        t = show_type(finish(self.checker.types[id(expr)]))
-        return EllaError(f"{a_or_an(t)} {t} can't be copied, so it can't be {what}", expr.span)
+        t = finish(self.checker.types[id(expr)])
+        shown = show_type(t)
+        return EllaError(f"{a_or_an(shown)} {shown} can't be copied, so it can't be {what}{keep_hint(t)}", expr.span)
 
     def walk(self, node: object, context: str) -> None:
         """Check a node whose value is used in `context`: "copy", "borrow", or "return" (moved to the caller)."""
+        if isinstance(node, Name):
+            self.check_not_given(node)
         match node:
             case Name() | Index() | Member() if context != "borrow" and self.nocopy(node):
                 if not (context == "return" and isinstance(node, Name) and self.is_movable(node)):
@@ -3755,9 +4001,13 @@ class CopyChecker:
                 if self.loop_depth == 0:
                     self.movable.update(id(binding) for binding in bindings)
                 self.function_binders.update(id(binding) for binding in bindings)
+                self.depths.update(
+                    (id(binding), self.loop_depth) for binding in bindings if id(binding) not in self.used_by_functions
+                )
             case LetPattern(pattern, value):
                 self.walk(value, "borrow")  # its parts are borrowed, as a match's are
                 self.function_binders.update(id(node) for node in pattern_names(pattern))
+                self.depths.update((id(node), self.loop_depth) for node in pattern_names(pattern))
             case Assign(_, target, value):
                 if self.nocopy(target):
                     t = show_type(finish(self.checker.types[id(target)]))
@@ -3773,11 +4023,15 @@ class CopyChecker:
                     self.walk_place(callee.target.target)  # `mut v.method(...)`
                 elif isinstance(callee, Member) and id(callee) in self.checker.methods and takes:
                     self.walk_taken(callee.target)
+                elif isinstance(callee, Member) and id(callee.target) in self.checker.iter_args:
+                    self.walk_iterable(callee.target, takes)
                 else:
                     self.walk(callee, "borrow")
                 for arg in args:
                     if isinstance(arg, MutArg):
                         self.walk_place(arg.target)
+                    elif id(arg) in self.checker.iter_args:
+                        self.walk_iterable(arg, takes)
                     elif takes:
                         self.walk_taken(arg)
                     elif (
@@ -3803,14 +4057,22 @@ class CopyChecker:
                     self.walk(item, "copy")
             case Match(subject, cases):
                 self.walk(subject, "borrow")
+                before, after = dict(self.given), dict(self.given)
                 for case in cases:
+                    self.given = dict(before)  # each case starts from what was given away before the match
                     self.function_binders.update(id(node) for node in pattern_names(case.pattern))
+                    self.depths.update((id(node), self.loop_depth) for node in pattern_names(case.pattern))
                     self.walk(case.guard, "copy")
                     self.walk(case.body, context)
+                    after |= self.given
+                self.given = after
             case If(cond, then, else_):
                 self.walk(cond, "copy")
+                before = dict(self.given)
                 self.walk(then, context)
+                after_then, self.given = self.given, before
                 self.walk(else_, context)
+                self.given |= after_then
             case Block(exprs):
                 for line in exprs[:-1]:
                     self.walk(line, "copy")
@@ -3821,16 +4083,19 @@ class CopyChecker:
                 via_iter, kind = self.checker.iterations.get(id(node), (False, "items"))
                 if isinstance(iterable, MutArg):
                     self.walk_place(iterable.target)
-                elif not via_iter and kind != "items" and self.nocopy(iterable) and is_place(iterable):
-                    t = show_type(finish(self.checker.types[id(iterable)]))
-                    raise EllaError(
-                        f"{a_or_an(t)} {t} can't be copied, so a loop over it must advance it in place: "
-                        "'for ... in mut ...'",
-                        iterable.span,
-                    )
+                elif not via_iter and kind in ("gen", "next") and self.nocopy(iterable) and is_place(iterable):
+                    # Not copied: given away at its last use (the loop advances it), or else it must be `mut`.
+                    if not self.give_away(iterable):
+                        t = show_type(finish(self.checker.types[id(iterable)]))
+                        raise EllaError(
+                            f"{a_or_an(t)} {t} can't be copied, so a loop over it must advance it in place "
+                            "('for ... in mut ...'), or be its last use",
+                            iterable.span,
+                        )
                 else:
                     self.walk(iterable, "borrow")
                 self.function_binders.update(id(node) for node in pattern_names(pattern))
+                self.depths.update((id(node), self.loop_depth + 1) for node in pattern_names(pattern))
                 self.walk_loop(body)
             case While(_, cond, body):
                 self.walk(cond, "copy")
@@ -3838,13 +4103,17 @@ class CopyChecker:
             case Loop(_, body):
                 self.walk_loop(body)
             case Lambda(params, _, where, body):
-                outer = self.movable, self.function_binders, self.loop_depth
+                outer = self.movable, self.function_binders, self.loop_depth, self.depths, self.given
                 self.movable, self.function_binders, self.loop_depth = set(), {id(p) for p in params}, 0
+                # A generator's parameters are its own variables, in its Gen, so it can give them away too, and
+                # so are Iter[T] parameters, which take their arguments.
+                self.depths = {id(p): 0 for p in params if is_generator(node) or self.takes(p)}
+                self.given = {}
                 self.function_binders.update(id(c) for c in where)
                 for condition in where:
                     self.walk(condition.expr, "borrow")
                 self.walk(body, "return")
-                self.movable, self.function_binders, self.loop_depth = outer
+                self.movable, self.function_binders, self.loop_depth, self.depths, self.given = outer
             case EnumDef(methods=methods):
                 for method in methods:
                     self.walk(method.function, "copy")
@@ -3857,15 +4126,75 @@ class CopyChecker:
         return t is not None and describe_kind(finish(t)) == "Gen"
 
     def walk_taken(self, arg: Expr) -> None:
-        """An argument a generator takes: one that can't be copied must be a new value."""
+        """An argument a generator takes: one that can't be copied must be a new value, or a variable given away."""
         if self.nocopy(arg) and is_place(arg):
-            t = show_type(finish(self.checker.types[id(arg)]))
+            if not self.give_away(arg):
+                raise self.not_given(arg, "a function that gives a generator takes its arguments")
+            return
+        self.walk(arg, "copy")
+
+    def takes(self, param: Param) -> bool:
+        """Whether a parameter takes its argument: an Iter[T] one."""
+        t = self.checker.types.get(id(param))
+        return isinstance(t, ParamTy) and t.item is not None
+
+    def give_away(self, arg: Expr) -> bool:
+        """Give away a variable that can't be copied, to a parameter that takes it, if it can be: one of the
+        function's own, declared in the loop this is in (if any), which nothing uses after this."""
+        if not isinstance(arg, Name):
+            return False
+        info = self.checker.resolved.get(id(arg))
+        if info is None or info.kind not in ("local", "global") or self.depths.get(id(info.binder)) != self.loop_depth:
+            return False
+        self.check_not_given(arg)
+        self.given[id(info.binder)] = arg.span
+        return True
+
+    def check_not_given(self, name: Name) -> None:
+        info = self.checker.resolved.get(id(name))
+        if info is not None and (where := self.given.get(id(info.binder))) is not None:
             raise EllaError(
-                f"{a_or_an(t)} {t} can't be copied, and a function that gives a generator takes its arguments, "
-                "so this must be a new value",
+                f"'{name.name}' was given away at {where.line}:{where.column}, so it can't be used after that",
+                name.span,
+            )
+
+    def not_given(self, arg: Expr, why: str) -> EllaError:
+        t = show_type(finish(self.checker.types[id(arg)]))
+        info = self.checker.resolved.get(id(arg)) if isinstance(arg, Name) else None
+        if info is not None and info.kind == "local" and id(info.binder) in self.depths:
+            return EllaError(
+                f"{a_or_an(t)} {t} can't be copied, and {why}, so a variable holding one can only be given away "
+                "in the loop it is declared in, not in a loop inside that",
                 arg.span,
             )
-        self.walk(arg, "copy")
+        if info is not None and info.kind == "global" and id(info.binder) in self.used_by_functions:
+            return EllaError(
+                f"{a_or_an(t)} {t} can't be copied, and {why}, so this must be a new value; a top-level variable "
+                "that a function uses can't be given away, since the function could run after that",
+                arg.span,
+            )
+        if info is not None and info.kind == "local" and isinstance(info.binder, Param):
+            return EllaError(
+                f"{a_or_an(t)} {t} can't be copied, and {why}, so this must be a new value; only a generator can "
+                "give away its parameters, which are its own variables",
+                arg.span,
+            )
+        return EllaError(
+            f"{a_or_an(t)} {t} can't be copied, and {why}, so this must be a new value or a local variable",
+            arg.span,
+        )
+
+    def walk_iterable(self, arg: Expr, takes: bool) -> None:
+        """An argument for an `Iter[T]` parameter, which takes it, since the loops over it may advance it: one that
+        can't be copied must be a new value. A function may pass on its own `Iter[T]` parameter, though, to one
+        that gives no generator (which could keep it)."""
+        t = self.checker.types.get(id(arg))
+        own = isinstance(arg, Name) and isinstance(t, ParamTy) and t.item is not None and not takes
+        if self.nocopy(arg) and is_place(arg) and not own:
+            if not self.give_away(arg):
+                raise self.not_given(arg, "an Iter parameter takes what it is given")
+            return
+        self.walk(arg, "borrow" if own else "copy")
 
     def walk_parts(self, node: object) -> None:
         """Walk a node's parts, as copies."""

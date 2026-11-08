@@ -1,5 +1,5 @@
 5:53: index 5 is out of range for a list of length 3
   called at 10:44 in pick
-  called at <std>/lists.ella:14:21 in lists.map
+  called at <std>/lists.ella:189:21 in lists.map
   called at 11:12 in total
   called at 19:16 in main

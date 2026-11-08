@@ -707,6 +707,7 @@ def test_type_namespace_functions() -> None:
 
 def test_builtin_receiver_methods() -> None:
     assert prepared_type_of("[1, 2].map((x: i64) -> i64 => x * 2)") == "[i64]"
+    assert prepared_type_of("count(1, 1).take(2)") == "Gen[i64]"  # iters' functions other than the eager ones' names
     assert prepared_type_of('" a ".trim()') == "str"
 
 
@@ -1704,6 +1705,8 @@ def test_exit_can_only_be_called() -> None:
 
 def test_prelude_functions() -> None:
     assert prepared_type_of("map([1], (n: i64) -> str => 'x')") == "[str]"
+    assert prepared_type_of("import iters\niters.map([1], (n: i64) -> str => 'x')") == "Gen[str]"
+    assert prepared_type_of("count(1, 2) |> take(3) |> collect") == "[i64]"  # iters is part of the prelude
     assert prepared_type_of("sort(['b', 'a'])") == "[str]"
     assert prepared_type_of("pi") == "f64"
     assert prepared_type_of("let map = (n: i64) -> i64 => n\nmap(1)") == "i64"  # a program's own definition wins
@@ -1720,7 +1723,8 @@ def test_prelude_functions() -> None:
         ("(x) => x + 1.0", "(f64) -> f64"),
         ("(x: str, y) => x + y", "(str, str) -> str"),
         ("let f = () -> (i64) -> bool =>\n    let g: (i64) -> bool = (n) => n > 0\n    g\nf()", "(i64) -> bool"),
-        ("let ys = map([1], (n) => n * 2)\n-ys[0]", "i64"),  # the lambda's body is checked when ys[0] needs its type
+        # the lambda's body is checked when ys[0] needs its type
+        ("let ys = map([1], (n) => n * 2)\n-ys[0]", "i64"),
         ("map(['a'], len)", "[i64]"),
         ("map([1], Some)", "[Optional[i64]]"),
         ("map([1], print)", "[()]"),
@@ -1752,7 +1756,11 @@ def test_prelude_code_keeps_its_own_meaning() -> None:
 def test_prelude_modules_are_linked_when_used() -> None:
     assert link(parse("let x = 1")).modules == (("", "main"),)
     used = link(parse("sort([1])"))
-    assert used.modules == (("<std>/lists.ella", "lists"), ("", "main"))
+    assert used.modules == (
+        ("<std>/iters.ella", "iters"),
+        ("<std>/lists.ella", "lists"),
+        ("", "main"),
+    )  # lists uses iters
     assert link(used) is used
     # A type in an annotation counts.
     assert link(parse("let f = (m: Map[str, i64]) -> i64 => len(m)")).modules[0] == ("<std>/maps.ella", "maps")
@@ -1813,13 +1821,25 @@ def test_generator_errors(source: str, message: str) -> None:
     ("source", "message"),
     [
         (
-            GEN + "let g = count(1)\nfor x in g\n    ()",
-            "a Gen[i64] can't be copied, so a loop over it must advance it in place: 'for ... in mut ...'",
+            GEN + "let g = count(1)\nfor i in 0..2\n    for x in g\n        ()",
+            (
+                "a Gen[i64] can't be copied, so a loop over it must advance it in place ('for ... in mut ...'), or "
+                "be its last use"
+            ),
+        ),
+        (
+            GEN + "let g = count(1)\nfor x in g\n    ()\nprint(g)",
+            "'g' was given away at 4:10, so it can't be used after that",
         ),
         (
             GEN
-            + "let twice = (g: Gen[i64]) -> Gen[i64] =>\n    for x in mut g\n        yield x\nlet g = count(1)\ntwice(g)",
-            "a Gen[i64] can't be copied, and a function that gives a generator takes its arguments, so this must be a new value",
+            + "let twice = (g: Gen[i64]) -> Gen[i64] =>\n    for x in mut g\n        yield x\nlet g = count(1)\n"
+            + "let f = () -> () =>\n    for x in twice(g)\n        print(x)",
+            (
+                "a Gen[i64] can't be copied, and a function that gives a generator takes its arguments, so this must "
+                "be a new value; a top-level variable that a function uses can't be given away, since the function "
+                "could run after that"
+            ),
         ),
         (GEN + "let g = count(1)\nlet h = g", "a Gen[i64] can't be copied, so it can't be used here"),
         (
@@ -1972,3 +1992,186 @@ def test_sums_shapes() -> None:
     assert error("sums(array([1.0]), 0)").message == (
         "sums() needs an array of 2 or more dimensions, not Array[f64; _]; use total()"
     )
+
+
+TOTAL = "let total = (xs: Iter[i64]) -> i64 =>\n    let mut sum = 0\n    for x in xs\n        sum += x\n    sum\n"
+COUNT = "let count = (n: i64) -> Gen[i64] =>\n    let mut i = 0\n    while i < n\n        yield i\n        i += 1\n"
+
+
+def test_iter_parameters() -> None:
+    # An Iter[T] parameter takes anything a loop can go through, with items of type T.
+    assert binding_type(TOTAL, "total") == "(Iter[i64]) -> i64"
+    assert type_of(TOTAL + "total") == "([i64]) -> i64"  # a list, unless a call decides
+    for source in ("[1, 2]", "0..3", "count(2)", "array([1])"):
+        assert type_of(TOTAL + COUNT + f"total({source})") == "i64"
+    assert (
+        type_of(
+            "let first[T] = (xs: Iter[T]) -> Optional[T] =>\n    for x in xs\n        return Some(x)\n    None\n"
+            'first("ab")'
+        )
+        == "Optional[str]"
+    )
+    # Its items decide T, so a lambda after it gets its parameter's type.
+    assert prepared_type_of("map(0..3, x => -x)") == "[i64]"
+    assert prepared_type_of('filter("abc", c => c != "b")') == "[str]"
+    assert prepared_type_of("(0..3).map(x => x > 1)") == "[bool]"
+    # A value whose type isn't known yet is taken to be a list, as it would be for a [T] parameter.
+    assert prepared_type_of("let g = () -> [i64] =>\n    let f = (ys) => map(ys, y => y + 1)\n    f([1])\ng()") == (
+        "[i64]"
+    )
+    assert error(TOTAL + "total(5)").message == (
+        "argument 1 of total must be something a 'for' loop can go through (a list, str, range, generator or "
+        "iterator), not an i64"
+    )
+    assert error(TOTAL + 'total(["a"])').message == "the items of argument 1 of total should be i64, not str"
+    assert prepared_error("let apply = (f: ([str]) -> i64) -> i64 => f([])\napply(total)\n" + TOTAL).message == (
+        "the items of argument 1 of total should be i64, not str"
+    )
+
+
+def test_iter_parameters_take_what_they_are_given() -> None:
+    # A generator passed to one must be a new value; inside, the parameter can't be copied, since it may be one.
+    assert error(TOTAL + COUNT + "let g = count(3)\nlet f = () -> i64 => total(g)").message == (
+        "a Gen[i64] can't be copied, and an Iter parameter takes what it is given, so this must be a new value; a "
+        "top-level variable that a function uses can't be given away, since the function could run after that"
+    )
+    assert warnings(TOTAL + COUNT + "let g = count(3)\nprint(total(g))") == []  # no function uses it
+    assert error("let f = (xs: Iter[i64]) -> i64 =>\n    let ys = xs\n    0").message == (
+        "an Iter[i64] can't be copied, so it can't be used here"
+        "; it may be a generator, and collect() makes a list of its items, which can be copied"
+    )
+    assert error(TOTAL + "let f = (xs: Iter[i64]) -> () =>\n    let g = () => total(xs)\n    print(g())").message == (
+        "an Iter[i64] can't be copied, so it can't be captured by a closure"
+        "; it may be a generator, and collect() makes a list of its items, which can be copied"
+    )
+    assert error(
+        "let id[T] = (x: T) -> T => x\nlet f = (xs: Iter[i64]) -> i64 =>\n    let _ = id(xs)\n    0"
+    ).message == (
+        "id can't be used with Iter[i64], which can't be copied"
+        "; it may be a generator, and collect() makes a list of its items, which can be copied"
+    )
+    assert error("let f = (xs: Iter[i64]) -> () =>\n    for x in mut xs\n        print(x)").message == (
+        "a loop goes through an Iter parameter without 'mut'"
+    )
+    # A function can pass its own on, and give it away, since it takes its argument.
+    assert binding_type(TOTAL + "let twice = (xs: Iter[i64]) -> i64 => total(xs) + total(xs)", "twice") == (
+        "(Iter[i64]) -> i64"
+    )
+    keep = "let keep = (xs: Iter[i64]) -> Gen[i64] =>\n    for x in xs\n        yield x\n"
+    assert warnings(keep + "let f = (xs: Iter[i64]) -> Gen[i64] => keep(xs)\nprint(f)") == []
+    assert error(keep + "let f = (xs: Iter[i64]) -> Gen[i64] =>\n    let g = keep(xs)\n    keep(xs)").message == (
+        "'xs' was given away at 5:18, so it can't be used after that"
+    )
+
+
+def test_giving_away_at_last_use() -> None:
+    # A local variable that can't be copied can be given away to a parameter that takes it, at its last use.
+    main = TOTAL + COUNT + "let main = () -> () =>\n    let g = count(3)\n    "
+    assert warnings(main + "print(total(g))") == []
+    assert error(main + "print(total(g))\n    print(total(g))").message == (
+        "'g' was given away at 13:17, so it can't be used after that"
+    )
+    assert error(main + "print(total(g))\n    print(g)").message.startswith("'g' was given")
+    # Each branch can give it away; after them, it is gone if any did.
+    assert warnings(main + "print(if true then total(g) else total(g))") == []
+    assert error(main + "let n = if true then total(g) else 0\n    print(n, g)").message.startswith(
+        "'g' was given away at 13:32"
+    )
+    # Not in a loop inside the one it is declared in, since the next time round would use it again.
+    assert error(main + "for i in 0..2\n        print(total(g))").message.endswith(
+        "can only be given away in the loop it is declared in, not in a loop inside that"
+    )
+    assert (
+        warnings(
+            TOTAL + COUNT + "let main = () -> () =>\n    for i in 0..2\n        let g = count(i)\n"
+            "        print(total(g))"
+        )
+        == []
+    )
+    # A generator can give away its own parameters, which are in its Gen.
+    keep = "let keep = (xs: Iter[i64]) -> Gen[i64] =>\n    for x in xs\n        yield x\n"
+    assert (
+        warnings(
+            keep + "let again = (xs: Iter[i64]) -> Gen[i64] =>\n    for x in keep(xs)\n        yield x\nprint(again)"
+        )
+        == []
+    )
+
+
+def test_iter_is_only_a_parameter_type() -> None:
+    message = "Iter[T] can only be the type of a parameter of a function bound by 'let'"
+    for source in (
+        "let f = (xs: Iter[i64]) -> Iter[i64] => xs",
+        "let f = (g: (Iter[i64]) -> i64) -> i64 => 0",
+        "let f = (xs: [Iter[i64]]) -> i64 => 0",
+        "print(((xs: Iter[i64]) => 1)([1]))",
+        "struct S\n    n: i64\n    f = (s: S, xs: Iter[i64]) -> i64 => 0",
+    ):
+        assert error(source).message.startswith(message), source
+
+
+def test_pattern_parameters() -> None:
+    assert type_of("let f = ((a, b): (i64, str)) -> str => b\nf") == "((i64, str)) -> str"
+    assert prepared_type_of("map([(1, 2.0)], ((n, x)) => x).collect()") == "[f64]"
+    assert type_of("struct P\n    x: i64\n    y: i64\nlet f = (P(x, _): P) -> i64 => x\nf(P(1, 2))") == "i64"
+    assert error("let f = ((a, b)) -> i64 => a").message.startswith("a pattern parameter needs a type")
+    assert error("let f = ((a, 0): (i64, i64)) -> i64 => a").message == (
+        "'let' needs a pattern that matches every value, and this one doesn't match (_, _)"
+    )
+    # Its names are variables like a `let`'s, warned about when unused.
+    assert warnings("let f = ((a, b): (i64, i64)) -> i64 => a\nprint(f((1, 2)))") == [
+        "1:14: 'b' is never used; start its name with '_' if that is on purpose"
+    ]
+
+
+def test_pattern_parameters_with_where() -> None:
+    function = "let f = ((a, b): (i64, i64)) -> i64 =>\n    where\n        a > 0\n        return > a\n    "
+    assert warnings(function + "b\nprint(f((1, 2)))") == []
+    assert warnings(function + "0\nprint(f((1, 2)))") == [
+        "1:14: 'b' is never used; start its name with '_' if that is on purpose"
+    ]
+    assert (
+        warnings("let f = ((mut a, b): (i64, i64)) -> i64 =>\n    where\n        a > 0\n    a += b\n    a\nprint(f)")
+        == []
+    )
+    # A pattern that doesn't match every value is an error, whichever copy keeps its variant.
+    message = "'let' needs a pattern that matches every value, and this one doesn't match (_, Some(_))"
+    for cond in ("a > 0", "None == None"):
+        source = f"let f = ((a, None): (i64, Optional[i64])) -> i64 =>\n    where\n        {cond}\n    a"
+        assert error(source).message == message, cond
+
+
+def test_generators_used_as_lists_hint_at_collect() -> None:
+    hint = "; a Gen gives its items one at a time, and collect() makes a list of them"
+    gen = "import iters\nlet ys = iters.map([1], n => n)\n"
+    for source in (gen + "ys[0]", gen + "len(ys)", gen + "ys == [1]", gen + "1 in ys", gen + "sort(ys)"):
+        assert prepared_error(source).message.endswith(hint), source
+    assert prepared_error("let ys: [i64] = count(1, 1)").message.endswith(hint)
+    # Printing one is allowed, but a library function's result printed as <gen> is probably a mistake.
+    _, checker = prepare(parse("print(count(1, 1))\nlet g = count(1, 1)\nprint(g)"))
+    assert [f"{w.span}: {w.message}" for w in checker.warnings] == [
+        "1:12: this prints a generator as <gen>, not its items; collect() makes a list of them"
+    ]
+
+
+def test_eager_functions_on_endless_generators_warn() -> None:
+    def warned(source: str) -> list[str]:
+        _, checker = prepare(parse("import iters\n" + source))
+        return [w.message.split(" goes through")[0] for w in checker.warnings if "without end" in w.message]
+
+    assert warned("let a = count(0, 1) |> map(x => x * 2) |> take(3)") == ["map"]
+    assert warned("let b = count(0, 1).filter(x => x > 2)") == ["filter"]
+    assert warned("let c = iters.map(count(0, 1), x => x) |> collect") == ["collect"]
+    assert warned("let d = zip(count(0, 1), count(5, 1))") == ["zip"]
+    assert warned("let e = enumerate(iters.skip(count(1, 1), 2))") == ["enumerate"]
+    # Not once something ends it, nor for zip with a side that ends, nor for a lazy function.
+    assert warned("let a = count(0, 1) |> take(3) |> map(x => x)") == []
+    assert warned('let b = zip(["a"], count(0, 1))') == []
+    assert warned("let c = iters.map(count(0, 1), x => x)") == []
+    _, checker = prepare(parse("let a = map(count(0, 1), x => x)"))
+    assert [w.message for w in checker.warnings] == [
+        (
+            "map goes through every item of a generator without end, so it never finishes; take(n) first, or "
+            "the lazy iters.map"
+        )
+    ]

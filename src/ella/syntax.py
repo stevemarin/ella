@@ -683,6 +683,22 @@ def bare_name(name: str) -> str:
     return head.rpartition(".")[2].rpartition("#")[2] + bracket + rest
 
 
+def iter_param(position: int) -> str:
+    """The hidden type parameter of a function's `Iter[T]` parameter at a position (ella.parser.with_iter_params)."""
+    return f"Iter#{position}"
+
+
+def is_iter_param(name: str) -> bool:
+    """Whether a type parameter is the hidden one of an `Iter[T]` parameter."""
+    return name.startswith("Iter#")
+
+
+def is_hidden(name: str) -> bool:
+    """Whether a name is one the parser makes, which programs can't write: a pattern parameter's (`#0`) or an
+    `Iter[T]` parameter's type parameter (`Iter#0`)."""
+    return name.startswith("#") or is_iter_param(name)
+
+
 def parts(node: object) -> list[object]:
     """The parts of a syntax tree node (or the items of a tuple of nodes)."""
     if isinstance(node, tuple):
@@ -790,6 +806,7 @@ def show(node: Expr | Pattern | TypeExpr) -> str:
         case NamedType(name, args, dims=dims) if dims is not None:
             return f"{name}[{show_list(args)}; {', '.join(str(d.value) for d in dims)}]"
         case NamedType(name, args):
+            name = "Iter" if is_iter_param(name) else name
             return f"{name}[{show_list(args)}]" if args else name
         case ListType(element):
             return f"[{show(element)}]"
@@ -951,10 +968,11 @@ def show_type_params(
     params: tuple[str, ...], constraints: tuple[tuple[str, ...], ...], sizes: tuple[str, ...] = ()
 ) -> str:
     """`[T: Ord + Add, U]` or `[T; N, M]`, or nothing without type or size parameters."""
-    if not params and not sizes:
-        return ""
     constraints = constraints or tuple(() for _ in params)
-    text = ", ".join(f"{p}: {' + '.join(c)}" if c else p for p, c in zip(params, constraints))
+    shown = [(p, c) for p, c in zip(params, constraints) if not is_iter_param(p)]  # they are written `Iter[T]`
+    if not shown and not sizes:
+        return ""
+    text = ", ".join(f"{p}: {' + '.join(c)}" if c else p for p, c in shown)
     if sizes:
         text += "; " + ", ".join(sizes)
     return f"[{text}]"

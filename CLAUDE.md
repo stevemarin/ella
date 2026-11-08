@@ -66,7 +66,10 @@ plain:
   makes them calls of the library's `map_of` and `set_of`.
 * `src/ella/parser.py`: Pratt parser following docs/grammar.md §8 and the
   parsing notes in §12. A file's `import` lines come first
-  (`Program.imports`); paths in types and patterns are dotted names.
+  (`Program.imports`); paths in types and patterns are dotted names. A
+  lambda's pattern parameter becomes a hidden parameter `#i` and a `let`
+  first in its body, and each `Iter[T]` parameter of a `let`'s function a
+  hidden type parameter `Iter#i` (`with_iter_params`; `syntax.is_hidden`).
 * `src/ella/checker.py`: static type checker with simple inference
   (unification of type variables). Records each node's type and what each
   name refers to, in tables keyed by `id(node)`, for the lowering. Lambdas
@@ -89,9 +92,14 @@ plain:
   `updates`, which the interpreters and lowering run instead), the `text`, `eq` and `hash` protocols (a type's text form
   for `print`, its `==`, and its hash; `eq` needs `hash`),
   generators (a lambda with `yield`,
-  `syntax.is_generator`; how each `for` loops is in `iterations`), and the
-  rules for `nocopy` values (`check_copies`; a call giving a `Gen` takes
-  its nocopy arguments, which must be new values), and array shapes
+  `syntax.is_generator`; how each `for` loops is in `iterations`, "any"
+  over an `Iter[T]` parameter, a `ParamTy` with an `item`, whose uses
+  `settle_iterable` checks and whose loops the lowering decides per
+  specialization, `iteration`), and the
+  rules for `nocopy` values (`check_copies`; a call giving a `Gen`, an
+  `Iter[T]` parameter and a `for` without `mut` take their nocopy
+  arguments: new values, or variables given away at their last use,
+  `give_away`), and array shapes
   (`Array[f64; N, 3]`: `SizeTy`, `array_dims`; `finish` erases them):
   where it can't be sure of one, a `ShapeCheck` (`shape_checks` by
   Lambda for its parameters and by Let, `result_shapes`) that the
@@ -153,13 +161,15 @@ plain:
   (`visible`, by the span's file). Values print with bare type names
   (`bare_name`).
 * `src/ella/lib/`: the standard library, in Ella: `lists.ella` (`map`,
-  `sort_by`, `sum`, `zip`, `fold`, ...), `maps.ella` (`Map[K, V]`, `new_map`),
-  `sets.ella` (`Set[T]` on a `Map`, `new_set`, `set_of`, `unique`),
-  `strings.ella` (`lines`, `words`, `split_once`, ...), `math.ella` (`pi`,
-  `e`, `inf`, `nan`, ...) and `iters.ella` (lazy `map`, `filter`, `take`, ... on
-  generators). Their public names are the prelude, which every module sees
-  without importing them, except those of `iters` (`UNPRELUDED` in
-  ella.modules), which share names with `lists`'; they can be imported too.
+  `filter`, `zip`, `enumerate`, eager on any `Iter[T]`, and `sort_by`,
+  `sum`, `fold`, ...), `iters.ella` (lazy: each takes an `Iter[T]` and
+  gives a `Gen`: `iters.map`, ..., `each`, `count`, `take`, ...,
+  `collect`), `maps.ella` (`Map[K, V]`, `new_map`), `sets.ella` (`Set[T]`
+  on a `Map`, `new_set`, `set_of`, `unique`), `strings.ella` (`lines`,
+  `words`, `split_once`, ...) and `math.ella` (`pi`, `e`, `inf`, `nan`,
+  ...). Their public names are the prelude, which every module sees
+  without importing them, except where `iters` (`checker.LAZY`) shares a
+  name with `lists`; they can be imported too.
 * `src/ella/operators.py`: operator semantics on run-time values, shared by
   both interpreters so results and error messages match exactly. Arrays
   (`ArrayValue` in values.py; `Array[T]` in the checker, `array_item`) work

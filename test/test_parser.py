@@ -4,7 +4,7 @@ import pytest
 
 from ella.lexer import EllaError, Span, tokenize
 from ella.parser import parse, parse_partial
-from ella.syntax import Assign, Binary, Call, IntLit, Lambda, Let, Name, show
+from ella.syntax import Assign, Binary, Call, IntLit, Lambda, Let, Name, NamedType, show
 
 EXAMPLE = Path(__file__).parent.parent / "example_syntax.ella"
 
@@ -28,8 +28,8 @@ def error(source: str) -> EllaError:
 def test_example_file_parses() -> None:
     """The stage 1 acceptance test."""
     program = parse(EXAMPLE.read_text())
-    assert [".".join(line.path) for line in program.imports] == ["lists", "maps.new_map"]
-    assert len(program.body) == 158
+    assert [".".join(line.path) for line in program.imports] == ["lists", "iters", "maps.new_map"]
+    assert len(program.body) == 163
 
 
 # Precedence (docs/grammar.md §8)
@@ -671,3 +671,38 @@ def test_map_and_set_literals() -> None:
 )
 def test_bad_map_and_set_literals(source: str, message: str) -> None:
     assert str(error(source)) == message
+
+
+def test_pattern_parameters() -> None:
+    # A pattern parameter is a hidden parameter, which a `let` at the start of the body takes apart.
+    assert one("((a, b)) => a + b") == "(lambda (#0) (block (let (tuple a b) #0) (+ a b)))"
+    assert one("(x: i64, (y, _): (i64, str)) -> i64 => x + y") == (
+        "(lambda (x: i64, #1: (i64, str)) -> i64 (block (let (tuple y _) #1) (+ x y)))"
+    )
+    assert one("(Point(x, y)) => x") == "(lambda (#0) (block (let (Point x y) #0) x))"
+    assert one("(geo.Point(x, _)) =>\n    print(x)\n    x") == (
+        "(lambda (#0) (block (let (geo.Point x _) #0) (call print x) x))"
+    )
+    # Inside parentheses that aren't parameters, items are expressions as before.
+    assert one("((a, b))") == "(tuple a b)"
+    assert "lambda parameters" in error("(0 | 1) => 1").message
+    assert "lambda parameters" in error('("a") => 1').message
+    # Each `where` condition that uses its names gets its own copy, keeping only those names.
+    assert one("((a, b)) -> i64 =>\n    where\n        a > 0\n    a + b") == (
+        "(lambda (#0) -> i64 (where (block (let (tuple a _) #0) (compare a > 0)))"
+        " (block (let (tuple a b) #0) (+ a b)))"
+    )
+    assert one("((a, b)) -> i64 =>\n    where\n        a > 0\n    b") == (
+        "(lambda (#0) -> i64 (where (block (let (tuple a _) #0) (compare a > 0))) (block (let (tuple _ b) #0) b))"
+    )
+
+
+def test_iter_parameters() -> None:
+    # Each Iter[T] parameter gets a hidden type parameter (written as Iter[T] still).
+    program = parse("let f[T] = (n: i64, xs: Iter[T]) -> () => ()")
+    let = program.body[0]
+    assert isinstance(let, Let) and isinstance(let.value, Lambda)
+    assert let.bindings[0].type_params == ("T", "Iter#1")
+    param_type = let.value.params[1].type
+    assert isinstance(param_type, NamedType) and param_type.name == "Iter#1" and show(param_type) == "Iter[T]"
+    assert show(let) == "(let [f[T]] (lambda (n: i64, xs: Iter[T]) -> () ()))"

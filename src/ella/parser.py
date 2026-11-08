@@ -1,6 +1,7 @@
 """Pratt parser: turns tokens into the syntax tree defined in ella.syntax."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 
 from ella.lexer import EllaError, Span, Token, TokenKind, tokenize
@@ -71,6 +72,8 @@ from ella.syntax import (
     While,
     WildcardPattern,
     Yield,
+    iter_param,
+    parts,
 )
 
 I64_MIN = -(2**63)
@@ -98,6 +101,101 @@ class Assoc(Enum):
     NONE = auto()  # not allowed: `a..b..c` is an error
     CHAIN = auto()  # comparisons: `a < b <= c` becomes one Compare node
     POSTFIX = auto()  # call, index, member and `?`, which have no right operand
+
+
+@dataclass(frozen=True, slots=True)
+class PatternParam:
+    """A lambda parameter that is a pattern, while parsing: `(a, b)` in `((a, b)) => a + b`."""
+
+    pattern: Pattern
+    type: TypeExpr | None
+
+
+def with_iter_params(let: Let) -> Let:
+    """A `let` of a function with `Iter[T]` parameters (docs/grammar.md §9), each made a hidden type parameter of
+    the function: `Iter#0` for the first parameter, whose type becomes `Iter#0[T]`.
+
+    So such a function is generic, and made for each type of value passed
+    (a list, a range, a generator, ...), as other generic functions are.
+    """
+    function = let.value
+    if not isinstance(function, Lambda):
+        return let
+    hidden: list[str] = []
+    params: list[Param] = []
+    for i, param in enumerate(function.params):
+        match param.type:
+            case NamedType("Iter", (item,), span, None):
+                name = iter_param(i)
+                hidden.append(name)
+                params.append(replace(param, type=NamedType(name, (item,), span)))
+            case _:
+                params.append(param)
+    if not hidden:
+        return let
+    first = let.bindings[0]
+    constraints = first.constraints + ((),) * len(hidden) if first.constraints else ()
+    first = replace(first, type_params=(*first.type_params, *hidden), constraints=constraints)
+    return replace(let, bindings=(first, *let.bindings[1:]), value=replace(function, params=tuple(params)))
+
+
+def take_apart(lets: list[LetPattern], where: tuple[Assert, ...], body: Expr) -> tuple[tuple[Assert, ...], Expr]:
+    """A function's `where` conditions and body, each starting with the `let`s that take apart its pattern
+    parameters, which `where` conditions run before the body.
+
+    Each condition gets its own copy of the `let`s whose names it uses, keeping only those names (the others
+    become `_`, and none is `mut`), so that the names it doesn't use aren't warned about there. The body's
+    keeps the names it uses, and those no condition uses, so a name used nowhere is warned about once. (A
+    variant's name, like `None`, is kept somewhere too, so a pattern that doesn't match every value is still
+    an error.)
+    """
+    conditions: list[Assert] = []
+    in_conditions: set[str] = set()
+    for cond in where:
+        used = names_in(cond.expr)
+        own = [keeping(let, used, mutable=False) for let in lets if pattern_names_in(let.pattern) & used]
+        conditions.append(replace(cond, expr=Block((*own, cond.expr), cond.span)) if own else cond)
+        in_conditions |= used
+    every = set().union(*(pattern_names_in(let.pattern) for let in lets))
+    keep = names_in(body) | (every - in_conditions)
+    lines = body.exprs if isinstance(body, Block) else (body,)
+    return tuple(conditions), Block((*(keeping(let, keep) for let in lets), *lines), body.span)
+
+
+def keeping(let: LetPattern, names: set[str], mutable: bool = True) -> LetPattern:
+    """A new copy of a pattern parameter's `let` (its nodes are new, as the checker's tables need), with the
+    names not in `names` made `_`, and `mut` left out unless `mutable`."""
+
+    def copy(pattern: Pattern) -> Pattern:
+        match pattern:
+            case NamePattern(name, span) if name not in names:
+                return WildcardPattern(span)
+            case NamePattern():
+                return replace(pattern, mutable=pattern.mutable and mutable)
+            case TuplePattern(items):
+                return replace(pattern, items=tuple(copy(item) for item in items))
+            case VariantPattern(_, args):
+                return replace(pattern, args=tuple(copy(arg) for arg in args))
+        return replace(pattern)
+
+    assert isinstance(let.value, Name)
+    return replace(let, pattern=copy(let.pattern), value=replace(let.value))
+
+
+def names_in(node: object) -> set[str]:
+    """The names some code uses (perhaps as other variables, in lambdas: then a pattern keeps a name it needn't)."""
+    if isinstance(node, Name):
+        return {node.name}
+    return set().union(*(names_in(part) for part in parts(node)))
+
+
+def pattern_names_in(pattern: object) -> set[str]:
+    """The names in a pattern: those it binds, and variants like `None`."""
+    if isinstance(pattern, NamePattern):
+        return {pattern.name}
+    if not isinstance(pattern, TuplePattern | VariantPattern | tuple):
+        return set()
+    return set().union(*(pattern_names_in(part) for part in parts(pattern)))
 
 
 def parse(source: str, file: str = "") -> Program:
@@ -762,6 +860,9 @@ class Parser:
         `)`, the items become lambda parameters. This avoids backtracking.
         """
         open_paren = self.advance()
+        if self.closes_before_arrow():
+            params, _ = self.parse_comma_list(self.parse_param, ")")
+            return self.parse_lambda(params, open_paren.span)
         items, trailing_comma = self.parse_comma_list(self.parse_paren_item, ")")
         if self.at("->") or self.at("=>"):
             return self.parse_lambda(items, open_paren.span)
@@ -791,15 +892,58 @@ class Parser:
             return Param(name.text, self.parse_type(), name.span)
         return self.parse_expr()
 
+    def closes_before_arrow(self) -> bool:
+        """Whether the `(` just read closes with a `)` followed by `->` or `=>`: whether it starts a lambda's
+        parameters. (A look ahead only: the tokens are read again as parameters.)"""
+        depth = 1
+        for i in range(self.pos, len(self.tokens)):
+            token = self.tokens[i]
+            if token.kind is not TokenKind.OP:
+                continue
+            if token.text in ("(", "[", "{"):
+                depth += 1
+            elif token.text in (")", "]", "}"):
+                depth -= 1
+                if depth == 0:
+                    following = self.tokens[i + 1] if i + 1 < len(self.tokens) else token
+                    return following.kind is TokenKind.OP and following.text in ("->", "=>")
+        return False
+
+    def parse_param(self) -> Param | PatternParam:
+        """One lambda parameter: `x`, `x: i64`, `mut xs: [i64]`, or a pattern, perhaps with a type: `(a, b)`,
+        `(a, b): (i64, i64)`, `Point(x, y)`."""
+        if self.accept("mut"):
+            name = self.expect_kind(TokenKind.NAME, "a parameter name")
+            self.expect(":")
+            return Param(name.text, self.parse_type(), name.span, mutable=True)
+        if self.at_kind(TokenKind.NAME) and not self.at("(", 1) and not self.at(".", 1):
+            name = self.advance()
+            return Param(name.text, self.parse_type() if self.accept(":") else None, name.span)
+        pattern = self.parse_pattern()
+        if isinstance(pattern, LiteralPattern | RangePattern | OrPattern):
+            raise EllaError("lambda parameters must look like 'x: i64', or be a pattern like '(a, b)'", pattern.span)
+        return PatternParam(pattern, self.parse_type() if self.accept(":") else None)
+
     # Functions
 
-    def parse_lambda(self, items: list[Expr | Param], span: Span) -> Lambda:
-        """The rest of `(params) -> ReturnType => body`, after the `)`."""
+    def parse_lambda(self, items: Sequence[Expr | Param | PatternParam], span: Span) -> Lambda:
+        """The rest of `(params) -> ReturnType => body`, after the `)`.
+
+        A pattern parameter becomes a hidden parameter (`#0` for the first)
+        that a `let` at the start of the body takes apart: `((a, b)) => a + b`
+        is `(#0) => (let (a, b) = #0; a + b)`, and so does each `where`
+        condition that uses its names (`take_apart`).
+        """
         params = []
-        for item in items:
+        lets: list[LetPattern] = []
+        for i, item in enumerate(items):
             match item:
                 case Param():
                     params.append(item)
+                case PatternParam(pattern, type_):
+                    name = f"#{i}"
+                    params.append(Param(name, type_, pattern.span))
+                    lets.append(LetPattern(pattern, Name(name, pattern.span), pattern.span))
                 case Name(name, name_span):
                     # An untyped parameter, as in `(x) => x`.
                     params.append(Param(name, None, name_span))
@@ -808,6 +952,8 @@ class Parser:
         return_type = self.parse_type() if self.accept("->") else None
         self.expect("=>")
         where, body = self.parse_lambda_body()
+        if lets:
+            where, body = take_apart(lets, where, body)
         return Lambda(tuple(params), return_type, where, body, span)
 
     def parse_untyped_lambda(self, left: Expr) -> Lambda:
@@ -896,7 +1042,7 @@ class Parser:
             # (A generic function's `f[T] =` can only be the first target.)
             bindings.append(self.parse_binding())
             self.expect("=")
-        return Let(tuple(bindings), self.parse_expr(), token.span)
+        return with_iter_params(Let(tuple(bindings), self.parse_expr(), token.span))
 
     def parse_binding(self) -> Binding:
         """One `let` target: `x`, `mut x`, `x: i64`, or `first[T]` for a generic function."""

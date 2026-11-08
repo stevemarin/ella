@@ -171,10 +171,25 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   read in generic code as `T.EMPTY`, computed once at compile time), also
   through a struct's own type parameters (`struct Acc[T: Monoid]`).
   Generic code is specialized per use: no dynamic dispatch. Local
-  `let`-bound generic functions can capture local values.
+  `let`-bound generic functions can capture local values. A parameter of
+  type `Iter[T]` takes anything a `for` loop can go through (list, str,
+  range, array, `Gen`, iterator, a type with `iter`): the parser gives each
+  one a hidden type parameter (`Iter#0`, `parser.with_iter_params`; the
+  checker's `ParamTy.item`, `expect_iterables`/`settle_iterable`), so the
+  function is specialized per source type, and the lowering picks how each
+  loop over it goes from the concrete type (`Checker.iteration`). Such a
+  value may be a generator, so it can't be copied; arguments for it are
+  taken (`CopyChecker.walk_iterable`). `lists`' `map`, `filter`, `zip`
+  and `enumerate`, and every function of `iters`, take one.
 * **Inference.** Lambdas other than top-level functions and methods can
   leave out their types (`xs |> map(n => n * 2)`); `print`, `len` and
   constructors are values (`map(xs, Some)`).
+* **Pattern parameters.** A lambda parameter can be a pattern
+  (`((a, b)) => a + b`, `(Point(x, y): Point) -> f64 => ...`): the parser
+  makes it a hidden parameter (`#0`) and a `let` at the start of the body
+  (`parse_param`, after a look ahead for `) =>`: `closes_before_arrow`).
+  Each `where` condition that uses its names gets its own copy of the
+  `let`, keeping only those names (`take_apart`), so warnings stay right.
 * **Arrays.** `Array[T]` of `i64`, `i32`, `f64` or `f32`, any rank,
   broadcasting, slices (copies), `matmul`, `transpose`, `total`, `dot`,
   `sums` (along one axis); AVX2 loops natively, fused with `-O`. Shapes in
@@ -186,7 +201,19 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   (grammar.md §9, "Static shapes").
 * **Generators.** A function with `yield` gives a `Gen[T]`; `for` and
   `next(mut g)` drive it; its frame and arenas live in the `Gen`
-  (memory-model.md §17). `import iters` gives lazy `map`, `filter`, `take`, ...
+  (memory-model.md §17). Eager by default: `lists`' `map`, `filter`, `zip`
+  and `enumerate` give lists. `iters` has the lazy ones (`iters.map`, ...:
+  their names give way to `lists`' in the prelude and for method calls,
+  `modules.prelude`, `checker.LAZY`) and `each`, `count`, `take`, `skip`,
+  `take_while`, `chain`, `scan`, `collect`, which are in the prelude.
+* **Giving away.** A local variable that can't be copied (a `Gen`, ...)
+  can be given away at its last use, to a parameter that takes it (a
+  generator's or an `Iter[T]` one) or a `for` without `mut`: the copy
+  checker's `give_away` (not across a loop it is declared outside of;
+  then any use is an error, `check_not_given`; branches are merged). A
+  generator's own parameters, `Iter[T]` parameters (which take their
+  arguments), and top-level variables no function uses, can be too. The
+  lowering already handled such values as moves.
 * **Modules and packages.** A file is a module (`import geo.poly`, `as`,
   imports of one item); `_names` are private; other modules' variables are
   read-only; packages are found on `--path` and `ELLA_PATH`. Errors name
@@ -201,10 +228,12 @@ Grouped by area; [TODO-Claude.md](TODO-Claude.md) has the dated log.
   math, code points, strings, `hash`, files, arguments, environment,
   `exit`. The standard library in Ella ([src/ella/lib/](src/ella/lib/)):
   `lists`, `maps` (`Map[K, V]`), `sets` (`Set[T]`), `strings`, `math`
-  (all in the prelude) and `iters` (imported). Map and set literals
+  and `iters` (all in the prelude). Map and set literals
   (`{"a": 1}`, `{1, 2}`, `{/}` for an empty set).
 * **Warnings.** Cases that never match, unused variables, parameters,
-  functions and imports, `mut` that isn't needed, code that never runs.
+  functions and imports, `mut` that isn't needed, code that never runs,
+  printing a library function's generator (`<gen>`), and an eager `map`
+  (or `filter`, `zip`, `enumerate`, `collect`) of a generator without end.
 * **Tooling.** The language server ([src/ella/lsp.py](src/ella/lsp.py)):
   errors and warnings as you type, hover, go to definition, semantic
   tokens, completion, across imported modules and open documents. The VS
