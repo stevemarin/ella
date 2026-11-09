@@ -6,6 +6,7 @@ print(repeat("ab", 3), [repeat("x", 0), repeat("x", -2)], repeat("", 5) == "")
 print(lines("a\nb\r\n\nc"), lines("a\n"), lines(""), lines("\n"), lines("x\r"), lines("é\r\nü"))
 print(words("  hello   big\tworld\n"), words(""), words("   "), words("one"), words("a\x0Bb\x0Cc"))
 print([trim_start("  a b  "), trim_end("  a b  "), trim_end(""), trim_start(" \t "), trim_end("x\r\n")])
+print([trim("  a b  "), trim("a b"), trim("    a b"), trim("a  b   ")])
 
 print(strip_prefix("unhappy", "un"), strip_prefix("happy", "un"), strip_prefix("un", "un"), strip_prefix("a", ""))
 print(strip_suffix("file.txt", ".txt"), strip_suffix("a", "ab"))

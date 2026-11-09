@@ -28,3 +28,6 @@ let main = () -> () =>
 
     # The eager ones go through generators too, if they end.
     print(count(1, 1) |> take(3) |> map((n) => n * 2), each("ab") |> collect)
+
+    print(iters.sum([1, 2, 3]))
+    

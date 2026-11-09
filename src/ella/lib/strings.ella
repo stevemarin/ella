@@ -52,6 +52,9 @@ let trim_end = (s: str) -> str =>
         i -= 1
     s[0..i]
 
+let trim = (s: str) -> str =>
+    s |> trim_start() |> trim_end()
+
 # s without `prefix` at its start (or `suffix` at its end), if it has it there.
 let strip_prefix = (s: str, prefix: str) -> Optional[str] =>
     if starts_with(s, prefix) then Some(s[len(prefix)..len(s)]) else None

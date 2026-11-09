@@ -1,0 +1,20 @@
+
+struct BTree[T]
+    _nodes: [T]
+
+    root = (tree: BTree[T]) -> (i64, T) =>
+        (0, tree._nodes[0])
+    
+    parent = (tree: BTree[T], idx: i64) -> (i64, T) => 
+        where
+            idx > 0
+        let i: i64 = (idx - 1) // 2
+        (i, tree._nodes[i])
+
+    left = (tree: BTree[T], idx: i64) -> (i64, T) => 
+        let i: i64 = 2 * idx + 1
+        (i, tree._nodes[i])
+    
+    right = (tree: BTree[T], idx: i64) -> (i64, T) => 
+        let i: i64 = 2 * idx + 2
+        (i, tree._nodes[i])
